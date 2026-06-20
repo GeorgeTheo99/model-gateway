@@ -1,0 +1,11 @@
+# Real provider credentials — never commit
+config/config.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# macOS
+.DS_Store

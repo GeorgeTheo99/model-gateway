@@ -1,0 +1,288 @@
+"""Translate between Anthropic Messages API and OpenAI Chat Completions API.
+
+Adapted from !old/anthropic-proxy/translator.py — simplified for cloud providers
+(no tool injection, no system reminder normalization, no ࿜ tag parsing).
+"""
+
+import json
+import logging
+import secrets
+
+from src.signature_cache import inject_into_tool_call
+
+log = logging.getLogger("cloud-gateway")
+
+
+def _gen_msg_id() -> str:
+    return "msg_" + secrets.token_hex(12)
+
+
+def anthropic_to_openai(body: dict) -> dict:
+    """Convert Anthropic Messages API request to OpenAI Chat Completions format.
+
+    Strips cache_control blocks (Fireworks uses automatic prefix caching,
+    not Anthropic's explicit cache_control markers).
+    """
+    messages = []
+
+    # System message — strip cache_control (Fireworks doesn't support it)
+    system = body.get("system")
+    if system:
+        if isinstance(system, list):
+            # Grab text from text blocks, silently ignore cache_control
+            system_text = " ".join(
+                b["text"] for b in system if b.get("type") == "text"
+            )
+        else:
+            system_text = system
+        if system_text:
+            messages.append({"role": "system", "content": system_text})
+
+    # Convert messages — strip cache_control from content blocks
+    for msg in body.get("messages", []):
+        role = msg["role"]
+        content = msg.get("content")
+
+        if isinstance(content, str):
+            messages.append({"role": role, "content": content})
+            continue
+
+        if not isinstance(content, list):
+            messages.append({"role": role, "content": str(content) if content else ""})
+            continue
+
+        # Content is an array of blocks
+        if role == "user":
+            # Filter out cache_control-only blocks, keep text and tool_result
+            tool_results = [b for b in content if b.get("type") == "tool_result"]
+            other_blocks = [b for b in content if b.get("type") != "tool_result"]
+
+            if other_blocks:
+                text_parts = []
+                image_parts = []
+                for block in other_blocks:
+                    if block.get("type") == "text":
+                        text_parts.append({"type": "text", "text": block["text"]})
+                    elif block.get("type") == "image":
+                        source = block.get("source", {})
+                        media_type = source.get("media_type", "image/png")
+                        data = source.get("data", "")
+                        image_parts.append({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{media_type};base64,{data}"
+                            }
+                        })
+
+                all_parts = text_parts + image_parts
+                if all_parts:
+                    # Use content array when there are images; plain string for text-only
+                    if image_parts:
+                        messages.append({"role": "user", "content": all_parts})
+                    elif text_parts:
+                        messages.append({"role": "user", "content": "\n".join(p["text"] for p in text_parts)})
+
+            for tr in tool_results:
+                tr_content = tr.get("content", "")
+                if isinstance(tr_content, list):
+                    tr_content = " ".join(
+                        b.get("text", "") for b in tr_content if b.get("type") == "text"
+                    )
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tr["tool_use_id"],
+                    "content": str(tr_content),
+                })
+
+        elif role == "assistant":
+            text_parts = []
+            tool_calls = []
+            reasoning_parts = []
+            for block in content:
+                if block.get("type") == "text":
+                    text_parts.append(block["text"])
+                elif block.get("type") == "thinking":
+                    reasoning_parts.append(block.get("thinking", ""))
+                elif block.get("type") == "tool_use":
+                    tc: dict = {
+                        "id": block["id"],
+                        "type": "function",
+                        "function": {
+                            "name": block["name"],
+                            "arguments": json.dumps(block["input"]),
+                        },
+                    }
+                    # Preserve Google thought_signature for Gemini models
+                    if block.get("thought_signature"):
+                        tc["extra_content"] = {"google": {"thought_signature": block["thought_signature"]}}
+                    # Inject cached signature if client didn't preserve it
+                    had_ec = bool(tc.get("extra_content"))
+                    inject_into_tool_call(tc)
+                    if not had_ec and tc.get("extra_content"):
+                        log.info("signature_cache: injected cached thought_signature for tool_use %s (%s)", block["id"], block["name"])
+                    elif not had_ec and not tc.get("extra_content") and not tool_calls:
+                        # First tool_call in this step lacks a signature — Gemini will reject this
+                        log.warning("signature_cache: NO cached thought_signature for first tool_use %s (%s) — Gemini may reject", block["id"], block["name"])
+                    tool_calls.append(tc)
+
+            msg_out: dict = {"role": "assistant"}
+            msg_out["content"] = "\n".join(text_parts) if text_parts else None
+            if reasoning_parts:
+                msg_out["reasoning_content"] = "\n".join(reasoning_parts)
+            if tool_calls:
+                msg_out["tool_calls"] = tool_calls
+            messages.append(msg_out)
+
+    # Build OpenAI request
+    openai_req: dict = {
+        "model": body.get("model", ""),
+        "messages": messages,
+        "max_tokens": body.get("max_tokens", 32768),
+    }
+
+    # Pass-through params
+    for key in ("temperature", "top_p", "stream"):
+        if key in body:
+            openai_req[key] = body[key]
+
+    # Reasoning — forward thinking/reasoning_effort to Fireworks
+    thinking = body.get("thinking")
+    if isinstance(thinking, dict):
+        thinking_type = thinking.get("type")
+        if thinking_type == "enabled":
+            budget = thinking.get("budget_tokens")
+            if budget:
+                openai_req["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            else:
+                openai_req["reasoning_effort"] = "high"
+        elif thinking_type == "adaptive":
+            # Map adaptive thinking to reasoning_effort for OpenAI-compatible providers
+            effort = (body.get("output_config") or {}).get("effort", "high")
+            openai_req["reasoning_effort"] = effort
+        elif thinking_type == "disabled":
+            openai_req["thinking"] = {"type": "disabled"}
+
+    if "stop_sequences" in body:
+        openai_req["stop"] = body["stop_sequences"]
+
+    # Tools — strip cache_control from tool definitions
+    if "tools" in body:
+        openai_req["tools"] = []
+        for t in body["tools"]:
+            tool_def = {
+                "type": "function",
+                "function": {
+                    "name": t["name"],
+                    "description": t.get("description", ""),
+                    "parameters": t.get("input_schema", {}),
+                },
+            }
+            openai_req["tools"].append(tool_def)
+
+        # Tool choice
+        tc = body.get("tool_choice")
+        if tc:
+            if isinstance(tc, dict):
+                tc_type = tc.get("type")
+                if tc_type == "auto":
+                    openai_req["tool_choice"] = "auto"
+                elif tc_type == "any":
+                    openai_req["tool_choice"] = "required"
+                elif tc_type == "tool":
+                    openai_req["tool_choice"] = {
+                        "type": "function",
+                        "function": {"name": tc["name"]},
+                    }
+            elif isinstance(tc, str):
+                if tc == "any":
+                    openai_req["tool_choice"] = "required"
+                else:
+                    openai_req["tool_choice"] = tc
+
+    return openai_req
+
+
+def openai_to_anthropic(resp: dict, model: str, has_tools: bool = False, thinking_enabled: bool = False) -> dict:
+    """Convert OpenAI Chat Completions response to Anthropic Messages format.
+
+    Passes through cache usage (cached_tokens) so Claude Code can see
+    Fireworks prompt cache hit rates.
+    """
+    choice = resp.get("choices", [{}])[0]
+    message = choice.get("message", {})
+
+    content = []
+    text = message.get("content")
+    reasoning_content = message.get("reasoning_content") or message.get("reasoning")
+    if not reasoning_content and message.get("reasoning_details"):
+        parts = []
+        for item in message.get("reasoning_details") or []:
+            if isinstance(item, dict):
+                parts.append(item.get("text") or item.get("summary") or "")
+        reasoning_content = "".join(parts)
+    tool_calls_raw = message.get("tool_calls")
+
+    # Thinking/reasoning content
+    if reasoning_content and thinking_enabled:
+        content.append({"type": "thinking", "thinking": reasoning_content})
+
+    # Tool calls
+    if tool_calls_raw:
+        if text:
+            content.append({"type": "text", "text": text})
+        for tc in tool_calls_raw:
+            fn = tc.get("function", {})
+            try:
+                args = json.loads(fn.get("arguments", "{}"))
+            except json.JSONDecodeError:
+                args = {}
+            block: dict = {
+                "type": "tool_use",
+                "id": tc.get("id", "toolu_" + secrets.token_hex(12)),
+                "name": fn.get("name", ""),
+                "input": args,
+            }
+            # Preserve Google thought_signature for Gemini models
+            ts = (tc.get("extra_content") or {}).get("google", {}).get("thought_signature")
+            if ts:
+                block["thought_signature"] = ts
+            content.append(block)
+    elif text:
+        content.append({"type": "text", "text": text})
+    else:
+        content.append({"type": "text", "text": ""})
+
+    # Stop reason
+    finish = choice.get("finish_reason", "stop")
+    has_tool_use = any(b.get("type") == "tool_use" for b in content)
+    if has_tool_use:
+        stop_reason = "tool_use"
+    elif finish == "length":
+        stop_reason = "max_tokens"
+    else:
+        stop_reason = "end_turn"
+
+    usage = resp.get("usage", {})
+
+    # Build Anthropic usage — pass through cache stats from Fireworks
+    anthropic_usage = {
+        "input_tokens": usage.get("prompt_tokens", 0),
+        "output_tokens": usage.get("completion_tokens", 0),
+    }
+
+    # Fireworks returns cached_tokens in prompt_tokens_details
+    prompt_details = usage.get("prompt_tokens_details") or {}
+    cached_tokens = prompt_details.get("cached_tokens", 0)
+    if cached_tokens:
+        anthropic_usage["cache_read_input_tokens"] = cached_tokens
+
+    return {
+        "id": _gen_msg_id(),
+        "type": "message",
+        "role": "assistant",
+        "content": content,
+        "model": model,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": anthropic_usage,
+    }

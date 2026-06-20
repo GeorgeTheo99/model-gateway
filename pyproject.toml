@@ -1,0 +1,20 @@
+[project]
+name = "cloud-gateway"
+version = "0.1.0"
+description = "Unified model gateway — OpenAI + Anthropic API across cloud providers"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "httpx>=0.28",
+    "pyyaml>=6.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.0",
+]

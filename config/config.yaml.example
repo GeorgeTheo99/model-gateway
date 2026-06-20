@@ -1,0 +1,15 @@
+# Model gateway provider configuration.
+# Copy to config.yaml and fill in API keys.
+# This file is symlinked to shared/ on the server (contains secrets).
+
+providers:
+  # cloud-gateway intentionally routes only remote/cloud providers.
+  # Local MLX/oMLX models are served directly by oMLX on port 9110.
+
+  fireworks:
+    base_url: https://api.fireworks.ai/inference/v1
+    api_key: "YOUR_FIREWORKS_API_KEY"
+  zhipuai:
+    base_url: https://open.bigmodel.cn/api/paas/v4
+    api_key_id: <REDACTED-KEY-ID>
+    api_key: "<REDACTED>"
