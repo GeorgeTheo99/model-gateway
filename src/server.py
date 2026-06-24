@@ -162,14 +162,22 @@ def _is_openrouter_gemini(info) -> bool:
 
 
 def _strip_fireworks_unsupported_message_fields(req: dict, info) -> None:
-    """Remove prior-provider reasoning metadata that Fireworks rejects in messages."""
+    """Remove OpenAI/Pi metadata that Fireworks rejects as extra inputs."""
     if getattr(info, "provider", "") != "fireworks":
-        return
-    messages = req.get("messages")
-    if not isinstance(messages, list):
         return
 
     removed = 0
+    for key in ("prompt_cache_key", "prompt_cache_retention"):
+        if key in req:
+            req.pop(key, None)
+            removed += 1
+
+    messages = req.get("messages")
+    if not isinstance(messages, list):
+        if removed:
+            log.info("Fireworks request cleanup: stripped %d unsupported field(s)", removed)
+        return
+
     for msg in messages:
         if not isinstance(msg, dict):
             continue

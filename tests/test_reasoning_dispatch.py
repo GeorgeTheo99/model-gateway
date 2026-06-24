@@ -242,6 +242,8 @@ def test_chat_completions_image_request_uses_fireworks_default_vision_fallback(c
     async def fake_passthrough_sync(endpoint, body, headers):
         assert endpoint == "http://up/chat/completions"
         assert body["model"] == "accounts/fireworks/models/qwen3p7-plus"
+        assert "prompt_cache_key" not in body
+        assert "prompt_cache_retention" not in body
         assert "reasoning" not in body["messages"][0]
         assert "reasoning_content" not in body["messages"][0]
         return server_module.JSONResponse(status_code=200, content={"ok": True})
@@ -252,6 +254,8 @@ def test_chat_completions_image_request_uses_fireworks_default_vision_fallback(c
 
     resp = client.post("/v1/chat/completions", json={
         "model": "text-model",
+        "prompt_cache_key": "pi-session",
+        "prompt_cache_retention": "24h",
         "messages": [
             {
                 "role": "assistant",
