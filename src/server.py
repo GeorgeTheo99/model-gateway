@@ -30,6 +30,8 @@ log = logging.getLogger("cloud-gateway")
 
 app = FastAPI(title="Model Gateway")
 
+DEFAULT_VISION_FALLBACK_MODEL = "qwen3.7-plus-fw"
+
 
 def _session_affinity_id(request: Request) -> str:
     """Derive a stable affinity ID for Fireworks x-session-affinity.
@@ -947,7 +949,7 @@ async def chat_completions(request: Request):
     # ProviderInfo), not from a keyword heuristic. Keep model-info.json accurate.
     vision_capable = info.vision
 
-    fallback_model = os.environ.get("GATEWAY_VISION_FALLBACK", "google/gemini-3.5-flash")
+    fallback_model = os.environ.get("GATEWAY_VISION_FALLBACK", DEFAULT_VISION_FALLBACK_MODEL)
     if not vision_capable and _payload_has_image(body) and fallback_model:
         log.info("Vision fallback: rerouting '%s' to '%s'", model, fallback_model)
         fallback_info = resolve(fallback_model)

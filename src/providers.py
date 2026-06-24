@@ -10,11 +10,10 @@ import yaml
 
 log = logging.getLogger("cloud-gateway")
 
-# model-info.json is the shared source of truth and normally lives in the
-# server repo root. The gateway no longer lives inside that tree, so allow the
-# path to be supplied via env (set by the launcher/deploy); fall back to the
-# legacy sibling-tree location for backward compat and local dev.
-_DEFAULT_MODEL_INFO = Path(__file__).resolve().parents[2] / "model-info.json"
+# model-info.json is the gateway-owned source of truth. Allow the path to be
+# supplied via env (set by the launcher/deploy); fall back to the checkout-local
+# catalog for tests and local dev.
+_DEFAULT_MODEL_INFO = Path(__file__).resolve().parents[1] / "model-info.json"
 MODEL_INFO_PATH = Path(os.environ.get("CLOUD_GATEWAY_MODEL_INFO", str(_DEFAULT_MODEL_INFO))).resolve()
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "config.yaml"
 

@@ -1,5 +1,5 @@
 {
-  "updated": "2026-06-14",
+  "updated": "2026-06-23",
   "_note": "After editing, run: python3 omlx-config/fan_out_settings.py (syncs oMLX settings + regenerates model-aliases.json)",
   "_thinking_policy": "Always enable thinking by default (set thinking: always). Use no_think: true only as an explicit override for specific use cases. Models with 3B active params especially need thinking to avoid context-forgetting in multi-turn agentic sessions.",
   "llm": [
@@ -405,7 +405,7 @@
       "max_output_tokens": 65536,
       "thinking": "optional",
       "vision": true,
-      "desc": "Qwen3.7 Plus on Fireworks, multimodal agent model, 262k context / 64k max output (~$0.40/$1.60 per 1M tokens)"
+      "desc": "Qwen3.7 Plus on Fireworks, multimodal agent model, 262k context / 64k max output (~$0.40/$1.60 per 1M tokens) - vision fallback"
     },
     {
       "name": "claude-fable-5",
@@ -541,7 +541,7 @@
       "max_output_tokens": 65536,
       "thinking": "optional",
       "vision": true,
-      "desc": "Gemini 3.5 Flash via OpenRouter ($1.50/$9 per 1M tokens) - vision fallback",
+      "desc": "Gemini 3.5 Flash via OpenRouter ($1.50/$9 per 1M tokens)",
       "thinking_format": "openrouter"
     }
   ],

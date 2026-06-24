@@ -24,7 +24,8 @@ except Exception:  # pragma: no cover - fastapi is a runtime dep
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _info(fmt: str, *, thinking: str = "always", provider: str = "x",
-          provider_model_id: str = "m", max_output_tokens: int = 32768) -> ProviderInfo:
+          provider_model_id: str = "m", max_output_tokens: int = 32768,
+          vision: bool = False) -> ProviderInfo:
     """Build a ProviderInfo with an explicit thinking_format."""
     return ProviderInfo(
         provider=provider,
@@ -36,6 +37,7 @@ def _info(fmt: str, *, thinking: str = "always", provider: str = "x",
         max_output_tokens=max_output_tokens,
         thinking=thinking,
         thinking_format=fmt,
+        vision=vision,
     )
 
 
@@ -213,6 +215,45 @@ def test_chat_completions_text_request_does_not_500_on_vision_fallback_env(clien
     resp = client.post("/v1/chat/completions", json={
         "model": "text-model",
         "messages": [{"role": "user", "content": "hello"}],
+    })
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_chat_completions_image_request_uses_fireworks_default_vision_fallback(client, monkeypatch):
+    text_info = _info("none", thinking="", provider="test", provider_model_id="text-upstream")
+    fallback_info = _info(
+        "",
+        thinking="optional",
+        provider="fireworks",
+        provider_model_id="accounts/fireworks/models/qwen3p7-plus",
+        vision=True,
+    )
+
+    def fake_resolve(model):
+        if model == "text-model":
+            return text_info
+        if model == server_module.DEFAULT_VISION_FALLBACK_MODEL:
+            return fallback_info
+        return None
+
+    async def fake_passthrough_sync(endpoint, body, headers):
+        assert endpoint == "http://up/chat/completions"
+        assert body["model"] == "accounts/fireworks/models/qwen3p7-plus"
+        return server_module.JSONResponse(status_code=200, content={"ok": True})
+
+    monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
+    monkeypatch.setattr(server_module, "resolve", fake_resolve)
+    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough_sync)
+
+    resp = client.post("/v1/chat/completions", json={
+        "model": "text-model",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is in this image?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]}],
     })
 
     assert resp.status_code == 200
