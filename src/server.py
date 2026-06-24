@@ -7,7 +7,9 @@ Presents the same dual API contract on port 9111:
   /health               (health check)
 """
 
+import base64
 import hashlib
+import io
 import json
 import logging
 import os
@@ -31,6 +33,9 @@ log = logging.getLogger("cloud-gateway")
 app = FastAPI(title="Model Gateway")
 
 DEFAULT_VISION_FALLBACK_MODEL = "qwen3.7-plus-fw"
+DEFAULT_FIREWORKS_IMAGE_MAX_BYTES = 1_000_000
+DEFAULT_FIREWORKS_IMAGE_MAX_DIMENSION = 1600
+DEFAULT_FIREWORKS_IMAGE_TOTAL_MAX_BYTES = 8_000_000
 
 
 def _session_affinity_id(request: Request) -> str:
@@ -192,7 +197,125 @@ def _strip_fireworks_unsupported_message_fields(req: dict, info) -> None:
                     tool_call.pop("extra_content", None)
                     removed += 1
     if removed:
-        log.info("Fireworks request cleanup: stripped %d unsupported message field(s)", removed)
+        log.info("Fireworks request cleanup: stripped %d unsupported field(s)", removed)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, ""))
+        return value if value > 0 else default
+    except Exception:
+        return default
+
+
+def _image_url_value(part: dict) -> str | None:
+    image_url = part.get("image_url")
+    if isinstance(image_url, dict):
+        url = image_url.get("url")
+    else:
+        url = image_url
+    return url if isinstance(url, str) else None
+
+
+def _set_image_url_value(part: dict, url: str) -> None:
+    image_url = part.get("image_url")
+    if isinstance(image_url, dict):
+        image_url["url"] = url
+    else:
+        part["image_url"] = {"url": url}
+
+
+def _inline_image_payloads(req: dict) -> list[tuple[dict, bytes]]:
+    messages = req.get("messages")
+    if not isinstance(messages, list):
+        return []
+
+    payloads = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            url = _image_url_value(part)
+            if not url or not url.startswith("data:image/") or ";base64," not in url:
+                continue
+            _, b64_data = url.split(";base64,", 1)
+            try:
+                payloads.append((part, base64.b64decode(b64_data, validate=False)))
+            except Exception:
+                continue
+    return payloads
+
+
+def _compress_fireworks_inline_images(req: dict, info) -> None:
+    """Downsample base64 images for Fireworks' documented image/request limits."""
+    if getattr(info, "provider", "") != "fireworks":
+        return
+
+    payloads = _inline_image_payloads(req)
+    if not payloads:
+        return
+
+    try:
+        from PIL import Image, ImageOps
+    except Exception as exc:  # pragma: no cover - dependency/runtime guard
+        log.warning("Fireworks image compression skipped: Pillow unavailable: %s", exc)
+        return
+
+    max_dim = _env_int("GATEWAY_FIREWORKS_IMAGE_MAX_DIMENSION", DEFAULT_FIREWORKS_IMAGE_MAX_DIMENSION)
+    max_bytes = _env_int("GATEWAY_FIREWORKS_IMAGE_MAX_BYTES", DEFAULT_FIREWORKS_IMAGE_MAX_BYTES)
+    total_max = _env_int("GATEWAY_FIREWORKS_IMAGE_TOTAL_MAX_BYTES", DEFAULT_FIREWORKS_IMAGE_TOTAL_MAX_BYTES)
+    total_before = sum(len(raw) for _, raw in payloads)
+    target_bytes = min(max_bytes, max(total_max // max(len(payloads), 1), 200_000))
+    force_compress = total_before > total_max
+
+    changed = 0
+    total_after = total_before
+    for part, raw in payloads:
+        try:
+            with Image.open(io.BytesIO(raw)) as image:
+                image = ImageOps.exif_transpose(image)
+                original_size = image.size
+                needs_resize = max(original_size) > max_dim
+                if not force_compress and len(raw) <= target_bytes and not needs_resize:
+                    continue
+
+                image.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+                if image.mode in {"RGBA", "LA"} or (image.mode == "P" and "transparency" in image.info):
+                    background = Image.new("RGB", image.size, (255, 255, 255))
+                    alpha = image.getchannel("A") if image.mode in {"RGBA", "LA"} else None
+                    background.paste(image.convert("RGBA"), mask=alpha)
+                    image = background
+                elif image.mode != "RGB":
+                    image = image.convert("RGB")
+
+                best = None
+                for quality in (85, 75, 65, 55, 45):
+                    out = io.BytesIO()
+                    image.save(out, format="JPEG", quality=quality, optimize=True)
+                    candidate = out.getvalue()
+                    best = candidate
+                    if len(candidate) <= target_bytes:
+                        break
+                if not best or len(best) >= len(raw) and not needs_resize:
+                    continue
+
+                encoded = base64.b64encode(best).decode("ascii")
+                _set_image_url_value(part, f"data:image/jpeg;base64,{encoded}")
+                total_after += len(best) - len(raw)
+                changed += 1
+        except Exception as exc:
+            log.warning("Fireworks image compression skipped one image: %s", exc)
+
+    if changed:
+        log.info(
+            "Fireworks image compression: compressed %d/%d inline image(s), raw bytes %d -> %d",
+            changed, len(payloads), total_before, total_after,
+        )
 
 
 _REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh", "max"}
@@ -653,6 +776,7 @@ async def create_response(request: Request):
             chat_req[key] = body[key]
     thinking_enabled = _apply_gateway_reasoning(chat_req, info, target_api="chat")
     _strip_fireworks_unsupported_message_fields(chat_req, info)
+    _compress_fireworks_inline_images(chat_req, info)
     if _is_openrouter_gemini(info):
         _enable_openrouter_gemini_prompt_cache(chat_req)
     if thinking_enabled:
@@ -1027,6 +1151,7 @@ async def chat_completions(request: Request):
 
     thinking_enabled = _apply_gateway_reasoning(body, info, target_api="chat")
     _strip_fireworks_unsupported_message_fields(body, info)
+    _compress_fireworks_inline_images(body, info)
     if _is_openrouter_gemini(info):
         _enable_openrouter_gemini_prompt_cache(body)
 
@@ -1294,6 +1419,7 @@ async def messages(request: Request):
             openai_req[key] = body[key]
     thinking_enabled = _apply_gateway_reasoning(openai_req, info, target_api="chat") or thinking_enabled
     _strip_fireworks_unsupported_message_fields(openai_req, info)
+    _compress_fireworks_inline_images(openai_req, info)
     if _is_openrouter_gemini(info):
         _enable_openrouter_gemini_prompt_cache(openai_req)
 

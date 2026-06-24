@@ -7,6 +7,8 @@ visible failure instead of a quiet behavior change.
 Run:  cd server/cloud-gateway && uv run pytest
 """
 
+import base64
+import io
 from types import SimpleNamespace
 
 import pytest
@@ -219,6 +221,30 @@ def test_chat_completions_text_request_does_not_500_on_vision_fallback_env(clien
 
     assert resp.status_code == 200
     assert resp.json() == {"ok": True}
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_fireworks_inline_image_compression(monkeypatch):
+    from PIL import Image
+
+    raw = io.BytesIO()
+    Image.new("RGB", (2200, 1200), (180, 40, 40)).save(raw, format="PNG")
+    body = {"messages": [{"role": "user", "content": [{
+        "type": "image_url",
+        "image_url": {"url": f"data:image/png;base64,{base64.b64encode(raw.getvalue()).decode('ascii')}"},
+    }]}]}
+    info = _info("", provider="fireworks", vision=True)
+
+    monkeypatch.setenv("GATEWAY_FIREWORKS_IMAGE_MAX_DIMENSION", "400")
+    monkeypatch.setenv("GATEWAY_FIREWORKS_IMAGE_MAX_BYTES", "50000")
+    server_module._compress_fireworks_inline_images(body, info)
+
+    url = body["messages"][0]["content"][0]["image_url"]["url"]
+    assert url.startswith("data:image/jpeg;base64,")
+    optimized = base64.b64decode(url.split(",", 1)[1])
+    with Image.open(io.BytesIO(optimized)) as image:
+        assert max(image.size) <= 400
+    assert len(optimized) <= 50000
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
