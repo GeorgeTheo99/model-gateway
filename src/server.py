@@ -161,6 +161,32 @@ def _is_openrouter_gemini(info) -> bool:
     return info.provider == "openrouter" and info.provider_model_id.startswith("google/gemini")
 
 
+def _strip_fireworks_unsupported_message_fields(req: dict, info) -> None:
+    """Remove prior-provider reasoning metadata that Fireworks rejects in messages."""
+    if getattr(info, "provider", "") != "fireworks":
+        return
+    messages = req.get("messages")
+    if not isinstance(messages, list):
+        return
+
+    removed = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        for key in ("reasoning", "reasoning_content", "reasoning_details"):
+            if key in msg:
+                msg.pop(key, None)
+                removed += 1
+        tool_calls = msg.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tool_call in tool_calls:
+                if isinstance(tool_call, dict) and "extra_content" in tool_call:
+                    tool_call.pop("extra_content", None)
+                    removed += 1
+    if removed:
+        log.info("Fireworks request cleanup: stripped %d unsupported message field(s)", removed)
+
+
 _REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh", "max"}
 _EFFORT_ALIASES = {"off": "none", "disabled": "none", "max": "xhigh"}
 _EFFORT_RATIOS = {"minimal": 0.10, "low": 0.20, "medium": 0.50, "high": 0.80, "xhigh": 0.95, "max": 0.95}
@@ -618,6 +644,7 @@ async def create_response(request: Request):
         if key in body and key not in chat_req:
             chat_req[key] = body[key]
     thinking_enabled = _apply_gateway_reasoning(chat_req, info, target_api="chat")
+    _strip_fireworks_unsupported_message_fields(chat_req, info)
     if _is_openrouter_gemini(info):
         _enable_openrouter_gemini_prompt_cache(chat_req)
     if thinking_enabled:
@@ -991,6 +1018,7 @@ async def chat_completions(request: Request):
     is_stream = body.get("stream", False)
 
     thinking_enabled = _apply_gateway_reasoning(body, info, target_api="chat")
+    _strip_fireworks_unsupported_message_fields(body, info)
     if _is_openrouter_gemini(info):
         _enable_openrouter_gemini_prompt_cache(body)
 
@@ -1257,6 +1285,7 @@ async def messages(request: Request):
         if key in body and key not in openai_req:
             openai_req[key] = body[key]
     thinking_enabled = _apply_gateway_reasoning(openai_req, info, target_api="chat") or thinking_enabled
+    _strip_fireworks_unsupported_message_fields(openai_req, info)
     if _is_openrouter_gemini(info):
         _enable_openrouter_gemini_prompt_cache(openai_req)
 

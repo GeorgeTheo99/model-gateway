@@ -242,6 +242,8 @@ def test_chat_completions_image_request_uses_fireworks_default_vision_fallback(c
     async def fake_passthrough_sync(endpoint, body, headers):
         assert endpoint == "http://up/chat/completions"
         assert body["model"] == "accounts/fireworks/models/qwen3p7-plus"
+        assert "reasoning" not in body["messages"][0]
+        assert "reasoning_content" not in body["messages"][0]
         return server_module.JSONResponse(status_code=200, content={"ok": True})
 
     monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
@@ -250,10 +252,18 @@ def test_chat_completions_image_request_uses_fireworks_default_vision_fallback(c
 
     resp = client.post("/v1/chat/completions", json={
         "model": "text-model",
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": "what is in this image?"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
-        ]}],
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "prior answer",
+                "reasoning": "prior hidden reasoning",
+                "reasoning_content": "prior hidden reasoning",
+            },
+            {"role": "user", "content": [
+                {"type": "text", "text": "what is in this image?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            ]},
+        ],
     })
 
     assert resp.status_code == 200
