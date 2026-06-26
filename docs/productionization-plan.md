@@ -6,6 +6,8 @@ Turn the local cloud gateway into a managed model-router product: a small admin 
 
 ## Current state
 
+Deployment/auth rollout details are documented in [`deployment-auth.md`](deployment-auth.md).
+
 - Runtime is a FastAPI service in `src/server.py` with:
   - `GET /health`
   - `GET /v1/models`
