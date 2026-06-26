@@ -11,5 +11,17 @@ providers:
     api_key: "YOUR_FIREWORKS_API_KEY"
   zhipuai:
     base_url: https://open.bigmodel.cn/api/paas/v4
-    api_key_id: <REDACTED-KEY-ID>
-    api_key: "<REDACTED>"
+    api_key: "YOUR_ZHIPUAI_API_KEY"
+
+  zai_coding:
+    base_url: https://api.z.ai/api/coding/paas/v4
+    api_key: "YOUR_ZAI_CODING_API_KEY"
+
+  anthropic:
+    base_url: https://api.anthropic.com/v1
+    api_key: "YOUR_ANTHROPIC_API_KEY"
+    protocol: anthropic
+
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key: "YOUR_OPENAI_API_KEY"

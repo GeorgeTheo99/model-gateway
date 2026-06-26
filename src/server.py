@@ -21,6 +21,8 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from src.admin import router as admin_router
+from src.auth import require_client_auth
 from src.providers import list_models as list_routable_models, resolve
 from src.responses import chat_to_responses, responses_to_chat, translate_responses_stream
 from src.signature_cache import store_from_extra_content
@@ -31,6 +33,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("cloud-gateway")
 
 app = FastAPI(title="Model Gateway")
+app.include_router(admin_router)
 
 DEFAULT_VISION_FALLBACK_MODEL = "qwen3.7-plus-fw"
 DEFAULT_FIREWORKS_IMAGE_MAX_BYTES = 1_000_000
@@ -662,7 +665,8 @@ async def health():
 
 
 @app.get("/v1/models")
-async def list_models():
+async def list_models(request: Request):
+    require_client_auth(request)
     models = list_routable_models()
     data = []
     for m in models:
@@ -682,7 +686,8 @@ async def list_models():
 
 
 @app.get("/v1/debug/thinking")
-async def debug_thinking():
+async def debug_thinking(request: Request):
+    require_client_auth(request)
     """Read-only matrix of per-model thinking forwarding, derived at runtime.
 
     Surfaces, for every routable model, which thinking params the dispatch
@@ -733,6 +738,7 @@ async def create_response(request: Request):
     Translates Responses API requests to Chat Completions, forwards to cloud
     provider, then translates results back to Responses format.
     """
+    require_client_auth(request)
     try:
         body = await request.json()
     except Exception:
@@ -1085,6 +1091,7 @@ async def _handle_responses_stream_google(endpoint: str, chat_req: dict, model: 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """OpenAI-compatible passthrough — forward to resolved provider with auth."""
+    require_client_auth(request)
     try:
         body = await request.json()
     except Exception:
@@ -1338,6 +1345,7 @@ async def messages(request: Request):
     Anthropic models: passthrough directly to Anthropic's native Messages API.
     Other providers: translate to OpenAI, forward, translate back.
     """
+    require_client_auth(request)
     try:
         body = await request.json()
     except Exception:

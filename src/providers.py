@@ -5,6 +5,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import yaml
 
@@ -199,3 +200,106 @@ def list_models() -> list[dict]:
             model_entry["id"] = model_id
             result.append(model_entry)
     return result
+
+
+def _configured_provider_ids() -> set[str]:
+    config = _load_config()
+    providers = config.get("providers", {}) or {}
+    return {_canonical_provider(key) for key in providers}
+
+
+def _safe_url(value: str) -> str:
+    """Strip URL userinfo before exposing provider config in admin APIs."""
+    if not value:
+        return ""
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return ""
+    if not parts.netloc:
+        return value
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    # Do not expose query/fragment: provider base URLs occasionally carry
+    # auth-ish parameters and admin status only needs the service origin/path.
+    return urlunsplit((parts.scheme, host, parts.path, "", ""))
+
+
+def provider_status() -> list[dict]:
+    """Return masked provider configuration status for admin/observability APIs."""
+    config = _load_config()
+    configured = config.get("providers", {}) or {}
+    models = list_models()
+
+    model_counts: dict[str, int] = {}
+    for model in models:
+        provider = _canonical_provider(model.get("provider", ""))
+        model_counts[provider] = model_counts.get(provider, 0) + 1
+
+    provider_ids = sorted(set(model_counts) | {_canonical_provider(key) for key in configured})
+    result = []
+    for provider in provider_ids:
+        provider_config = _resolve_provider_config(config, provider)
+        base_url = _safe_url(provider_config.get("base_url", ""))
+        has_api_key = bool(provider_config.get("api_key"))
+        issues = []
+        if model_counts.get(provider, 0) and not base_url:
+            issues.append("missing_base_url")
+        if model_counts.get(provider, 0) and not has_api_key:
+            issues.append("missing_api_key")
+        result.append({
+            "id": provider,
+            "configured": bool(provider_config),
+            "enabled_models": model_counts.get(provider, 0),
+            "base_url": base_url,
+            "protocol": provider_config.get("protocol", "openai") if provider_config else "openai",
+            "has_api_key": has_api_key,
+            "ready": not issues,
+            "issues": issues,
+        })
+    return result
+
+
+def model_status() -> list[dict]:
+    """Return routable model metadata with provider-config status."""
+    ready = {p["id"]: p["ready"] for p in provider_status()}
+    configured = _configured_provider_ids()
+    result = []
+    for model in list_models():
+        provider = _canonical_provider(model.get("provider", ""))
+        result.append({
+            "id": model.get("id"),
+            "name": model.get("name", ""),
+            "alias": model.get("alias", ""),
+            "provider": provider,
+            "provider_model_id": model.get("provider_model_id", ""),
+            "provider_configured": provider in configured,
+            "provider_ready": ready.get(provider, False),
+            "context": model.get("context", 0),
+            "max_output_tokens": model.get("max_output_tokens", 0),
+            "thinking": model.get("thinking", ""),
+            "thinking_format": model.get("thinking_format", ""),
+            "vision": bool(model.get("vision", False)),
+        })
+    return result
+
+
+def config_validation() -> dict:
+    """Validate current provider/model config without exposing secrets."""
+    providers = provider_status()
+    missing = [p for p in providers if p["enabled_models"] and p["issues"]]
+    return {
+        "ok": not missing,
+        "model_info_path": str(MODEL_INFO_PATH),
+        "config_path": str(CONFIG_PATH),
+        "providers": providers,
+        "issues": [
+            {
+                "provider": p["id"],
+                "enabled_models": p["enabled_models"],
+                "issues": p["issues"],
+            }
+            for p in missing
+        ],
+    }
