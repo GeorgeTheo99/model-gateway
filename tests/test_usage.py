@@ -4,6 +4,8 @@ from src.usage import Usage, extract_usage, estimate_cost
 
 
 def test_extract_openai_chat_shape():
+    # OpenAI prompt_tokens INCLUDES cached tokens; extract_usage subtracts
+    # them so input_tokens is cache-miss input (1000 - 200 = 800).
     resp = {"usage": {
         "prompt_tokens": 1000,
         "completion_tokens": 500,
@@ -12,7 +14,7 @@ def test_extract_openai_chat_shape():
     }}
     u = extract_usage(resp)
     assert u.reported is True
-    assert u.input_tokens == 1000
+    assert u.input_tokens == 800
     assert u.output_tokens == 500
     assert u.cached_read_tokens == 200
     assert u.cache_write_tokens == 0
@@ -36,6 +38,8 @@ def test_extract_anthropic_shape():
 
 
 def test_extract_responses_shape():
+    # OpenAI Responses input_tokens INCLUDES cached; subtracted to cache-miss
+    # (1200 - 300 = 900).
     resp = {"usage": {
         "input_tokens": 1200,
         "output_tokens": 600,
@@ -45,7 +49,7 @@ def test_extract_responses_shape():
     }}
     u = extract_usage(resp)
     assert u.reported is True
-    assert u.input_tokens == 1200
+    assert u.input_tokens == 900
     assert u.output_tokens == 600
     assert u.cached_read_tokens == 300
     assert u.cache_write_tokens == 0
@@ -60,6 +64,7 @@ def test_extract_no_usage_returns_unreported():
 
 
 def test_estimate_cost_full_pricing():
+    # input_tokens is cache-miss (1M), cached_read 200k, cache_write 100k.
     usage = Usage(input_tokens=1_000_000, output_tokens=500_000,
                   cached_read_tokens=200_000, cache_write_tokens=100_000,
                   reasoning_tokens=50_000, reported=True)
@@ -68,7 +73,7 @@ def test_estimate_cost_full_pricing():
     cost = estimate_cost(usage, pricing)
     assert cost.pricing_complete is True
     assert cost.missing_classes == []
-    # 1M*3 + 500k*15 + 200k*0.3 + 100k*3.75 + 50k*15 (reasoning priced as output)
+    # 1M*3 + 500k*15 + 200k*0.3 + 100k*3.75 + 50k*15
     expected = 3.0 + 7.5 + 0.06 + 0.375 + 0.75
     assert abs(cost.cost_usd - round(expected, 6)) < 1e-6
 

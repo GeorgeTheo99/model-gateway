@@ -98,12 +98,14 @@ def test_non_streaming_request_records_ledger_with_cost(tmp_ledger, monkeypatch)
     assert r["model"] == "priced-model"
     assert r["provider"] == "anthropic"
     assert r["status"] == 200
-    assert r["input_tokens"] == 100000
+    # OpenAI-shape: input_tokens = prompt_tokens - cached = 100k - 20k = 80k
+    assert r["input_tokens"] == 80000
     assert r["output_tokens"] == 50000
     assert r["cached_read_tokens"] == 20000
     assert r["usage_reported"] == 1
-    # 100k*3 + 50k*15 + 20k*0.3 per 1M = 0.3 + 0.75 + 0.006 = 1.056
-    assert r["cost_usd"] == pytest.approx(1.056, abs=1e-6)
+    # 80k*3 + 20k*0.3 + 50k*15 per 1M = 0.24 + 0.006 + 0.75 = 0.996
+    # (cached tokens priced once at cache_read, not double-counted at input rate)
+    assert r["cost_usd"] == pytest.approx(0.996, abs=1e-6)
     assert r["pricing_complete"] == 1
 
 

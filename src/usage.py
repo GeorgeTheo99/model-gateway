@@ -73,6 +73,8 @@ def extract_usage(resp: dict | None) -> Usage:
             return Usage()
 
     # Anthropic Messages shape: top-level cache_read/cache_creation keys.
+    # Anthropic's input_tokens EXCLUDES cached tokens (cache reads and writes
+    # are reported separately), so no subtraction needed.
     if "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage:
         return Usage(
             input_tokens=_as_int(usage.get("input_tokens")),
@@ -84,13 +86,18 @@ def extract_usage(resp: dict | None) -> Usage:
         )
 
     # OpenAI Responses shape: nested *_tokens_details.
+    # OpenAI's input_tokens INCLUDES cached tokens, so subtract cached to get
+    # cache-miss input (consistent with Anthropic semantics). This prevents
+    # estimate_cost from billing cached tokens at both the input and cache_read
+    # rates.
     if "input_tokens_details" in usage or "output_tokens_details" in usage:
         in_details = usage.get("input_tokens_details") or {}
         out_details = usage.get("output_tokens_details") or {}
+        cached = _as_int(in_details.get("cached_tokens"))
         return Usage(
-            input_tokens=_as_int(usage.get("input_tokens")),
+            input_tokens=max(0, _as_int(usage.get("input_tokens")) - cached),
             output_tokens=_as_int(usage.get("output_tokens")),
-            cached_read_tokens=_as_int(in_details.get("cached_tokens")),
+            cached_read_tokens=cached,
             cache_write_tokens=0,
             reasoning_tokens=_as_int(out_details.get("reasoning_tokens")),
             reported=True,
@@ -98,12 +105,14 @@ def extract_usage(resp: dict | None) -> Usage:
 
     # OpenAI Chat Completions shape: prompt_tokens / completion_tokens +
     # prompt_tokens_details.cached_tokens + completion_tokens_details.reasoning_tokens.
+    # prompt_tokens INCLUDES cached tokens; subtract to get cache-miss input.
     in_details = usage.get("prompt_tokens_details") or {}
     out_details = usage.get("completion_tokens_details") or {}
+    cached = _as_int(in_details.get("cached_tokens"))
     return Usage(
-        input_tokens=_as_int(usage.get("prompt_tokens")),
+        input_tokens=max(0, _as_int(usage.get("prompt_tokens")) - cached),
         output_tokens=_as_int(usage.get("completion_tokens")),
-        cached_read_tokens=_as_int(in_details.get("cached_tokens")),
+        cached_read_tokens=cached,
         cache_write_tokens=0,
         reasoning_tokens=_as_int(out_details.get("reasoning_tokens")),
         reported=True,

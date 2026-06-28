@@ -1,0 +1,130 @@
+# Provider Pricing Sources
+
+Authoritative sources for token pricing used when adding a model to
+`cloud-gateway/model-info.json` or reviewing prices for drift. The gateway
+routes to the providers below; **price each model from the provider we actually
+route to**, not from aggregators (LiteLLM, morphllm, etc.). Aggregators are
+useful only as a cross-check, never as the source of record.
+
+## Pricing field schema (in model-info.json)
+
+```json
+"pricing": {
+  "input": 3.0,
+  "output": 15.0,
+  "cache_read": 0.3,
+  "cache_write": 3.75
+}
+```
+
+- All values are **USD per 1,000,000 tokens** ($/Mtok).
+- `input` and `output` are required for a priced entry.
+- `cache_read` / `cache_write`: include only when the provider reports those
+  token classes **and** the gateway receives them. The gateway receives:
+  - Anthropic: `cache_read_input_tokens` + `cache_creation_input_tokens` ✓
+  - OpenAI / Fireworks / OpenRouter / Z.ai: `prompt_tokens_details.cached_tokens`
+    (cache reads only; cache writes are not reported by these providers) — set
+    `cache_read` when the provider charges a distinct cache-read rate, omit
+    `cache_write`.
+- `reasoning`: omit unless the provider bills reasoning tokens at a separate
+  rate from output. None of the current providers do.
+- If a rate is genuinely unknown, **omit the whole `pricing` field** — the
+  ledger records `cost_usd = NULL` (unknown). Never guess or copy a rate from a
+  different model/provider.
+
+## Provider → official pricing source
+
+| Provider (in model-info.json) | Official pricing source | Format | Cache fields |
+|---|---|---|---|
+| `anthropic` | https://www.anthropic.com/pricing | HTML, per-model blocks | Write + Read |
+| `openai` | https://platform.openai.com/docs/pricing | HTML table | cached input (read only) |
+| `fireworks` | https://docs.fireworks.ai/serverless/pricing | HTML table (per-model: input / cached input / output) | cached input (read only) |
+| `openrouter` | https://openrouter.ai/api/v1/models | **JSON API** (machine-readable) | `prompt_cache_read` / `prompt_cache_write` (often null) |
+| `zai_coding` | https://docs.z.ai/guides/overview/pricing | HTML | none reported |
+| `zhipuai` | https://open.bigmodel.cn/pricing | HTML (Chinese site) | none reported |
+
+### Parsing notes per provider
+
+**Anthropic** (verified parseable 2026-06-28): the page has a block per model
+with four lines: `Input $X / MTok`, `Output $Y / MTok`, then a "Prompt
+caching" group with `Write $Z / MTok` and `Read $W / MTok`. Map directly:
+input→input, output→output, Write→cache_write, Read→cache_read. Rates are
+concrete (Anthropic documents cache_read = 0.1× input, cache_write = 1.25×
+input, but read the concrete numbers off the page).
+
+**OpenAI**: the pricing page lists models in a table with Input / Output /
+Cached input per 1M tokens. GPT-5.x models report a cached-input rate (0.5×
+input typical) but no cache-write field. Map: input→input, output→output,
+Cached input→cache_read. Omit cache_write. Same OpenAI-shape cost-model caveat
+as Fireworks applies (see above).
+
+**Fireworks**: the serverless pricing docs page
+(https://docs.fireworks.ai/serverless/pricing) lists each headline model with
+three per-1M-token figures: **input / cached input / output**. The
+`https://fireworks.ai/pricing` marketing page defers to the docs page for
+actual rates — use the docs page. Map: input→input, "cached input"→cache_read,
+output→output. Omit cache_write (Fireworks reports cache reads only; the
+gateway receives `prompt_tokens_details.cached_tokens`).
+
+⚠️ **Cost-model caveat (OpenAI-shape providers: Fireworks, OpenAI, OpenRouter):**
+`prompt_tokens` *includes* cached tokens, while Anthropic's `input_tokens`
+*excludes* them. `src/usage.py` `extract_usage()` normalizes this so
+`input_tokens` is always cache-miss input (it subtracts `cached_tokens` from
+`prompt_tokens` for OpenAI-shape responses). This makes `estimate_cost()`
+uniform across providers and avoids double-counting cached tokens. If you ever
+change that normalization, re-verify the cost math for both shapes.
+
+> ⚠️ Common drift bug: Fireworks model prices differ from the same model on
+> Z.ai direct or OpenRouter. Always read the price off the **Fireworks** docs
+> page for `provider: fireworks` models, not Z.ai's page. (This is how
+> `glm-5.1-fw` got the wrong rate: the Z.ai GLM-5 price $1/$3 was used instead
+> of the Fireworks GLM-5.1 price $1.40/$4.40.)
+
+**OpenRouter** (JSON, verified 2026-06-28): `GET
+https://openrouter.ai/api/v1/models` returns `{data: [...]}`. Each model has
+`id` (matches `provider_model_id` in model-info.json, e.g.
+`google/gemini-3-flash-preview`) and `pricing` with `prompt`, `completion`
+(both **$/token** — multiply ×1,000,000 for $/Mtok), and optionally
+`prompt_cache_read` / `prompt_cache_write`. Match by `provider_model_id`.
+This is the only provider with a machine-readable source — prefer it for
+`openrouter` models. For `prompt_cache_read`/`prompt_cache_write`: if null,
+omit the cache field (Google via OpenRouter does not report cache tokens
+reliably). Same OpenAI-shape cost-model caveat as Fireworks applies (see
+above) when `prompt_cache_read` is non-null.
+
+**Z.ai (`zai_coding`)**: the Z.ai docs pricing page lists GLM models with
+input/output per 1M tokens. No cache fields. Match by `provider_model_id`
+(e.g. `glm-5.2`). Note: the `zai_coding` provider points at
+`api.z.ai/api/coding/paas/v4` (the coding tier) — confirm the price is for the
+**coding** endpoint, which sometimes differs from the standard Z.ai API tier.
+
+**ZhipuAI (`zhipuai`)**: the BigModel pricing page
+(https://open.bigmodel.cn/pricing) lists GLM models in CNY per 1M tokens.
+Convert CNY→USD at the current rate and note the conversion date in the commit
+message. `glm-5-turbo` and `glm-5.1` are the relevant IDs.
+
+## Model → provider → upstream lookup (current catalog)
+
+Use this to know which source to read for each model. Regenerate with:
+`python3 -c "import json; [print(f\"{e['name']:24} {e.get('provider','?'):12} {e.get('provider_model_id','?')}\") for e in json.load(open('cloud-gateway/model-info.json'))['llm'] if e.get('provider')]"`
+
+| Gateway model | Provider | Upstream model id | Source page |
+|---|---|---|---|
+| claude-fable-5 | anthropic | claude-fable-5 | anthropic |
+| claude-mythos-5 | anthropic | claude-mythos-5 | anthropic |
+| claude-sonnet-4.6 | anthropic | claude-sonnet-4-6 | anthropic |
+| claude-opus-4.8 / 4.7 / 4.6 / 4.5 | anthropic | claude-opus-4-* | anthropic |
+| gpt-5.4 | openai | gpt-5.4 | openai |
+| gpt-5.4-mini | openai | gpt-5.4-mini | openai |
+| deepseek-v4-pro-fw | fireworks | accounts/fireworks/models/deepseek-v4-pro | fireworks |
+| glm-5.1-fw | fireworks | accounts/fireworks/models/glm-5p1 | fireworks |
+| kimi-k2.7-code-fw | fireworks | accounts/fireworks/models/kimi-k2p7-code | fireworks |
+| minimax-m3-fw | fireworks | accounts/fireworks/models/minimax-m3 | fireworks |
+| qwen3.7-plus-fw | fireworks | accounts/fireworks/models/qwen3p7-plus | fireworks |
+| deepseek-v4-flash-or | openrouter | deepseek/deepseek-v4-flash | openrouter API |
+| gemini-3.1-pro | openrouter | google/gemini-3.1-pro-preview | openrouter API |
+| gemini-3-flash | openrouter | google/gemini-3-flash-preview | openrouter API |
+| gemini-3.5-flash | openrouter | google/gemini-3.5-flash | openrouter API |
+| glm-5.2-zai | zai_coding | glm-5.2 | z.ai |
+| glm-5.1-zai | zhipuai | glm-5.1 | zhipuai (CNY→USD) |
+| glm-5-zai-turbo | zhipuai | glm-5-turbo | zhipuai (CNY→USD) |
