@@ -11,13 +11,47 @@ The production launchd service is `com.local.cloud-gateway`.
 - Health check: `GET http://127.0.0.1:9111/health`
 - Admin UI: `GET http://127.0.0.1:9111/admin`
 
-As of commit `b8880cf`, the live service has:
+As of commit `e5ba25a`, the live service has:
 
 - `/admin` available.
-- `/admin/api/*` fail-closed with `401` until `CLOUD_GATEWAY_ADMIN_KEY` is configured.
-- `/v1/*` unchanged and open unless `CLOUD_GATEWAY_CLIENT_KEYS` is configured.
+- `/admin/api/*` fail-closed with `401` until an admin key is configured.
+- `/v1/*` protected with `401` unless a valid client (or admin) key is sent.
+
+Both admin and client auth are **currently enabled** on the deployed service.
+Keys live in the gitignored runtime config `~/srv/cloud-gateway/shared/config/config.yaml`
+(symlinked into the deploy tree as `config/config.yaml`) under the `auth:` section.
+The launchd plist does **not** carry auth env vars, keeping secrets out of the
+repo and the plist.
+
+## Where keys are configured
+
+Admin/client keys are read from two sources, merged at runtime (env takes
+precedence over config):
+
+1. `auth:` section in `config/config.yaml` (canonical; gitignored, holds provider keys too):
+
+   ```yaml
+   auth:
+     admin_keys:
+       - "<admin-key>"
+     client_keys:
+       - "cloud"
+   ```
+
+   Each field accepts a list or a single comma-separated string. Reloaded on
+   `POST /admin/api/reload` (and on service restart).
+
+2. Env vars `CLOUD_GATEWAY_ADMIN_KEY` / `CLOUD_GATEWAY_CLIENT_KEYS`
+   (comma-separated), which override/extend config. Useful for ad-hoc overrides
+   without editing the file.
+
+The launchd plist (`com.local.cloud-gateway`) only sets `CLOUD_GATEWAY_MODEL_INFO`;
+auth env vars are intentionally not wired into the plist template in `server-ci`
+`install-launchagents` to avoid committing secrets.
 
 ## Auth environment variables
+
+These are optional overrides for the config-file keys above.
 
 ### `CLOUD_GATEWAY_ADMIN_KEY`
 
@@ -82,42 +116,41 @@ Known clients that already send the default `cloud` token and should continue wo
 - `server/scripts/probe-thinking-shapes.py`
   - Cloud endpoint default token is `cloud`.
 
-Known no-header probes/checks that will break if client auth is enabled before updating them:
+Known no-header probes/checks (updated to use `/health`, which stays unauthenticated):
 
 - `server/scripts/install-home-server.sh`
-  - Probes `http://127.0.0.1:9111/v1/models` without auth.
+  - Now probes `http://127.0.0.1:9111/health` (liveness) instead of `/v1/models`.
 - `server/docs/operations/HOME_SERVER_BACKEND_DISTRIBUTION.md`
-  - Documents `curl -fsS http://127.0.0.1:9111/v1/models` without auth.
-- Any ad-hoc `curl http://127.0.0.1:9111/v1/*` without `Authorization` or `x-api-key`.
+  - Documents `curl -fsS http://127.0.0.1:9111/health` for unauthenticated liveness,
+    plus an authenticated `/v1/models` example.
+- Any ad-hoc `curl http://127.0.0.1:9111/v1/*` without `Authorization` or `x-api-key`
+  will now return `401`; use `/health` for liveness or send `Authorization: Bearer cloud`.
 
 ## Recommended rollout order
 
-1. Deploy the code first while leaving `/v1/*` open.
-2. Configure `CLOUD_GATEWAY_ADMIN_KEY` and restart the service.
+This rollout is now complete. The steps are retained as a reference for
+re-running on a fresh install or another machine.
+
+1. Deploy the code first while leaving `/v1/*` open (no `auth:` section in config).
+2. Configure `auth.admin_keys` in `config/config.yaml` and restart the service.
 3. Verify:
 
    ```bash
    curl -fsS http://127.0.0.1:9111/health
    curl -fsS http://127.0.0.1:9111/admin
-   curl -i http://127.0.0.1:9111/admin/api/status
-   curl -fsS -H "Authorization: Bearer $CLOUD_GATEWAY_ADMIN_KEY" \
+   curl -i http://127.0.0.1:9111/admin/api/status   # 401
+   curl -fsS -H "Authorization: Bearer $ADMIN_KEY" \
      http://127.0.0.1:9111/admin/api/status
-   curl -fsS http://127.0.0.1:9111/v1/models
    ```
 
-4. Update no-header probes to send the future client token.
-5. Set `CLOUD_GATEWAY_CLIENT_KEYS=cloud` and restart.
+4. Update no-header probes to use `/health` (unauthenticated liveness).
+5. Add `auth.client_keys: ["cloud"]` to config and restart.
 6. Verify:
 
    ```bash
-   curl -i http://127.0.0.1:9111/v1/models
+   curl -i http://127.0.0.1:9111/v1/models                       # 401
    curl -fsS -H "Authorization: Bearer cloud" http://127.0.0.1:9111/v1/models
    ```
-
-Expected after client auth is enabled:
-
-- First command returns `401`.
-- Second command returns model data.
 
 ## Service commands
 
@@ -138,6 +171,6 @@ Live service smoke check:
 
 ```bash
 curl -fsS http://127.0.0.1:9111/health
-curl -i http://127.0.0.1:9111/admin/api/status
-curl -fsS http://127.0.0.1:9111/v1/models | jq '.data | length'
+curl -i http://127.0.0.1:9111/admin/api/status                       # 401 without key
+curl -fsS -H "Authorization: Bearer cloud" http://127.0.0.1:9111/v1/models | jq '.data | length'
 ```
