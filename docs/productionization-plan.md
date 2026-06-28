@@ -214,16 +214,16 @@ Clients that will break until updated:
 
 ## Milestones
 
-1. **Hardening baseline**
+1. **Hardening baseline** ✅
    - Sanitize examples/docs.
    - Add opt-in inbound client/admin auth.
    - Add config validation and masked provider status endpoint.
-2. **Read-only admin UI**
+2. **Read-only admin UI** ✅
    - Overview, providers, models, existing thinking matrix.
    - No secret writes yet.
-3. **Request/usage ledger**
+3. **Request/usage ledger** ✅
    - SQLite schema, request ids, latency/status/error logging.
-   - Token/cost extraction for non-streaming first.
+   - Token/cost extraction for non-streaming AND streaming (SSE tee).
 4. **Provider/key management**
    - Add/edit provider configs and API keys via admin API/UI.
    - Validate provider connection.
@@ -231,9 +231,12 @@ Clients that will break until updated:
 5. **Model management**
    - Add/import/enable/disable model mappings.
    - Routing preview and config validation.
-6. **Cost dashboard**
-   - Pricing config, daily/monthly spend, per-provider/model breakdown.
-   - Streaming usage support where possible.
+6. **Cost dashboard** ✅ (v1)
+   - Pricing in model-info.json `pricing` field, per-provider/model breakdown,
+     windowed aggregates, recent-requests table. Streaming usage supported.
+   - Follow-up: price the 8 unpriced cloud models (deepseek-v4-flash-or,
+     kimi-k2.7-code-fw, minimax-m3-fw, glm-5.2-zai, glm-5.1-zai, glm-5-turbo,
+     gpt-5.4, gpt-5.4-mini) so their costs stop recording as unknown.
 7. **Adapter refactor**
    - Move provider-specific behavior out of route bodies incrementally.
 
