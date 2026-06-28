@@ -2,6 +2,17 @@
 # Copy to config.yaml and fill in API keys.
 # This file is symlinked to shared/ on the server (contains secrets).
 
+# Inbound auth for the gateway itself. Both fields are optional.
+#   admin_keys  -> protects /admin/api/* (fail-closed until at least one is set)
+#   client_keys -> protects /v1/* (leave empty to keep /v1 open)
+# Each field accepts a list of keys or a single comma-separated string.
+# Env vars CLOUD_GATEWAY_ADMIN_KEY / CLOUD_GATEWAY_CLIENT_KEYS override these.
+auth:
+  admin_keys:
+    - "YOUR_CLOUD_GATEWAY_ADMIN_KEY"
+  # client_keys:
+  #   - "cloud"
+
 providers:
   # cloud-gateway intentionally routes only remote/cloud providers.
   # Local MLX/oMLX models are served directly by oMLX on port 9110.

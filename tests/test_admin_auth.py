@@ -82,3 +82,44 @@ def test_admin_provider_status_never_exposes_secret_values(monkeypatch):
     assert provider["has_api_key"] is True
     assert provider["base_url"] == "https://example.invalid/v1"
     assert "config" not in provider
+
+
+def test_config_client_keys_protect_v1(monkeypatch):
+    """client_keys in config.yaml protect /v1 even without env."""
+    monkeypatch.delenv("CLOUD_GATEWAY_CLIENT_KEYS", raising=False)
+    monkeypatch.delenv("CLOUD_GATEWAY_ADMIN_KEY", raising=False)
+    monkeypatch.setattr(providers, "_config", {"auth": {"client_keys": ["cfg-cloud"]}})
+
+    assert client.get("/v1/models").status_code == 401
+    assert client.get("/v1/models", headers={"Authorization": "Bearer cfg-cloud"}).status_code == 200
+
+
+def test_config_admin_keys_protect_admin_api(monkeypatch):
+    """admin_keys in config.yaml protect /admin/api even without env."""
+    monkeypatch.delenv("CLOUD_GATEWAY_ADMIN_KEY", raising=False)
+    monkeypatch.setattr(providers, "_config", {"auth": {"admin_keys": ["cfg-admin"]}})
+
+    assert client.get("/admin/api/status").status_code == 401
+    resp = client.get("/admin/api/status", headers={"Authorization": "Bearer cfg-admin"})
+    assert resp.status_code == 200
+    assert resp.json()["auth"]["admin_auth_enabled"] is True
+
+
+def test_env_and_config_keys_are_merged(monkeypatch):
+    """Env keys and config keys union; either is accepted."""
+    monkeypatch.setenv("CLOUD_GATEWAY_CLIENT_KEYS", "env-key")
+    monkeypatch.setattr(providers, "_config", {"auth": {"client_keys": ["cfg-key"]}})
+
+    assert client.get("/v1/models", headers={"Authorization": "Bearer env-key"}).status_code == 200
+    assert client.get("/v1/models", headers={"Authorization": "Bearer cfg-key"}).status_code == 200
+    assert client.get("/v1/models", headers={"Authorization": "Bearer nope"}).status_code == 401
+
+
+def test_config_client_keys_accepts_comma_string(monkeypatch):
+    """A comma-separated string is also accepted for config keys."""
+    monkeypatch.delenv("CLOUD_GATEWAY_CLIENT_KEYS", raising=False)
+    monkeypatch.setattr(providers, "_config", {"auth": {"client_keys": "alpha, beta"}})
+
+    assert client.get("/v1/models", headers={"Authorization": "Bearer alpha"}).status_code == 200
+    assert client.get("/v1/models", headers={"x-api-key": "beta"}).status_code == 200
+    assert client.get("/v1/models").status_code == 401

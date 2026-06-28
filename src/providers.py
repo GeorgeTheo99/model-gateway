@@ -129,6 +129,16 @@ def _load_models() -> dict[str, dict]:
     return _models
 
 
+def auth_config() -> dict:
+    """Return the live ``auth`` section from config.yaml.
+
+    Re-reads after :func:`reload` resets the cached config. Used by
+    :mod:`src.auth` so admin/client keys can live in the gitignored
+    config.yaml instead of the launchd plist environment.
+    """
+    return _load_config().get("auth") or {}
+
+
 def reload():
     """Force reload of config and models (e.g. after config change)."""
     global _config, _models
