@@ -312,7 +312,11 @@
       "context": 1048576,
       "max_output_tokens": 100000,
       "thinking": "always",
-      "desc": "DeepSeek V4 Flash via OpenRouter, 1M context / 100k max output"
+      "desc": "DeepSeek V4 Flash via OpenRouter, 1M context / 100k max output",
+      "pricing": {
+        "input": 0.09,
+        "output": 0.18
+      }
     },
     {
       "name": "deepseek-v4-pro-fw",
@@ -325,7 +329,8 @@
       "desc": "DeepSeek V4 Pro on Fireworks, 1M context / 384k max output",
       "pricing": {
         "input": 1.74,
-        "output": 3.48
+        "output": 3.48,
+        "cache_read": 0.145
       }
     },
     {
@@ -339,8 +344,9 @@
       "thinking": "always",
       "desc": "GLM 5.1 754B MoE on Fireworks",
       "pricing": {
-        "input": 1.0,
-        "output": 3.0
+        "input": 1.4,
+        "output": 4.4,
+        "cache_read": 0.26
       }
     },
     {
@@ -354,7 +360,12 @@
       "max_output_tokens": 98304,
       "thinking": "always",
       "vision": true,
-      "desc": "Kimi K2.7 Code on Fireworks, 1T MoE / 32B active, 256k context, multimodal agent/coding model"
+      "desc": "Kimi K2.7 Code on Fireworks, 1T MoE / 32B active, 256k context, multimodal agent/coding model",
+      "pricing": {
+        "input": 0.95,
+        "output": 4.0,
+        "cache_read": 0.19
+      }
     },
     {
       "name": "minimax-m3-fw",
@@ -367,7 +378,12 @@
       "max_output_tokens": 65536,
       "thinking": "optional",
       "vision": true,
-      "desc": "MiniMax M3 on Fireworks, 428B MoE / 23B active, 512k context, native multimodal agent/coding model"
+      "desc": "MiniMax M3 on Fireworks, 428B MoE / 23B active, 512k context, native multimodal agent/coding model",
+      "pricing": {
+        "input": 0.3,
+        "output": 1.2,
+        "cache_read": 0.06
+      }
     },
     {
       "name": "glm-5.2-zai",
@@ -416,7 +432,8 @@
       "desc": "Qwen3.7 Plus on Fireworks, multimodal agent model, 262k context / 64k max output - vision fallback",
       "pricing": {
         "input": 0.4,
-        "output": 1.6
+        "output": 1.6,
+        "cache_read": 0.08
       }
     },
     {
