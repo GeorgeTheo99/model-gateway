@@ -25,8 +25,8 @@ def test_pricing_for_known_model():
 
 
 def test_pricing_for_unpriced_model_is_none():
-    # gpt-5.4 has no pricing field -> unknown cost
-    assert pricing_for("gpt-5.4") is None
+    # Local MLX models have no pricing field -> unknown cost
+    assert pricing_for("qwen3.5-397b") is None
 
 
 def test_pricing_for_unknown_model_is_none():

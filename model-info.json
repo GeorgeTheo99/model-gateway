@@ -394,7 +394,12 @@
       "max_output_tokens": 131072,
       "thinking": "always",
       "thinking_format": "zai",
-      "desc": "GLM 5.2 on Z.ai/ZhipuAI, 1M context / 128k max output"
+      "desc": "GLM 5.2 on Z.ai/ZhipuAI, 1M context / 128k max output",
+      "pricing": {
+        "input": 1.4,
+        "output": 4.4,
+        "cache_read": 0.26
+      }
     },
     {
       "name": "glm-5.1-zai",
@@ -405,7 +410,12 @@
       "context": 200000,
       "max_output_tokens": 128000,
       "thinking": "always",
-      "desc": "GLM 5.1 on ZhipuAI (glm-5.1, cheapest GLM-5.1 rates)"
+      "desc": "GLM 5.1 on ZhipuAI (glm-5.1, cheapest GLM-5.1 rates)",
+      "pricing": {
+        "input": 0.8333,
+        "output": 3.3333,
+        "cache_read": 0.1806
+      }
     },
     {
       "name": "glm-5-zai-turbo",
@@ -417,7 +427,12 @@
       "max_output_tokens": 16384,
       "desc": "GLM 5 Turbo on ZhipuAI (glm-5-turbo, fast & cheap, for home automation)",
       "thinking": "optional",
-      "thinking_format": "zai"
+      "thinking_format": "zai",
+      "pricing": {
+        "input": 0.6944,
+        "output": 3.0556,
+        "cache_read": 0.1667
+      }
     },
     {
       "name": "qwen3.7-plus-fw",
@@ -565,7 +580,12 @@
       "desc": "GPT-5.4 on OpenAI API",
       "thinking": "optional",
       "thinking_format": "openai-responses",
-      "vision": true
+      "vision": true,
+      "pricing": {
+        "input": 2.5,
+        "output": 15.0,
+        "cache_read": 0.25
+      }
     },
     {
       "name": "gpt-5.4-mini",
@@ -577,7 +597,12 @@
       "desc": "GPT-5.4 Mini on OpenAI API",
       "thinking": "optional",
       "thinking_format": "openai-responses",
-      "vision": true
+      "vision": true,
+      "pricing": {
+        "input": 0.75,
+        "output": 4.5,
+        "cache_read": 0.075
+      }
     },
     {
       "name": "gemini-3.1-pro",
