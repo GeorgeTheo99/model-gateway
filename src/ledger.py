@@ -258,9 +258,11 @@ def summary(*, since: float | None = None, until: float | None = None) -> dict:
         return {}
     d = dict(row)
     # Normalize averages/sums that may be NULL when the table is empty.
-    for k in ("cost_usd", "avg_latency_ms"):
+    for k in ("cost_usd",):
         if d.get(k) is not None:
-            d[k] = round(float(d[k]), 4)
+            d[k] = round(float(d[k]), 6)
+    if d.get("avg_latency_ms") is not None:
+        d["avg_latency_ms"] = round(float(d["avg_latency_ms"]), 1)
     return d
 
 
