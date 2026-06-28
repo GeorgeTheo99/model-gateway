@@ -65,17 +65,31 @@ def test_extract_no_usage_returns_unreported():
 
 def test_estimate_cost_full_pricing():
     # input_tokens is cache-miss (1M), cached_read 200k, cache_write 100k.
+    # reasoning_tokens (50k) is a SUBSET of output_tokens for every current
+    # provider, so it is NOT billed separately — it's already covered by the
+    # output rate. Including it would double-count.
     usage = Usage(input_tokens=1_000_000, output_tokens=500_000,
                   cached_read_tokens=200_000, cache_write_tokens=100_000,
                   reasoning_tokens=50_000, reported=True)
     pricing = {"input": 3.0, "output": 15.0, "cache_read": 0.3,
-               "cache_write": 3.75, "reasoning": 15.0}
+               "cache_write": 3.75}
     cost = estimate_cost(usage, pricing)
     assert cost.pricing_complete is True
     assert cost.missing_classes == []
-    # 1M*3 + 500k*15 + 200k*0.3 + 100k*3.75 + 50k*15
-    expected = 3.0 + 7.5 + 0.06 + 0.375 + 0.75
+    # 1M*3 + 500k*15 + 200k*0.3 + 100k*3.75 (reasoning not billed separately)
+    expected = 3.0 + 7.5 + 0.06 + 0.375
     assert abs(cost.cost_usd - round(expected, 6)) < 1e-6
+
+
+def test_reasoning_tokens_not_flagged_as_missing():
+    """reasoning_tokens must not make pricing_complete False (subset of output)."""
+    usage = Usage(input_tokens=100, output_tokens=50, reasoning_tokens=30, reported=True)
+    pricing = {"input": 3.0, "output": 15.0}  # no reasoning key, none needed
+    cost = estimate_cost(usage, pricing)
+    assert cost.pricing_complete is True
+    assert cost.missing_classes == []
+    # cost covers input + output only (reasoning already in output)
+    assert cost.cost_usd == round((100 * 3.0 + 50 * 15.0) / 1_000_000, 6)
 
 
 def test_estimate_cost_missing_pricing_class():

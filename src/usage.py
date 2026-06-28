@@ -142,12 +142,21 @@ class CostEstimate:
 
 
 # Map Usage fields to pricing keys.
+#
+# ``reasoning_tokens`` is intentionally NOT in this list: for every provider
+# the gateway currently routes to, reasoning tokens are a SUBSET of
+# output_tokens (OpenAI-shape ``completion_tokens_details.reasoning_tokens``
+# is part of ``completion_tokens``; Anthropic reports no separate reasoning
+# field). Billing them separately would double-count, and flagging them as a
+# missing pricing class made ``pricing_complete`` misleadingly false for every
+# thinking request. reasoning_tokens is still recorded in the ledger for
+# observability; if a provider that bills reasoning SEPARATELY from output is
+# ever added, revisit this.
 _CLASS_FIELDS = [
     ("input", "input_tokens"),
     ("output", "output_tokens"),
     ("cache_read", "cached_read_tokens"),
     ("cache_write", "cache_write_tokens"),
-    ("reasoning", "reasoning_tokens"),
 ]
 
 
