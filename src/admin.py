@@ -17,6 +17,7 @@ from src.providers import (
     provider_status,
     reload as reload_provider_registry,
 )
+from src import ledger
 
 router = APIRouter()
 _STARTED_AT = time.time()
@@ -72,6 +73,61 @@ async def admin_reload(request: Request):
     require_admin_auth(request)
     reload_provider_registry()
     return {"status": "ok", "message": "provider registry reloaded"}
+
+
+@router.get("/admin/api/usage")
+async def admin_usage(request: Request):
+    """Aggregate usage/cost by provider, model, endpoint, and status.
+
+    Query params:
+      since   - epoch seconds (inclusive)
+      until   - epoch seconds (exclusive)
+      window  - shorthand: '1h', '24h', '7d', '30d' (sets `since`)
+    """
+    require_admin_auth(request)
+    import time as _time
+
+    params = request.query_params
+    since = None
+    until = None
+    window = params.get("window")
+    if window:
+        units = {"h": 3600, "d": 86400}
+        try:
+            secs = int(window[:-1]) * units[window[-1].lower()]
+            since = _time.time() - secs
+        except (KeyError, ValueError):
+            pass
+    if params.get("since"):
+        try:
+            since = float(params["since"])
+        except ValueError:
+            pass
+    if params.get("until"):
+        try:
+            until = float(params["until"])
+        except ValueError:
+            pass
+
+    return {
+        "summary": ledger.summary(since=since, until=until),
+        "by_provider": ledger.aggregate(since=since, until=until, group_by="provider"),
+        "by_model": ledger.aggregate(since=since, until=until, group_by="model"),
+        "by_endpoint": ledger.aggregate(since=since, until=until, group_by="endpoint"),
+        "by_status": ledger.aggregate(since=since, until=until, group_by="status"),
+    }
+
+
+@router.get("/admin/api/requests")
+async def admin_requests(request: Request):
+    """Recent redacted ledger rows (no prompt/completion content)."""
+    require_admin_auth(request)
+    limit = 50
+    try:
+        limit = max(1, min(500, int(request.query_params.get("limit", 50))))
+    except ValueError:
+        pass
+    return {"requests": ledger.recent(limit=limit)}
 
 
 _ADMIN_HTML = r"""
@@ -142,6 +198,29 @@ _ADMIN_HTML = r"""
       <p>Existing reasoning matrix: <a href="/v1/debug/thinking">/v1/debug/thinking</a>. If client auth is enabled, open it with an admin/client key-capable HTTP client.</p>
       <pre id="errors" class="muted"></pre>
     </section>
+
+    <section class="card">
+      <h2>Usage &amp; Cost</h2>
+      <div class="toolbar" style="margin-bottom:12px;">
+        <button class="secondary" onclick="loadUsage('1h')">1h</button>
+        <button class="secondary" onclick="loadUsage('24h')">24h</button>
+        <button class="secondary" onclick="loadUsage('7d')">7d</button>
+        <button class="secondary" onclick="loadUsage('30d')">30d</button>
+        <button class="secondary" onclick="loadUsage('')">All</button>
+        <span id="usageRange" class="muted" style="margin-left:auto;"></span>
+      </div>
+      <div class="grid" style="margin-bottom:14px;">
+        <div class="card"><h2>Requests</h2><div id="uRequests" class="metric muted">—</div><p id="uRequestsSub" class="muted">ok / errors</p></div>
+        <div class="card"><h2>Tokens</h2><div id="uTokens" class="metric muted">—</div><p id="uTokensSub" class="muted">in / out (cached read)</p></div>
+        <div class="card"><h2>Est. cost</h2><div id="uCost" class="metric muted">—</div><p id="uCostSub" class="muted">USD, priced rows only</p></div>
+        <div class="card"><h2>Avg latency</h2><div id="uLatency" class="metric muted">—</div><p id="uLatencySub" class="muted">ms over window</p></div>
+      </div>
+      <h2>By model</h2>
+      <div class="scroll"><table id="usageByModel"><thead><tr><th>Model</th><th>Requests</th><th>Errors</th><th>In tok</th><th>Out tok</th><th>Cached</th><th>Cost</th><th>Avg ms</th></tr></thead><tbody></tbody></table></div>
+      <h2 style="margin-top:16px;">Recent requests</h2>
+      <div class="scroll"><table id="recentReq"><thead><tr><th>Time</th><th>Endpoint</th><th>Model</th><th>Status</th><th>Stream</th><th>In</th><th>Out</th><th>Cached</th><th>Cost</th><th>Latency</th></tr></thead><tbody></tbody></table></div>
+      <pre id="usageErrors" class="muted"></pre>
+    </section>
   </main>
 <script>
 const keyInput = document.getElementById('adminKey');
@@ -185,6 +264,40 @@ async function loadAll(){
   }
 }
 loadAll();
+
+const _winLabel = {'1h':'Last hour','24h':'Last 24 hours','7d':'Last 7 days','30d':'Last 30 days','':'All time'};
+function fmtNum(v){ return (v===null||v===undefined) ? '—' : Number(v).toLocaleString(); }
+function fmtCost(v){ return (v===null||v===undefined) ? '—' : '$'+Number(v).toFixed(4); }
+function fmtMs(v){ return (v===null||v===undefined) ? '—' : Math.round(v)+'ms'; }
+async function loadUsage(window){
+  const err = document.getElementById('usageErrors'); err.textContent = '';
+  document.getElementById('usageRange').textContent = _winLabel[window] || window || 'All';
+  try {
+    const q = window ? ('?window='+encodeURIComponent(window)) : '';
+    const [usage, recent] = await Promise.all([ get('/admin/api/usage'+q), get('/admin/api/requests?limit=50') ]);
+    const s = usage.summary || {};
+    const ok = s.ok || 0, errs = s.errors || 0;
+    document.getElementById('uRequests').textContent = fmtNum(s.requests);
+    document.getElementById('uRequests').className = 'metric ' + (errs ? 'warn' : 'ok');
+    document.getElementById('uRequestsSub').textContent = ok + ' ok / ' + errs + ' errors';
+    document.getElementById('uTokens').textContent = fmtNum((s.input_tokens||0) + (s.output_tokens||0));
+    document.getElementById('uTokens').className = 'metric ok';
+    document.getElementById('uTokensSub').textContent = fmtNum(s.input_tokens) + ' in / ' + fmtNum(s.output_tokens) + ' out (' + fmtNum(s.cached_read_tokens) + ' cached)';
+    document.getElementById('uCost').textContent = fmtCost(s.cost_usd);
+    document.getElementById('uCost').className = 'metric ok';
+    document.getElementById('uCostSub').textContent = 'unpriced rows excluded';
+    document.getElementById('uLatency').textContent = fmtMs(s.avg_latency_ms);
+    document.getElementById('uLatency').className = 'metric ok';
+    document.getElementById('uLatencySub').textContent = s.requests ? 'over ' + s.requests + ' requests' : 'no requests';
+    const byModel = usage.by_model || [];
+    document.querySelector('#usageByModel tbody').innerHTML = byModel.map(r => `<tr><td>${pill(r.dim || '—')}</td><td>${fmtNum(r.requests)}</td><td class="${cls(!(r.errors))}">${fmtNum(r.errors)}</td><td>${fmtNum(r.input_tokens)}</td><td>${fmtNum(r.output_tokens)}</td><td>${fmtNum(r.cached_read_tokens)}</td><td>${fmtCost(r.cost_usd)}</td><td>${fmtMs(r.avg_latency_ms)}</td></tr>`).join('') || '<tr><td class="muted" colspan="8">No requests in window</td></tr>';
+    const reqs = recent.requests || [];
+    document.querySelector('#recentReq tbody').innerHTML = reqs.map(r => `<tr><td>${escapeHtml(r.ts_iso||'—')}</td><td>${escapeHtml(r.endpoint||'—')}</td><td>${pill(r.model||'—')}</td><td class="${cls(r.status && r.status < 400)}">${r.status||'—'}</td><td>${r.is_stream ? 'stream' : 'sync'}</td><td>${fmtNum(r.input_tokens)}</td><td>${fmtNum(r.output_tokens)}</td><td>${fmtNum(r.cached_read_tokens)}</td><td>${fmtCost(r.cost_usd)}</td><td>${fmtMs(r.latency_ms)}</td></tr>`).join('') || '<tr><td class="muted" colspan="10">No requests yet</td></tr>';
+  } catch(e) {
+    err.textContent = e.message;
+  }
+}
+loadUsage('24h');
 </script>
 </body>
 </html>

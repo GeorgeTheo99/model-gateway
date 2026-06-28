@@ -15,24 +15,39 @@ import logging
 import os
 import secrets
 import time
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from src.admin import router as admin_router
 from src.auth import require_client_auth
-from src.providers import list_models as list_routable_models, resolve
+from src.providers import list_models as list_routable_models, pricing_for, resolve
 from src.responses import chat_to_responses, responses_to_chat, translate_responses_stream
 from src.signature_cache import store_from_extra_content
 from src.streaming import translate_stream
 from src.translator import anthropic_to_openai, openai_to_anthropic
+from src import ledger
+from src.usage import extract_usage, estimate_cost
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("cloud-gateway")
 
-app = FastAPI(title="Model Gateway")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Initialize the request ledger on startup."""
+    try:
+        ledger.init()
+        log.info("ledger ready at %s", ledger.ledger_path())
+    except Exception as exc:  # noqa: BLE001
+        log.warning("ledger init failed (ledger disabled): %s", exc)
+    yield
+
+
+app = FastAPI(title="Model Gateway", lifespan=_lifespan)
 app.include_router(admin_router)
 
 DEFAULT_VISION_FALLBACK_MODEL = "qwen3.7-plus-fw"
@@ -659,6 +674,152 @@ def _enable_openrouter_gemini_prompt_cache(req: dict) -> None:
     return
 
 
+# ── Request/usage ledger middleware ─────────────────────────────────────────
+
+_LEDGER_PATHS = {"/v1/chat/completions", "/v1/messages", "/v1/responses"}
+
+
+def _set_ledger_ctx(request: Request, model: str, info, is_stream: bool = False) -> None:
+    """Stash served-model context for the ledger middleware.
+
+    Handlers call this after ``resolve()`` finalizes the served model (after
+    any vision fallback). The middleware reads it after the response is built.
+    ``is_stream`` is the client-facing stream flag (whether the client receives
+    an SSE stream), which the middleware needs because Starlette wraps every
+    response from ``call_next`` in a StreamingResponse regardless of type.
+    """
+    request.state.ledger_ctx = {
+        "model": model,
+        "provider": info.provider,
+        "provider_model_id": info.provider_model_id,
+        "is_stream": bool(is_stream),
+    }
+
+
+def _usage_from_sse_line(line: str) -> dict | None:
+    """Extract a usage dict from an SSE ``data:`` line, if present.
+
+    Handles OpenAI Chat (top-level ``usage``), Anthropic Messages
+    (``message_delta`` -> ``usage``), and OpenAI Responses
+    (``response.completed`` -> ``response.usage``).
+    """
+    s = line.strip()
+    if not s.startswith("data:"):
+        return None
+    payload = s[5:].strip()
+    if not payload or payload == "[DONE]":
+        return None
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, dict):
+        if isinstance(data.get("usage"), dict):
+            return data["usage"]
+        resp = data.get("response")
+        if isinstance(resp, dict) and isinstance(resp.get("usage"), dict):
+            return resp["usage"]
+    return None
+
+
+def _ledger_record(
+    endpoint: str, method: str, model: str | None, provider: str | None,
+    provider_model_id: str | None, status: int | None, latency_ms: int | None,
+    is_stream: bool, usage_dict: dict | None, pricing: dict | None,
+) -> None:
+    """Best-effort: normalize usage, estimate cost, insert a ledger row."""
+    try:
+        usage = extract_usage({"usage": usage_dict}) if usage_dict else extract_usage(None)
+        cost = estimate_cost(usage, pricing)
+        ledger.record(
+            endpoint=endpoint, method=method, model=model, provider=provider,
+            provider_model_id=provider_model_id, status=status, latency_ms=latency_ms,
+            is_stream=is_stream, usage=usage, cost=cost, error=None,
+        )
+    except Exception as exc:  # noqa: BLE001 - ledger must never break requests
+        log.warning("ledger record failed: %s", exc)
+
+
+@app.middleware("http")
+async def ledger_middleware(request: Request, call_next):
+    """Record one ledger row per /v1/* model request.
+
+    Starlette wraps every response from ``call_next`` in a StreamingResponse,
+    so we cannot inspect ``response.body`` or rely on ``isinstance``. Instead
+    we branch on the client-facing ``is_stream`` flag stashed by the handler:
+      - streaming: tee SSE chunks, capture the final usage block, record after
+        the stream completes (no buffering, preserves streaming UX).
+      - non-streaming: buffer the full body, parse JSON for a usage block,
+        record, and re-emit the buffered bytes.
+    Errors before model resolution still produce a row (null model/tokens).
+    """
+    if request.url.path not in _LEDGER_PATHS:
+        return await call_next(request)
+    start = time.time()
+    response = await call_next(request)
+    latency_ms = int((time.time() - start) * 1000)
+    ctx = getattr(request.state, "ledger_ctx", None) or {}
+    model = ctx.get("model")
+    provider = ctx.get("provider")
+    provider_model_id = ctx.get("provider_model_id")
+    is_stream = bool(ctx.get("is_stream"))
+    pricing = pricing_for(model) if model else None
+    status = response.status_code
+
+    if is_stream:
+        original_iter = response.body_iterator
+        usage_capture = {"usage": None}
+
+        async def wrapped_iter():
+            try:
+                async for chunk in original_iter:
+                    if isinstance(chunk, (bytes, bytearray)):
+                        for line in chunk.decode("utf-8", errors="replace").splitlines():
+                            u = _usage_from_sse_line(line)
+                            if u is not None:
+                                # Last usage block wins (Anthropic sends an
+                                # initial message_start usage then a final
+                                # message_delta usage).
+                                usage_capture["usage"] = u
+                    yield chunk
+            finally:
+                _ledger_record(
+                    request.url.path, "POST", model, provider, provider_model_id,
+                    status, latency_ms, True, usage_capture["usage"], pricing,
+                )
+
+        response.body_iterator = wrapped_iter()
+        return response
+
+    # Non-streaming: buffer the full body, parse for a usage block, re-emit.
+    chunks: list[bytes] = []
+    async for chunk in response.body_iterator:
+        if isinstance(chunk, str):
+            chunk = chunk.encode("utf-8")
+        chunks.append(chunk)
+    body_bytes = b"".join(chunks)
+
+    usage_dict = None
+    if body_bytes:
+        try:
+            parsed = json.loads(body_bytes)
+            if isinstance(parsed, dict) and isinstance(parsed.get("usage"), dict):
+                usage_dict = parsed["usage"]
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass
+    _ledger_record(
+        request.url.path, "POST", model, provider, provider_model_id,
+        status, latency_ms, False, usage_dict, pricing,
+    )
+
+    return Response(
+        content=body_bytes,
+        status_code=status,
+        headers=dict(response.headers),
+        media_type=response.media_type,
+    )
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "model-gateway"}
@@ -751,6 +912,7 @@ async def create_response(request: Request):
     if not info:
         return _error(404, "invalid_request_error", f"Model '{model}' not found in gateway")
 
+    _set_ledger_ctx(request, model, info, is_stream=is_stream)
     _inject_responses_instruction(body, info.system_instruction)
 
     # Anthropic models don't support Responses API directly — translate via Messages
@@ -1149,12 +1311,14 @@ async def chat_completions(request: Request):
                 f"Set GATEWAY_VISION_FALLBACK to a vision-capable model.",
             )
         info = fallback_info
+        model = fallback_model  # ledger/cost follow the served (fallback) model
 
     # Swap model to the provider's model ID
     body["model"] = info.provider_model_id
+    is_stream = body.get("stream", False)
+    _set_ledger_ctx(request, model, info, is_stream=is_stream)
 
     _inject_openai_system_instruction(body, info.system_instruction)
-    is_stream = body.get("stream", False)
 
     thinking_enabled = _apply_gateway_reasoning(body, info, target_api="chat")
     _strip_fireworks_unsupported_message_fields(body, info)
@@ -1359,6 +1523,7 @@ async def messages(request: Request):
     if not info:
         return _error(404, "invalid_request_error", f"Model '{model}' not found in gateway")
 
+    _set_ledger_ctx(request, model, info, is_stream=is_stream)
     _inject_anthropic_system_instruction(body, info.system_instruction)
 
     # Check/normalize thinking — from request or model config. Native Anthropic

@@ -32,6 +32,7 @@ class ProviderInfo:
     thinking_format: str = ""  # optional explicit gateway normalization format
     system_instruction: str = ""
     vision: bool = False  # authoritative: True if the model can natively handle image inputs
+    pricing: dict = None  # $/Mtok rates: input, output, cache_read?, cache_write?, reasoning?
 
 
 _config: dict | None = None
@@ -190,7 +191,24 @@ def resolve(model_id: str) -> ProviderInfo | None:
         thinking_format=entry.get("thinking_format", ""),
         system_instruction=entry.get("system_instruction", ""),
         vision=bool(entry.get("vision", False)),
+        pricing=entry.get("pricing"),
     )
+
+
+def pricing_for(model_id: str) -> dict | None:
+    """Return the $/Mtok pricing dict for a routable model, or None if unset.
+
+    Keys may include: input, output, cache_read, cache_write, reasoning.
+    None means cost is "unknown" for this model (ledger must not guess).
+    """
+    models = _load_models()
+    entry = models.get(model_id)
+    if not entry:
+        return None
+    pricing = entry.get("pricing")
+    if not isinstance(pricing, dict):
+        return None
+    return pricing
 
 
 def list_models() -> list[dict]:
@@ -291,6 +309,7 @@ def model_status() -> list[dict]:
             "thinking": model.get("thinking", ""),
             "thinking_format": model.get("thinking_format", ""),
             "vision": bool(model.get("vision", False)),
+            "pricing": model.get("pricing"),
         })
     return result
 
