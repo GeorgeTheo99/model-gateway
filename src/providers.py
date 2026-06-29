@@ -16,6 +16,16 @@ log = logging.getLogger("cloud-gateway")
 # catalog for tests and local dev.
 _DEFAULT_MODEL_INFO = Path(__file__).resolve().parents[1] / "model-info.json"
 MODEL_INFO_PATH = Path(os.environ.get("CLOUD_GATEWAY_MODEL_INFO", str(_DEFAULT_MODEL_INFO))).resolve()
+# Optional source-repo path for durable model edits. When set, model write
+# operations mirror edits here (pending commit) in addition to the deployed
+# MODEL_INFO_PATH, so changes survive deploys once committed. The deployed
+# copy is overwritten by git checkout on each deploy; the source copy is not.
+_DEFAULT_MODEL_INFO_SOURCE = Path.home() / "local_code" / "cloud-gateway" / "model-info.json"
+MODEL_INFO_SOURCE_PATH = (
+    Path(os.environ.get("CLOUD_GATEWAY_MODEL_INFO_SOURCE", str(_DEFAULT_MODEL_INFO_SOURCE))).resolve()
+    if os.environ.get("CLOUD_GATEWAY_MODEL_INFO_SOURCE") or _DEFAULT_MODEL_INFO_SOURCE.exists()
+    else None
+)
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "config.yaml"
 
 
@@ -152,6 +162,12 @@ def resolve(model_id: str) -> ProviderInfo | None:
     models = _load_models()
     entry = models.get(model_id)
     if not entry:
+        return None
+
+    # Disabled models are not routable via /v1/* but remain visible in admin
+    # model_status() so they can be re-enabled.
+    if not entry.get("enabled", True):
+        log.info("Model %r is disabled; not routing", model_id)
         return None
 
     provider = _canonical_provider(entry.get("provider", "local"))
@@ -310,6 +326,7 @@ def model_status() -> list[dict]:
             "thinking_format": model.get("thinking_format", ""),
             "vision": bool(model.get("vision", False)),
             "pricing": model.get("pricing"),
+            "enabled": bool(model.get("enabled", True)),
         })
     return result
 

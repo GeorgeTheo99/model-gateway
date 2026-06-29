@@ -17,7 +17,7 @@ from src.providers import (
     provider_status,
     reload as reload_provider_registry,
 )
-from src import ledger
+from src import config_io, ledger
 
 router = APIRouter()
 _STARTED_AT = time.time()
@@ -130,6 +130,159 @@ async def admin_requests(request: Request):
     return {"requests": ledger.recent(limit=limit)}
 
 
+# ── Provider management (writeable) ──────────────────────────────────────────
+
+
+@router.post("/admin/api/providers/{provider_id}")
+async def admin_upsert_provider(provider_id: str, request: Request):
+    """Create or update a provider block in config.yaml.
+
+    Body: {base_url, protocol?, api_key?, default_headers?}. ``api_key`` is
+    write-only (None preserves the existing key; "" removes it). Reloads the
+    provider registry after writing.
+    """
+    require_admin_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        return _bad_request("Invalid JSON body")
+    try:
+        result = config_io.upsert_provider(
+            provider_id,
+            base_url=body.get("base_url", ""),
+            api_key=body.get("api_key"),
+            protocol=body.get("protocol"),
+            default_headers=body.get("default_headers"),
+        )
+    except ValueError as exc:
+        return _bad_request(str(exc))
+    reload_provider_registry()
+    result["reloaded"] = True
+    return result
+
+
+@router.delete("/admin/api/providers/{provider_id}")
+async def admin_delete_provider(provider_id: str, request: Request):
+    """Remove a provider. Refuses if enabled models depend on it."""
+    require_admin_auth(request)
+    try:
+        result = config_io.delete_provider(provider_id)
+    except KeyError as exc:
+        return _bad_request(str(exc), status=404)
+    except ValueError as exc:
+        return _bad_request(str(exc), status=409)
+    reload_provider_registry()
+    return result
+
+
+@router.post("/admin/api/providers/{provider_id}/validate")
+async def admin_validate_provider(provider_id: str, request: Request):
+    """Lightweight upstream validation: authenticated GET {base_url}/models.
+
+    Read-only upstream probe. Returns {ok, status_code, model_count?, error?}.
+    """
+    require_admin_auth(request)
+    import httpx
+    from src.providers import resolve as _resolve  # noqa: F401 (kept for clarity)
+    import src.providers as providers
+
+    provider_id = provider_id.strip().lower()
+    config = providers._load_config()
+    block = providers._resolve_provider_config(config, provider_id)
+    if not block:
+        return _bad_request(f"provider {provider_id!r} not configured", status=404)
+    base_url = block.get("base_url", "")
+    api_key = block.get("api_key", "")
+    protocol = block.get("protocol", "openai")
+    if not base_url or not api_key:
+        return _bad_request("provider missing base_url or api_key")
+
+    headers = {"Authorization": f"Bearer {api_key}"}
+    if protocol == "anthropic":
+        headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01"}
+    url = f"{base_url.rstrip('/')}/models"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(url, headers=headers)
+        ok = resp.status_code == 200
+        model_count = None
+        if ok:
+            try:
+                data = resp.json()
+                items = data.get("data") if isinstance(data, dict) else data
+                model_count = len(items) if isinstance(items, list) else None
+            except Exception:  # noqa: BLE001
+                pass
+        return {"ok": ok, "status_code": resp.status_code, "model_count": model_count, "error": None if ok else resp.text[:300]}
+    except httpx.HTTPError as exc:
+        return {"ok": False, "status_code": None, "model_count": None, "error": str(exc)}
+
+
+# ── Model management (writeable) ────────────────────────────────────────────
+
+
+@router.post("/admin/api/models/{model_name}")
+async def admin_upsert_model(model_name: str, request: Request):
+    """Create or update a model entry in model-info.json.
+
+    Body fields (provider + provider_model_id required): provider,
+    provider_model_id, alias, context, max_output_tokens, thinking,
+    thinking_format, vision, system_instruction, pricing, desc, enabled.
+    Writes deploy to the live catalog + source-repo mirror; reloads registry.
+    """
+    require_admin_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        return _bad_request("Invalid JSON body")
+    try:
+        result = config_io.upsert_model(model_name, **body)
+    except ValueError as exc:
+        return _bad_request(str(exc))
+    reload_provider_registry()
+    result["reloaded"] = True
+    return result
+
+
+@router.delete("/admin/api/models/{model_name}")
+async def admin_delete_model(model_name: str, request: Request):
+    """Remove a model entry by name."""
+    require_admin_auth(request)
+    try:
+        result = config_io.delete_model(model_name)
+    except KeyError as exc:
+        return _bad_request(str(exc), status=404)
+    reload_provider_registry()
+    return result
+
+
+@router.post("/admin/api/models/{model_name}/enable")
+async def admin_enable_model(model_name: str, request: Request):
+    require_admin_auth(request)
+    try:
+        result = config_io.set_model_enabled(model_name, True)
+    except KeyError as exc:
+        return _bad_request(str(exc), status=404)
+    reload_provider_registry()
+    return result
+
+
+@router.post("/admin/api/models/{model_name}/disable")
+async def admin_disable_model(model_name: str, request: Request):
+    require_admin_auth(request)
+    try:
+        result = config_io.set_model_enabled(model_name, False)
+    except KeyError as exc:
+        return _bad_request(str(exc), status=404)
+    reload_provider_registry()
+    return result
+
+
+def _bad_request(message: str, status: int = 400):
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=status, content={"error": {"message": message}})
+
+
 _ADMIN_HTML = r"""
 <!doctype html>
 <html lang="en">
@@ -185,12 +338,51 @@ _ADMIN_HTML = r"""
 
     <section class="card">
       <h2>Providers</h2>
-      <div class="scroll"><table id="providers"><thead><tr><th>ID</th><th>Models</th><th>Protocol</th><th>Base URL</th><th>API key</th><th>Issues</th></tr></thead><tbody></tbody></table></div>
+      <div class="scroll"><table id="providers"><thead><tr><th>ID</th><th>Models</th><th>Protocol</th><th>Base URL</th><th>API key</th><th>Issues</th><th>Actions</th></tr></thead><tbody></tbody></table></div>
+      <details style="margin-top:12px;"><summary class="muted">Add / edit provider</summary>
+        <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); margin-top:10px; gap:10px;">
+          <input id="pId" placeholder="provider id (e.g. anthropic)" />
+          <input id="pBaseUrl" placeholder="base_url (https://...)" style="min-width:240px;" />
+          <input id="pProtocol" placeholder="protocol (openai|anthropic)" />
+          <input id="pApiKey" type="password" placeholder="api_key (write-only)" />
+        </div>
+        <div class="toolbar" style="margin-top:8px;">
+          <button onclick="saveProvider()">Save provider</button>
+          <button class="secondary" onclick="validateProvider()">Validate connection</button>
+          <button class="secondary" onclick="deleteProvider()">Delete</button>
+          <span id="pMsg" class="muted"></span>
+        </div>
+        <p class="muted" style="font-size:12px; margin-top:6px;">api_key is write-only: leave blank to keep the existing key. Provider config is stored in the gitignored config.yaml and is durable across deploys.</p>
+      </details>
     </section>
 
     <section class="card">
       <h2>Models</h2>
-      <div class="scroll"><table id="models"><thead><tr><th>ID</th><th>Provider</th><th>Upstream model</th><th>Context</th><th>Thinking</th><th>Vision</th><th>Provider config</th></tr></thead><tbody></tbody></table></div>
+      <div class="scroll"><table id="models"><thead><tr><th>Name</th><th>Provider</th><th>Upstream</th><th>Context</th><th>Max out</th><th>Thinking</th><th>Vision</th><th>Enabled</th><th>Actions</th></tr></thead><tbody></tbody></table></div>
+      <details style="margin-top:12px;"><summary class="muted">Add / edit model</summary>
+        <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); margin-top:10px; gap:10px;">
+          <input id="mName" placeholder="name (gateway id)" />
+          <input id="mProvider" placeholder="provider" />
+          <input id="mPmid" placeholder="provider_model_id" />
+          <input id="mAlias" placeholder="alias" />
+          <input id="mContext" type="number" placeholder="context" />
+          <input id="mMaxOut" type="number" placeholder="max_output_tokens" />
+          <input id="mThinking" placeholder="thinking (|optional|always)" />
+          <input id="mThinkingFmt" placeholder="thinking_format" />
+          <input id="mPricing" placeholder="pricing JSON" style="min-width:200px;" />
+        </div>
+        <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); margin-top:8px; gap:10px;">
+          <label class="muted"><input id="mVision" type="checkbox" /> vision</label>
+          <label class="muted"><input id="mEnabled" type="checkbox" checked /> enabled</label>
+          <input id="mDesc" placeholder="desc (no $ prices)" style="min-width:240px;" />
+        </div>
+        <div class="toolbar" style="margin-top:8px;">
+          <button onclick="saveModel()">Save model</button>
+          <button class="secondary" onclick="deleteModel()">Delete</button>
+          <span id="mMsg" class="muted"></span>
+        </div>
+        <p class="muted" style="font-size:12px; margin-top:6px;">Writes are hot (immediate) and mirrored to the source repo (pending commit). Pricing should come from the official provider — use the cloud-gateway-add-model skill to fetch it. Disabled models are hidden from /v1/models.</p>
+      </details>
     </section>
 
     <section class="card">
@@ -254,8 +446,15 @@ async function loadAll(){
     document.getElementById('validationMetric').textContent = validation.ok ? 'ok' : 'issues';
     document.getElementById('validationMetric').className = 'metric ' + (validation.ok ? 'ok' : 'bad');
     document.getElementById('validationSub').textContent = validation.issues?.length ? JSON.stringify(validation.issues) : 'No missing provider credentials detected';
-    document.querySelector('#providers tbody').innerHTML = providerRows.map(p => `<tr><td>${pill(p.id)}</td><td>${escapeHtml(p.enabled_models)}</td><td>${escapeHtml(p.protocol)}</td><td>${escapeHtml(p.base_url)}</td><td class="${cls(p.has_api_key)}">${p.has_api_key ? 'present' : 'missing'}</td><td>${(p.issues||[]).map(pill).join(' ') || '—'}</td></tr>`).join('');
-    document.querySelector('#models tbody').innerHTML = modelRows.map(m => `<tr><td>${pill(m.id)}</td><td>${escapeHtml(m.provider)}</td><td>${escapeHtml(m.provider_model_id)}</td><td>${escapeHtml(m.context)}</td><td>${escapeHtml(m.thinking || m.thinking_format)}</td><td>${m.vision ? 'yes' : 'no'}</td><td class="${cls(m.provider_ready)}">${m.provider_ready ? 'ready' : (m.provider_configured ? 'incomplete' : 'missing')}</td></tr>`).join('');
+    document.querySelector('#providers tbody').innerHTML = providerRows.map(p => `<tr><td>${pill(p.id)}</td><td>${escapeHtml(p.enabled_models)}</td><td>${escapeHtml(p.protocol)}</td><td>${escapeHtml(p.base_url)}</td><td class="${cls(p.has_api_key)}">${p.has_api_key ? 'present' : 'missing'}</td><td>${(p.issues||[]).map(pill).join(' ') || '—'}</td><td><button class="secondary" onclick="editProvider('${escapeHtml(p.id)}')">edit</button></td></tr>`).join('');
+    // Dedupe models by name (list_models returns name+alias+id rows).
+    const seen = new Set(); const uniq = [];
+    for (const m of modelRows) { const n = m.name || m.id; if (n && !seen.has(n)) { seen.add(n); uniq.push(m); } }
+    document.querySelector('#models tbody').innerHTML = uniq.map(m => {
+      const en = m.enabled !== false;
+      const nm = escapeHtml(m.name || m.id);
+      return `<tr><td>${pill(m.name || m.id)}</td><td>${escapeHtml(m.provider)}</td><td>${escapeHtml(m.provider_model_id)}</td><td>${escapeHtml(m.context)}</td><td>${escapeHtml(m.max_output_tokens)}</td><td>${escapeHtml(m.thinking || m.thinking_format)}</td><td>${m.vision ? 'yes' : 'no'}</td><td class="${cls(en)}">${en ? 'yes' : 'no'}</td><td><button class="secondary" onclick="editModel('${nm}')">edit</button> <button class="secondary" onclick="toggleModel('${nm}', ${!en})">${en ? 'disable' : 'enable'}</button></td></tr>`;
+    }).join('');
   } catch(e) {
     err.textContent = e.message;
     document.getElementById('statusMetric').textContent = 'error';
@@ -264,6 +463,90 @@ async function loadAll(){
   }
 }
 loadAll();
+
+// ── Provider/model CRUD ───────────────────────────────────────────────
+async function send(method, path, body){
+  const opts = {method, headers: headers()};
+  if (body !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
+  const res = await fetch(path, opts);
+  const txt = await res.text();
+  let j = null; try { j = JSON.parse(txt); } catch(e) { j = {raw: txt}; }
+  if (!res.ok) throw new Error((j && j.error && j.error.message) || txt || ('HTTP '+res.status));
+  return j;
+}
+function setMsg(id, msg, ok){ const el = document.getElementById(id); el.textContent = msg; el.className = ok ? 'ok' : 'bad'; }
+async function saveProvider(){
+  const id = document.getElementById('pId').value.trim().toLowerCase();
+  if (!id) return setMsg('pMsg', 'provider id required', false);
+  const body = {base_url: document.getElementById('pBaseUrl').value.trim()};
+  const proto = document.getElementById('pProtocol').value.trim(); if (proto) body.protocol = proto;
+  const key = document.getElementById('pApiKey').value; if (key) body.api_key = key;
+  try { await send('POST', '/admin/api/providers/'+encodeURIComponent(id), body); setMsg('pMsg', 'saved + reloaded', true); loadAll(); }
+  catch(e){ setMsg('pMsg', e.message, false); }
+}
+async function deleteProvider(){
+  const id = document.getElementById('pId').value.trim().toLowerCase();
+  if (!id) return setMsg('pMsg', 'provider id required', false);
+  if (!confirm('Delete provider '+id+'?')) return;
+  try { await send('DELETE', '/admin/api/providers/'+encodeURIComponent(id)); setMsg('pMsg', 'deleted + reloaded', true); loadAll(); }
+  catch(e){ setMsg('pMsg', e.message, false); }
+}
+async function validateProvider(){
+  const id = document.getElementById('pId').value.trim().toLowerCase();
+  if (!id) return setMsg('pMsg', 'provider id required', false);
+  setMsg('pMsg', 'validating…', true);
+  try { const r = await send('POST', '/admin/api/providers/'+encodeURIComponent(id)+'/validate'); setMsg('pMsg', r.ok ? ('OK · '+r.status_code+' · '+(r.model_count??'?')+' models') : ('failed: '+(r.error||r.status_code)), r.ok); }
+  catch(e){ setMsg('pMsg', e.message, false); }
+}
+function editProvider(id){
+  document.getElementById('pId').value = id;
+  // Fetch current values from the loaded table row is fragile; leave fields for user to fill.
+  setMsg('pMsg', 'editing '+id+' — fill base_url (blank=keep) + key (blank=keep)', true);
+}
+function editModel(name){
+  // Populate the form from the loaded model row.
+  const rows = document.querySelectorAll('#models tbody tr');
+  let m = null;
+  for (const r of rows) { if (r.children[0].textContent.replace(/[^a-z0-9.-]/gi,'') === name || r.children[0].textContent.includes(name)) { m = r.children; break; } }
+  if (!m) return setMsg('mMsg', 'could not find '+name, false);
+  document.getElementById('mName').value = name;
+  document.getElementById('mProvider').value = m[1].textContent === '—' ? '' : m[1].textContent;
+  document.getElementById('mPmid').value = m[2].textContent === '—' ? '' : m[2].textContent;
+  document.getElementById('mContext').value = m[3].textContent === '—' ? '' : m[3].textContent;
+  document.getElementById('mMaxOut').value = '';
+  document.getElementById('mThinking').value = m[5].textContent === '—' ? '' : m[5].textContent;
+  document.getElementById('mEnabled').checked = m[7].textContent === 'yes';
+  setMsg('mMsg', 'editing '+name, true);
+}
+async function saveModel(){
+  const name = document.getElementById('mName').value.trim();
+  if (!name) return setMsg('mMsg', 'name required', false);
+  const body = {provider: document.getElementById('mProvider').value.trim(), provider_model_id: document.getElementById('mPmid').value.trim()};
+  if (!body.provider || !body.provider_model_id) return setMsg('mMsg', 'provider + provider_model_id required', false);
+  const alias = document.getElementById('mAlias').value.trim(); if (alias) body.alias = alias;
+  const ctx = parseInt(document.getElementById('mContext').value); if (!isNaN(ctx)) body.context = ctx;
+  const mo = parseInt(document.getElementById('mMaxOut').value); if (!isNaN(mo)) body.max_output_tokens = mo;
+  const th = document.getElementById('mThinking').value.trim(); if (th) body.thinking = th;
+  const tf = document.getElementById('mThinkingFmt').value.trim(); if (tf) body.thinking_format = tf;
+  const pr = document.getElementById('mPricing').value.trim(); if (pr) { try { body.pricing = JSON.parse(pr); } catch(e){ return setMsg('mMsg', 'pricing JSON invalid', false); } }
+  const desc = document.getElementById('mDesc').value.trim(); if (desc) body.desc = desc;
+  body.vision = document.getElementById('mVision').checked;
+  body.enabled = document.getElementById('mEnabled').checked;
+  try { await send('POST', '/admin/api/models/'+encodeURIComponent(name), body); setMsg('mMsg', 'saved + reloaded (hot; commit source repo to persist)', true); loadAll(); }
+  catch(e){ setMsg('mMsg', e.message, false); }
+}
+async function deleteModel(){
+  const name = document.getElementById('mName').value.trim();
+  if (!name) return setMsg('mMsg', 'name required', false);
+  if (!confirm('Delete model '+name+'?')) return;
+  try { await send('DELETE', '/admin/api/models/'+encodeURIComponent(name)); setMsg('mMsg', 'deleted + reloaded', true); loadAll(); }
+  catch(e){ setMsg('mMsg', e.message, false); }
+}
+async function toggleModel(name, enable){
+  const ep = enable ? 'enable' : 'disable';
+  try { await send('POST', '/admin/api/models/'+encodeURIComponent(name)+'/'+ep); setMsg('mMsg', name+' '+ep+'d', true); loadAll(); }
+  catch(e){ setMsg('mMsg', e.message, false); }
+}
 
 const _winLabel = {'1h':'Last hour','24h':'Last 24 hours','7d':'Last 7 days','30d':'Last 30 days','':'All time'};
 function fmtNum(v){ return (v===null||v===undefined) ? '—' : Number(v).toLocaleString(); }

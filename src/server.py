@@ -831,6 +831,10 @@ async def list_models(request: Request):
     models = list_routable_models()
     data = []
     for m in models:
+        # Disabled models are not exposed to clients; they remain in admin
+        # model_status() for re-enabling.
+        if not m.get("enabled", True):
+            continue
         caps = _thinking_capabilities(m)
         data.append({
             "id": m.get("id") or m["name"],
