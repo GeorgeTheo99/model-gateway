@@ -42,12 +42,30 @@ def load_config_full() -> dict:
         return yaml.safe_load(f) or {}
 
 
+def _resolve_target(path: Path) -> Path:
+    """Resolve symlinks so writes land on the real file, not replace the link.
+
+    The deployed config.yaml is a symlink to the shared gitignored file. A
+    naive os.replace would write a real file at the link location, breaking
+    the link and splitting config state. Resolve to the real target first.
+    """
+    try:
+        return Path(os.path.realpath(path))
+    except OSError:
+        return path
+
+
 def _atomic_write(path: Path, text: str) -> None:
-    """Write text to path atomically: temp file in same dir, then rename."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    """Write text to path atomically: temp file in same dir, then rename.
+
+    Resolves symlinks first so a symlinked config file (deployed config.yaml)
+    is updated in place rather than replaced with a real file.
+    """
+    target = _resolve_target(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + f".tmp.{os.getpid()}")
     tmp.write_text(text)
-    os.replace(tmp, path)
+    os.replace(tmp, target)
 
 
 def _backup(path: Path) -> Path | None:

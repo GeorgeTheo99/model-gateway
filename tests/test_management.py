@@ -138,6 +138,29 @@ def test_set_model_enabled_writes_config_yaml(tmp_config, monkeypatch):
     assert "enabled" not in entry
 
 
+def test_atomic_write_preserves_symlink(tmp_path, monkeypatch):
+    """config.yaml is a symlink to a shared file; writes must update the target,
+    not replace the link with a real file (which would split config state)."""
+    config_io.log_dir = tmp_path / "logs"
+    # Set up: deploy dir with a symlink to a shared real file.
+    shared = tmp_path / "shared.yaml"
+    shared.write_text("providers:\n  anthropic:\n    base_url: https://x\n    api_key: k\n")
+    link = tmp_path / "deploy" / "config.yaml"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(shared)
+    monkeypatch.setattr(providers, "CONFIG_PATH", link)
+    monkeypatch.setattr(config_io, "CONFIG_PATH", link)
+    providers.reload()
+    # Write via config_io (upsert_provider uses _atomic_write).
+    config_io.upsert_provider("anthropic", base_url="https://y", api_key="k2")
+    # The link must still be a symlink.
+    assert link.is_symlink(), "symlink was replaced by a real file"
+    # And the shared target must hold the new content.
+    import yaml
+    d = yaml.safe_load(shared.read_text())
+    assert d["providers"]["anthropic"]["base_url"] == "https://y"
+
+
 def test_delete_model(tmp_config, monkeypatch):
     config_io.log_dir = tmp_config / "logs"
     config_io.delete_model("claude-test")
