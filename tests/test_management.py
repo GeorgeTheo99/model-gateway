@@ -122,13 +122,20 @@ def test_upsert_model_updates_existing(tmp_config, monkeypatch):
     assert entry["pricing"] == {"input": 3.0, "output": 15.0}
 
 
-def test_set_model_enabled(tmp_config, monkeypatch):
+def test_set_model_enabled_writes_config_yaml(tmp_config, monkeypatch):
+    """enabled state lives in config.yaml model_overrides, not model-info.json."""
     config_io.log_dir = tmp_config / "logs"
     r = config_io.set_model_enabled("claude-test", False)
     assert r["enabled"] is False
+    assert str(tmp_config / "config.yaml") in r["written_to"]
+    # Override landed in config.yaml.
+    import yaml
+    cfg = yaml.safe_load((tmp_config / "config.yaml").read_text())
+    assert cfg["model_overrides"]["claude-test"]["enabled"] is False
+    # model-info.json is NOT touched by the toggle.
     doc = json.loads((tmp_config / "model-info.json").read_text())
     entry = next(e for e in doc["llm"] if e["name"] == "claude-test")
-    assert entry["enabled"] is False
+    assert "enabled" not in entry
 
 
 def test_delete_model(tmp_config, monkeypatch):

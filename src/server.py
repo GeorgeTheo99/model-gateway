@@ -24,7 +24,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from src.admin import router as admin_router
 from src.auth import require_client_auth
-from src.providers import list_models as list_routable_models, pricing_for, resolve
+from src.providers import _is_model_enabled, list_models as list_routable_models, pricing_for, resolve
 from src.responses import chat_to_responses, responses_to_chat, translate_responses_stream
 from src.signature_cache import store_from_extra_content
 from src.streaming import translate_stream
@@ -832,8 +832,9 @@ async def list_models(request: Request):
     data = []
     for m in models:
         # Disabled models are not exposed to clients; they remain in admin
-        # model_status() for re-enabling.
-        if not m.get("enabled", True):
+        # model_status() for re-enabling. Enabled state lives in config.yaml
+        # model_overrides (runtime), not the committed catalog.
+        if not _is_model_enabled(m.get("name") or m.get("id")):
             continue
         caps = _thinking_capabilities(m)
         data.append({

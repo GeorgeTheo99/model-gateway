@@ -150,6 +150,34 @@ def auth_config() -> dict:
     return _load_config().get("auth") or {}
 
 
+def model_overrides() -> dict:
+    """Return the live ``model_overrides`` section from config.yaml.
+
+    Runtime state for models (currently just ``enabled``) lives here — NOT in
+    model-info.json — so admin enable/disable toggles don't dirty the committed
+    catalog and aren't reverted by deploys. Keys are model names; values are
+    dicts with ``enabled: bool``. Missing entry = enabled (default true).
+
+    Example config.yaml::
+
+        model_overrides:
+          gemini-3-flash:
+            enabled: false
+    """
+    return _load_config().get("model_overrides") or {}
+
+
+def _is_model_enabled(name: str | None) -> bool:
+    """Check the runtime enabled override for a model. Default True."""
+    if not name:
+        return True
+    overrides = model_overrides()
+    entry = overrides.get(name)
+    if isinstance(entry, dict):
+        return bool(entry.get("enabled", True))
+    return True
+
+
 def reload():
     """Force reload of config and models (e.g. after config change)."""
     global _config, _models
@@ -164,10 +192,11 @@ def resolve(model_id: str) -> ProviderInfo | None:
     if not entry:
         return None
 
-    # Disabled models are not routable via /v1/* but remain visible in admin
-    # model_status() so they can be re-enabled.
-    if not entry.get("enabled", True):
-        log.info("Model %r is disabled; not routing", model_id)
+    # Runtime enabled state lives in config.yaml model_overrides (not the
+    # committed catalog), so toggles survive deploys and don't dirty the repo.
+    name = entry.get("name") or model_id
+    if not _is_model_enabled(name):
+        log.info("Model %r is disabled; not routing", name)
         return None
 
     provider = _canonical_provider(entry.get("provider", "local"))
@@ -326,7 +355,7 @@ def model_status() -> list[dict]:
             "thinking_format": model.get("thinking_format", ""),
             "vision": bool(model.get("vision", False)),
             "pricing": model.get("pricing"),
-            "enabled": bool(model.get("enabled", True)),
+            "enabled": _is_model_enabled(model.get("name") or model.get("id")),
         })
     return result
 

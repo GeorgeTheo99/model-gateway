@@ -119,10 +119,10 @@ def delete_provider(provider_id: str) -> dict:
         raise KeyError(f"provider {provider_id!r} not found")
 
     # Refuse if any enabled model routes to this provider.
+    from src.providers import _canonical_provider, _is_model_enabled
     dependents = []
     for entry in {id(v): v for v in _load_models().values()}.values():
-        from src.providers import _canonical_provider
-        if _canonical_provider(entry.get("provider")) == provider_id and entry.get("enabled", True):
+        if _canonical_provider(entry.get("provider")) == provider_id and _is_model_enabled(entry.get("name")):
             dependents.append(entry.get("name", ""))
     if dependents:
         raise ValueError(
@@ -183,10 +183,12 @@ def _write_model_info(doc: dict) -> list[str]:
 
 
 # Fields a cloud model entry may carry. Used to validate + order writes.
+# NOTE: "enabled" is intentionally absent — runtime state lives in
+# config.yaml model_overrides, not the committed catalog.
 _MODEL_FIELDS = [
     "name", "provider", "provider_model_id", "alias", "context",
     "max_output_tokens", "thinking", "thinking_format", "vision",
-    "system_instruction", "pricing", "desc", "enabled",
+    "system_instruction", "pricing", "desc",
 ]
 
 
@@ -224,15 +226,15 @@ def upsert_model(name: str, **fields) -> dict:
             entry[f] = fields[f]
     if "vision" in fields and fields["vision"] is not None:
         entry["vision"] = bool(fields["vision"])
-    if "enabled" in fields and fields["enabled"] is not None:
-        entry["enabled"] = bool(fields["enabled"])
+    # "enabled" is handled by set_model_enabled() writing config.yaml
+    # model_overrides; it is never written to the committed catalog.
 
     paths = _write_model_info(doc)
     return {"name": name, "entry": _model_summary(entry), "written_to": paths}
 
 
 def delete_model(name: str) -> dict:
-    """Remove a model entry by name."""
+    """Remove a model entry by name. Also clears any runtime override."""
     name = (name or "").strip()
     doc = load_model_info()
     llm = doc.get("llm", [])
@@ -242,20 +244,41 @@ def delete_model(name: str) -> dict:
         raise KeyError(f"model {name!r} not found")
     doc["llm"] = llm
     paths = _write_model_info(doc)
+    # Clean up any stale runtime override for the deleted model.
+    config = load_config_full()
+    overrides = config.get("model_overrides") or {}
+    if name in overrides:
+        del overrides[name]
+        config["model_overrides"] = overrides
+        _backup(CONFIG_PATH)
+        _atomic_write(CONFIG_PATH, yaml.safe_dump(config, sort_keys=False, default_flow_style=False))
+        paths.append(str(CONFIG_PATH))
     return {"name": name, "deleted": True, "written_to": paths}
 
 
 def set_model_enabled(name: str, enabled: bool) -> dict:
-    """Toggle the enabled flag on a model entry."""
+    """Toggle a model's runtime enabled state in config.yaml model_overrides.
+
+    Writes to the gitignored config.yaml (symlinked shared file), NOT the
+    committed model-info.json — so the toggle is hot, durable across deploys,
+    and doesn't dirty the repo. The catalog stays the source of truth for
+    *what models exist*; this is purely runtime on/off state.
+    """
     name = (name or "").strip()
+    if not name:
+        raise ValueError("model name is required")
+    # Verify the model exists in the catalog before recording an override.
     doc = load_model_info()
-    llm = doc.get("llm", [])
-    entry = next((e for e in llm if e.get("name") == name), None)
-    if entry is None:
+    if not any(e.get("name") == name for e in doc.get("llm", [])):
         raise KeyError(f"model {name!r} not found")
-    entry["enabled"] = bool(enabled)
-    paths = _write_model_info(doc)
-    return {"name": name, "enabled": bool(enabled), "written_to": paths}
+
+    config = load_config_full()
+    overrides = config.setdefault("model_overrides", {}) or {}
+    overrides[name] = {"enabled": bool(enabled)}
+    config["model_overrides"] = overrides
+    _backup(CONFIG_PATH)
+    _atomic_write(CONFIG_PATH, yaml.safe_dump(config, sort_keys=False, default_flow_style=False))
+    return {"name": name, "enabled": bool(enabled), "written_to": [str(CONFIG_PATH)]}
 
 
 def _model_summary(entry: dict) -> dict:
