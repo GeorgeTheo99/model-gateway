@@ -224,13 +224,14 @@ Clients that will break until updated:
 3. **Request/usage ledger** ✅
    - SQLite schema, request ids, latency/status/error logging.
    - Token/cost extraction for non-streaming AND streaming (SSE tee).
-4. **Provider/key management**
+4. **Provider/key management** ✅
    - Add/edit provider configs and API keys via admin API/UI.
    - Validate provider connection.
    - Hot reload provider/model registry.
-5. **Model management**
+5. **Model management** ✅
    - Add/import/enable/disable model mappings.
    - Routing preview and config validation.
+   - Follow-up: import-from-provider-list-models (GET /admin/api/models/import) not yet built.
 6. **Cost dashboard** ✅ (v1)
    - Pricing in model-info.json `pricing` field, per-provider/model breakdown,
      windowed aggregates, recent-requests table. Streaming usage supported.
