@@ -350,6 +350,22 @@
       }
     },
     {
+      "name": "glm-5.2-fw",
+      "params": "743B",
+      "provider": "fireworks",
+      "provider_model_id": "accounts/fireworks/models/glm-5p2",
+      "alias": "glm52fw",
+      "context": 1048576,
+      "max_output_tokens": 32768,
+      "thinking": "always",
+      "desc": "GLM 5.2 743B MoE on Fireworks, 1M context",
+      "pricing": {
+        "input": 1.4,
+        "output": 4.4,
+        "cache_read": 0.14
+      }
+    },
+    {
       "name": "kimi-k2.7-code-fw",
       "params": "1T",
       "active": "32B",
