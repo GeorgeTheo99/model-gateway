@@ -105,7 +105,7 @@ Admin keys are also accepted on `/v1/*`, so an admin token can be used for debug
 
 Known clients that already send the default `cloud` token and should continue working if `MODEL_GATEWAY_CLIENT_KEYS=cloud` is enabled:
 
-- `server/local_claude/zshrc-launcher.zsh`
+- `runtime/pi-launcher.zsh`
   - Claude path sends `ANTHROPIC_AUTH_TOKEN=cloud`.
   - Codex path sends `OPENAI_API_KEY=cloud`.
   - Pi generated `models.json` uses `apiKey: cloud` for the model-gateway provider.

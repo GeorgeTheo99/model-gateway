@@ -187,8 +187,8 @@ Set `MODEL_GATEWAY_CLIENT_KEYS=cloud` to match the current local launchers befor
 
 Known clients that should continue working because they already send a token:
 
-- `server/local_claude/zshrc-launcher.zsh` Claude path sends `ANTHROPIC_AUTH_TOKEN=cloud`.
-- `server/local_claude/zshrc-launcher.zsh` Codex path sends `OPENAI_API_KEY=cloud`.
+- `runtime/pi-launcher.zsh` Claude path sends `ANTHROPIC_AUTH_TOKEN=cloud`.
+- `runtime/pi-launcher.zsh` Codex path sends `OPENAI_API_KEY=cloud`.
 - Pi generated `models.json` uses `apiKey: cloud` for the model-gateway provider.
 
 Clients that will break until updated:
