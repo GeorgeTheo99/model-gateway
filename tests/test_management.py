@@ -185,6 +185,47 @@ def test_resolve_skips_disabled_model(tmp_config, monkeypatch):
     assert providers.resolve("claude-test") is None  # disabled -> not routable
 
 
+def test_resolve_local_omlx_model_uses_builtin_proxy_defaults(tmp_config, monkeypatch):
+    doc = json.loads((tmp_config / "model-info.json").read_text())
+    doc["llm"].append({
+        "name": "local-test",
+        "alias": "lt",
+        "omlx_id": "local-upstream",
+        "context": 65536,
+        "max_output_tokens": 4096,
+        "thinking": "always",
+        "thinking_format": "glm-chat-template",
+    })
+    (tmp_config / "model-info.json").write_text(json.dumps(doc))
+    providers.reload()
+
+    for model_id in ("local-test", "lt", "local-upstream"):
+        info = providers.resolve(model_id)
+        assert info is not None
+        assert info.provider == "omlx"
+        assert info.base_url == "http://localhost:9110/v1"
+        assert info.api_key == "omlx"
+        assert info.provider_model_id == "local-upstream"
+        assert info.protocol == "openai"
+
+    omlx_status = next(p for p in providers.provider_status() if p["id"] == "omlx")
+    assert omlx_status["ready"] is True
+    assert omlx_status["issues"] == []
+
+
+def test_upsert_model_allows_local_omlx_id(tmp_config, monkeypatch):
+    config_io.log_dir = tmp_config / "logs"
+    result = config_io.upsert_model(
+        "local-created", provider="omlx", omlx_id="local-created-upstream",
+        context=32768, max_output_tokens=2048,
+    )
+    assert result["entry"]["omlx_id"] == "local-created-upstream"
+    providers.reload()
+    info = providers.resolve("local-created")
+    assert info is not None
+    assert info.provider_model_id == "local-created-upstream"
+
+
 # ── admin API endpoints ─────────────────────────────────────────────────────
 
 

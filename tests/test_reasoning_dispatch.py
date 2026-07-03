@@ -89,6 +89,12 @@ CASES = [
     pytest.param("qwen-chat-template", "chat", {}, True,
                  {"chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True}},
                  id="qwen-ctk-always-default"),
+    pytest.param("glm-chat-template", "chat", {}, True,
+                 {"chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True, "reasoning_effort": "high"}},
+                 id="glm-ctk-always-default"),
+    pytest.param("deepseek-v4-dsml", "chat", {}, True,
+                 {"chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True}},
+                 id="deepseek-v4-dsml-always-default"),
     pytest.param("qwen", "chat", {}, True,
                  {"enable_thinking": True}, id="qwen-always-default"),
     pytest.param("deepseek", "chat", {}, True,
@@ -111,6 +117,12 @@ CASES = [
     pytest.param("qwen-chat-template", "chat", {"reasoning_effort": "max"}, True,
                  {"chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True}},
                  id="qwen-ctk-max"),
+    pytest.param("glm-chat-template", "chat", {"reasoning_effort": "max"}, True,
+                 {"chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True, "reasoning_effort": "max"}},
+                 id="glm-ctk-max"),
+    pytest.param("deepseek-v4-dsml", "chat", {"reasoning_effort": "max"}, True,
+                 {"chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True}},
+                 id="deepseek-v4-dsml-max"),
     pytest.param("qwen", "chat", {"reasoning_effort": "max"}, True,
                  {"enable_thinking": True}, id="qwen-max"),
     pytest.param("deepseek", "chat", {"reasoning_effort": "max"}, True,
@@ -131,6 +143,10 @@ CASES = [
                  {"reasoning": {"effort": "none"}}, id="openrouter-disabled"),
     pytest.param("qwen-chat-template", "chat", {"reasoning_effort": "none"}, False,
                  {"chat_template_kwargs": {"enable_thinking": False}}, id="qwen-ctk-disabled"),
+    pytest.param("glm-chat-template", "chat", {"reasoning_effort": "none"}, False,
+                 {"chat_template_kwargs": {"enable_thinking": False}}, id="glm-ctk-disabled"),
+    pytest.param("deepseek-v4-dsml", "chat", {"reasoning_effort": "none"}, False,
+                 {"chat_template_kwargs": {"enable_thinking": False}}, id="deepseek-v4-dsml-disabled"),
     pytest.param("qwen", "chat", {"reasoning_effort": "none"}, False,
                  {"enable_thinking": False}, id="qwen-disabled"),
     pytest.param("deepseek", "chat", {"reasoning_effort": "none"}, False,
@@ -183,6 +199,39 @@ def test_client_reasoning_dict_effort_is_normalized():
     assert view == {"reasoning_effort": "xhigh"}
 
 
+def test_glm_chat_template_reads_nested_effort_from_pi():
+    enabled, view = _run("glm-chat-template", {
+        "messages": [],
+        "chat_template_kwargs": {
+            "enable_thinking": True,
+            "reasoning_effort": "max",
+        },
+    }, thinking="optional")
+    assert enabled is True
+    assert view == {
+        "chat_template_kwargs": {
+            "enable_thinking": True,
+            "preserve_thinking": True,
+            "reasoning_effort": "max",
+        }
+    }
+
+
+def test_disabled_glm_chat_template_strips_stale_nested_effort():
+    enabled, view = _run("glm-chat-template", {
+        "messages": [],
+        "reasoning_effort": "none",
+        "chat_template_kwargs": {
+            "enable_thinking": True,
+            "preserve_thinking": True,
+            "reasoning_effort": "max",
+            "unrelated": "kept",
+        },
+    })
+    assert enabled is False
+    assert view == {"chat_template_kwargs": {"unrelated": "kept", "enable_thinking": False}}
+
+
 def test_budget_overrides_effort_ratio_for_anthropic():
     """An explicit reasoning.max_tokens budget is forwarded verbatim (>=1024)."""
     enabled, view = _run("anthropic",
@@ -217,6 +266,41 @@ def test_chat_completions_text_request_does_not_500_on_vision_fallback_env(clien
     resp = client.post("/v1/chat/completions", json={
         "model": "text-model",
         "messages": [{"role": "user", "content": "hello"}],
+    })
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_chat_completions_local_omlx_proxies_to_upstream_model(client, monkeypatch):
+    info = _info(
+        "glm-chat-template",
+        provider="omlx",
+        provider_model_id="local-upstream",
+    )
+
+    def fake_resolve(model):
+        return info if model == "local-alias" else None
+
+    async def fake_passthrough_sync(endpoint, body, headers):
+        assert endpoint == "http://up/chat/completions"
+        assert headers["Authorization"] == "Bearer k"
+        assert body["model"] == "local-upstream"
+        assert body["chat_template_kwargs"] == {
+            "enable_thinking": True,
+            "preserve_thinking": True,
+            "reasoning_effort": "max",
+        }
+        return server_module.JSONResponse(status_code=200, content={"ok": True})
+
+    monkeypatch.setattr(server_module, "resolve", fake_resolve)
+    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough_sync)
+
+    resp = client.post("/v1/chat/completions", json={
+        "model": "local-alias",
+        "messages": [{"role": "user", "content": "hello"}],
+        "reasoning_effort": "max",
     })
 
     assert resp.status_code == 200
@@ -310,7 +394,7 @@ def test_chat_completions_image_request_uses_fireworks_default_vision_fallback(c
     ("openai", "gpt-x", "", "openai"),            # non-responses target
     ("google", "gemini", "", "google-openai"),
     ("omlx", "qwen3", "", "qwen-chat-template"),
-    ("omlx", "glm-5", "", "zai"),
+    ("omlx", "glm-5", "", "glm-chat-template"),
     ("zai_coding", "glm-5.2", "zai", "zai"),       # explicit wins
 ])
 def test_infer_thinking_format(provider, model_id, explicit, expected):
@@ -353,7 +437,8 @@ def test_every_routable_model_has_known_format():
     # only because no model currently uses it.
     assert seen_formats.issubset({
         "zai", "openai", "openai-responses", "anthropic", "openrouter",
-        "qwen", "qwen-chat-template", "deepseek", "google-openai", "none",
+        "qwen", "qwen-chat-template", "glm-chat-template", "deepseek",
+        "deepseek-v4-dsml", "google-openai", "none",
     })
 
 

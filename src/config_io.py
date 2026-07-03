@@ -204,7 +204,7 @@ def _write_model_info(doc: dict) -> list[str]:
 # NOTE: "enabled" is intentionally absent — runtime state lives in
 # config.yaml model_overrides, not the committed catalog.
 _MODEL_FIELDS = [
-    "name", "provider", "provider_model_id", "alias", "context",
+    "name", "provider", "provider_model_id", "omlx_id", "alias", "context",
     "max_output_tokens", "thinking", "thinking_format", "vision",
     "system_instruction", "pricing", "desc",
 ]
@@ -224,7 +224,11 @@ def upsert_model(name: str, **fields) -> dict:
     if not provider:
         raise ValueError("provider is required")
     provider_model_id = (fields.get("provider_model_id") or "").strip()
-    if not provider_model_id:
+    omlx_id = (fields.get("omlx_id") or "").strip()
+    if provider in {"local", "omlx", "mlx"}:
+        if not omlx_id and not provider_model_id:
+            raise ValueError("omlx_id or provider_model_id is required for local/oMLX models")
+    elif not provider_model_id:
         raise ValueError("provider_model_id is required")
 
     doc = load_model_info()
@@ -237,7 +241,12 @@ def upsert_model(name: str, **fields) -> dict:
 
     entry["name"] = name
     entry["provider"] = provider
-    entry["provider_model_id"] = provider_model_id
+    if provider_model_id:
+        entry["provider_model_id"] = provider_model_id
+    else:
+        entry.pop("provider_model_id", None)
+    if omlx_id:
+        entry["omlx_id"] = omlx_id
     for f in ("alias", "context", "max_output_tokens", "thinking",
               "thinking_format", "system_instruction", "pricing", "desc"):
         if f in fields and fields[f] is not None:

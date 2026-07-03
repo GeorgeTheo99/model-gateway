@@ -416,8 +416,13 @@ def _extract_reasoning_control(req: dict, info) -> dict:
             effort = "none"
 
     chat_template_kwargs = req.get("chat_template_kwargs")
-    if isinstance(chat_template_kwargs, dict) and "enable_thinking" in chat_template_kwargs:
-        enabled = bool(chat_template_kwargs.get("enable_thinking"))
+    if isinstance(chat_template_kwargs, dict):
+        if "enable_thinking" in chat_template_kwargs and enabled is None:
+            enabled = bool(chat_template_kwargs.get("enable_thinking"))
+        nested_effort = _normalize_effort(chat_template_kwargs.get("reasoning_effort"))
+        if nested_effort and effort is None:
+            effort = nested_effort
+            enabled = nested_effort != "none"
 
     if enabled is None and getattr(info, "thinking", "") == "always":
         enabled = True
@@ -447,7 +452,7 @@ def _infer_thinking_format(info, target_api: str) -> str:
         if "qwen" in model_id:
             return "qwen-chat-template"
         if "glm" in model_id:
-            return "zai"
+            return "glm-chat-template"
     if provider == "google":
         return "google-openai"
     return "openai"
@@ -457,12 +462,13 @@ def _strip_reasoning_controls(req: dict) -> None:
     req.pop("reasoning_effort", None)
     req.pop("thinking", None)
     req.pop("output_config", None)
-    # Preserve other chat_template_kwargs, but drop the thinking toggle unless
-    # the selected backend format explicitly re-adds it.
+    # Preserve unrelated chat_template_kwargs, but drop thinking controls unless
+    # the selected backend format explicitly re-adds them.
     ctk = req.get("chat_template_kwargs")
-    if isinstance(ctk, dict) and "enable_thinking" in ctk:
+    if isinstance(ctk, dict):
         ctk = dict(ctk)
-        ctk.pop("enable_thinking", None)
+        for key in ("enable_thinking", "preserve_thinking", "reasoning_effort"):
+            ctk.pop(key, None)
         if ctk:
             req["chat_template_kwargs"] = ctk
         else:
@@ -556,6 +562,28 @@ def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat") -> bool:
             req["thinking_budget"] = budget
         return bool(enabled)
 
+    if fmt == "glm-chat-template":
+        ctk = dict(req.get("chat_template_kwargs") or {})
+        ctk["enable_thinking"] = bool(enabled)
+        if enabled:
+            ctk.setdefault("preserve_thinking", True)
+            if effort and effort != "none":
+                ctk["reasoning_effort"] = "max" if effort == "xhigh" else "high"
+        req["chat_template_kwargs"] = ctk
+        if budget:
+            req["thinking_budget"] = budget
+        return bool(enabled)
+
+    if fmt == "deepseek-v4-dsml":
+        ctk = dict(req.get("chat_template_kwargs") or {})
+        ctk["enable_thinking"] = bool(enabled)
+        if enabled:
+            ctk.setdefault("preserve_thinking", True)
+        req["chat_template_kwargs"] = ctk
+        if budget:
+            req["thinking_budget"] = budget
+        return bool(enabled)
+
     if fmt == "qwen":
         req["enable_thinking"] = bool(enabled)
         if budget:
@@ -594,11 +622,21 @@ def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat") -> bool:
 # evolves, rather than duplicating the per-format forwarding logic.
 
 _THINK_UPSTREAM_KEYS = ("enable_thinking", "reasoning", "reasoning_effort",
-                        "thinking", "chat_template_kwargs", "thinking_budget")
+                        "thinking", "chat_template_kwargs", "chat_template_kwargs.reasoning_effort",
+                        "thinking_budget")
 # Params that carry an effort/budget *level* (not just an on/off toggle).
-_THINK_LEVEL_KEYS = ("reasoning", "reasoning_effort", "thinking", "thinking_budget")
+_THINK_LEVEL_KEYS = ("reasoning", "reasoning_effort", "thinking", "thinking_budget",
+                     "chat_template_kwargs.reasoning_effort")
 # Effort levels the gateway recognizes and normalizes (see _REASONING_EFFORTS).
 _GATEWAY_EFFORT_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"]
+
+
+def _forwarded_thinking_keys(req: dict) -> set[str]:
+    forwarded = {k for k in _THINK_UPSTREAM_KEYS if "." not in k and k in req}
+    ctk = req.get("chat_template_kwargs")
+    if isinstance(ctk, dict) and "reasoning_effort" in ctk:
+        forwarded.add("chat_template_kwargs.reasoning_effort")
+    return forwarded
 
 
 def _probe_forwarded_params(entry: dict) -> set[str]:
@@ -623,7 +661,7 @@ def _probe_forwarded_params(entry: dict) -> set[str]:
     ):
         req = dict(probe)
         _apply_gateway_reasoning(req, info, target_api="chat")
-        forwarded |= {k for k in _THINK_UPSTREAM_KEYS if k in req}
+        forwarded |= _forwarded_thinking_keys(req)
     return forwarded
 
 

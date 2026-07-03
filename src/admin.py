@@ -183,12 +183,11 @@ async def admin_validate_provider(provider_id: str, request: Request):
     """
     require_admin_auth(request)
     import httpx
-    from src.providers import resolve as _resolve  # noqa: F401 (kept for clarity)
     import src.providers as providers
 
-    provider_id = provider_id.strip().lower()
+    provider_id = providers._canonical_provider(provider_id.strip().lower())
     config = providers._load_config()
-    block = providers._resolve_provider_config(config, provider_id)
+    block = providers._effective_provider_config(config, provider_id)
     if not block:
         return _bad_request(f"provider {provider_id!r} not configured", status=404)
     base_url = block.get("base_url", "")
@@ -225,9 +224,9 @@ async def admin_validate_provider(provider_id: str, request: Request):
 async def admin_upsert_model(model_name: str, request: Request):
     """Create or update a model entry in model-info.json.
 
-    Body fields (provider + provider_model_id required): provider,
-    provider_model_id, alias, context, max_output_tokens, thinking,
-    thinking_format, vision, system_instruction, pricing, desc, enabled.
+    Body fields: provider, provider_model_id (or omlx_id for local/oMLX),
+    alias, context, max_output_tokens, thinking, thinking_format, vision,
+    system_instruction, pricing, desc, enabled.
     Writes deploy to the live catalog + source-repo mirror; reloads registry.
     """
     require_admin_auth(request)

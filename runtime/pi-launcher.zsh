@@ -1,8 +1,8 @@
 # ── Pi / Claude Code / Codex Launcher (oMLX + model-gateway) ──
-# Local sessions route through oMLX (port 9110) or model-gateway (port 9111).
-# oMLX handles model loading, SSD KV cache, and Anthropic API translation.
-# Model metadata (context windows, max tokens) comes from oMLX API.
-# Aliases come from ~/.claude/model-aliases.json.
+# Interactive sessions route through model-gateway (port 9111); local MLX
+# requests are proxied onward to oMLX (port 9110). oMLX still handles model
+# loading, SSD KV cache, and local inference. Model metadata comes from oMLX
+# API + model-info.json. Aliases come from ~/.claude/model-aliases.json.
 
 OMLX_PORT=9110
 OMLX_URL="http://localhost:$OMLX_PORT"
@@ -216,6 +216,26 @@ _ensure_omlx() {
   return 1
 }
 
+_ensure_model_gateway() {
+  if curl -sf --max-time 2 "$CLOUD_GW_URL/health" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "Starting model-gateway..."
+  local label="gui/$(id -u)/com.local.model-gateway"
+  if launchctl print "$label" >/dev/null 2>&1; then
+    launchctl kickstart -k "$label" >/dev/null 2>&1 || true
+  else
+    launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.local.model-gateway.plist 2>/dev/null || true
+  fi
+  local elapsed=0
+  while [ $elapsed -lt 30 ]; do
+    curl -sf --max-time 2 "$CLOUD_GW_URL/health" >/dev/null 2>&1 && { echo "model-gateway ready"; return 0; }
+    sleep 2; elapsed=$((elapsed + 2))
+  done
+  echo "WARNING: model-gateway may not be ready — check ~/.claude/model-gateway.log"
+  return 1
+}
+
 _LS99_QWEN_SESSION_INSTRUCTION='Session discipline: follow the latest user instruction only. If the user requests a handoff, stop coding immediately and only write the handoff plus fresh-session instructions. Before any edit/commit/push, restate the current task and verify it matches the latest user message. If interrupted and resumed, re-read the latest user message and discard stale plans.'
 
 _ls99_session_instruction_for_alias() {
@@ -256,6 +276,7 @@ _claude_local() {
   fi
 
   _ensure_omlx || return 1
+  _ensure_model_gateway || return 1
 
   # Fetch fresh context/max_out from oMLX if we had stale data (fallback mode)
   local ctx="${_OMLX_CTX[$model_id]}"
@@ -293,9 +314,9 @@ else:
   local model_alias="${_OMLX_ALIAS[$model_id]}"
   local session_instruction
   session_instruction="$(_ls99_session_instruction_for_alias "$model_alias")"
-  local base_url="$OMLX_URL"
-  local auth_token="omlx"
-  local backend_label="oMLX"
+  local base_url="$CLOUD_GW_URL"
+  local auth_token="$CLOUD_GW_API_KEY"
+  local backend_label="model-gateway → oMLX"
   local -a claude_cmd
   claude_cmd=(claude --permission-mode bypassPermissions)
   if [ -n "$session_instruction" ]; then
@@ -306,7 +327,7 @@ else:
   echo "Claude Code → ${backend_label} (${_OMLX_ALIAS[$model_id]}, ${ctx} context, ${max_out} max output)"
   _ls99_with_ai_env \
     claude \
-    omlx \
+    model-gateway \
     "$model_id" \
       "${_OMLX_ALIAS[$model_id]}" \
       "claude-${_OMLX_ALIAS[$model_id]}" \
@@ -333,6 +354,8 @@ _claude_cloud() {
     echo "Error: unknown cloud model '$cloud_id'"
     return 1
   fi
+
+  _ensure_model_gateway || return 1
 
   local provider_model="${_CLOUD_PROVIDER_MODEL[$cloud_id]}"
   local ctx="${_CLOUD_CTX[$cloud_id]}"
@@ -511,6 +534,7 @@ _codex_local() {
   fi
 
   _ensure_omlx || return 1
+  _ensure_model_gateway || return 1
 
   local ctx="${_OMLX_CTX[$model_id]}"
   local max_out="${_OMLX_MAX_OUT[$model_id]}"
@@ -526,11 +550,11 @@ _codex_local() {
   local -a codex_cmd
   codex_cmd=(
     codex --dangerously-bypass-approvals-and-sandbox
-    -c 'model_provider="ls99_omlx"'
-    -c 'model_providers.ls99_omlx.name="LS99 oMLX"'
-    -c "model_providers.ls99_omlx.base_url=\"$OMLX_URL/v1\""
-    -c 'model_providers.ls99_omlx.env_key="OPENAI_API_KEY"'
-    -c 'model_providers.ls99_omlx.supports_websockets=false'
+    -c 'model_provider="ls99_models"'
+    -c 'model_providers.ls99_models.name="LS99 model-gateway"'
+    -c "model_providers.ls99_models.base_url=\"$CLOUD_GW_URL/v1\""
+    -c 'model_providers.ls99_models.env_key="OPENAI_API_KEY"'
+    -c 'model_providers.ls99_models.supports_websockets=false'
     -c "model_context_window=$ctx"
     -m "$model_id"
   )
@@ -542,17 +566,17 @@ _codex_local() {
   fi
   codex_cmd+=("$@")
 
-  echo "Codex → oMLX (${_OMLX_ALIAS[$model_id]}, ${ctx} context, ${max_out} max output)"
+  echo "Codex → model-gateway → oMLX (${_OMLX_ALIAS[$model_id]}, ${ctx} context, ${max_out} max output)"
   _ls99_with_ai_env \
     codex \
-    omlx \
+    model-gateway \
     "$model_id" \
     "${_OMLX_ALIAS[$model_id]}" \
     "codex-${_OMLX_ALIAS[$model_id]}" \
     env \
       CODEX_HOME="$HOME/.codex-omlx" \
-      OPENAI_API_KEY="$OMLX_API_KEY" \
-      OPENAI_BASE_URL="$OMLX_URL/v1" \
+      OPENAI_API_KEY="$CLOUD_GW_API_KEY" \
+      OPENAI_BASE_URL="$CLOUD_GW_URL/v1" \
       "${codex_cmd[@]}"
 }
 
@@ -563,6 +587,8 @@ _codex_cloud() {
     echo "Error: unknown cloud model '$cloud_id'"
     return 1
   fi
+
+  _ensure_model_gateway || return 1
 
   local provider_model="${_CLOUD_PROVIDER_MODEL[$cloud_id]}"
   local gateway_model="${_CLOUD_NAME[$cloud_id]:-$provider_model}"
@@ -580,11 +606,11 @@ _codex_cloud() {
   local -a codex_cmd
   codex_cmd=(
     codex --dangerously-bypass-approvals-and-sandbox
-    -c 'model_provider="ls99_cloud"'
-    -c 'model_providers.ls99_cloud.name="LS99 model-gateway"'
-    -c "model_providers.ls99_cloud.base_url=\"$CLOUD_GW_URL/v1\""
-    -c 'model_providers.ls99_cloud.env_key="OPENAI_API_KEY"'
-    -c 'model_providers.ls99_cloud.supports_websockets=false'
+    -c 'model_provider="ls99_models"'
+    -c 'model_providers.ls99_models.name="LS99 model-gateway"'
+    -c "model_providers.ls99_models.base_url=\"$CLOUD_GW_URL/v1\""
+    -c 'model_providers.ls99_models.env_key="OPENAI_API_KEY"'
+    -c 'model_providers.ls99_models.supports_websockets=false'
     -c "model_context_window=$ctx"
     -m "$gateway_model"
   )
@@ -718,8 +744,7 @@ _PI_AGENT_DIR="$HOME/.pi-omlx/agent"
 # reroutes the request to GATEWAY_VISION_FALLBACK (default google/gemini-3.5-flash
 # via OpenRouter) in server.py /v1/chat/completions. No client-side env vars needed.
 
-_PI_OMLX_PROVIDER="ls99-omlx"
-_PI_CLOUD_PROVIDER="ls99-cloud"
+_PI_MODELS_PROVIDER="ls99-models"
 _PI_SHARED_REPAIR="$HOME/local_code/pi-shared/bin/pi-omlx-repair"
 
 _pi_repair_profile() {
@@ -740,8 +765,7 @@ _pi_write_models() {
   OMLX_API_KEY="$OMLX_API_KEY" \
   CLOUD_GW_URL="$CLOUD_GW_URL" \
   CLOUD_GW_API_KEY="$CLOUD_GW_API_KEY" \
-  PI_OMLX_PROVIDER="$_PI_OMLX_PROVIDER" \
-  PI_CLOUD_PROVIDER="$_PI_CLOUD_PROVIDER" \
+  PI_MODELS_PROVIDER="$_PI_MODELS_PROVIDER" \
   python3 - "$_PI_AGENT_DIR/models.json" <<'PY'
 import json
 import os
@@ -769,14 +793,14 @@ try:
         with open(model_info_file) as f:
             model_info = json.load(f)
         for entry in model_info.get("llm", []):
-            provider = entry.get("provider", "local") or "local"
-            if provider != "local":
+            provider = (entry.get("provider", "local") or "local").strip().lower()
+            if provider not in {"local", "omlx", "mlx"}:
                 provider_model = entry.get("provider_model_id")
                 if provider_model:
                     model_info_by_key[f"cloud:{provider_model}"] = entry
                     model_info_by_key[provider_model] = entry
             else:
-                omlx_id = entry.get("omlx_id")
+                omlx_id = entry.get("omlx_id") or entry.get("provider_model_id")
                 if omlx_id:
                     model_info_by_key[omlx_id] = entry
             alias = entry.get("alias")
@@ -1015,19 +1039,12 @@ for key, alias_meta in aliases.items():
 
 data = {
     "providers": {
-        os.environ["PI_OMLX_PROVIDER"]: {
-            "baseUrl": os.environ["OMLX_URL"].rstrip("/") + "/v1",
-            "api": "openai-completions",
-            "apiKey": os.environ["OMLX_API_KEY"],
-            "compat": compat,
-            "models": local_models,
-        },
-        os.environ["PI_CLOUD_PROVIDER"]: {
+        os.environ["PI_MODELS_PROVIDER"]: {
             "baseUrl": os.environ["CLOUD_GW_URL"].rstrip("/") + "/v1",
             "api": "openai-completions",
             "apiKey": os.environ["CLOUD_GW_API_KEY"],
             "compat": compat,
-            "models": cloud_models,
+            "models": local_models + cloud_models,
         },
     }
 }
@@ -1047,6 +1064,7 @@ _pi_local() {
   fi
 
   _ensure_omlx || return 1
+  _ensure_model_gateway || return 1
   _pi_write_models || return 1
 
   local ctx="${_OMLX_CTX[$model_id]}"
@@ -1054,16 +1072,16 @@ _pi_local() {
   ctx="${ctx:-32768}"
   max_out="${max_out:-32768}"
 
-  echo "Pi → oMLX (${_OMLX_ALIAS[$model_id]}, ${ctx} context, ${max_out} max output)"
+  echo "Pi → model-gateway → oMLX (${_OMLX_ALIAS[$model_id]}, ${ctx} context, ${max_out} max output)"
   _ls99_with_ai_env \
     pi \
-    omlx \
+    model-gateway \
     "$model_id" \
     "${_OMLX_ALIAS[$model_id]}" \
     "pi-${_OMLX_ALIAS[$model_id]}" \
     env \
       PI_CODING_AGENT_DIR="$_PI_AGENT_DIR" \
-      pi --provider "$_PI_OMLX_PROVIDER" --model "$model_id" "$@"
+      pi --provider "$_PI_MODELS_PROVIDER" --model "$model_id" "$@"
 }
 
 _pi_cloud() {
@@ -1074,6 +1092,7 @@ _pi_cloud() {
     return 1
   fi
 
+  _ensure_model_gateway || return 1
   _pi_write_models || return 1
 
   local provider_model="${_CLOUD_PROVIDER_MODEL[$cloud_id]}"
@@ -1091,7 +1110,7 @@ _pi_cloud() {
     "pi-${_CLOUD_ALIAS[$cloud_id]}" \
     env \
       PI_CODING_AGENT_DIR="$_PI_AGENT_DIR" \
-      pi --provider "$_PI_CLOUD_PROVIDER" --model "$provider_model" "$@"
+      pi --provider "$_PI_MODELS_PROVIDER" --model "$provider_model" "$@"
 }
 
 pi-default() {

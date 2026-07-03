@@ -38,6 +38,9 @@ CONFIG_PATH = Path(
     or Path(__file__).resolve().parents[1] / "config" / "config.yaml"
 ).resolve()
 
+_DEFAULT_OMLX_BASE_URL = os.environ.get("MODEL_GATEWAY_OMLX_BASE_URL", "http://localhost:9110/v1")
+_DEFAULT_OMLX_API_KEY = os.environ.get("MODEL_GATEWAY_OMLX_API_KEY", "omlx")
+
 
 @dataclass
 class ProviderInfo:
@@ -93,6 +96,24 @@ def _resolve_provider_config(config: dict, provider: str) -> dict:
     return {}
 
 
+def _provider_defaults(provider: str) -> dict:
+    """Built-in provider defaults for local backends managed on this machine."""
+    if provider == "omlx":
+        return {
+            "base_url": _DEFAULT_OMLX_BASE_URL,
+            "api_key": _DEFAULT_OMLX_API_KEY,
+            "protocol": "openai",
+        }
+    return {}
+
+
+def _effective_provider_config(config: dict, provider: str) -> dict:
+    """Provider config with local-machine defaults overlaid by config.yaml."""
+    effective = _provider_defaults(provider)
+    effective.update(_resolve_provider_config(config, provider))
+    return effective
+
+
 def _load_config() -> dict:
     global _config
     if _config is not None:
@@ -121,10 +142,9 @@ def _load_models() -> dict[str, dict]:
 
     for entry in data.get("llm", []):
         provider = _canonical_provider(entry.get("provider", "local"))
-        # model-gateway currently routes only remote/cloud providers.
-        # Local MLX/oMLX models are served directly by oMLX on port 9110;
-        # GGUF/llama.cpp serving has been retired on this machine.
-        if provider in {"omlx", "local", "mlx", "gguf", "llama", "llama_cpp", "llama.cpp"}:
+        # GGUF/llama.cpp serving has been retired on this machine. Local MLX
+        # entries are routable through model-gateway as a thin proxy to oMLX.
+        if provider in {"gguf", "llama", "llama_cpp", "llama.cpp"}:
             continue
         normalized_entry = dict(entry)
         normalized_entry["provider"] = provider
@@ -212,16 +232,10 @@ def resolve(model_id: str) -> ProviderInfo | None:
     provider = _canonical_provider(entry.get("provider", "local"))
 
     config = _load_config()
-    provider_config = _resolve_provider_config(config, provider)
+    provider_config = _effective_provider_config(config, provider)
 
-    default_base_url = ""
-    default_api_key = ""
-    if provider == "omlx":
-        log.error("Provider %r is not routed by model-gateway yet; use oMLX directly", provider)
-        return None
-
-    base_url = provider_config.get("base_url", default_base_url)
-    api_key = provider_config.get("api_key", default_api_key)
+    base_url = provider_config.get("base_url", "")
+    api_key = provider_config.get("api_key", "")
     protocol = provider_config.get("protocol", "openai")
 
     if not base_url or not api_key:
@@ -323,7 +337,8 @@ def provider_status() -> list[dict]:
     provider_ids = sorted(set(model_counts) | {_canonical_provider(key) for key in configured})
     result = []
     for provider in provider_ids:
-        provider_config = _resolve_provider_config(config, provider)
+        explicit_config = _resolve_provider_config(config, provider)
+        provider_config = _effective_provider_config(config, provider)
         base_url = _safe_url(provider_config.get("base_url", ""))
         has_api_key = bool(provider_config.get("api_key"))
         issues = []
@@ -333,7 +348,7 @@ def provider_status() -> list[dict]:
             issues.append("missing_api_key")
         result.append({
             "id": provider,
-            "configured": bool(provider_config),
+            "configured": bool(explicit_config or _provider_defaults(provider)),
             "enabled_models": model_counts.get(provider, 0),
             "base_url": base_url,
             "protocol": provider_config.get("protocol", "openai") if provider_config else "openai",
@@ -347,7 +362,7 @@ def provider_status() -> list[dict]:
 def model_status() -> list[dict]:
     """Return routable model metadata with provider-config status."""
     ready = {p["id"]: p["ready"] for p in provider_status()}
-    configured = _configured_provider_ids()
+    configured = _configured_provider_ids() | {"omlx"}
     result = []
     for model in list_models():
         provider = _canonical_provider(model.get("provider", ""))
@@ -356,7 +371,8 @@ def model_status() -> list[dict]:
             "name": model.get("name", ""),
             "alias": model.get("alias", ""),
             "provider": provider,
-            "provider_model_id": model.get("provider_model_id", ""),
+            "provider_model_id": model.get("provider_model_id") or model.get("omlx_id") or model.get("name", ""),
+            "omlx_id": model.get("omlx_id", ""),
             "provider_configured": provider in configured,
             "provider_ready": ready.get(provider, False),
             "context": model.get("context", 0),
