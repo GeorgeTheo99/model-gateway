@@ -1063,7 +1063,9 @@ _ADMIN_HTML = r"""
     try { sessionStorage.setItem(STORAGE_KEY, key); } catch(e) {}
     lockedErr.classList.add('hidden');
     showDash();
-    Promise.all([loadHealth(), loadUsage(currentWindow)]).catch(()=>{});
+    // Load health first so _modelsCache is populated before loadUsage renders
+    // the by-model table (whose click-through resolves dims to model names).
+    loadHealth().then(() => loadUsage(currentWindow)).catch(()=>{});
   }
   function refresh(){ if (!unlocked) return; closeModelDetail(); loadHealth(); loadUsage(currentWindow); }
 
