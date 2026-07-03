@@ -139,3 +139,30 @@ def test_record_best_effort_does_not_raise_on_bad_path(monkeypatch, tmp_path):
 def test_group_by_validation():
     with pytest.raises(ValueError):
         ledger.aggregate(group_by="bogus")
+
+
+def test_summary_and_recent_filtered_by_model(tmp_ledger):
+    ledger.record(endpoint="/v1/messages", method="POST", model="glm-5.2",
+                  provider="zai_coding", provider_model_id="glm-5.2", status=200,
+                  latency_ms=100, is_stream=False,
+                  usage=_usage(input_tokens=100, output_tokens=50),
+                  cost=CostEstimate(0.02, True, []))
+    ledger.record(endpoint="/v1/messages", method="POST", model="claude",
+                  provider="anthropic", provider_model_id="claude", status=200,
+                  latency_ms=80, is_stream=False,
+                  usage=_usage(input_tokens=10, output_tokens=5),
+                  cost=CostEstimate(0.01, True, []))
+    # Filter to glm-5.2 across all its routable ids.
+    s = ledger.summary(models=["glm-5.2", "glm52"])
+    assert s["requests"] == 1
+    assert s["input_tokens"] == 100
+    assert s["cost_usd"] == 0.02
+    # recent() respects the same filter.
+    rows = ledger.recent(limit=10, models=["glm-5.2"])
+    assert len(rows) == 1
+    assert rows[0]["model"] == "glm-5.2"
+    # No matches for an unknown id set.
+    assert ledger.summary(models=["does-not-exist"])["requests"] == 0
+    assert ledger.recent(limit=10, models=["does-not-exist"]) == []
+    # Empty/None filter returns everything.
+    assert ledger.summary()["requests"] == 2

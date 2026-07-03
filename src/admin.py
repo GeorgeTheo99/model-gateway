@@ -16,6 +16,7 @@ from src.providers import (
     model_status,
     provider_status,
     reload as reload_provider_registry,
+    routable_ids,
 )
 from src import config_io, ledger
 
@@ -128,6 +129,61 @@ async def admin_requests(request: Request):
     except ValueError:
         pass
     return {"requests": ledger.recent(limit=limit)}
+
+
+@router.get("/admin/api/models/{model_name}/stats")
+async def admin_model_stats(model_name: str, request: Request):
+    """Per-model config + usage/cost + recent requests for a window.
+
+    Query params: window ('1h','24h','7d','30d'), since/until epoch seconds.
+    Matches ledger rows by every routable identifier for the model (name,
+    alias, provider_model_id, omlx_id) so stats follow whichever alias the
+    caller sent. Requires admin auth.
+    """
+    require_admin_auth(request)
+    import time as _time
+
+    params = request.query_params
+    since = None
+    until = None
+    window = params.get("window")
+    if window:
+        units = {"h": 3600, "d": 86400}
+        try:
+            secs = int(window[:-1]) * units[window[-1].lower()]
+            since = _time.time() - secs
+        except (KeyError, ValueError):
+            pass
+    if params.get("since"):
+        try:
+            since = float(params["since"])
+        except ValueError:
+            pass
+    if params.get("until"):
+        try:
+            until = float(params["until"])
+        except ValueError:
+            pass
+
+    # Resolve the model config from model_status (find by name).
+    rows = [m for m in model_status() if (m.get("name") or m.get("id")) == model_name]
+    model = rows[0] if rows else None
+    # Only query the ledger when the model actually exists; an unknown name
+    # would otherwise fall back to a self-named id and return NULL-filled rows.
+    if model:
+        ids = routable_ids(model_name)
+        usage = ledger.summary(since=since, until=until, models=ids) if ids else {}
+        recent = ledger.recent(limit=25, models=ids) if ids else []
+    else:
+        ids = []
+        usage = {}
+        recent = []
+    return {
+        "model": model,
+        "routable_ids": ids,
+        "usage": usage,
+        "recent": recent,
+    }
 
 
 # ── Provider management (writeable) ──────────────────────────────────────────
@@ -510,6 +566,30 @@ _ADMIN_HTML = r"""
     .two-col { display: grid; grid-template-columns: 1.4fr 1fr; gap: 28px; align-items: start; }
     @media (max-width: 980px) { .two-col { grid-template-columns: 1fr; } }
     code.kv { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; background: var(--surface-2); border: 1px solid var(--rule); border-radius: var(--radius-sm); padding: 1px 5px; }
+
+    /* ── Model detail panel ──────────────────────────────────── */
+    .detail {
+      border: 1px solid var(--rule); border-radius: var(--radius); background: var(--surface);
+      display: grid; gap: 16px; padding: 16px;
+    }
+    .detail .detail-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+    .detail .detail-head h3 { font-size: 16px; font-weight: 700; letter-spacing: -0.015em; }
+    .detail .detail-head .close { appearance: none; border: 0; background: transparent; color: var(--muted); cursor: pointer; font-size: 18px; line-height: 1; padding: 2px 6px; border-radius: var(--radius-sm); }
+    .detail .detail-head .close:hover { color: var(--text); background: var(--surface-2); }
+    .kv-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px 18px; }
+    .kv-item { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+    .kv-item .k { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+    .kv-item .v { font-size: 13px; font-variant-numeric: tabular-nums; word-break: break-all; }
+    .detail .subhead { font-size: 12px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); font-weight: 600; margin-top: 2px; }
+    .cost-callout { display: flex; align-items: baseline; gap: 10px; padding: 12px 14px; background: var(--accent-soft); border: 1px solid color-mix(in oklab, var(--accent) 30%, var(--rule)); border-radius: var(--radius); }
+    .cost-callout .cost-value { font-size: 24px; font-weight: 700; letter-spacing: -0.02em; color: var(--accent); font-variant-numeric: tabular-nums; }
+    .cost-callout .cost-label { font-size: 12px; color: var(--text-2); }
+    .clickable { cursor: pointer; }
+    .clickable:hover { color: var(--accent); }
+    tbody tr.clickable-row:hover { background: var(--accent-soft); }
+    .bymodel-clickable { cursor: pointer; }
+    .bymodel-clickable:hover td { background: var(--accent-soft); color: var(--text); }
+    .loading-bar { font-size: 12px; color: var(--muted); padding: 8px 0; }
   </style>
 </head>
 <body>
@@ -580,6 +660,7 @@ _ADMIN_HTML = r"""
         <div class="scroll">
           <table id="models"><thead><tr><th>Name</th><th>Upstream id</th><th>Provider</th><th class="num">Context</th><th class="num">Max out</th><th>Thinking</th><th>Vision</th><th>State</th><th></th></tr></thead><tbody></tbody></table>
         </div>
+        <div id="modelDetail" class="detail hidden" aria-live="polite"></div>
         <details class="formset"><summary>Add or edit a model</summary>
           <div class="form-body">
             <div class="form-grid">
@@ -664,6 +745,7 @@ _ADMIN_HTML = r"""
 
   let unlocked = false;
   let currentWindow = '24h';
+  let _modelsCache = [];  // deduped model rows, for resolving ledger dims to model names
 
   function headers(){ const key = keyInput.value.trim(); return key ? {'Authorization':'Bearer '+key} : {}; }
   function text(v){ return (v === undefined || v === null || v === '') ? '—' : String(v); }
@@ -753,6 +835,7 @@ _ADMIN_HTML = r"""
 
   function renderModels(rows){
     const uniq = dedupeModels(rows);
+    _modelsCache = uniq;
     const local = uniq.filter(m => String(m.provider).toLowerCase() === 'omlx');
     const cloud = uniq.filter(m => String(m.provider).toLowerCase() !== 'omlx');
     const body = document.querySelector('#models tbody');
@@ -767,13 +850,23 @@ _ADMIN_HTML = r"""
         const th = escapeHtml(m.thinking || m.thinking_format || '');
         const state = en ? statePill('ok','on') : statePill('bad','off');
         const toggle = '<button class="btn secondary" data-toggle-model="'+nm+'" data-enable="'+(!en)+'">'+(en?'disable':'enable')+'</button> <button class="btn secondary" data-edit-model="'+nm+'">edit</button>';
-        parts.push('<tr><td>'+idPill(m.name || m.id)+'</td><td class="id">'+up+'</td><td>'+escapeHtml(m.provider)+'</td><td class="num">'+escapeHtml(m.context)+'</td><td class="num">'+escapeHtml(m.max_output_tokens)+'</td><td>'+th+'</td><td>'+(m.vision?'yes':'no')+'</td><td>'+state+'</td><td>'+toggle+'</td></tr>');
+        parts.push('<tr class="clickable-row" data-open-model="'+nm+'"><td>'+idPill(m.name || m.id)+'</td><td class="id">'+up+'</td><td>'+escapeHtml(m.provider)+'</td><td class="num">'+escapeHtml(m.context)+'</td><td class="num">'+escapeHtml(m.max_output_tokens)+'</td><td>'+th+'</td><td>'+(m.vision?'yes':'no')+'</td><td>'+state+'</td><td>'+toggle+'</td></tr>');
       }
     }
     group('Local (oMLX)', local);
     group('Cloud', cloud);
     body.innerHTML = parts.join('') || '<tr class="empty"><td colspan="9">No models configured.</td></tr>';
     document.getElementById('modelsMeta').textContent = local.length + ' local · ' + cloud.length + ' cloud';
+  }
+
+  function resolveModelName(dim){
+    if (!dim) return null;
+    for (const m of _modelsCache) {
+      const name = m.name || m.id;
+      if (!name) continue;
+      if (dim === name || dim === m.alias || dim === m.provider_model_id || dim === m.omlx_id) return name;
+    }
+    return null;
   }
 
   // ── Usage ───────────────────────────────────────────────────
@@ -800,7 +893,12 @@ _ADMIN_HTML = r"""
       uLat.textContent = fmtMs(s.avg_latency_ms); uLat.className = 'value ok-c';
       document.getElementById('uLatencyDetail').textContent = s.requests ? 'over '+s.requests+' requests' : 'no requests';
       const byModel = usage.by_model || [];
-      document.querySelector('#usageByModel tbody').innerHTML = byModel.map(r => '<tr><td>'+idPill(r.dim||'—')+'</td><td class="num">'+fmtNum(r.requests)+'</td><td class="num '+(r.errors?'bad-c':'ok-c')+'">'+fmtNum(r.errors)+'</td><td class="num">'+fmtNum(r.input_tokens)+'</td><td class="num">'+fmtNum(r.output_tokens)+'</td><td class="num">'+fmtNum(r.cached_read_tokens)+'</td><td class="num">'+fmtCost(r.cost_usd)+'</td><td class="num">'+fmtMs(r.avg_latency_ms)+'</td></tr>').join('') || '<tr class="empty"><td colspan="8">No requests in this window.</td></tr>';
+      document.querySelector('#usageByModel tbody').innerHTML = byModel.map(r => {
+        const name = resolveModelName(r.dim);
+        const cls = name ? 'bymodel-clickable' : '';
+        const attr = name ? ' data-open-model="'+escapeHtml(name)+'"' : '';
+        return '<tr class="'+cls+'"'+attr+'><td>'+idPill(r.dim||'—')+'</td><td class="num">'+fmtNum(r.requests)+'</td><td class="num '+(r.errors?'bad-c':'ok-c')+'">'+fmtNum(r.errors)+'</td><td class="num">'+fmtNum(r.input_tokens)+'</td><td class="num">'+fmtNum(r.output_tokens)+'</td><td class="num">'+fmtNum(r.cached_read_tokens)+'</td><td class="num">'+fmtCost(r.cost_usd)+'</td><td class="num">'+fmtMs(r.avg_latency_ms)+'</td></tr>';
+      }).join('') || '<tr class="empty"><td colspan="8">No requests in this window.</td></tr>';
       const reqs = recent.requests || [];
       document.querySelector('#recentReq tbody').innerHTML = reqs.map(r => '<tr><td>'+escapeHtml(r.ts_iso||'—')+'</td><td>'+escapeHtml(r.endpoint||'—')+'</td><td>'+idPill(r.model||'—')+'</td><td class="num '+(r.status && r.status < 400 ? 'ok-c' : 'bad-c')+'">'+(r.status||'—')+'</td><td>'+(r.is_stream?'stream':'sync')+'</td><td class="num">'+fmtNum(r.input_tokens)+'</td><td class="num">'+fmtNum(r.output_tokens)+'</td><td class="num">'+fmtNum(r.cached_read_tokens)+'</td><td class="num">'+fmtCost(r.cost_usd)+'</td><td class="num">'+fmtMs(r.latency_ms)+'</td></tr>').join('') || '<tr class="empty"><td colspan="10">No requests yet.</td></tr>';
     } catch (e) {
@@ -892,6 +990,72 @@ _ADMIN_HTML = r"""
     catch(e){ if (e instanceof AuthError) return showLocked(); setMsg('mMsg', e.message, false); }
   }
 
+  // ── Model detail click-through ─────────────────────────────
+  const modelDetail = document.getElementById('modelDetail');
+  function closeModelDetail(){ modelDetail.classList.add('hidden'); modelDetail.innerHTML = ''; }
+  function pricingText(p){
+    if (!p) return '—';
+    const parts = [];
+    if (p.input != null) parts.push('in $'+Number(p.input).toFixed(2));
+    if (p.output != null) parts.push('out $'+Number(p.output).toFixed(2));
+    if (p.cache_read != null) parts.push('cache $'+Number(p.cache_read).toFixed(3));
+    if (p.reasoning != null) parts.push('reason $'+Number(p.reasoning).toFixed(3));
+    return parts.length ? parts.join(' · ') : JSON.stringify(p);
+  }
+  async function showModelDetail(name){
+    if (!name) return;
+    modelDetail.classList.remove('hidden');
+    modelDetail.innerHTML = '<div class="loading-bar">Loading '+escapeHtml(name)+'…</div>';
+    modelDetail.scrollIntoView({behavior:'smooth', block:'nearest'});
+    try {
+      const q = currentWindow ? ('?window='+encodeURIComponent(currentWindow)) : '';
+      const data = await get('/admin/api/models/'+encodeURIComponent(name)+'/stats'+q);
+      renderModelDetail(name, data);
+    } catch (e) {
+      if (e instanceof AuthError) { showLocked(); return; }
+      modelDetail.innerHTML = '<div class="inline-err">Failed to load stats: '+escapeHtml(e.message)+'</div>';
+    }
+  }
+  function renderModelDetail(name, data){
+    const m = data.model || {};
+    const u = data.usage || {};
+    const ids = data.routable_ids || [];
+    const en = m.enabled !== false;
+    const reqs = fmtNum(u.requests);
+    const errs = u.errors || 0;
+    const cost = fmtCost(u.cost_usd);
+    const winLabel = _winLabel[currentWindow] || currentWindow || 'All';
+    const kv = (k, v) => '<div class="kv-item"><span class="k">'+k+'</span><span class="v">'+v+'</span></div>';
+    let html = '<div class="detail-head"><h3>'+idPill(name)+'</h3>';
+    html += '<div class="toolbar"><span class="meta">'+escapeHtml(m.provider||'—')+' · '+(en?statePill('ok','on'):statePill('bad','off'))+'</span>';
+    html += '<button class="btn secondary" data-edit-model="'+escapeHtml(name)+'">Edit</button>';
+    html += '<button class="close" type="button" data-close-detail aria-label="Close">×</button></div></div>';
+    // Cost callout
+    html += '<div class="cost-callout"><span class="cost-value">'+cost+'</span><span class="cost-label">estimated cost · '+escapeHtml(winLabel)+' · priced rows only</span></div>';
+    // Usage strip
+    html += '<div class="strip"><div class="stat"><span class="label">Requests</span><span class="value '+(errs?'warn-c':'ok-c')+'">'+reqs+'</span><span class="detail">'+fmtNum(u.ok)+' ok / '+fmtNum(errs)+' errors</span></div>';
+    html += '<div class="stat"><span class="label">Tokens</span><span class="value ok-c">'+fmtNum((u.input_tokens||0)+(u.output_tokens||0))+'</span><span class="detail">'+fmtNum(u.input_tokens)+' in / '+fmtNum(u.output_tokens)+' out ('+fmtNum(u.cached_read_tokens)+' cached)</span></div>';
+    html += '<div class="stat"><span class="label">Avg latency</span><span class="value ok-c">'+fmtMs(u.avg_latency_ms)+'</span><span class="detail">over '+fmtNum(u.requests)+' requests</span></div>';
+    html += '<div class="stat"><span class="label">Reasoning tok</span><span class="value ok-c">'+fmtNum(u.reasoning_tokens)+'</span><span class="detail">thinking output</span></div></div>';
+    // Config grid
+    html += '<div><div class="subhead">Configuration</div><div class="kv-grid">';
+    html += kv('Upstream id', '<span class="id">'+escapeHtml(m.provider_model_id || m.omlx_id || '—')+'</span>');
+    html += kv('Provider', escapeHtml(m.provider||'—'));
+    html += kv('Context', escapeHtml(m.context));
+    html += kv('Max output', escapeHtml(m.max_output_tokens));
+    html += kv('Thinking', escapeHtml(m.thinking || m.thinking_format || '—'));
+    html += kv('Vision', m.vision ? 'yes' : 'no');
+    html += kv('Pricing ($/Mtok)', '<span class="id">'+escapeHtml(pricingText(m.pricing))+'</span>');
+    html += kv('Routable ids', '<span class="id">'+escapeHtml(ids.join(', ')||'—')+'</span>');
+    html += '</div></div>';
+    // Recent requests for this model
+    const reqs2 = data.recent || [];
+    html += '<div><div class="subhead">Recent requests · this model · '+winLabel+'</div><div class="scroll"><table><thead><tr><th>Time</th><th class="num">Status</th><th>Stream</th><th class="num">In</th><th class="num">Out</th><th class="num">Cached</th><th class="num">Cost</th><th class="num">Latency</th></tr></thead><tbody>';
+    html += reqs2.map(r => '<tr><td>'+escapeHtml(r.ts_iso||'—')+'</td><td class="num '+(r.status && r.status < 400 ? 'ok-c' : 'bad-c')+'">'+(r.status||'—')+'</td><td>'+(r.is_stream?'stream':'sync')+'</td><td class="num">'+fmtNum(r.input_tokens)+'</td><td class="num">'+fmtNum(r.output_tokens)+'</td><td class="num">'+fmtNum(r.cached_read_tokens)+'</td><td class="num">'+fmtCost(r.cost_usd)+'</td><td class="num">'+fmtMs(r.latency_ms)+'</td></tr>').join('') || '<tr class="empty"><td colspan="8">No requests for this model in '+escapeHtml(winLabel)+'.</td></tr>';
+    html += '</tbody></table></div></div>';
+    modelDetail.innerHTML = html;
+  }
+
   // ── Wiring ──────────────────────────────────────────────────
   function unlock(){
     const key = keyInput.value.trim();
@@ -901,7 +1065,7 @@ _ADMIN_HTML = r"""
     showDash();
     Promise.all([loadHealth(), loadUsage(currentWindow)]).catch(()=>{});
   }
-  function refresh(){ if (!unlocked) return; loadHealth(); loadUsage(currentWindow); }
+  function refresh(){ if (!unlocked) return; closeModelDetail(); loadHealth(); loadUsage(currentWindow); }
 
   unlockBtn.addEventListener('click', unlock);
   refreshBtn.addEventListener('click', refresh);
@@ -912,9 +1076,14 @@ _ADMIN_HTML = r"""
     keyToggle.textContent = show ? 'hide' : 'show';
   });
 
-  // Delegated clicks for table action buttons.
+  // Delegated clicks for table action buttons and click-throughs.
   document.addEventListener('click', (e) => {
     const t = e.target;
+    if (t.closest && t.closest('[data-close-detail]')) { closeModelDetail(); return; }
+    // Ignore clicks on buttons inside clickable rows (edit/toggle).
+    if (t.tagName === 'BUTTON' && (t.getAttribute('data-edit-model') || t.getAttribute('data-toggle-model') || t.getAttribute('data-edit-provider'))) return;
+    const openModel = (t.closest && t.closest('[data-open-model]')) || (t.getAttribute && t.getAttribute('data-open-model') ? t : null);
+    if (openModel) { const nm = openModel.getAttribute('data-open-model'); if (nm) { showModelDetail(nm); return; } }
     const ep = t.getAttribute && t.getAttribute('data-edit-provider');
     if (ep) { editProvider(ep); return; }
     const em = t.getAttribute && t.getAttribute('data-edit-model');
@@ -950,7 +1119,13 @@ _ADMIN_HTML = r"""
   document.getElementById('validateProviderBtn').addEventListener('click', validateProvider);
   document.getElementById('saveModelBtn').addEventListener('click', saveModel);
   document.getElementById('deleteModelBtn').addEventListener('click', deleteModel);
-  document.querySelectorAll('#winSeg button').forEach(b => b.addEventListener('click', () => loadUsage(b.dataset.w)));
+  document.querySelectorAll('#winSeg button').forEach(b => b.addEventListener('click', () => {
+    loadUsage(b.dataset.w);
+    if (!modelDetail.classList.contains('hidden')) {
+      const nm = modelDetail.querySelector('h3');
+      if (nm) { const n = nm.textContent.trim(); if (n) showModelDetail(n); }
+    }
+  }));
 
   document.addEventListener('keydown', (e) => {
     if (e.key === 'r' && !/INPUT|TEXTAREA|SELECT/.test((e.target.tagName||'').toUpperCase()) && !e.metaKey && !e.ctrlKey) { refresh(); }

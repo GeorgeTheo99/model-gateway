@@ -170,6 +170,22 @@ def _load_models() -> dict[str, dict]:
     return _models
 
 
+def routable_ids(name: str) -> list[str]:
+    """Return every identifier that routes to the named model.
+
+    Used by per-model stats to match ledger rows regardless of which alias or
+    upstream id the caller sent. Includes name, alias, provider_model_id, and
+    omlx_id, with empties/duplicates removed.
+    """
+    entry = _load_models().get(name)
+    if not entry:
+        return [name] if name else []
+    ids = {entry.get("name"), entry.get("alias"), entry.get("provider_model_id"), entry.get("omlx_id")}
+    ids.discard(None)
+    ids.discard("")
+    return sorted(ids)
+
+
 def auth_config() -> dict:
     """Return the live ``auth`` section from config.yaml.
 
@@ -329,10 +345,17 @@ def provider_status() -> list[dict]:
     configured = config.get("providers", {}) or {}
     models = list_models()
 
-    model_counts: dict[str, int] = {}
+    # Count unique models per provider by canonical name. list_models()
+    # exposes every routable identifier (name + alias + provider_model_id +
+    # omlx_id), so counting its rows would over-count models 2-3x. Dedupe by
+    # the model `name`, which every identifier row for a model shares.
+    model_names: dict[str, set[str]] = {}
     for model in models:
         provider = _canonical_provider(model.get("provider", ""))
-        model_counts[provider] = model_counts.get(provider, 0) + 1
+        name = model.get("name") or model.get("id")
+        if name:
+            model_names.setdefault(provider, set()).add(name)
+    model_counts = {p: len(names) for p, names in model_names.items()}
 
     provider_ids = sorted(set(model_counts) | {_canonical_provider(key) for key in configured})
     result = []

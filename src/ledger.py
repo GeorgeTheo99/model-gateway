@@ -164,12 +164,24 @@ def record(
     return rid
 
 
-def recent(limit: int = 50) -> list[dict]:
-    """Return the most recent ledger rows (newest first)."""
+def recent(limit: int = 50, *, models: list[str] | None = None) -> list[dict]:
+    """Return the most recent ledger rows (newest first).
+
+    If ``models`` is given, restrict to rows whose ``model`` column matches any
+    of the supplied identifiers (used for per-model stats click-through).
+    """
+    clauses: list[str] = []
+    params: list = []
+    if models:
+        placeholders = ",".join("?" for _ in models)
+        clauses.append(f"model IN ({placeholders})")
+        params.extend(models)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with _lock, _connect() as conn:
         _ensure_schema(conn)
         rows = conn.execute(
-            "SELECT * FROM requests ORDER BY ts DESC LIMIT ?", (int(limit),)
+            f"SELECT * FROM requests {where} ORDER BY ts DESC LIMIT ?",
+            (*params, int(limit)),
         ).fetchall()
     return [_row_to_dict(r) for r in rows]
 
@@ -223,8 +235,12 @@ def aggregate(
     return [dict(r) for r in rows]
 
 
-def summary(*, since: float | None = None, until: float | None = None) -> dict:
-    """Return top-level totals for the dashboard header."""
+def summary(*, since: float | None = None, until: float | None = None, models: list[str] | None = None) -> dict:
+    """Return top-level totals for the dashboard header.
+
+    If ``models`` is given, restrict to rows whose ``model`` column matches any
+    of the supplied identifiers (per-model stats).
+    """
     clauses = []
     params: list = []
     if since is not None:
@@ -233,6 +249,10 @@ def summary(*, since: float | None = None, until: float | None = None) -> dict:
     if until is not None:
         clauses.append("ts < ?")
         params.append(until)
+    if models:
+        placeholders = ",".join("?" for _ in models)
+        clauses.append(f"model IN ({placeholders})")
+        params.extend(models)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     sql = f"""
         SELECT

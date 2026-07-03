@@ -213,6 +213,23 @@ def test_resolve_local_omlx_model_uses_builtin_proxy_defaults(tmp_config, monkey
     assert omlx_status["issues"] == []
 
 
+def test_provider_status_counts_unique_models_not_identifiers(tmp_config, monkeypatch):
+    """A model with name + alias + provider_model_id + omlx_id must count as 1."""
+    doc = json.loads((tmp_config / "model-info.json").read_text())
+    doc["llm"].append({
+        "name": "local-multi", "alias": "lm", "omlx_id": "lm-up",
+        "provider_model_id": "lm-pmid", "context": 4096, "max_output_tokens": 1024,
+    })
+    (tmp_config / "model-info.json").write_text(json.dumps(doc))
+    providers.reload()
+    counts = {p["id"]: p["enabled_models"] for p in providers.provider_status()}
+    # omlx has exactly one unique local model (local-multi); claude-test is anthropic.
+    assert counts.get("omlx") == 1
+    assert counts.get("anthropic") == 1
+    # routable_ids exposes all four identifiers for the local model.
+    assert set(providers.routable_ids("local-multi")) == {"local-multi", "lm", "lm-up", "lm-pmid"}
+
+
 def test_upsert_model_allows_local_omlx_id(tmp_config, monkeypatch):
     config_io.log_dir = tmp_config / "logs"
     result = config_io.upsert_model(
@@ -289,3 +306,42 @@ def test_admin_upsert_provider_validates_required(client):
     h = {"Authorization": "Bearer admin"}
     resp = client.post("/admin/api/providers/x", headers=h, json={"base_url": ""})
     assert resp.status_code == 400
+
+
+def test_admin_model_stats_endpoint(client, monkeypatch):
+    """Per-model stats returns config + usage + recent, filtered by routable ids."""
+    from src import ledger
+    from src.usage import Usage, CostEstimate
+    db = client  # reuse tmp_config-backed app; point ledger at temp db
+    import tempfile, os
+    monkeypatch.setenv("MODEL_GATEWAY_LEDGER_PATH", str(tempfile.mkdtemp() + "/ledger.db"))
+    ledger.init()
+    # Record a request for claude-test under its name and an alias.
+    for mid in ("claude-test", "claude-test-1"):
+        ledger.record(endpoint="/v1/messages", method="POST", model=mid,
+                      provider="anthropic", provider_model_id="claude-test-1",
+                      status=200, latency_ms=120, is_stream=False,
+                      usage=Usage(input_tokens=100, output_tokens=50, cached_read_tokens=0,
+                                  cache_write_tokens=0, reasoning_tokens=0, reported=True),
+                      cost=CostEstimate(0.012, True, []))
+    h = {"Authorization": "Bearer admin"}
+    resp = client.get("/admin/api/models/claude-test/stats?window=24h", headers=h)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["model"]["name"] == "claude-test"
+    assert "claude-test" in body["routable_ids"]
+    # Both rows matched via the routable id set.
+    assert body["usage"]["requests"] == 2
+    assert body["usage"]["input_tokens"] == 200
+    assert body["usage"]["cost_usd"] == 0.024
+    assert len(body["recent"]) == 2
+    # Unknown model returns empty usage/recent, null model — not an error.
+    resp2 = client.get("/admin/api/models/does-not-exist/stats", headers=h)
+    assert resp2.status_code == 200
+    assert resp2.json()["model"] is None
+    assert resp2.json()["usage"] == {}
+    assert resp2.json()["recent"] == []
+    # Requires admin auth.
+    assert client.get("/admin/api/models/claude-test/stats").status_code == 401
+    # Reset the providers cache so later modules reload the real catalog.
+    providers.reload()
