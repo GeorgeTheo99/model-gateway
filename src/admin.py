@@ -288,306 +288,680 @@ _ADMIN_HTML = r"""
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Model Gateway Admin</title>
+  <title>Model Gateway</title>
   <style>
-    :root { color-scheme: dark; --bg:#0b1020; --panel:#121a2f; --muted:#94a3b8; --text:#e5e7eb; --ok:#34d399; --warn:#f59e0b; --bad:#fb7185; --line:#26324c; }
-    * { box-sizing: border-box; }
-    body { margin: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: radial-gradient(circle at top left, #1e3a8a55, transparent 34rem), var(--bg); color: var(--text); }
-    header { padding: 28px clamp(18px, 4vw, 52px); border-bottom: 1px solid var(--line); display:flex; justify-content:space-between; gap:16px; align-items:center; }
-    h1 { margin: 0 0 6px; font-size: clamp(28px, 4vw, 44px); letter-spacing: -0.04em; }
-    h2 { margin: 0 0 14px; font-size: 18px; }
-    p { margin: 0; color: var(--muted); }
-    main { padding: 26px clamp(18px, 4vw, 52px) 48px; display: grid; gap: 18px; }
-    .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px; }
-    .card { background: color-mix(in oklab, var(--panel) 92%, black); border: 1px solid var(--line); border-radius: 18px; padding: 18px; box-shadow: 0 16px 60px #0005; }
-    .metric { font-size: 34px; font-weight: 760; letter-spacing: -0.04em; }
+    :root {
+      color-scheme: light;
+      /* Tinted neutrals (cool slate, low chroma) — never pure white/black. */
+      --bg: oklch(98.5% 0.004 250);
+      --surface: oklch(100% 0.002 250);
+      --surface-2: oklch(97% 0.006 250);
+      --rule: oklch(90% 0.012 250);
+      --rule-strong: oklch(82% 0.016 250);
+      --text: oklch(28% 0.025 250);
+      --text-2: oklch(45% 0.020 250);
+      --muted: oklch(58% 0.018 250);
+      /* Single restrained accent: a steady teal-blue, used for primary actions + state. */
+      --accent: oklch(54% 0.110 220);
+      --accent-ink: oklch(100% 0.002 250);
+      --accent-soft: oklch(94% 0.04 220);
+      /* Semantic, restrained. Paired with text/shape, never color alone. */
+      --ok: oklch(52% 0.110 155);
+      --ok-soft: oklch(94% 0.045 155);
+      --warn: oklch(62% 0.120 60);
+      --warn-soft: oklch(95% 0.05 65);
+      --bad: oklch(54% 0.155 25);
+      --bad-soft: oklch(95% 0.05 25);
+      --radius: 8px;
+      --radius-sm: 5px;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: oklch(20% 0.012 250);
+        --surface: oklch(23.5% 0.014 250);
+        --surface-2: oklch(26% 0.016 250);
+        --rule: oklch(32% 0.018 250);
+        --rule-strong: oklch(40% 0.020 250);
+        --text: oklch(93% 0.008 250);
+        --text-2: oklch(80% 0.012 250);
+        --muted: oklch(66% 0.014 250);
+        --accent: oklch(70% 0.110 220);
+        --accent-ink: oklch(18% 0.02 250);
+        --accent-soft: oklch(30% 0.05 220);
+        --ok: oklch(72% 0.110 155);
+        --ok-soft: oklch(30% 0.05 155);
+        --warn: oklch(78% 0.115 65);
+        --warn-soft: oklch(30% 0.06 65);
+        --bad: oklch(72% 0.140 25);
+        --bad-soft: oklch(30% 0.07 25);
+      }
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    html, body { margin: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, Inter, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+    a { color: var(--accent); }
+    h1, h2, h3 { margin: 0; font-weight: 650; letter-spacing: -0.01em; color: var(--text); }
+    h2 { font-size: 15px; }
+    p { margin: 0; }
     .muted { color: var(--muted); }
-    .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
-    .toolbar { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
-    input { background:#0f172a; color:var(--text); border:1px solid var(--line); border-radius:12px; padding:10px 12px; min-width:260px; }
-    button { background:#2563eb; color:white; border:0; border-radius:12px; padding:10px 14px; font-weight:700; cursor:pointer; }
-    button.secondary { background:#334155; }
-    table { width:100%; border-collapse:collapse; font-size: 14px; }
-    th, td { text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
-    th { color:#cbd5e1; font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
-    code, .pill { background:#0f172a; border:1px solid var(--line); border-radius:999px; padding:3px 7px; white-space:nowrap; }
-    .scroll { overflow:auto; }
-    .error { border-color: color-mix(in oklab, var(--bad), var(--line)); }
+    .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+
+    /* ── Top bar ─────────────────────────────────────────────── */
+    .topbar {
+      position: sticky; top: 0; z-index: 10;
+      display: flex; align-items: center; gap: 16px;
+      padding: 12px clamp(16px, 4vw, 40px);
+      background: color-mix(in oklab, var(--surface) 88%, transparent);
+      backdrop-filter: saturate(140%) blur(8px);
+      border-bottom: 1px solid var(--rule);
+    }
+    .brand { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+    .brand h1 { font-size: 16px; font-weight: 700; letter-spacing: -0.015em; }
+    .brand .sub { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .topbar .spacer { flex: 1; }
+    .keybar { display: flex; align-items: center; gap: 8px; }
+    .field {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: var(--surface-2); border: 1px solid var(--rule); border-radius: var(--radius-sm);
+      padding: 6px 9px;
+    }
+    .field:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+    .field input {
+      border: 0; background: transparent; outline: 0; color: inherit; font: inherit;
+      width: 180px; padding: 0;
+    }
+    .field input::placeholder { color: var(--muted); }
+    .iconbtn {
+      appearance: none; border: 1px solid var(--rule); background: var(--surface-2); color: var(--text-2);
+      border-radius: var(--radius-sm); padding: 6px 8px; font: inherit; font-size: 13px; cursor: pointer;
+      display: inline-flex; align-items: center; gap: 6px;
+    }
+    .iconbtn:hover { background: var(--surface); border-color: var(--rule-strong); color: var(--text); }
+    .iconbtn:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-soft); border-color: var(--accent); }
+    .btn {
+      appearance: none; border: 1px solid transparent; background: var(--accent); color: var(--accent-ink);
+      border-radius: var(--radius-sm); padding: 7px 13px; font: inherit; font-weight: 600; font-size: 13px; cursor: pointer;
+    }
+    .btn:hover { filter: brightness(1.06); }
+    .btn:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-soft); }
+    .btn.secondary { background: var(--surface-2); color: var(--text); border-color: var(--rule); }
+    .btn.secondary:hover { border-color: var(--rule-strong); background: var(--surface); }
+    .btn.danger { background: var(--bad); color: var(--accent-ink); }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .showtoggle { appearance: none; border: 0; background: transparent; color: var(--muted); cursor: pointer; padding: 2px; font-size: 12px; }
+    .showtoggle:hover { color: var(--text-2); }
+
+    /* ── Layout ──────────────────────────────────────────────── */
+    main { padding: 20px clamp(16px, 4vw, 40px) 56px; display: grid; gap: 28px; max-width: 1320px; margin: 0 auto; }
+    section { display: grid; gap: 12px; }
+    .sec-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+    .sec-head h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); font-weight: 650; }
+    .sec-head .meta { font-size: 12px; color: var(--muted); }
+
+    /* ── Status strip ────────────────────────────────────────── */
+    .strip {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      border: 1px solid var(--rule); border-radius: var(--radius); overflow: hidden;
+      background: var(--surface);
+    }
+    .stat { padding: 12px 14px; border-right: 1px solid var(--rule); display: flex; flex-direction: column; gap: 2px; }
+    .stat:last-child { border-right: 0; }
+    .stat .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); }
+    .stat .value { font-size: 18px; font-weight: 650; letter-spacing: -0.01em; font-variant-numeric: tabular-nums; }
+    .stat .detail { font-size: 12px; color: var(--muted); }
+    @media (max-width: 640px) { .stat { border-right: 0; border-bottom: 1px solid var(--rule); } }
+
+    /* ── Tables ──────────────────────────────────────────────── */
+    .scroll { overflow-x: auto; border: 1px solid var(--rule); border-radius: var(--radius); background: var(--surface); }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    thead th {
+      text-align: left; padding: 9px 12px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+      color: var(--muted); font-weight: 600; background: var(--surface-2);
+      border-bottom: 1px solid var(--rule); white-space: nowrap; position: sticky; top: 0;
+    }
+    tbody td { padding: 8px 12px; border-bottom: 1px solid var(--rule); vertical-align: middle; font-variant-numeric: tabular-nums; }
+    tbody tr:last-child td { border-bottom: 0; }
+    tbody tr:hover { background: var(--surface-2); }
+    td.num, th.num { text-align: right; }
+    .group-row td { background: var(--surface-2); font-weight: 650; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-2); }
+
+    /* ── Pills / state ───────────────────────────────────────── */
+    .pill {
+      display: inline-flex; align-items: center; gap: 5px;
+      font-size: 12px; font-weight: 550; padding: 2px 8px; border-radius: 999px;
+      border: 1px solid var(--rule); background: var(--surface-2); white-space: nowrap;
+      font-variant-numeric: normal;
+    }
+    .pill .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); }
+    .pill.ok { background: var(--ok-soft); border-color: color-mix(in oklab, var(--ok) 40%, var(--rule)); color: var(--ok); }
+    .pill.ok .dot { background: var(--ok); }
+    .pill.warn { background: var(--warn-soft); border-color: color-mix(in oklab, var(--warn) 40%, var(--rule)); color: var(--warn); }
+    .pill.warn .dot { background: var(--warn); }
+    .pill.bad { background: var(--bad-soft); border-color: color-mix(in oklab, var(--bad) 40%, var(--rule)); color: var(--bad); }
+    .pill.bad .dot { background: var(--bad); }
+    .pill.accent { background: var(--accent-soft); border-color: color-mix(in oklab, var(--accent) 40%, var(--rule)); color: var(--accent); }
+    .id { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; }
+    .ok-c { color: var(--ok); } .warn-c { color: var(--warn); } .bad-c { color: var(--bad); }
+
+    /* ── Forms ───────────────────────────────────────────────── */
+    details.formset {
+      border: 1px solid var(--rule); border-radius: var(--radius); background: var(--surface);
+    }
+    details.formset > summary {
+      cursor: pointer; list-style: none; padding: 10px 14px; font-size: 13px; color: var(--text-2); font-weight: 550;
+      display: flex; align-items: center; gap: 8px;
+    }
+    details.formset > summary::-webkit-details-marker { display: none; }
+    details.formset > summary::before { content: "+"; color: var(--accent); font-weight: 700; font-size: 15px; }
+    details.formset[open] > summary::before { content: "\2013"; }
+    details.formset[open] > summary { border-bottom: 1px solid var(--rule); }
+    .form-body { padding: 14px; display: grid; gap: 10px; }
+    .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+    .control { display: flex; flex-direction: column; gap: 3px; }
+    .control > label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+    .control input[type=text], .control input[type=password], .control input[type=number], input[type=text].ctl, input[type=password].ctl, input[type=number].ctl {
+      font: inherit; font-size: 13px; color: var(--text); background: var(--surface-2);
+      border: 1px solid var(--rule); border-radius: var(--radius-sm); padding: 7px 9px; width: 100%;
+    }
+    .control input:focus, input.ctl:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+    .checkrow { display: flex; gap: 18px; flex-wrap: wrap; align-items: center; }
+    .check { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-2); }
+    .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .msg { font-size: 12px; color: var(--muted); }
+    .msg.ok-c { color: var(--ok); } .msg.bad-c { color: var(--bad); }
+    .hint { font-size: 12px; color: var(--muted); max-width: 70ch; }
+
+    /* ── Segmented control (usage windows) ───────────────────── */
+    .seg { display: inline-flex; border: 1px solid var(--rule); border-radius: var(--radius-sm); overflow: hidden; background: var(--surface); }
+    .seg button {
+      appearance: none; border: 0; background: transparent; color: var(--text-2);
+      padding: 6px 12px; font: inherit; font-size: 12px; font-weight: 550; cursor: pointer; border-right: 1px solid var(--rule);
+    }
+    .seg button:last-child { border-right: 0; }
+    .seg button:hover { background: var(--surface-2); color: var(--text); }
+    .seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
+    .seg button:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--accent-soft); }
+
+    /* ── States: locked, loading, empty, error ───────────────── */
+    .locked {
+      display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px;
+      padding: 64px 24px; text-align: center; border: 1px dashed var(--rule-strong); border-radius: var(--radius); background: var(--surface);
+    }
+    .locked .lockglyph { width: 38px; height: 38px; border-radius: 50%; background: var(--surface-2); border: 1px solid var(--rule); display: grid; place-items: center; color: var(--muted); font-size: 18px; }
+    .locked h2 { font-size: 16px; }
+    .locked p { color: var(--muted); max-width: 46ch; }
+    .inline-err {
+      font-size: 12px; color: var(--bad); background: var(--bad-soft);
+      border: 1px solid color-mix(in oklab, var(--bad) 35%, var(--rule));
+      border-radius: var(--radius-sm); padding: 7px 10px; max-width: 80ch;
+    }
+    .skeleton { color: transparent; background: linear-gradient(90deg, var(--surface-2), var(--rule), var(--surface-2)); background-size: 200% 100%; animation: shimmer 1.3s ease-in-out infinite; border-radius: 4px; }
+    @media (prefers-reduced-motion: reduce) { .skeleton { animation: none; background: var(--surface-2); } }
+    @keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+    .empty td { text-align: center; color: var(--muted); padding: 28px 12px; font-size: 13px; }
+    .hidden { display: none !important; }
+    .two-col { display: grid; grid-template-columns: 1.4fr 1fr; gap: 28px; align-items: start; }
+    @media (max-width: 980px) { .two-col { grid-template-columns: 1fr; } }
+    code.kv { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; background: var(--surface-2); border: 1px solid var(--rule); border-radius: var(--radius-sm); padding: 1px 5px; }
   </style>
 </head>
 <body>
-  <header>
-    <div>
+  <header class="topbar">
+    <div class="brand">
       <h1>Model Gateway</h1>
-      <p>Local model router admin: provider status, model inventory, config validation, and debug entry points.</p>
+      <span class="sub" id="brandSub">Router health, models, usage</span>
     </div>
-    <div class="toolbar">
-      <input id="adminKey" type="password" placeholder="Admin key" autocomplete="off" />
-      <button onclick="loadAll()">Use key</button>
-      <button class="secondary" onclick="loadAll()">Refresh</button>
+    <div class="spacer"></div>
+    <div class="keybar">
+      <div class="field">
+        <input id="adminKey" type="password" placeholder="Admin key" autocomplete="off" aria-label="Admin key" />
+        <button class="showtoggle" id="keyToggle" type="button" aria-label="Show admin key">show</button>
+      </div>
+      <button class="btn" id="unlockBtn" type="button">Unlock</button>
+      <button class="iconbtn" id="refreshBtn" type="button" title="Refresh (R)" aria-label="Refresh">↻</button>
     </div>
   </header>
-  <main>
-    <section class="grid">
-      <div class="card"><h2>Status</h2><div id="statusMetric" class="metric muted">—</div><p id="statusSub">Loading…</p></div>
-      <div class="card"><h2>Providers</h2><div id="providerMetric" class="metric muted">—</div><p id="providerSub">Configured and missing keys.</p></div>
-      <div class="card"><h2>Models</h2><div id="modelMetric" class="metric muted">—</div><p id="modelSub">Routable aliases exposed by /v1/models.</p></div>
-      <div class="card"><h2>Validation</h2><div id="validationMetric" class="metric muted">—</div><p id="validationSub">Provider config readiness.</p></div>
-    </section>
 
-    <section class="card">
-      <h2>Providers</h2>
-      <div class="scroll"><table id="providers"><thead><tr><th>ID</th><th>Models</th><th>Protocol</th><th>Base URL</th><th>API key</th><th>Issues</th><th>Actions</th></tr></thead><tbody></tbody></table></div>
-      <details style="margin-top:12px;"><summary class="muted">Add / edit provider</summary>
-        <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); margin-top:10px; gap:10px;">
-          <input id="pId" placeholder="provider id (e.g. anthropic)" />
-          <input id="pBaseUrl" placeholder="base_url (https://...)" style="min-width:240px;" />
-          <input id="pProtocol" placeholder="protocol (openai|anthropic)" />
-          <input id="pApiKey" type="password" placeholder="api_key (write-only)" />
-        </div>
-        <div class="toolbar" style="margin-top:8px;">
-          <button onclick="saveProvider()">Save provider</button>
-          <button class="secondary" onclick="validateProvider()">Validate connection</button>
-          <button class="secondary" onclick="deleteProvider()">Delete</button>
-          <span id="pMsg" class="muted"></span>
-        </div>
-        <p class="muted" style="font-size:12px; margin-top:6px;">api_key is write-only: leave blank to keep the existing key. Provider config is stored in the gitignored config.yaml and is durable across deploys.</p>
-      </details>
-    </section>
+  <main id="main">
+    <!-- Locked state shown until an admin key is supplied. -->
+    <div id="lockedView" class="locked">
+      <div class="lockglyph" aria-hidden="true">⚿</div>
+      <h2>Enter an admin key to load the dashboard</h2>
+      <p>Provider status, model inventory, usage, and recent requests live behind admin-authenticated endpoints. Paste an admin key above and choose Unlock.</p>
+      <div id="lockedErr" class="inline-err hidden"></div>
+    </div>
 
-    <section class="card">
-      <h2>Models</h2>
-      <div class="scroll"><table id="models"><thead><tr><th>Name</th><th>Provider</th><th>Upstream</th><th>Context</th><th>Max out</th><th>Thinking</th><th>Vision</th><th>Enabled</th><th>Actions</th></tr></thead><tbody></tbody></table></div>
-      <details style="margin-top:12px;"><summary class="muted">Add / edit model</summary>
-        <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); margin-top:10px; gap:10px;">
-          <input id="mName" placeholder="name (gateway id)" />
-          <input id="mProvider" placeholder="provider" />
-          <input id="mPmid" placeholder="provider_model_id" />
-          <input id="mAlias" placeholder="alias" />
-          <input id="mContext" type="number" placeholder="context" />
-          <input id="mMaxOut" type="number" placeholder="max_output_tokens" />
-          <input id="mThinking" placeholder="thinking (|optional|always)" />
-          <input id="mThinkingFmt" placeholder="thinking_format" />
-          <input id="mPricing" placeholder="pricing JSON" style="min-width:200px;" />
+    <!-- Dashboard (hidden until unlocked). -->
+    <div id="dash" class="hidden" style="display:grid; gap:28px;">
+      <section>
+        <div class="sec-head"><h2>Health</h2><span class="meta" id="healthMeta">—</span></div>
+        <div class="strip" id="statusStrip">
+          <div class="stat"><span class="label">Service</span><span class="value" id="sService">—</span><span class="detail" id="sServiceDetail">—</span></div>
+          <div class="stat"><span class="label">Uptime</span><span class="value" id="sUptime">—</span><span class="detail">since last restart</span></div>
+          <div class="stat"><span class="label">Providers</span><span class="value" id="sProviders">—</span><span class="detail" id="sProvidersDetail">—</span></div>
+          <div class="stat"><span class="label">Models</span><span class="value" id="sModels">—</span><span class="detail" id="sModelsDetail">routable</span></div>
+          <div class="stat"><span class="label">Config</span><span class="value" id="sConfig">—</span><span class="detail" id="sConfigDetail">—</span></div>
         </div>
-        <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); margin-top:8px; gap:10px;">
-          <label class="muted"><input id="mVision" type="checkbox" /> vision</label>
-          <label class="muted"><input id="mEnabled" type="checkbox" checked /> enabled</label>
-          <input id="mDesc" placeholder="desc (no $ prices)" style="min-width:240px;" />
-        </div>
-        <div class="toolbar" style="margin-top:8px;">
-          <button onclick="saveModel()">Save model</button>
-          <button class="secondary" onclick="deleteModel()">Delete</button>
-          <span id="mMsg" class="muted"></span>
-        </div>
-        <p class="muted" style="font-size:12px; margin-top:6px;">Writes are hot (immediate) and mirrored to the source repo (pending commit). Pricing should come from the official provider — use the model-gateway add-model workflow to fetch it. Disabled models are hidden from /v1/models.</p>
-      </details>
-    </section>
+      </section>
 
-    <section class="card">
-      <h2>Debug</h2>
-      <p>Existing reasoning matrix: <a id="thinkingLink" href="/v1/debug/thinking">/v1/debug/thinking</a>. If client auth is enabled, open it with an admin/client key-capable HTTP client.</p>
-      <pre id="errors" class="muted"></pre>
-    </section>
+      <section>
+        <div class="sec-head"><h2>Providers</h2><span class="meta">config.yaml readiness</span></div>
+        <div class="scroll">
+          <table id="providers"><thead><tr><th>ID</th><th class="num">Models</th><th>Protocol</th><th>Base URL</th><th>Key</th><th>State</th><th>Issues</th><th></th></tr></thead><tbody></tbody></table>
+        </div>
+        <details class="formset"><summary>Add or edit a provider</summary>
+          <div class="form-body">
+            <div class="form-grid">
+              <div class="control"><label>Provider id</label><input id="pId" type="text" placeholder="anthropic" /></div>
+              <div class="control"><label>Base URL</label><input id="pBaseUrl" type="text" placeholder="https://api.anthropic.com" /></div>
+              <div class="control"><label>Protocol</label><input id="pProtocol" type="text" placeholder="openai | anthropic" /></div>
+              <div class="control"><label>API key (write-only)</label><input id="pApiKey" type="password" placeholder="leave blank to keep" /></div>
+            </div>
+            <div class="toolbar">
+              <button class="btn" id="saveProviderBtn" type="button">Save provider</button>
+              <button class="btn secondary" id="validateProviderBtn" type="button">Validate connection</button>
+              <button class="btn danger" id="deleteProviderBtn" type="button">Delete</button>
+              <span id="pMsg" class="msg"></span>
+            </div>
+            <p class="hint">The api_key is write-only: leave blank to keep the existing key. Provider config lives in the gitignored config.yaml and persists across deploys.</p>
+          </div>
+        </details>
+      </section>
 
-    <section class="card">
-      <h2>Usage &amp; Cost</h2>
-      <div class="toolbar" style="margin-bottom:12px;">
-        <button class="secondary" onclick="loadUsage('1h')">1h</button>
-        <button class="secondary" onclick="loadUsage('24h')">24h</button>
-        <button class="secondary" onclick="loadUsage('7d')">7d</button>
-        <button class="secondary" onclick="loadUsage('30d')">30d</button>
-        <button class="secondary" onclick="loadUsage('')">All</button>
-        <span id="usageRange" class="muted" style="margin-left:auto;"></span>
-      </div>
-      <div class="grid" style="margin-bottom:14px;">
-        <div class="card"><h2>Requests</h2><div id="uRequests" class="metric muted">—</div><p id="uRequestsSub" class="muted">ok / errors</p></div>
-        <div class="card"><h2>Tokens</h2><div id="uTokens" class="metric muted">—</div><p id="uTokensSub" class="muted">in / out (cached read)</p></div>
-        <div class="card"><h2>Est. cost</h2><div id="uCost" class="metric muted">—</div><p id="uCostSub" class="muted">USD, priced rows only</p></div>
-        <div class="card"><h2>Avg latency</h2><div id="uLatency" class="metric muted">—</div><p id="uLatencySub" class="muted">ms over window</p></div>
-      </div>
-      <h2>By model</h2>
-      <div class="scroll"><table id="usageByModel"><thead><tr><th>Model</th><th>Requests</th><th>Errors</th><th>In tok</th><th>Out tok</th><th>Cached</th><th>Cost</th><th>Avg ms</th></tr></thead><tbody></tbody></table></div>
-      <h2 style="margin-top:16px;">Recent requests</h2>
-      <div class="scroll"><table id="recentReq"><thead><tr><th>Time</th><th>Endpoint</th><th>Model</th><th>Status</th><th>Stream</th><th>In</th><th>Out</th><th>Cached</th><th>Cost</th><th>Latency</th></tr></thead><tbody></tbody></table></div>
-      <pre id="usageErrors" class="muted"></pre>
-    </section>
+      <section>
+        <div class="sec-head"><h2>Models</h2><span class="meta" id="modelsMeta">grouped local / cloud</span></div>
+        <div class="scroll">
+          <table id="models"><thead><tr><th>Name</th><th>Upstream id</th><th>Provider</th><th class="num">Context</th><th class="num">Max out</th><th>Thinking</th><th>Vision</th><th>State</th><th></th></tr></thead><tbody></tbody></table>
+        </div>
+        <details class="formset"><summary>Add or edit a model</summary>
+          <div class="form-body">
+            <div class="form-grid">
+              <div class="control"><label>Name (gateway id)</label><input id="mName" type="text" placeholder="claude-sonnet-4.5" /></div>
+              <div class="control"><label>Provider</label><input id="mProvider" type="text" placeholder="anthropic" /></div>
+              <div class="control"><label>Provider model id</label><input id="mPmid" type="text" placeholder="claude-sonnet-4.5-20250929" /></div>
+              <div class="control"><label>Alias</label><input id="mAlias" type="text" placeholder="optional" /></div>
+              <div class="control"><label>Context</label><input id="mContext" type="number" placeholder="tokens" /></div>
+              <div class="control"><label>Max output tokens</label><input id="mMaxOut" type="number" placeholder="tokens" /></div>
+              <div class="control"><label>Thinking</label><input id="mThinking" type="text" placeholder="| optional | always" /></div>
+              <div class="control"><label>Thinking format</label><input id="mThinkingFmt" type="text" placeholder="glm-chat-template" /></div>
+              <div class="control" style="grid-column: 1 / -1;"><label>Pricing JSON ($/Mtok)</label><input id="mPricing" class="ctl" type="text" placeholder='{"input":3,"output":15}' /></div>
+              <div class="control" style="grid-column: 1 / -1;"><label>Description (no $ prices)</label><input id="mDesc" class="ctl" type="text" placeholder="short note" /></div>
+            </div>
+            <div class="checkrow">
+              <label class="check"><input id="mVision" type="checkbox" /> vision</label>
+              <label class="check"><input id="mEnabled" type="checkbox" checked /> enabled</label>
+            </div>
+            <div class="toolbar">
+              <button class="btn" id="saveModelBtn" type="button">Save model</button>
+              <button class="btn danger" id="deleteModelBtn" type="button">Delete</button>
+              <span id="mMsg" class="msg"></span>
+            </div>
+            <p class="hint">Writes are hot (immediate) and mirrored to the source repo, pending a commit. Fetch pricing from the official provider via the add-model workflow. Disabled models are hidden from /v1/models.</p>
+          </div>
+        </details>
+      </section>
+
+      <section>
+        <div class="sec-head"><h2>Usage &amp; cost</h2>
+          <div class="toolbar">
+            <div class="seg" id="winSeg" role="group" aria-label="Time window">
+              <button data-w="1h" type="button">1h</button>
+              <button data-w="24h" type="button" aria-pressed="true">24h</button>
+              <button data-w="7d" type="button">7d</button>
+              <button data-w="30d" type="button">30d</button>
+              <button data-w="" type="button">All</button>
+            </div>
+            <span id="usageRange" class="meta"></span>
+          </div>
+        </div>
+        <div class="strip" id="usageStrip">
+          <div class="stat"><span class="label">Requests</span><span class="value" id="uRequests">—</span><span class="detail" id="uRequestsDetail">ok / errors</span></div>
+          <div class="stat"><span class="label">Tokens</span><span class="value" id="uTokens">—</span><span class="detail" id="uTokensDetail">in / out (cached)</span></div>
+          <div class="stat"><span class="label">Est. cost</span><span class="value" id="uCost">—</span><span class="detail">priced rows only</span></div>
+          <div class="stat"><span class="label">Avg latency</span><span class="value" id="uLatency">—</span><span class="detail" id="uLatencyDetail">over window</span></div>
+        </div>
+        <div class="scroll"><table id="usageByModel"><thead><tr><th>Model</th><th class="num">Requests</th><th class="num">Errors</th><th class="num">In tok</th><th class="num">Out tok</th><th class="num">Cached</th><th class="num">Cost</th><th class="num">Avg ms</th></tr></thead><tbody></tbody></table></div>
+        <div class="sec-head" style="margin-top:4px;"><h2>Recent requests</h2><span class="meta">last 50</span></div>
+        <div class="scroll"><table id="recentReq"><thead><tr><th>Time</th><th>Endpoint</th><th>Model</th><th class="num">Status</th><th>Stream</th><th class="num">In</th><th class="num">Out</th><th class="num">Cached</th><th class="num">Cost</th><th class="num">Latency</th></tr></thead><tbody></tbody></table></div>
+        <div id="usageErr" class="inline-err hidden"></div>
+      </section>
+
+      <section>
+        <div class="sec-head"><h2>Debug</h2><span class="meta">read-only probes</span></div>
+        <p class="hint">Reasoning matrix: <a id="thinkingLink" href="/v1/debug/thinking">/v1/debug/thinking</a>. If client auth is enabled, open it with a key-capable HTTP client.</p>
+        <div id="dashErr" class="inline-err hidden"></div>
+      </section>
+    </div>
   </main>
 <script>
-const keyInput = document.getElementById('adminKey');
-const BASE_PATH = (() => {
-  const marker = '/admin';
-  const path = window.location.pathname;
-  const idx = path.indexOf(marker);
-  return idx > 0 ? path.slice(0, idx).replace(/\/$/, '') : '';
+(function () {
+  const STORAGE_KEY = 'mg-admin-key';
+  const keyInput = document.getElementById('adminKey');
+  const keyToggle = document.getElementById('keyToggle');
+  const unlockBtn = document.getElementById('unlockBtn');
+  const refreshBtn = document.getElementById('refreshBtn');
+  const lockedView = document.getElementById('lockedView');
+  const lockedErr = document.getElementById('lockedErr');
+  const dash = document.getElementById('dash');
+  const dashErr = document.getElementById('dashErr');
+  const usageErr = document.getElementById('usageErr');
+
+  const BASE_PATH = (() => {
+    const marker = '/admin';
+    const path = window.location.pathname;
+    const idx = path.indexOf(marker);
+    return idx > 0 ? path.slice(0, idx).replace(/\/$/, '') : '';
+  })();
+  function api(path){ return BASE_PATH + path; }
+  document.getElementById('thinkingLink').href = api('/v1/debug/thinking');
+
+  let unlocked = false;
+  let currentWindow = '24h';
+
+  function headers(){ const key = keyInput.value.trim(); return key ? {'Authorization':'Bearer '+key} : {}; }
+  function text(v){ return (v === undefined || v === null || v === '') ? '—' : String(v); }
+  function escapeHtml(value){ return text(value).replace(/[&<>'"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch])); }
+  function fmtNum(v){ return (v===null||v===undefined) ? '—' : Number(v).toLocaleString(); }
+  function fmtCost(v){ return (v===null||v===undefined) ? '—' : '$'+Number(v).toFixed(4); }
+  function fmtMs(v){ return (v===null||v===undefined) ? '—' : Math.round(v)+'ms'; }
+  function fmtUptime(s){ if (s===undefined||s===null) return '—'; s = Math.round(s); const d=Math.floor(s/86400), h=Math.floor((s%86400)/3600), m=Math.floor((s%3600)/60); if (d) return d+'d '+h+'h'; if (h) return h+'h '+m+'m'; return m+'m'; }
+  function statePill(kind, label){ return '<span class="pill '+kind+'"><span class="dot"></span>'+escapeHtml(label)+'</span>'; }
+  function idPill(v){ return '<span class="pill id">'+escapeHtml(v)+'</span>'; }
+
+  async function get(path){
+    const res = await fetch(api(path), {headers: headers()});
+    if (res.status === 401) throw new AuthError();
+    if (!res.ok) throw new Error(path + ' → HTTP ' + res.status + ': ' + (await res.text()).slice(0,200));
+    return res.json();
+  }
+  class AuthError extends Error { constructor(){ super('admin key required or invalid'); this.name='AuthError'; } }
+
+  function showLocked(message){
+    unlocked = false;
+    dash.classList.add('hidden');
+    lockedView.classList.remove('hidden');
+    unlockBtn.textContent = 'Unlock';
+    if (message) { lockedErr.textContent = message; lockedErr.classList.remove('hidden'); } else { lockedErr.classList.add('hidden'); }
+    keyInput.focus();
+  }
+  function showDash(){
+    unlocked = true;
+    lockedView.classList.add('hidden');
+    dash.classList.remove('hidden');
+    unlockBtn.textContent = 'Locked in';
+  }
+
+  function handleFatal(e){
+    if (e instanceof AuthError) showLocked('That key was rejected, or no key was sent. Paste a valid admin key and choose Unlock.');
+    else { dashErr.textContent = e.message; dashErr.classList.remove('hidden'); }
+  }
+
+  // ── Loaders ─────────────────────────────────────────────────
+  async function loadHealth(){
+    dashErr.classList.add('hidden');
+    try {
+      const [status, providers, models, validation] = await Promise.all([
+        get('/admin/api/status'), get('/admin/api/providers'), get('/admin/api/models'), get('/admin/api/config/validation')
+      ]);
+      renderHealth(status, providers.providers||[], models.models||[], validation);
+      renderProviders(providers.providers||[]);
+      renderModels(models.models||[]);
+    } catch (e) { handleFatal(e); throw e; }
+  }
+
+  function renderHealth(status, providerRows, modelRows, validation){
+    document.getElementById('sService').textContent = status.status || '—';
+    document.getElementById('sService').className = 'value ' + (status.status === 'ok' ? 'ok-c' : 'bad-c');
+    document.getElementById('sServiceDetail').textContent = 'pid ' + status.pid + ' · admin auth ' + (status.auth.admin_auth_enabled ? 'on' : 'off') + ' · client auth ' + (status.auth.client_auth_enabled ? 'on' : 'off');
+    document.getElementById('sUptime').textContent = fmtUptime(status.uptime_seconds);
+    const bad = providerRows.filter(p => (p.issues||[]).length);
+    document.getElementById('sProviders').textContent = providerRows.length;
+    document.getElementById('sProvidersDetail').textContent = bad.length ? bad.length + ' need config' : 'all configured';
+    document.getElementById('sProviders').className = 'value ' + (bad.length ? 'warn-c' : 'ok-c');
+    const uniq = dedupeModels(modelRows);
+    const enabled = uniq.filter(m => m.enabled !== false).length;
+    document.getElementById('sModels').textContent = enabled + '/' + uniq.length;
+    document.getElementById('sModelsDetail').textContent = 'enabled / total';
+    document.getElementById('sConfig').textContent = validation.ok ? 'ready' : 'issues';
+    document.getElementById('sConfig').className = 'value ' + (validation.ok ? 'ok-c' : 'bad-c');
+    document.getElementById('sConfigDetail').textContent = validation.ok ? 'no missing credentials' : (validation.issues||[]).length + ' provider(s)';
+    document.getElementById('healthMeta').textContent = 'updated ' + new Date().toLocaleTimeString();
+  }
+
+  function renderProviders(rows){
+    document.querySelector('#providers tbody').innerHTML = rows.map(p => {
+      const ready = !(p.issues||[]).length;
+      const issues = (p.issues||[]).map(i => idPill(i)).join(' ') || '<span class="muted">—</span>';
+      const state = ready ? statePill('ok','ready') : statePill('warn','config');
+      const keyCell = p.has_api_key ? '<span class="ok-c">present</span>' : '<span class="bad-c">missing</span>';
+      return '<tr><td>'+idPill(p.id)+'</td><td class="num">'+escapeHtml(p.enabled_models)+'</td><td>'+escapeHtml(p.protocol)+'</td><td class="id">'+escapeHtml(p.base_url)+'</td><td>'+keyCell+'</td><td>'+state+'</td><td>'+issues+'</td><td><button class="btn secondary" data-edit-provider="'+escapeHtml(p.id)+'">edit</button></td></tr>';
+    }).join('') || '<tr class="empty"><td colspan="8">No providers configured.</td></tr>';
+  }
+
+  function dedupeModels(rows){
+    const seen = new Set(); const out = [];
+    for (const m of rows) { const n = m.name || m.id; if (n && !seen.has(n)) { seen.add(n); out.push(m); } }
+    return out;
+  }
+
+  function renderModels(rows){
+    const uniq = dedupeModels(rows);
+    const local = uniq.filter(m => String(m.provider).toLowerCase() === 'omlx');
+    const cloud = uniq.filter(m => String(m.provider).toLowerCase() !== 'omlx');
+    const body = document.querySelector('#models tbody');
+    const parts = [];
+    function group(label, items){
+      if (!items.length) return;
+      parts.push('<tr class="group-row"><td colspan="9">'+escapeHtml(label)+' · '+items.length+'</td></tr>');
+      for (const m of items) {
+        const en = m.enabled !== false;
+        const nm = escapeHtml(m.name || m.id);
+        const up = escapeHtml(m.provider_model_id || m.omlx_id || m.name || '');
+        const th = escapeHtml(m.thinking || m.thinking_format || '');
+        const state = en ? statePill('ok','on') : statePill('bad','off');
+        const toggle = '<button class="btn secondary" data-toggle-model="'+nm+'" data-enable="'+(!en)+'">'+(en?'disable':'enable')+'</button> <button class="btn secondary" data-edit-model="'+nm+'">edit</button>';
+        parts.push('<tr><td>'+idPill(m.name || m.id)+'</td><td class="id">'+up+'</td><td>'+escapeHtml(m.provider)+'</td><td class="num">'+escapeHtml(m.context)+'</td><td class="num">'+escapeHtml(m.max_output_tokens)+'</td><td>'+th+'</td><td>'+(m.vision?'yes':'no')+'</td><td>'+state+'</td><td>'+toggle+'</td></tr>');
+      }
+    }
+    group('Local (oMLX)', local);
+    group('Cloud', cloud);
+    body.innerHTML = parts.join('') || '<tr class="empty"><td colspan="9">No models configured.</td></tr>';
+    document.getElementById('modelsMeta').textContent = local.length + ' local · ' + cloud.length + ' cloud';
+  }
+
+  // ── Usage ───────────────────────────────────────────────────
+  const _winLabel = {'1h':'Last hour','24h':'Last 24 hours','7d':'Last 7 days','30d':'Last 30 days','':'All time'};
+  async function loadUsage(window){
+    currentWindow = window;
+    for (const b of document.querySelectorAll('#winSeg button')) b.setAttribute('aria-pressed', String(b.dataset.w === window));
+    document.getElementById('usageRange').textContent = _winLabel[window] || window || 'All';
+    usageErr.classList.add('hidden');
+    try {
+      const q = window ? ('?window='+encodeURIComponent(window)) : '';
+      const [usage, recent] = await Promise.all([ get('/admin/api/usage'+q), get('/admin/api/requests?limit=50') ]);
+      const s = usage.summary || {};
+      const ok = s.ok || 0, errs = s.errors || 0;
+      const uReq = document.getElementById('uRequests');
+      uReq.textContent = fmtNum(s.requests); uReq.className = 'value ' + (errs ? 'warn-c' : 'ok-c');
+      document.getElementById('uRequestsDetail').textContent = ok + ' ok / ' + errs + ' errors';
+      const uTok = document.getElementById('uTokens');
+      uTok.textContent = fmtNum((s.input_tokens||0) + (s.output_tokens||0)); uTok.className = 'value ok-c';
+      document.getElementById('uTokensDetail').textContent = fmtNum(s.input_tokens)+' in / '+fmtNum(s.output_tokens)+' out ('+fmtNum(s.cached_read_tokens)+' cached)';
+      const uCost = document.getElementById('uCost');
+      uCost.textContent = fmtCost(s.cost_usd); uCost.className = 'value ok-c';
+      const uLat = document.getElementById('uLatency');
+      uLat.textContent = fmtMs(s.avg_latency_ms); uLat.className = 'value ok-c';
+      document.getElementById('uLatencyDetail').textContent = s.requests ? 'over '+s.requests+' requests' : 'no requests';
+      const byModel = usage.by_model || [];
+      document.querySelector('#usageByModel tbody').innerHTML = byModel.map(r => '<tr><td>'+idPill(r.dim||'—')+'</td><td class="num">'+fmtNum(r.requests)+'</td><td class="num '+(r.errors?'bad-c':'ok-c')+'">'+fmtNum(r.errors)+'</td><td class="num">'+fmtNum(r.input_tokens)+'</td><td class="num">'+fmtNum(r.output_tokens)+'</td><td class="num">'+fmtNum(r.cached_read_tokens)+'</td><td class="num">'+fmtCost(r.cost_usd)+'</td><td class="num">'+fmtMs(r.avg_latency_ms)+'</td></tr>').join('') || '<tr class="empty"><td colspan="8">No requests in this window.</td></tr>';
+      const reqs = recent.requests || [];
+      document.querySelector('#recentReq tbody').innerHTML = reqs.map(r => '<tr><td>'+escapeHtml(r.ts_iso||'—')+'</td><td>'+escapeHtml(r.endpoint||'—')+'</td><td>'+idPill(r.model||'—')+'</td><td class="num '+(r.status && r.status < 400 ? 'ok-c' : 'bad-c')+'">'+(r.status||'—')+'</td><td>'+(r.is_stream?'stream':'sync')+'</td><td class="num">'+fmtNum(r.input_tokens)+'</td><td class="num">'+fmtNum(r.output_tokens)+'</td><td class="num">'+fmtNum(r.cached_read_tokens)+'</td><td class="num">'+fmtCost(r.cost_usd)+'</td><td class="num">'+fmtMs(r.latency_ms)+'</td></tr>').join('') || '<tr class="empty"><td colspan="10">No requests yet.</td></tr>';
+    } catch (e) {
+      if (e instanceof AuthError) { showLocked(); return; }
+      usageErr.textContent = e.message; usageErr.classList.remove('hidden');
+    }
+  }
+
+  // ── CRUD ────────────────────────────────────────────────────
+  async function send(method, path, body){
+    const opts = {method, headers: headers()};
+    if (body !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
+    const res = await fetch(api(path), opts);
+    const txt = await res.text();
+    let j = null; try { j = JSON.parse(txt); } catch(e) { j = {raw: txt}; }
+    if (res.status === 401) throw new AuthError();
+    if (!res.ok) throw new Error((j && j.error && j.error.message) || txt || ('HTTP '+res.status));
+    return j;
+  }
+  function setMsg(id, msg, ok){ const el = document.getElementById(id); el.textContent = msg; el.className = 'msg '+(ok ? 'ok-c' : 'bad-c'); }
+
+  async function saveProvider(){
+    const id = document.getElementById('pId').value.trim().toLowerCase();
+    if (!id) return setMsg('pMsg', 'provider id required', false);
+    const body = {base_url: document.getElementById('pBaseUrl').value.trim()};
+    const proto = document.getElementById('pProtocol').value.trim(); if (proto) body.protocol = proto;
+    const key = document.getElementById('pApiKey').value; if (key) body.api_key = key;
+    try { await send('POST', '/admin/api/providers/'+encodeURIComponent(id), body); setMsg('pMsg', 'saved + reloaded', true); loadHealth(); }
+    catch(e){ if (e instanceof AuthError) return showLocked(); setMsg('pMsg', e.message, false); }
+  }
+  async function deleteProvider(){
+    const id = document.getElementById('pId').value.trim().toLowerCase();
+    if (!id) return setMsg('pMsg', 'provider id required', false);
+    if (!confirm('Delete provider '+id+'?')) return;
+    try { await send('DELETE', '/admin/api/providers/'+encodeURIComponent(id)); setMsg('pMsg', 'deleted + reloaded', true); loadHealth(); }
+    catch(e){ if (e instanceof AuthError) return showLocked(); setMsg('pMsg', e.message, false); }
+  }
+  async function validateProvider(){
+    const id = document.getElementById('pId').value.trim().toLowerCase();
+    if (!id) return setMsg('pMsg', 'provider id required', false);
+    setMsg('pMsg', 'validating…', true);
+    try { const r = await send('POST', '/admin/api/providers/'+encodeURIComponent(id)+'/validate'); setMsg('pMsg', r.ok ? ('OK · '+r.status_code+' · '+(r.model_count??'?')+' models') : ('failed: '+(r.error||r.status_code)), r.ok); }
+    catch(e){ if (e instanceof AuthError) return showLocked(); setMsg('pMsg', e.message, false); }
+  }
+  function editProvider(id){
+    document.getElementById('pId').value = id;
+    setMsg('pMsg', 'editing '+id+' — fill base_url (blank=keep) + key (blank=keep)', true);
+  }
+  function editModel(name){
+    const rows = document.querySelectorAll('#models tbody tr');
+    let m = null;
+    for (const r of rows) { if (r.dataset.modelName === name) { m = r.dataset; break; } }
+    if (!m) return setMsg('mMsg', 'could not find '+name, false);
+    document.getElementById('mName').value = name;
+    document.getElementById('mProvider').value = m.provider || '';
+    document.getElementById('mPmid').value = m.upstream || '';
+    document.getElementById('mContext').value = m.context && m.context !== '—' ? m.context : '';
+    document.getElementById('mThinking').value = m.thinking && m.thinking !== '—' ? m.thinking : '';
+    document.getElementById('mEnabled').checked = m.enabled === 'true';
+    setMsg('mMsg', 'editing '+name, true);
+  }
+  async function saveModel(){
+    const name = document.getElementById('mName').value.trim();
+    if (!name) return setMsg('mMsg', 'name required', false);
+    const body = {provider: document.getElementById('mProvider').value.trim(), provider_model_id: document.getElementById('mPmid').value.trim()};
+    if (!body.provider || !body.provider_model_id) return setMsg('mMsg', 'provider + provider_model_id required', false);
+    const alias = document.getElementById('mAlias').value.trim(); if (alias) body.alias = alias;
+    const ctx = parseInt(document.getElementById('mContext').value); if (!isNaN(ctx)) body.context = ctx;
+    const mo = parseInt(document.getElementById('mMaxOut').value); if (!isNaN(mo)) body.max_output_tokens = mo;
+    const th = document.getElementById('mThinking').value.trim(); if (th) body.thinking = th;
+    const tf = document.getElementById('mThinkingFmt').value.trim(); if (tf) body.thinking_format = tf;
+    const pr = document.getElementById('mPricing').value.trim(); if (pr) { try { body.pricing = JSON.parse(pr); } catch(e){ return setMsg('mMsg', 'pricing JSON invalid', false); } }
+    const desc = document.getElementById('mDesc').value.trim(); if (desc) body.desc = desc;
+    body.vision = document.getElementById('mVision').checked;
+    body.enabled = document.getElementById('mEnabled').checked;
+    try { await send('POST', '/admin/api/models/'+encodeURIComponent(name), body); setMsg('mMsg', 'saved + reloaded (hot; commit source repo to persist)', true); loadHealth(); }
+    catch(e){ if (e instanceof AuthError) return showLocked(); setMsg('mMsg', e.message, false); }
+  }
+  async function deleteModel(){
+    const name = document.getElementById('mName').value.trim();
+    if (!name) return setMsg('mMsg', 'name required', false);
+    if (!confirm('Delete model '+name+'?')) return;
+    try { await send('DELETE', '/admin/api/models/'+encodeURIComponent(name)); setMsg('mMsg', 'deleted + reloaded', true); loadHealth(); }
+    catch(e){ if (e instanceof AuthError) return showLocked(); setMsg('mMsg', e.message, false); }
+  }
+  async function toggleModel(name, enable){
+    const ep = enable ? 'enable' : 'disable';
+    try { await send('POST', '/admin/api/models/'+encodeURIComponent(name)+'/'+ep); setMsg('mMsg', name+' '+ep+'d', true); loadHealth(); }
+    catch(e){ if (e instanceof AuthError) return showLocked(); setMsg('mMsg', e.message, false); }
+  }
+
+  // ── Wiring ──────────────────────────────────────────────────
+  function unlock(){
+    const key = keyInput.value.trim();
+    if (!key) { lockedErr.textContent = 'Enter an admin key first.'; lockedErr.classList.remove('hidden'); keyInput.focus(); return; }
+    try { sessionStorage.setItem(STORAGE_KEY, key); } catch(e) {}
+    lockedErr.classList.add('hidden');
+    showDash();
+    Promise.all([loadHealth(), loadUsage(currentWindow)]).catch(()=>{});
+  }
+  function refresh(){ if (!unlocked) return; loadHealth(); loadUsage(currentWindow); }
+
+  unlockBtn.addEventListener('click', unlock);
+  refreshBtn.addEventListener('click', refresh);
+  keyInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') unlock(); });
+  keyToggle.addEventListener('click', () => {
+    const show = keyInput.type === 'password';
+    keyInput.type = show ? 'text' : 'password';
+    keyToggle.textContent = show ? 'hide' : 'show';
+  });
+
+  // Delegated clicks for table action buttons.
+  document.addEventListener('click', (e) => {
+    const t = e.target;
+    const ep = t.getAttribute && t.getAttribute('data-edit-provider');
+    if (ep) { editProvider(ep); return; }
+    const em = t.getAttribute && t.getAttribute('data-edit-model');
+    if (em) { editModel(em); return; }
+    const tm = t.getAttribute && t.getAttribute('data-toggle-model');
+    if (tm) { toggleModel(tm, t.getAttribute('data-enable') === 'true'); return; }
+  });
+
+  // Annotate model rows with dataset for editModel lookups after render.
+  const _origRender = renderModels;
+  renderModels = function(rows){
+    _origRender(rows);
+    const uniq = dedupeModels(rows);
+    const byName = {};
+    for (const m of uniq) byName[m.name || m.id] = m;
+    document.querySelectorAll('#models tbody tr').forEach(tr => {
+      const idCell = tr.querySelector('td .id');
+      if (!idCell) return;
+      const name = idCell.textContent.trim();
+      const m = byName[name];
+      if (!m) return;
+      tr.dataset.modelName = name;
+      tr.dataset.provider = m.provider || '';
+      tr.dataset.upstream = m.provider_model_id || m.omlx_id || '';
+      tr.dataset.context = (m.context === undefined || m.context === null || m.context === '') ? '—' : String(m.context);
+      tr.dataset.thinking = m.thinking || m.thinking_format || '—';
+      tr.dataset.enabled = String(m.enabled !== false);
+    });
+  };
+
+  document.getElementById('saveProviderBtn').addEventListener('click', saveProvider);
+  document.getElementById('deleteProviderBtn').addEventListener('click', deleteProvider);
+  document.getElementById('validateProviderBtn').addEventListener('click', validateProvider);
+  document.getElementById('saveModelBtn').addEventListener('click', saveModel);
+  document.getElementById('deleteModelBtn').addEventListener('click', deleteModel);
+  document.querySelectorAll('#winSeg button').forEach(b => b.addEventListener('click', () => loadUsage(b.dataset.w)));
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'r' && !/INPUT|TEXTAREA|SELECT/.test((e.target.tagName||'').toUpperCase()) && !e.metaKey && !e.ctrlKey) { refresh(); }
+  });
+
+  // ── Boot ────────────────────────────────────────────────────
+  let stored = '';
+  try { stored = sessionStorage.getItem(STORAGE_KEY) || ''; } catch(e) {}
+  if (stored) { keyInput.value = stored; unlock(); }
+  else showLocked();
 })();
-function api(path){ return BASE_PATH + path; }
-document.getElementById('thinkingLink').href = api('/v1/debug/thinking');
-function headers(){ const key = keyInput.value.trim(); return key ? {'Authorization':'Bearer '+key} : {}; }
-function escapeHtml(value){ return text(value).replace(/[&<>'"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch])); }
-async function get(path){
-  const res = await fetch(api(path), {headers: headers()});
-  if(!res.ok) throw new Error(path + ' -> HTTP ' + res.status + ': ' + await res.text());
-  return res.json();
-}
-function text(v){ return (v === undefined || v === null || v === '') ? '—' : String(v); }
-function cls(ok){ return ok ? 'ok' : 'bad'; }
-function pill(v){ return '<span class="pill">'+escapeHtml(v)+'</span>'; }
-async function loadAll(){
-  const err = document.getElementById('errors'); err.textContent = '';
-  try {
-    const [status, providers, models, validation] = await Promise.all([
-      get('/admin/api/status'), get('/admin/api/providers'), get('/admin/api/models'), get('/admin/api/config/validation')
-    ]);
-    document.getElementById('statusMetric').textContent = status.status;
-    document.getElementById('statusMetric').className = 'metric ok';
-    document.getElementById('statusSub').textContent = 'Uptime ' + Math.round(status.uptime_seconds) + 's · client auth ' + (status.auth.client_auth_enabled ? 'on' : 'off') + ' · admin auth ' + (status.auth.admin_auth_enabled ? 'on' : 'off');
-    const providerRows = providers.providers || [];
-    const modelRows = models.models || [];
-    const badProviders = providerRows.filter(p => (p.issues || []).length);
-    document.getElementById('providerMetric').textContent = providerRows.length;
-    document.getElementById('providerMetric').className = 'metric ' + (badProviders.length ? 'warn' : 'ok');
-    document.getElementById('providerSub').textContent = badProviders.length ? badProviders.length + ' provider(s) need config' : 'All providers with models look configured';
-    document.getElementById('modelMetric').textContent = modelRows.length;
-    document.getElementById('modelMetric').className = 'metric ok';
-    document.getElementById('validationMetric').textContent = validation.ok ? 'ok' : 'issues';
-    document.getElementById('validationMetric').className = 'metric ' + (validation.ok ? 'ok' : 'bad');
-    document.getElementById('validationSub').textContent = validation.issues?.length ? JSON.stringify(validation.issues) : 'No missing provider credentials detected';
-    document.querySelector('#providers tbody').innerHTML = providerRows.map(p => `<tr><td>${pill(p.id)}</td><td>${escapeHtml(p.enabled_models)}</td><td>${escapeHtml(p.protocol)}</td><td>${escapeHtml(p.base_url)}</td><td class="${cls(p.has_api_key)}">${p.has_api_key ? 'present' : 'missing'}</td><td>${(p.issues||[]).map(pill).join(' ') || '—'}</td><td><button class="secondary" onclick="editProvider('${escapeHtml(p.id)}')">edit</button></td></tr>`).join('');
-    // Dedupe models by name (list_models returns name+alias+id rows).
-    const seen = new Set(); const uniq = [];
-    for (const m of modelRows) { const n = m.name || m.id; if (n && !seen.has(n)) { seen.add(n); uniq.push(m); } }
-    document.querySelector('#models tbody').innerHTML = uniq.map(m => {
-      const en = m.enabled !== false;
-      const nm = escapeHtml(m.name || m.id);
-      return `<tr><td>${pill(m.name || m.id)}</td><td>${escapeHtml(m.provider)}</td><td>${escapeHtml(m.provider_model_id)}</td><td>${escapeHtml(m.context)}</td><td>${escapeHtml(m.max_output_tokens)}</td><td>${escapeHtml(m.thinking || m.thinking_format)}</td><td>${m.vision ? 'yes' : 'no'}</td><td class="${cls(en)}">${en ? 'yes' : 'no'}</td><td><button class="secondary" onclick="editModel('${nm}')">edit</button> <button class="secondary" onclick="toggleModel('${nm}', ${!en})">${en ? 'disable' : 'enable'}</button></td></tr>`;
-    }).join('');
-  } catch(e) {
-    err.textContent = e.message;
-    document.getElementById('statusMetric').textContent = 'error';
-    document.getElementById('statusMetric').className = 'metric bad';
-    document.getElementById('statusSub').textContent = 'Check admin key or gateway logs.';
-  }
-}
-loadAll();
-
-// ── Provider/model CRUD ───────────────────────────────────────────────
-async function send(method, path, body){
-  const opts = {method, headers: headers()};
-  if (body !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
-  const res = await fetch(api(path), opts);
-  const txt = await res.text();
-  let j = null; try { j = JSON.parse(txt); } catch(e) { j = {raw: txt}; }
-  if (!res.ok) throw new Error((j && j.error && j.error.message) || txt || ('HTTP '+res.status));
-  return j;
-}
-function setMsg(id, msg, ok){ const el = document.getElementById(id); el.textContent = msg; el.className = ok ? 'ok' : 'bad'; }
-async function saveProvider(){
-  const id = document.getElementById('pId').value.trim().toLowerCase();
-  if (!id) return setMsg('pMsg', 'provider id required', false);
-  const body = {base_url: document.getElementById('pBaseUrl').value.trim()};
-  const proto = document.getElementById('pProtocol').value.trim(); if (proto) body.protocol = proto;
-  const key = document.getElementById('pApiKey').value; if (key) body.api_key = key;
-  try { await send('POST', '/admin/api/providers/'+encodeURIComponent(id), body); setMsg('pMsg', 'saved + reloaded', true); loadAll(); }
-  catch(e){ setMsg('pMsg', e.message, false); }
-}
-async function deleteProvider(){
-  const id = document.getElementById('pId').value.trim().toLowerCase();
-  if (!id) return setMsg('pMsg', 'provider id required', false);
-  if (!confirm('Delete provider '+id+'?')) return;
-  try { await send('DELETE', '/admin/api/providers/'+encodeURIComponent(id)); setMsg('pMsg', 'deleted + reloaded', true); loadAll(); }
-  catch(e){ setMsg('pMsg', e.message, false); }
-}
-async function validateProvider(){
-  const id = document.getElementById('pId').value.trim().toLowerCase();
-  if (!id) return setMsg('pMsg', 'provider id required', false);
-  setMsg('pMsg', 'validating…', true);
-  try { const r = await send('POST', '/admin/api/providers/'+encodeURIComponent(id)+'/validate'); setMsg('pMsg', r.ok ? ('OK · '+r.status_code+' · '+(r.model_count??'?')+' models') : ('failed: '+(r.error||r.status_code)), r.ok); }
-  catch(e){ setMsg('pMsg', e.message, false); }
-}
-function editProvider(id){
-  document.getElementById('pId').value = id;
-  // Fetch current values from the loaded table row is fragile; leave fields for user to fill.
-  setMsg('pMsg', 'editing '+id+' — fill base_url (blank=keep) + key (blank=keep)', true);
-}
-function editModel(name){
-  // Populate the form from the loaded model row.
-  const rows = document.querySelectorAll('#models tbody tr');
-  let m = null;
-  for (const r of rows) { if (r.children[0].textContent.replace(/[^a-z0-9.-]/gi,'') === name || r.children[0].textContent.includes(name)) { m = r.children; break; } }
-  if (!m) return setMsg('mMsg', 'could not find '+name, false);
-  document.getElementById('mName').value = name;
-  document.getElementById('mProvider').value = m[1].textContent === '—' ? '' : m[1].textContent;
-  document.getElementById('mPmid').value = m[2].textContent === '—' ? '' : m[2].textContent;
-  document.getElementById('mContext').value = m[3].textContent === '—' ? '' : m[3].textContent;
-  document.getElementById('mMaxOut').value = '';
-  document.getElementById('mThinking').value = m[5].textContent === '—' ? '' : m[5].textContent;
-  document.getElementById('mEnabled').checked = m[7].textContent === 'yes';
-  setMsg('mMsg', 'editing '+name, true);
-}
-async function saveModel(){
-  const name = document.getElementById('mName').value.trim();
-  if (!name) return setMsg('mMsg', 'name required', false);
-  const body = {provider: document.getElementById('mProvider').value.trim(), provider_model_id: document.getElementById('mPmid').value.trim()};
-  if (!body.provider || !body.provider_model_id) return setMsg('mMsg', 'provider + provider_model_id required', false);
-  const alias = document.getElementById('mAlias').value.trim(); if (alias) body.alias = alias;
-  const ctx = parseInt(document.getElementById('mContext').value); if (!isNaN(ctx)) body.context = ctx;
-  const mo = parseInt(document.getElementById('mMaxOut').value); if (!isNaN(mo)) body.max_output_tokens = mo;
-  const th = document.getElementById('mThinking').value.trim(); if (th) body.thinking = th;
-  const tf = document.getElementById('mThinkingFmt').value.trim(); if (tf) body.thinking_format = tf;
-  const pr = document.getElementById('mPricing').value.trim(); if (pr) { try { body.pricing = JSON.parse(pr); } catch(e){ return setMsg('mMsg', 'pricing JSON invalid', false); } }
-  const desc = document.getElementById('mDesc').value.trim(); if (desc) body.desc = desc;
-  body.vision = document.getElementById('mVision').checked;
-  body.enabled = document.getElementById('mEnabled').checked;
-  try { await send('POST', '/admin/api/models/'+encodeURIComponent(name), body); setMsg('mMsg', 'saved + reloaded (hot; commit source repo to persist)', true); loadAll(); }
-  catch(e){ setMsg('mMsg', e.message, false); }
-}
-async function deleteModel(){
-  const name = document.getElementById('mName').value.trim();
-  if (!name) return setMsg('mMsg', 'name required', false);
-  if (!confirm('Delete model '+name+'?')) return;
-  try { await send('DELETE', '/admin/api/models/'+encodeURIComponent(name)); setMsg('mMsg', 'deleted + reloaded', true); loadAll(); }
-  catch(e){ setMsg('mMsg', e.message, false); }
-}
-async function toggleModel(name, enable){
-  const ep = enable ? 'enable' : 'disable';
-  try { await send('POST', '/admin/api/models/'+encodeURIComponent(name)+'/'+ep); setMsg('mMsg', name+' '+ep+'d', true); loadAll(); }
-  catch(e){ setMsg('mMsg', e.message, false); }
-}
-
-const _winLabel = {'1h':'Last hour','24h':'Last 24 hours','7d':'Last 7 days','30d':'Last 30 days','':'All time'};
-function fmtNum(v){ return (v===null||v===undefined) ? '—' : Number(v).toLocaleString(); }
-function fmtCost(v){ return (v===null||v===undefined) ? '—' : '$'+Number(v).toFixed(4); }
-function fmtMs(v){ return (v===null||v===undefined) ? '—' : Math.round(v)+'ms'; }
-async function loadUsage(window){
-  const err = document.getElementById('usageErrors'); err.textContent = '';
-  document.getElementById('usageRange').textContent = _winLabel[window] || window || 'All';
-  try {
-    const q = window ? ('?window='+encodeURIComponent(window)) : '';
-    const [usage, recent] = await Promise.all([ get('/admin/api/usage'+q), get('/admin/api/requests?limit=50') ]);
-    const s = usage.summary || {};
-    const ok = s.ok || 0, errs = s.errors || 0;
-    document.getElementById('uRequests').textContent = fmtNum(s.requests);
-    document.getElementById('uRequests').className = 'metric ' + (errs ? 'warn' : 'ok');
-    document.getElementById('uRequestsSub').textContent = ok + ' ok / ' + errs + ' errors';
-    document.getElementById('uTokens').textContent = fmtNum((s.input_tokens||0) + (s.output_tokens||0));
-    document.getElementById('uTokens').className = 'metric ok';
-    document.getElementById('uTokensSub').textContent = fmtNum(s.input_tokens) + ' in / ' + fmtNum(s.output_tokens) + ' out (' + fmtNum(s.cached_read_tokens) + ' cached)';
-    document.getElementById('uCost').textContent = fmtCost(s.cost_usd);
-    document.getElementById('uCost').className = 'metric ok';
-    document.getElementById('uCostSub').textContent = 'unpriced rows excluded';
-    document.getElementById('uLatency').textContent = fmtMs(s.avg_latency_ms);
-    document.getElementById('uLatency').className = 'metric ok';
-    document.getElementById('uLatencySub').textContent = s.requests ? 'over ' + s.requests + ' requests' : 'no requests';
-    const byModel = usage.by_model || [];
-    document.querySelector('#usageByModel tbody').innerHTML = byModel.map(r => `<tr><td>${pill(r.dim || '—')}</td><td>${fmtNum(r.requests)}</td><td class="${cls(!(r.errors))}">${fmtNum(r.errors)}</td><td>${fmtNum(r.input_tokens)}</td><td>${fmtNum(r.output_tokens)}</td><td>${fmtNum(r.cached_read_tokens)}</td><td>${fmtCost(r.cost_usd)}</td><td>${fmtMs(r.avg_latency_ms)}</td></tr>`).join('') || '<tr><td class="muted" colspan="8">No requests in window</td></tr>';
-    const reqs = recent.requests || [];
-    document.querySelector('#recentReq tbody').innerHTML = reqs.map(r => `<tr><td>${escapeHtml(r.ts_iso||'—')}</td><td>${escapeHtml(r.endpoint||'—')}</td><td>${pill(r.model||'—')}</td><td class="${cls(r.status && r.status < 400)}">${r.status||'—'}</td><td>${r.is_stream ? 'stream' : 'sync'}</td><td>${fmtNum(r.input_tokens)}</td><td>${fmtNum(r.output_tokens)}</td><td>${fmtNum(r.cached_read_tokens)}</td><td>${fmtCost(r.cost_usd)}</td><td>${fmtMs(r.latency_ms)}</td></tr>`).join('') || '<tr><td class="muted" colspan="10">No requests yet</td></tr>';
-  } catch(e) {
-    err.textContent = e.message;
-  }
-}
-loadUsage('24h');
 </script>
 </body>
 </html>
