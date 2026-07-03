@@ -804,7 +804,7 @@ _ADMIN_HTML = r"""
       const reqs = recent.requests || [];
       document.querySelector('#recentReq tbody').innerHTML = reqs.map(r => '<tr><td>'+escapeHtml(r.ts_iso||'—')+'</td><td>'+escapeHtml(r.endpoint||'—')+'</td><td>'+idPill(r.model||'—')+'</td><td class="num '+(r.status && r.status < 400 ? 'ok-c' : 'bad-c')+'">'+(r.status||'—')+'</td><td>'+(r.is_stream?'stream':'sync')+'</td><td class="num">'+fmtNum(r.input_tokens)+'</td><td class="num">'+fmtNum(r.output_tokens)+'</td><td class="num">'+fmtNum(r.cached_read_tokens)+'</td><td class="num">'+fmtCost(r.cost_usd)+'</td><td class="num">'+fmtMs(r.latency_ms)+'</td></tr>').join('') || '<tr class="empty"><td colspan="10">No requests yet.</td></tr>';
     } catch (e) {
-      if (e instanceof AuthError) { showLocked(); return; }
+      if (e instanceof AuthError) { return; } // loadHealth drives the locked state on auth failure
       usageErr.textContent = e.message; usageErr.classList.remove('hidden');
     }
   }
