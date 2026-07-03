@@ -41,7 +41,7 @@ def tmp_config(tmp_path, monkeypatch):
 
 def test_upsert_provider_creates_new(tmp_config, monkeypatch):
     # Set log/backup dir to tmp so backups don't litter the real log dir.
-    monkeypatch.setenv("CLOUD_GATEWAY_LOG_DIR", str(tmp_config / "logs"))
+    monkeypatch.setenv("MODEL_GATEWAY_LOG_DIR", str(tmp_config / "logs"))
     config_io.log_dir = tmp_config / "logs"
     result = config_io.upsert_provider("openai", base_url="https://api.openai.com/v1", api_key="sk-new")
     assert result["id"] == "openai"
@@ -191,7 +191,7 @@ def test_resolve_skips_disabled_model(tmp_config, monkeypatch):
 @pytest.fixture
 def client(tmp_config, monkeypatch):
     config_io.log_dir = tmp_config / "logs"
-    monkeypatch.setenv("CLOUD_GATEWAY_ADMIN_KEY", "admin")
+    monkeypatch.setenv("MODEL_GATEWAY_ADMIN_KEY", "admin")
     with TestClient(app) as c:
         yield c
 

@@ -1,11 +1,10 @@
 """Inbound gateway authentication helpers.
 
-Auth is intentionally opt-in for backward compatibility with the existing local
-clients. Set MODEL_GATEWAY_CLIENT_KEYS to protect /v1/* and
-MODEL_GATEWAY_ADMIN_KEY to protect /admin/api/*. Legacy CLOUD_GATEWAY_* names
-remain accepted during migration. Both may also be configured in config.yaml
-under an ``auth`` section (``admin_keys`` / ``client_keys`` lists, or a
-comma-separated string); env vars take precedence over config.
+Auth is intentionally opt-in for trusted local clients. Set
+MODEL_GATEWAY_CLIENT_KEYS to protect /v1/* and MODEL_GATEWAY_ADMIN_KEY to
+protect /admin/api/*. Both may also be configured in config.yaml under an
+``auth`` section (``admin_keys`` / ``client_keys`` lists, or a comma-separated
+string); env vars take precedence over config.
 """
 
 from __future__ import annotations
@@ -55,26 +54,18 @@ def _config_keys(field: str) -> set[str]:
     return set()
 
 
-def _env(*names: str) -> str | None:
-    for name in names:
-        value = os.environ.get(name)
-        if value:
-            return value
-    return None
-
-
 def _client_keys() -> set[str]:
     # Env takes precedence so operators can override without editing config,
     # but config.yaml is the canonical home for secrets (it is gitignored and
     # already holds provider API keys).
-    keys = _split_keys(_env("MODEL_GATEWAY_CLIENT_KEYS", "CLOUD_GATEWAY_CLIENT_KEYS"))
+    keys = _split_keys(os.environ.get("MODEL_GATEWAY_CLIENT_KEYS"))
     keys |= _config_keys("client_keys")
     return keys
 
 
 def _admin_keys() -> set[str]:
     # Allow a future comma-separated admin key list without changing the env name.
-    keys = _split_keys(_env("MODEL_GATEWAY_ADMIN_KEY", "CLOUD_GATEWAY_ADMIN_KEY"))
+    keys = _split_keys(os.environ.get("MODEL_GATEWAY_ADMIN_KEY"))
     keys |= _config_keys("admin_keys")
     return keys
 
@@ -103,9 +94,7 @@ def _truthy_env(name: str) -> bool:
 
 
 def _unsafe_admin_without_key_enabled() -> bool:
-    return _truthy_env("MODEL_GATEWAY_ALLOW_UNAUTHENTICATED_ADMIN") or _truthy_env(
-        "CLOUD_GATEWAY_ALLOW_UNAUTHENTICATED_ADMIN"
-    )
+    return _truthy_env("MODEL_GATEWAY_ALLOW_UNAUTHENTICATED_ADMIN")
 
 
 def auth_mode() -> AuthMode:

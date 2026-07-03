@@ -6,15 +6,15 @@
 #   admin_keys  -> protects /admin/api/* (fail-closed until at least one is set)
 #   client_keys -> protects /v1/* (leave empty to keep /v1 open)
 # Each field accepts a list of keys or a single comma-separated string.
-# Env vars CLOUD_GATEWAY_ADMIN_KEY / CLOUD_GATEWAY_CLIENT_KEYS override these.
+# Env vars MODEL_GATEWAY_ADMIN_KEY / MODEL_GATEWAY_CLIENT_KEYS override these.
 auth:
   admin_keys:
-    - "YOUR_CLOUD_GATEWAY_ADMIN_KEY"
+    - "YOUR_MODEL_GATEWAY_ADMIN_KEY"
   # client_keys:
   #   - "cloud"
 
 providers:
-  # cloud-gateway intentionally routes only remote/cloud providers.
+  # model-gateway intentionally routes only remote/cloud providers.
   # Local MLX/oMLX models are served directly by oMLX on port 9110.
 
   fireworks:

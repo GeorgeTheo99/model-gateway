@@ -1,8 +1,8 @@
-# Cloud Gateway Productionization Plan
+# Model Gateway Productionization Plan
 
 ## Outcome
 
-Turn the local cloud gateway into a managed model-router product: a small admin UI, durable provider/model configuration, explicit access control, live observability, and cost tracking while preserving the existing OpenAI-compatible, Anthropic-compatible, and Responses-compatible APIs.
+Turn the local model gateway into a managed model-router product: a small admin UI, durable provider/model configuration, explicit access control, live observability, and cost tracking while preserving the existing OpenAI-compatible, Anthropic-compatible, and Responses-compatible APIs.
 
 ## Current state
 
@@ -74,10 +74,10 @@ Recommended store for v1: SQLite + encrypted/permissioned local secret file, wit
 
 Add two explicit token classes before exposing write endpoints:
 
-- `CLOUD_GATEWAY_CLIENT_KEYS`: tokens allowed to call `/v1/*`.
-- `CLOUD_GATEWAY_ADMIN_KEY`: token allowed to call `/admin/api/*` and load the UI.
+- `MODEL_GATEWAY_CLIENT_KEYS`: tokens allowed to call `/v1/*`.
+- `MODEL_GATEWAY_ADMIN_KEY`: token allowed to call `/admin/api/*` and load the UI.
 
-For backward compatibility, allow an env flag like `CLOUD_GATEWAY_ALLOW_UNAUTHENTICATED_LOCAL=true` only when bound to loopback/private local dev.
+For local development, allow an env flag like `MODEL_GATEWAY_ALLOW_UNAUTHENTICATED_LOCAL=true` only when bound to loopback/private local dev.
 
 ### 3. Admin API
 
@@ -176,34 +176,34 @@ The gateway is already used by local launchers and services, so productionizatio
 
 ### Safe in the first slice
 
-- `/v1/*` remains unauthenticated unless `CLOUD_GATEWAY_CLIENT_KEYS` is set.
-- `/admin/api/*` now fails closed unless `CLOUD_GATEWAY_ADMIN_KEY` is set, or `CLOUD_GATEWAY_ALLOW_UNAUTHENTICATED_ADMIN=true` is explicitly set for local development.
+- `/v1/*` remains unauthenticated unless `MODEL_GATEWAY_CLIENT_KEYS` is set.
+- `/admin/api/*` now fails closed unless `MODEL_GATEWAY_ADMIN_KEY` is set, or `MODEL_GATEWAY_ALLOW_UNAUTHENTICATED_ADMIN=true` is explicitly set for local development.
 - Existing model ids, aliases, request bodies, and upstream routing behavior are unchanged.
 - Provider API keys are still read from `config/config.yaml`; the new admin APIs only report masked status.
 
 ### What will break if client auth is enabled
 
-Set `CLOUD_GATEWAY_CLIENT_KEYS=cloud` to match the current local launchers before requiring auth.
+Set `MODEL_GATEWAY_CLIENT_KEYS=cloud` to match the current local launchers before requiring auth.
 
 Known clients that should continue working because they already send a token:
 
 - `server/local_claude/zshrc-launcher.zsh` Claude path sends `ANTHROPIC_AUTH_TOKEN=cloud`.
 - `server/local_claude/zshrc-launcher.zsh` Codex path sends `OPENAI_API_KEY=cloud`.
-- Pi generated `models.json` uses `apiKey: cloud` for the cloud-gateway provider.
+- Pi generated `models.json` uses `apiKey: cloud` for the model-gateway provider.
 
 Clients that will break until updated:
 
 - raw `curl` calls without `Authorization: Bearer <key>` or `x-api-key: <key>`.
 - scripts that call `http://localhost:9111/v1/*` with no API key.
-- health/model probes that use `/v1/models` without auth after `CLOUD_GATEWAY_CLIENT_KEYS` is configured.
+- health/model probes that use `/v1/models` without auth after `MODEL_GATEWAY_CLIENT_KEYS` is configured.
 
 `/health` intentionally stays unauthenticated for launchd and load-balancer-style checks.
 
 ### What will break if admin auth is enabled
 
-- Browser access to `/admin` still loads the static UI, but `/admin/api/*` calls return `401` until `CLOUD_GATEWAY_ADMIN_KEY` is configured and entered in the UI.
-- Programmatic admin calls need `Authorization: Bearer $CLOUD_GATEWAY_ADMIN_KEY` or `x-api-key: $CLOUD_GATEWAY_ADMIN_KEY`.
-- For temporary local-only development, set `CLOUD_GATEWAY_ALLOW_UNAUTHENTICATED_ADMIN=true`; do not use that when binding beyond trusted loopback/private development.
+- Browser access to `/admin` still loads the static UI, but `/admin/api/*` calls return `401` until `MODEL_GATEWAY_ADMIN_KEY` is configured and entered in the UI.
+- Programmatic admin calls need `Authorization: Bearer $MODEL_GATEWAY_ADMIN_KEY` or `x-api-key: $MODEL_GATEWAY_ADMIN_KEY`.
+- For temporary local-only development, set `MODEL_GATEWAY_ALLOW_UNAUTHENTICATED_ADMIN=true`; do not use that when binding beyond trusted loopback/private development.
 
 ### Future breaking changes to avoid or stage carefully
 

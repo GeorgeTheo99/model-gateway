@@ -1,7 +1,7 @@
 # Provider Pricing Sources
 
 Authoritative sources for token pricing used when adding a model to
-`cloud-gateway/model-info.json` or reviewing prices for drift. The gateway
+`model-gateway/model-info.json` or reviewing prices for drift. The gateway
 routes to the providers below; **price each model from the provider we actually
 route to**, not from aggregators (LiteLLM, morphllm, etc.). Aggregators are
 useful only as a cross-check, never as the source of record.
@@ -106,7 +106,7 @@ message. `glm-5-turbo` and `glm-5.1` are the relevant IDs.
 ## Model → provider → upstream lookup (current catalog)
 
 Use this to know which source to read for each model. Regenerate with:
-`python3 -c "import json; [print(f\"{e['name']:24} {e.get('provider','?'):12} {e.get('provider_model_id','?')}\") for e in json.load(open('cloud-gateway/model-info.json'))['llm'] if e.get('provider')]"`
+`python3 -c "import json; [print(f\"{e['name']:24} {e.get('provider','?'):12} {e.get('provider_model_id','?')}\") for e in json.load(open('model-gateway/model-info.json'))['llm'] if e.get('provider')]"`
 
 | Gateway model | Provider | Upstream model id | Source page |
 |---|---|---|---|

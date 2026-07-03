@@ -1,12 +1,12 @@
-# Cloud Gateway Deployment and Auth Rollout
+# Model Gateway Deployment and Auth Rollout
 
 ## Current deployed state
 
-The production launchd service is `com.local.cloud-gateway`.
+The production launchd service is `com.local.model-gateway`.
 
-- Working directory: `~/srv/cloud-gateway/current`
-- Source repo: `~/local_code/cloud-gateway`
-- Deployed via push to local bare repo: `~/repos/cloud-gateway.git`
+- Working directory: `~/srv/model-gateway/current`
+- Source repo: `~/local_code/model-gateway`
+- Deployed via push to local bare repo: `~/repos/model-gateway.git`
 - Runtime port: `9111`
 - Health check: `GET http://127.0.0.1:9111/health`
 - Admin UI: `GET http://127.0.0.1:9111/admin`
@@ -18,7 +18,7 @@ As of commit `e5ba25a`, the live service has:
 - `/v1/*` protected with `401` unless a valid client (or admin) key is sent.
 
 Both admin and client auth are **currently enabled** on the deployed service.
-Keys live in the gitignored runtime config `~/srv/cloud-gateway/shared/config/config.yaml`
+Keys live in the gitignored runtime config `~/srv/model-gateway/shared/config/config.yaml`
 (symlinked into the deploy tree as `config/config.yaml`) under the `auth:` section.
 The launchd plist does **not** carry auth env vars, keeping secrets out of the
 repo and the plist.
@@ -41,11 +41,11 @@ precedence over config):
    Each field accepts a list or a single comma-separated string. Reloaded on
    `POST /admin/api/reload` (and on service restart).
 
-2. Env vars `CLOUD_GATEWAY_ADMIN_KEY` / `CLOUD_GATEWAY_CLIENT_KEYS`
+2. Env vars `MODEL_GATEWAY_ADMIN_KEY` / `MODEL_GATEWAY_CLIENT_KEYS`
    (comma-separated), which override/extend config. Useful for ad-hoc overrides
    without editing the file.
 
-The launchd plist (`com.local.cloud-gateway`) only sets `CLOUD_GATEWAY_MODEL_INFO`;
+The launchd plist (`com.local.model-gateway`) only sets `MODEL_GATEWAY_*` path env vars;
 auth env vars are intentionally not wired into the plist template in `server-ci`
 `install-launchagents` to avoid committing secrets.
 
@@ -53,7 +53,7 @@ auth env vars are intentionally not wired into the plist template in `server-ci`
 
 These are optional overrides for the config-file keys above.
 
-### `CLOUD_GATEWAY_ADMIN_KEY`
+### `MODEL_GATEWAY_ADMIN_KEY`
 
 Protects the admin API only.
 
@@ -64,8 +64,8 @@ Protects the admin API only.
 Programmatic admin calls must include one of:
 
 ```bash
-Authorization: Bearer $CLOUD_GATEWAY_ADMIN_KEY
-x-api-key: $CLOUD_GATEWAY_ADMIN_KEY
+Authorization: Bearer $MODEL_GATEWAY_ADMIN_KEY
+x-api-key: $MODEL_GATEWAY_ADMIN_KEY
 ```
 
 The browser UI at `/admin` still loads without a key, but its API calls return `401` until the key is entered in the UI.
@@ -73,12 +73,12 @@ The browser UI at `/admin` still loads without a key, but its API calls return `
 For temporary local development only, admin auth can be bypassed with:
 
 ```bash
-CLOUD_GATEWAY_ALLOW_UNAUTHENTICATED_ADMIN=true
+MODEL_GATEWAY_ALLOW_UNAUTHENTICATED_ADMIN=true
 ```
 
 Do not use that when the gateway is reachable beyond trusted local development.
 
-### `CLOUD_GATEWAY_CLIENT_KEYS`
+### `MODEL_GATEWAY_CLIENT_KEYS`
 
 Protects client/model APIs.
 
@@ -89,7 +89,7 @@ Protects client/model APIs.
 Recommended least-breakage value when enabling client auth:
 
 ```bash
-CLOUD_GATEWAY_CLIENT_KEYS=cloud
+MODEL_GATEWAY_CLIENT_KEYS=cloud
 ```
 
 Clients must then send one of:
@@ -103,12 +103,12 @@ Admin keys are also accepted on `/v1/*`, so an admin token can be used for debug
 
 ## Known consumer compatibility
 
-Known clients that already send the default `cloud` token and should continue working if `CLOUD_GATEWAY_CLIENT_KEYS=cloud` is enabled:
+Known clients that already send the default `cloud` token and should continue working if `MODEL_GATEWAY_CLIENT_KEYS=cloud` is enabled:
 
 - `server/local_claude/zshrc-launcher.zsh`
   - Claude path sends `ANTHROPIC_AUTH_TOKEN=cloud`.
   - Codex path sends `OPENAI_API_KEY=cloud`.
-  - Pi generated `models.json` uses `apiKey: cloud` for the cloud-gateway provider.
+  - Pi generated `models.json` uses `apiKey: cloud` for the model-gateway provider.
 - `server/directory/install.sh`
   - Remote Claude/Codex launcher functions use `LS99_CLOUD_KEY`.
 - `server/voice-gateway/nlu/chat_client.py`
@@ -157,14 +157,14 @@ re-running on a fresh install or another machine.
 Restart/status are managed by `server-ci`:
 
 ```bash
-server-ci restart --cloud-gw
+server-ci restart --model-gw
 server-ci restart --status
 ```
 
 Launchd inspection:
 
 ```bash
-launchctl print gui/$(id -u)/com.local.cloud-gateway
+launchctl print gui/$(id -u)/com.local.model-gateway
 ```
 
 Live service smoke check:

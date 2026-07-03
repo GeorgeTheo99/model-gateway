@@ -28,10 +28,7 @@ import yaml
 
 from src.providers import CONFIG_PATH, MODEL_INFO_PATH, MODEL_INFO_SOURCE_PATH
 
-log_dir = Path(
-    os.environ.get("MODEL_GATEWAY_LOG_DIR")
-    or os.environ.get("CLOUD_GATEWAY_LOG_DIR", str(Path.home() / ".claude"))
-)
+log_dir = Path(os.environ.get("MODEL_GATEWAY_LOG_DIR", str(Path.home() / ".claude")))
 
 
 # ── provider config (config.yaml) ───────────────────────────────────────────

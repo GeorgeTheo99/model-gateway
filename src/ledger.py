@@ -6,8 +6,7 @@ see docs/productionization-plan.md "redact prompts by default").
 
 The database lives in the shared runtime state dir so it survives deploys:
 ``~/srv/model-gateway/shared/ledger.db`` by default, overridable via
-``MODEL_GATEWAY_LEDGER_PATH``. Legacy ``CLOUD_GATEWAY_LEDGER_PATH`` remains
-accepted during migration. Writes are best-effort: a ledger failure must
+``MODEL_GATEWAY_LEDGER_PATH``. Writes are best-effort: a ledger failure must
 never break a model request.
 
 Schema is intentionally flat (one table) for v1. Migration is additive: if
@@ -40,10 +39,7 @@ _ADDITIVE_COLUMNS: dict[str, str] = {}
 
 
 def ledger_path() -> Path:
-    return Path(
-        os.environ.get("MODEL_GATEWAY_LEDGER_PATH")
-        or os.environ.get("CLOUD_GATEWAY_LEDGER_PATH", str(_DEFAULT_LEDGER_PATH))
-    )
+    return Path(os.environ.get("MODEL_GATEWAY_LEDGER_PATH", str(_DEFAULT_LEDGER_PATH)))
 
 
 @contextmanager

@@ -4,7 +4,7 @@ These lock in the exact upstream params each `thinking_format` forwards, so a
 silent divergence (e.g. the `zai` branch dropping `reasoning_effort`) becomes a
 visible failure instead of a quiet behavior change.
 
-Run:  cd server/cloud-gateway && uv run pytest
+Run:  cd model-gateway && uv run pytest
 """
 
 import base64

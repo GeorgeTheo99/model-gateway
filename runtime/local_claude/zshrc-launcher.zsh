@@ -1134,14 +1134,14 @@ unset _mid _cid
 pi-restart() {
   # Restart the model-gateway (and oMLX/other services) via the canonical
   # server-ci interface, which is already on PATH and maps flags to launchd
-  # labels (see `server-ci restart --help`). Defaults to cloud-gw so the
+  # labels (see `server-ci restart --help`). Defaults to model-gw so the
   # common case is just `pi-restart`.
-  local svc="${1:-cloud-gw}"
+  local svc="${1:-model-gw}"
   if [ "$svc" = "-h" ] || [ "$svc" = "--help" ]; then
-    echo "Usage: pi-restart [service]   (default: cloud-gw)"
+    echo "Usage: pi-restart [service]   (default: model-gw)"
     echo ""
     echo "Wraps \`server-ci restart --<service>\`. Common services:"
-    echo "  cloud-gw            Cloud LLM gateway (port $CLOUD_GW_PORT)  [default]"
+    echo "  model-gw            Cloud LLM gateway (port $CLOUD_GW_PORT)  [default]"
     echo "  omlx                oMLX inference server (port $OMLX_PORT)"
     echo "  proxy               Caddy reverse proxy (port 8080)"
     echo "  ha-hub              Home automation dashboard (port 8100)"
@@ -1174,7 +1174,7 @@ pi-restart() {
     # the boot window.
     local port=""
     case "$svc" in
-      cloud-gw) port=9111 ;;
+      model-gw) port=9111 ;;
       omlx) port=9110 ;;
       proxy) port=8080 ;;
       ha-hub) port=8100 ;;
@@ -1246,7 +1246,7 @@ pi-list() {
   fi
   echo ""
   echo "Utilities:"
-  echo "  pi-restart [service]  restart a service via server-ci (default: cloud-gw); 'pi-restart status' or '-h' for more"
+  echo "  pi-restart [service]  restart a service via server-ci (default: model-gw); 'pi-restart status' or '-h' for more"
   echo "  pi-list               show this help"
 }
 

@@ -8,13 +8,13 @@ client = TestClient(app)
 
 
 def test_v1_auth_is_open_by_default(monkeypatch):
-    monkeypatch.delenv("CLOUD_GATEWAY_CLIENT_KEYS", raising=False)
+    monkeypatch.delenv("MODEL_GATEWAY_CLIENT_KEYS", raising=False)
     resp = client.get("/v1/models")
     assert resp.status_code == 200
 
 
 def test_v1_auth_requires_configured_client_key(monkeypatch):
-    monkeypatch.setenv("CLOUD_GATEWAY_CLIENT_KEYS", "other-key, good-key")
+    monkeypatch.setenv("MODEL_GATEWAY_CLIENT_KEYS", "other-key, good-key")
 
     assert client.get("/v1/models").status_code == 401
     assert client.get("/v1/models", headers={"Authorization": "Bearer bad"}).status_code == 401
@@ -23,22 +23,22 @@ def test_v1_auth_requires_configured_client_key(monkeypatch):
 
 
 def test_v1_auth_accepts_admin_key(monkeypatch):
-    monkeypatch.setenv("CLOUD_GATEWAY_CLIENT_KEYS", "client-key")
-    monkeypatch.setenv("CLOUD_GATEWAY_ADMIN_KEY", "admin-key")
+    monkeypatch.setenv("MODEL_GATEWAY_CLIENT_KEYS", "client-key")
+    monkeypatch.setenv("MODEL_GATEWAY_ADMIN_KEY", "admin-key")
 
     assert client.get("/v1/debug/thinking", headers={"Authorization": "Bearer admin-key"}).status_code == 200
 
 
 def test_admin_api_fails_closed_without_admin_key(monkeypatch):
-    monkeypatch.delenv("CLOUD_GATEWAY_ADMIN_KEY", raising=False)
-    monkeypatch.delenv("CLOUD_GATEWAY_ALLOW_UNAUTHENTICATED_ADMIN", raising=False)
+    monkeypatch.delenv("MODEL_GATEWAY_ADMIN_KEY", raising=False)
+    monkeypatch.delenv("MODEL_GATEWAY_ALLOW_UNAUTHENTICATED_ADMIN", raising=False)
 
     assert client.get("/admin").status_code == 200
     assert client.get("/admin/api/status").status_code == 401
 
 
 def test_admin_auth_requires_configured_admin_key(monkeypatch):
-    monkeypatch.setenv("CLOUD_GATEWAY_ADMIN_KEY", "admin-key")
+    monkeypatch.setenv("MODEL_GATEWAY_ADMIN_KEY", "admin-key")
 
     assert client.get("/admin/api/status").status_code == 401
     resp = client.get("/admin/api/status", headers={"Authorization": "Bearer admin-key"})
@@ -47,8 +47,8 @@ def test_admin_auth_requires_configured_admin_key(monkeypatch):
 
 
 def test_admin_provider_status_never_exposes_secret_values(monkeypatch):
-    monkeypatch.delenv("CLOUD_GATEWAY_ADMIN_KEY", raising=False)
-    monkeypatch.setenv("CLOUD_GATEWAY_ALLOW_UNAUTHENTICATED_ADMIN", "true")
+    monkeypatch.delenv("MODEL_GATEWAY_ADMIN_KEY", raising=False)
+    monkeypatch.setenv("MODEL_GATEWAY_ALLOW_UNAUTHENTICATED_ADMIN", "true")
     monkeypatch.setattr(providers, "_config", {
         "providers": {
             "openai": {
@@ -86,8 +86,8 @@ def test_admin_provider_status_never_exposes_secret_values(monkeypatch):
 
 def test_config_client_keys_protect_v1(monkeypatch):
     """client_keys in config.yaml protect /v1 even without env."""
-    monkeypatch.delenv("CLOUD_GATEWAY_CLIENT_KEYS", raising=False)
-    monkeypatch.delenv("CLOUD_GATEWAY_ADMIN_KEY", raising=False)
+    monkeypatch.delenv("MODEL_GATEWAY_CLIENT_KEYS", raising=False)
+    monkeypatch.delenv("MODEL_GATEWAY_ADMIN_KEY", raising=False)
     monkeypatch.setattr(providers, "_config", {"auth": {"client_keys": ["cfg-cloud"]}})
 
     assert client.get("/v1/models").status_code == 401
@@ -96,7 +96,7 @@ def test_config_client_keys_protect_v1(monkeypatch):
 
 def test_config_admin_keys_protect_admin_api(monkeypatch):
     """admin_keys in config.yaml protect /admin/api even without env."""
-    monkeypatch.delenv("CLOUD_GATEWAY_ADMIN_KEY", raising=False)
+    monkeypatch.delenv("MODEL_GATEWAY_ADMIN_KEY", raising=False)
     monkeypatch.setattr(providers, "_config", {"auth": {"admin_keys": ["cfg-admin"]}})
 
     assert client.get("/admin/api/status").status_code == 401
@@ -107,7 +107,7 @@ def test_config_admin_keys_protect_admin_api(monkeypatch):
 
 def test_env_and_config_keys_are_merged(monkeypatch):
     """Env keys and config keys union; either is accepted."""
-    monkeypatch.setenv("CLOUD_GATEWAY_CLIENT_KEYS", "env-key")
+    monkeypatch.setenv("MODEL_GATEWAY_CLIENT_KEYS", "env-key")
     monkeypatch.setattr(providers, "_config", {"auth": {"client_keys": ["cfg-key"]}})
 
     assert client.get("/v1/models", headers={"Authorization": "Bearer env-key"}).status_code == 200
@@ -117,7 +117,7 @@ def test_env_and_config_keys_are_merged(monkeypatch):
 
 def test_config_client_keys_accepts_comma_string(monkeypatch):
     """A comma-separated string is also accepted for config keys."""
-    monkeypatch.delenv("CLOUD_GATEWAY_CLIENT_KEYS", raising=False)
+    monkeypatch.delenv("MODEL_GATEWAY_CLIENT_KEYS", raising=False)
     monkeypatch.setattr(providers, "_config", {"auth": {"client_keys": "alpha, beta"}})
 
     assert client.get("/v1/models", headers={"Authorization": "Bearer alpha"}).status_code == 200

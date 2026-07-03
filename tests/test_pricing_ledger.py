@@ -49,7 +49,7 @@ def _info(provider="test", provider_model_id="upstream", vision=False):
 
 @pytest.fixture
 def tmp_ledger(tmp_path, monkeypatch):
-    monkeypatch.setenv("CLOUD_GATEWAY_LEDGER_PATH", str(tmp_path / "ledger.db"))
+    monkeypatch.setenv("MODEL_GATEWAY_LEDGER_PATH", str(tmp_path / "ledger.db"))
     ledger.init()
     yield tmp_path / "ledger.db"
 
@@ -154,7 +154,7 @@ def test_model_not_found_records_row_with_null_model(tmp_ledger, monkeypatch):
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
 def test_admin_usage_endpoint_requires_admin_key(monkeypatch, tmp_ledger):
-    monkeypatch.delenv("CLOUD_GATEWAY_ADMIN_KEY", raising=False)
+    monkeypatch.delenv("MODEL_GATEWAY_ADMIN_KEY", raising=False)
     with TestClient(app) as c:
         assert c.get("/admin/api/usage").status_code == 401
         assert c.get("/admin/api/requests").status_code == 401

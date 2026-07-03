@@ -12,7 +12,7 @@ from src.usage import Usage, CostEstimate
 @pytest.fixture(autouse=True)
 def tmp_ledger(tmp_path, monkeypatch):
     db = tmp_path / "ledger.db"
-    monkeypatch.setenv("CLOUD_GATEWAY_LEDGER_PATH", str(db))
+    monkeypatch.setenv("MODEL_GATEWAY_LEDGER_PATH", str(db))
     # Reset any cached path by re-importing is unnecessary; ledger_path() reads env live.
     ledger.init()
     yield db
@@ -126,7 +126,7 @@ def test_record_best_effort_does_not_raise_on_bad_path(monkeypatch, tmp_path):
     # Point ledger at a path inside a file (not a dir) to force a sqlite error.
     bad = tmp_path / "notadir"
     bad.write_text("x")
-    monkeypatch.setenv("CLOUD_GATEWAY_LEDGER_PATH", str(bad / "ledger.db"))
+    monkeypatch.setenv("MODEL_GATEWAY_LEDGER_PATH", str(bad / "ledger.db"))
     # Should not raise.
     ledger.record(
         endpoint="/v1/chat/completions", method="POST", model="a",

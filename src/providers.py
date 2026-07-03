@@ -12,22 +12,12 @@ import yaml
 log = logging.getLogger("model-gateway")
 
 
-def _env(*names: str) -> str | None:
-    """Return the first non-empty env var, preferring MODEL_GATEWAY_* names."""
-    for name in names:
-        value = os.environ.get(name)
-        if value:
-            return value
-    return None
-
-
 # model-info.json is the gateway-owned source of truth. Allow the path to be
 # supplied via env (set by the launcher/deploy); fall back to the checkout-local
-# catalog for tests and local dev. CLOUD_GATEWAY_* names remain supported during
-# the cloud-gateway -> model-gateway migration.
+# catalog for tests and local dev.
 _DEFAULT_MODEL_INFO = Path(__file__).resolve().parents[1] / "model-info.json"
 MODEL_INFO_PATH = Path(
-    _env("MODEL_GATEWAY_MODEL_INFO", "CLOUD_GATEWAY_MODEL_INFO") or str(_DEFAULT_MODEL_INFO)
+    os.environ.get("MODEL_GATEWAY_MODEL_INFO") or str(_DEFAULT_MODEL_INFO)
 ).resolve()
 # Optional source-repo path for durable model edits. When set, model write
 # operations mirror edits here (pending commit) in addition to the deployed
@@ -36,15 +26,15 @@ MODEL_INFO_PATH = Path(
 _DEFAULT_MODEL_INFO_SOURCE = Path.home() / "local_code" / "model-gateway" / "model-info.json"
 MODEL_INFO_SOURCE_PATH = (
     Path(
-        _env("MODEL_GATEWAY_MODEL_INFO_SOURCE", "CLOUD_GATEWAY_MODEL_INFO_SOURCE")
+        os.environ.get("MODEL_GATEWAY_MODEL_INFO_SOURCE")
         or str(_DEFAULT_MODEL_INFO_SOURCE)
     ).resolve()
-    if _env("MODEL_GATEWAY_MODEL_INFO_SOURCE", "CLOUD_GATEWAY_MODEL_INFO_SOURCE")
+    if os.environ.get("MODEL_GATEWAY_MODEL_INFO_SOURCE")
     or _DEFAULT_MODEL_INFO_SOURCE.exists()
     else None
 )
 CONFIG_PATH = Path(
-    _env("MODEL_GATEWAY_CONFIG", "CLOUD_GATEWAY_CONFIG")
+    os.environ.get("MODEL_GATEWAY_CONFIG")
     or Path(__file__).resolve().parents[1] / "config" / "config.yaml"
 ).resolve()
 
