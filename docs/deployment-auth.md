@@ -109,7 +109,7 @@ Known clients that already send the default `cloud` token and should continue wo
   - Claude path sends `ANTHROPIC_AUTH_TOKEN=cloud`.
   - Codex path sends `OPENAI_API_KEY=cloud`.
   - Pi generated `models.json` uses `apiKey: cloud` for the model-gateway provider.
-- `server/directory/install.sh`
+- `local-directory/install.sh`
   - Remote Claude/Codex launcher functions use `LS99_CLOUD_KEY`.
 - `server/voice-gateway/nlu/chat_client.py`
   - Defaults `MODEL_GATEWAY_API_KEY` to `cloud`.
