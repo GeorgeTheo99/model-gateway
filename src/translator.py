@@ -10,7 +10,7 @@ import secrets
 
 from src.signature_cache import inject_into_tool_call
 
-log = logging.getLogger("cloud-gateway")
+log = logging.getLogger("model-gateway")
 
 
 def _gen_msg_id() -> str:

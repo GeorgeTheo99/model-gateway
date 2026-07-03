@@ -1,4 +1,4 @@
-"""Admin API and lightweight UI for cloud-gateway."""
+"""Admin API and lightweight UI for model-gateway."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ async def admin_status(request: Request):
     require_admin_auth(request)
     mode = auth_mode()
     return {
-        "service": "cloud-gateway",
+        "service": "model-gateway",
         "status": "ok",
         "pid": os.getpid(),
         "uptime_seconds": round(time.time() - _STARTED_AT, 3),
@@ -381,7 +381,7 @@ _ADMIN_HTML = r"""
           <button class="secondary" onclick="deleteModel()">Delete</button>
           <span id="mMsg" class="muted"></span>
         </div>
-        <p class="muted" style="font-size:12px; margin-top:6px;">Writes are hot (immediate) and mirrored to the source repo (pending commit). Pricing should come from the official provider — use the cloud-gateway-add-model skill to fetch it. Disabled models are hidden from /v1/models.</p>
+        <p class="muted" style="font-size:12px; margin-top:6px;">Writes are hot (immediate) and mirrored to the source repo (pending commit). Pricing should come from the official provider — use the model-gateway add-model workflow to fetch it. Disabled models are hidden from /v1/models.</p>
       </details>
     </section>
 

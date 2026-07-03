@@ -1,6 +1,6 @@
 {
   "updated": "2026-07-03",
-  "_note": "Model-gateway routable provider catalog. Remote/provider entries are served by this gateway; local oMLX entries may remain as shared metadata but are skipped by gateway routing until local routing is implemented.",
+  "_note": "Machine runtime model catalog migrated out of server. Home Automation and voice-gateway read this via MODEL_GATEWAY_RUNTIME_MODEL_INFO/MODEL_INFO_PATH. Local models run on oMLX; cloud chat routes through configured provider/gateway paths.",
   "_thinking_policy": "Always enable thinking by default (set thinking: always). Use no_think: true only as an explicit override for specific use cases. Models with 3B active params especially need thinking to avoid context-forgetting in multi-turn agentic sessions.",
   "llm": [
     {
@@ -312,42 +312,7 @@
       "context": 1048576,
       "max_output_tokens": 100000,
       "thinking": "always",
-      "desc": "DeepSeek V4 Flash via OpenRouter, 1M context / 100k max output",
-      "pricing": {
-        "input": 0.09,
-        "output": 0.18
-      }
-    },
-    {
-      "name": "deepseek-v4-pro-fw",
-      "provider": "fireworks",
-      "provider_model_id": "accounts/fireworks/models/deepseek-v4-pro",
-      "alias": "dsv4pro",
-      "context": 1048576,
-      "max_output_tokens": 393216,
-      "thinking": "always",
-      "desc": "DeepSeek V4 Pro on Fireworks, 1M context / 384k max output",
-      "pricing": {
-        "input": 1.74,
-        "output": 3.48,
-        "cache_read": 0.145
-      }
-    },
-    {
-      "name": "glm-5.1-fw",
-      "params": "754B",
-      "provider": "fireworks",
-      "provider_model_id": "accounts/fireworks/models/glm-5p1",
-      "alias": "glm5fw",
-      "context": 203000,
-      "max_output_tokens": 32768,
-      "thinking": "always",
-      "desc": "GLM 5.1 754B MoE on Fireworks",
-      "pricing": {
-        "input": 1.4,
-        "output": 4.4,
-        "cache_read": 0.26
-      }
+      "desc": "DeepSeek V4 Flash via OpenRouter, 1M context / 100k max output"
     },
     {
       "name": "glm-5.2-fw",
@@ -363,42 +328,6 @@
         "input": 1.4,
         "output": 4.4,
         "cache_read": 0.14
-      }
-    },
-    {
-      "name": "kimi-k2.7-code-fw",
-      "params": "1T",
-      "active": "32B",
-      "provider": "fireworks",
-      "provider_model_id": "accounts/fireworks/models/kimi-k2p7-code",
-      "alias": "kimi27fw",
-      "context": 262144,
-      "max_output_tokens": 98304,
-      "thinking": "always",
-      "vision": true,
-      "desc": "Kimi K2.7 Code on Fireworks, 1T MoE / 32B active, 256k context, multimodal agent/coding model",
-      "pricing": {
-        "input": 0.95,
-        "output": 4.0,
-        "cache_read": 0.19
-      }
-    },
-    {
-      "name": "minimax-m3-fw",
-      "params": "428B",
-      "active": "23B",
-      "provider": "fireworks",
-      "provider_model_id": "accounts/fireworks/models/minimax-m3",
-      "alias": "minimaxm3fw",
-      "context": 512000,
-      "max_output_tokens": 65536,
-      "thinking": "optional",
-      "vision": true,
-      "desc": "MiniMax M3 on Fireworks, 428B MoE / 23B active, 512k context, native multimodal agent/coding model",
-      "pricing": {
-        "input": 0.3,
-        "output": 1.2,
-        "cache_read": 0.06
       }
     },
     {
@@ -418,209 +347,6 @@
       }
     },
     {
-      "name": "glm-5.1-zai",
-      "params": "754B",
-      "provider": "zhipuai",
-      "provider_model_id": "glm-5.1",
-      "alias": "glm51zai",
-      "context": 200000,
-      "max_output_tokens": 128000,
-      "thinking": "always",
-      "desc": "GLM 5.1 on ZhipuAI (glm-5.1, cheapest GLM-5.1 rates)",
-      "pricing": {
-        "input": 0.8333,
-        "output": 3.3333,
-        "cache_read": 0.1806
-      }
-    },
-    {
-      "name": "glm-5-zai-turbo",
-      "params": "754B",
-      "provider": "zhipuai",
-      "provider_model_id": "glm-5-turbo",
-      "alias": "glm5zai",
-      "context": 128000,
-      "max_output_tokens": 16384,
-      "desc": "GLM 5 Turbo on ZhipuAI (glm-5-turbo, fast & cheap, for home automation)",
-      "thinking": "optional",
-      "thinking_format": "zai",
-      "pricing": {
-        "input": 0.6944,
-        "output": 3.0556,
-        "cache_read": 0.1667
-      }
-    },
-    {
-      "name": "qwen3.7-plus-fw",
-      "params": "1T+",
-      "provider": "fireworks",
-      "provider_model_id": "accounts/fireworks/models/qwen3p7-plus",
-      "alias": "qwen37fw",
-      "context": 262144,
-      "max_output_tokens": 65536,
-      "thinking": "optional",
-      "vision": true,
-      "desc": "Qwen3.7 Plus on Fireworks, multimodal agent model, 262k context / 64k max output - vision fallback",
-      "pricing": {
-        "input": 0.4,
-        "output": 1.6,
-        "cache_read": 0.08
-      }
-    },
-    {
-      "name": "claude-fable-5",
-      "provider": "anthropic",
-      "provider_model_id": "claude-fable-5",
-      "alias": "fable",
-      "context": 1000000,
-      "max_output_tokens": 128000,
-      "thinking": "always",
-      "vision": true,
-      "desc": "Claude Fable 5 on Anthropic API",
-      "pricing": {
-        "input": 10.0,
-        "output": 50.0,
-        "cache_read": 1.0,
-        "cache_write": 12.5
-      }
-    },
-    {
-      "name": "claude-mythos-5",
-      "provider": "anthropic",
-      "provider_model_id": "claude-mythos-5",
-      "alias": "mythos",
-      "context": 1000000,
-      "max_output_tokens": 128000,
-      "thinking": "always",
-      "vision": true,
-      "desc": "Claude Mythos 5 on Anthropic API (Project Glasswing limited availability,, adaptive thinking always on)",
-      "pricing": {
-        "input": 10.0,
-        "output": 50.0,
-        "cache_read": 1.0,
-        "cache_write": 12.5
-      }
-    },
-    {
-      "name": "claude-sonnet-4.6",
-      "provider": "anthropic",
-      "provider_model_id": "claude-sonnet-4-6",
-      "alias": "sonnet",
-      "context": 1000000,
-      "max_output_tokens": 64000,
-      "thinking": "optional",
-      "vision": true,
-      "desc": "Claude Sonnet 4.6 on Anthropic API",
-      "pricing": {
-        "input": 3.0,
-        "output": 15.0,
-        "cache_read": 0.3,
-        "cache_write": 3.75
-      }
-    },
-    {
-      "name": "claude-opus-4.8",
-      "provider": "anthropic",
-      "provider_model_id": "claude-opus-4-8",
-      "alias": "opus48",
-      "context": 1000000,
-      "max_output_tokens": 128000,
-      "thinking": "optional",
-      "vision": true,
-      "desc": "Claude Opus 4.8 on Anthropic API",
-      "pricing": {
-        "input": 5.0,
-        "output": 25.0,
-        "cache_read": 0.5,
-        "cache_write": 6.25
-      }
-    },
-    {
-      "name": "claude-opus-4.7",
-      "provider": "anthropic",
-      "provider_model_id": "claude-opus-4-7",
-      "alias": "opus47",
-      "context": 1000000,
-      "max_output_tokens": 128000,
-      "thinking": "optional",
-      "vision": true,
-      "desc": "Claude Opus 4.7 on Anthropic API",
-      "pricing": {
-        "input": 5.0,
-        "output": 25.0,
-        "cache_read": 0.5,
-        "cache_write": 6.25
-      }
-    },
-    {
-      "name": "claude-opus-4.6",
-      "provider": "anthropic",
-      "provider_model_id": "claude-opus-4-6",
-      "alias": "opus",
-      "context": 1000000,
-      "max_output_tokens": 128000,
-      "thinking": "optional",
-      "vision": true,
-      "desc": "Claude Opus 4.6 on Anthropic API",
-      "pricing": {
-        "input": 5.0,
-        "output": 25.0,
-        "cache_read": 0.5,
-        "cache_write": 6.25
-      }
-    },
-    {
-      "name": "claude-opus-4.5",
-      "provider": "anthropic",
-      "provider_model_id": "claude-opus-4-5",
-      "alias": "opus45",
-      "context": 200000,
-      "max_output_tokens": 64000,
-      "thinking": "optional",
-      "vision": true,
-      "desc": "Claude Opus 4.5 on Anthropic API",
-      "pricing": {
-        "input": 5.0,
-        "output": 25.0,
-        "cache_read": 0.5,
-        "cache_write": 6.25
-      }
-    },
-    {
-      "name": "gpt-5.4",
-      "provider": "openai",
-      "provider_model_id": "gpt-5.4",
-      "alias": "gpt",
-      "context": 1000000,
-      "max_output_tokens": 32768,
-      "desc": "GPT-5.4 on OpenAI API",
-      "thinking": "optional",
-      "thinking_format": "openai-responses",
-      "vision": true,
-      "pricing": {
-        "input": 2.5,
-        "output": 15.0,
-        "cache_read": 0.25
-      }
-    },
-    {
-      "name": "gpt-5.4-mini",
-      "provider": "openai",
-      "provider_model_id": "gpt-5.4-mini",
-      "alias": "gpt54mini",
-      "context": 1000000,
-      "max_output_tokens": 32768,
-      "desc": "GPT-5.4 Mini on OpenAI API",
-      "thinking": "optional",
-      "thinking_format": "openai-responses",
-      "vision": true,
-      "pricing": {
-        "input": 0.75,
-        "output": 4.5,
-        "cache_read": 0.075
-      }
-    },
-    {
       "name": "gemini-3.1-pro",
       "provider": "openrouter",
       "provider_model_id": "google/gemini-3.1-pro-preview",
@@ -629,12 +355,8 @@
       "max_output_tokens": 65536,
       "thinking": "optional",
       "vision": true,
-      "desc": "Gemini 3.1 Pro via OpenRouter",
-      "thinking_format": "openrouter",
-      "pricing": {
-        "input": 2.0,
-        "output": 12.0
-      }
+      "desc": "Gemini 3.1 Pro via OpenRouter ($2/$12 per 1M tokens)",
+      "thinking_format": "openrouter"
     },
     {
       "name": "gemini-3-flash",
@@ -645,12 +367,8 @@
       "max_output_tokens": 65536,
       "thinking": "optional",
       "vision": true,
-      "desc": "Gemini 3 Flash via OpenRouter",
-      "thinking_format": "openrouter",
-      "pricing": {
-        "input": 0.5,
-        "output": 3.0
-      }
+      "desc": "Gemini 3 Flash via OpenRouter ($0.50/$3 per 1M tokens)",
+      "thinking_format": "openrouter"
     },
     {
       "name": "gemini-3.5-flash",
@@ -661,12 +379,112 @@
       "max_output_tokens": 65536,
       "thinking": "optional",
       "vision": true,
-      "desc": "Gemini 3.5 Flash via OpenRouter",
-      "thinking_format": "openrouter",
-      "pricing": {
-        "input": 1.5,
-        "output": 9.0
-      }
+      "desc": "Gemini 3.5 Flash via OpenRouter ($1.50/$9 per 1M tokens) - vision fallback",
+      "thinking_format": "openrouter"
+    },
+    {
+      "name": "claude-fable-5",
+      "provider": "openrouter",
+      "provider_model_id": "anthropic/claude-fable-5",
+      "alias": "fable",
+      "context": 1000000,
+      "max_output_tokens": 128000,
+      "thinking": "always",
+      "vision": true,
+      "desc": "Claude Fable 5 on Anthropic API ($10/$50 per 1M tokens, adaptive thinking always on)"
+    },
+    {
+      "name": "claude-opus-4.8",
+      "provider": "openrouter",
+      "provider_model_id": "anthropic/claude-opus-4.8",
+      "alias": "opus48",
+      "context": 1000000,
+      "max_output_tokens": 128000,
+      "thinking": "optional",
+      "vision": true,
+      "desc": "Claude Opus 4.8 on Anthropic API ($5/$25 per 1M tokens)"
+    },
+    {
+      "name": "claude-opus-4.7",
+      "provider": "openrouter",
+      "provider_model_id": "anthropic/claude-opus-4.7",
+      "alias": "opus47",
+      "context": 1000000,
+      "max_output_tokens": 128000,
+      "thinking": "optional",
+      "vision": true,
+      "desc": "Claude Opus 4.7 on Anthropic API ($5/$25 per 1M tokens)"
+    },
+    {
+      "name": "claude-sonnet-4.6",
+      "provider": "openrouter",
+      "provider_model_id": "anthropic/claude-sonnet-4.6",
+      "alias": "sonnet",
+      "context": 1000000,
+      "max_output_tokens": 64000,
+      "thinking": "optional",
+      "vision": true,
+      "desc": "Claude Sonnet 4.6 on Anthropic API ($3/$15 per 1M tokens)"
+    },
+    {
+      "name": "claude-opus-4.6",
+      "provider": "openrouter",
+      "provider_model_id": "anthropic/claude-opus-4.6",
+      "alias": "opus",
+      "context": 1000000,
+      "max_output_tokens": 128000,
+      "thinking": "optional",
+      "vision": true,
+      "desc": "Claude Opus 4.6 on Anthropic API ($5/$25 per 1M tokens)"
+    },
+    {
+      "name": "claude-opus-4.5",
+      "provider": "openrouter",
+      "provider_model_id": "anthropic/claude-opus-4.5",
+      "alias": "opus45",
+      "context": 200000,
+      "max_output_tokens": 64000,
+      "thinking": "optional",
+      "vision": true,
+      "desc": "Claude Opus 4.5 on Anthropic API ($5/$25 per 1M tokens)"
+    },
+    {
+      "name": "gpt-5.4",
+      "provider": "openrouter",
+      "provider_model_id": "openai/gpt-5.4",
+      "alias": "gpt",
+      "context": 1000000,
+      "max_output_tokens": 32768,
+      "desc": "GPT-5.4 on OpenAI API",
+      "thinking": "optional",
+      "thinking_format": "openai-responses",
+      "vision": true
+    },
+    {
+      "name": "gpt-5.4-mini",
+      "provider": "openrouter",
+      "provider_model_id": "openai/gpt-5.4-mini",
+      "alias": "gpt54mini",
+      "context": 1000000,
+      "max_output_tokens": 32768,
+      "desc": "GPT-5.4 Mini on OpenAI API",
+      "thinking": "optional",
+      "thinking_format": "openai-responses",
+      "vision": true
+    },
+    {
+      "name": "gpt-5.5",
+      "alias": "gpt-55",
+      "vision": true,
+      "provider": "openrouter",
+      "provider_model_id": "openai/gpt-5.5"
+    },
+    {
+      "name": "gpt-5.5-pro",
+      "alias": "gpt-55-pro",
+      "vision": true,
+      "provider": "openrouter",
+      "provider_model_id": "openai/gpt-5.5-pro"
     }
   ],
   "stt": [
@@ -760,7 +578,7 @@
       "preferred_models": [
         "qwen3.5-VL-397b-a17b-heretic-6bit-302gb",
         "claude-fable-5",
-        "claude-mythos-5"
+        "claude-opus-4.8"
       ],
       "max_tokens": null,
       "temperature": null,

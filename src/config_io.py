@@ -1,4 +1,4 @@
-"""Safe read/write layer for cloud-gateway config files.
+"""Safe read/write layer for model-gateway config files.
 
 Two files, two deploy models (see docs/provider-pricing-sources.md and the
 productionization plan):
@@ -28,7 +28,10 @@ import yaml
 
 from src.providers import CONFIG_PATH, MODEL_INFO_PATH, MODEL_INFO_SOURCE_PATH
 
-log_dir = Path(os.environ.get("CLOUD_GATEWAY_LOG_DIR", str(Path.home() / ".claude")))
+log_dir = Path(
+    os.environ.get("MODEL_GATEWAY_LOG_DIR")
+    or os.environ.get("CLOUD_GATEWAY_LOG_DIR", str(Path.home() / ".claude"))
+)
 
 
 # ── provider config (config.yaml) ───────────────────────────────────────────

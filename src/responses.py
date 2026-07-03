@@ -21,7 +21,7 @@ import uuid
 
 from src.signature_cache import inject_into_tool_call, store_from_extra_content
 
-log = logging.getLogger("cloud-gateway")
+log = logging.getLogger("model-gateway")
 
 
 def _gen_id(prefix: str = "resp") -> str:

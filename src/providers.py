@@ -9,24 +9,44 @@ from urllib.parse import urlsplit, urlunsplit
 
 import yaml
 
-log = logging.getLogger("cloud-gateway")
+log = logging.getLogger("model-gateway")
+
+
+def _env(*names: str) -> str | None:
+    """Return the first non-empty env var, preferring MODEL_GATEWAY_* names."""
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return None
+
 
 # model-info.json is the gateway-owned source of truth. Allow the path to be
 # supplied via env (set by the launcher/deploy); fall back to the checkout-local
-# catalog for tests and local dev.
+# catalog for tests and local dev. CLOUD_GATEWAY_* names remain supported during
+# the cloud-gateway -> model-gateway migration.
 _DEFAULT_MODEL_INFO = Path(__file__).resolve().parents[1] / "model-info.json"
-MODEL_INFO_PATH = Path(os.environ.get("CLOUD_GATEWAY_MODEL_INFO", str(_DEFAULT_MODEL_INFO))).resolve()
+MODEL_INFO_PATH = Path(
+    _env("MODEL_GATEWAY_MODEL_INFO", "CLOUD_GATEWAY_MODEL_INFO") or str(_DEFAULT_MODEL_INFO)
+).resolve()
 # Optional source-repo path for durable model edits. When set, model write
 # operations mirror edits here (pending commit) in addition to the deployed
 # MODEL_INFO_PATH, so changes survive deploys once committed. The deployed
 # copy is overwritten by git checkout on each deploy; the source copy is not.
-_DEFAULT_MODEL_INFO_SOURCE = Path.home() / "local_code" / "cloud-gateway" / "model-info.json"
+_DEFAULT_MODEL_INFO_SOURCE = Path.home() / "local_code" / "model-gateway" / "model-info.json"
 MODEL_INFO_SOURCE_PATH = (
-    Path(os.environ.get("CLOUD_GATEWAY_MODEL_INFO_SOURCE", str(_DEFAULT_MODEL_INFO_SOURCE))).resolve()
-    if os.environ.get("CLOUD_GATEWAY_MODEL_INFO_SOURCE") or _DEFAULT_MODEL_INFO_SOURCE.exists()
+    Path(
+        _env("MODEL_GATEWAY_MODEL_INFO_SOURCE", "CLOUD_GATEWAY_MODEL_INFO_SOURCE")
+        or str(_DEFAULT_MODEL_INFO_SOURCE)
+    ).resolve()
+    if _env("MODEL_GATEWAY_MODEL_INFO_SOURCE", "CLOUD_GATEWAY_MODEL_INFO_SOURCE")
+    or _DEFAULT_MODEL_INFO_SOURCE.exists()
     else None
 )
-CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "config.yaml"
+CONFIG_PATH = Path(
+    _env("MODEL_GATEWAY_CONFIG", "CLOUD_GATEWAY_CONFIG")
+    or Path(__file__).resolve().parents[1] / "config" / "config.yaml"
+).resolve()
 
 
 @dataclass
@@ -111,7 +131,7 @@ def _load_models() -> dict[str, dict]:
 
     for entry in data.get("llm", []):
         provider = _canonical_provider(entry.get("provider", "local"))
-        # cloud-gateway intentionally routes only remote/cloud providers.
+        # model-gateway currently routes only remote/cloud providers.
         # Local MLX/oMLX models are served directly by oMLX on port 9110;
         # GGUF/llama.cpp serving has been retired on this machine.
         if provider in {"omlx", "local", "mlx", "gguf", "llama", "llama_cpp", "llama.cpp"}:
@@ -207,7 +227,7 @@ def resolve(model_id: str) -> ProviderInfo | None:
     default_base_url = ""
     default_api_key = ""
     if provider == "omlx":
-        log.error("Provider %r is not routed by cloud-gateway; use oMLX directly", provider)
+        log.error("Provider %r is not routed by model-gateway yet; use oMLX directly", provider)
         return None
 
     base_url = provider_config.get("base_url", default_base_url)

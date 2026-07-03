@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator
 
 from src.signature_cache import store_from_extra_content
 
-log = logging.getLogger("cloud-gateway")
+log = logging.getLogger("model-gateway")
 
 
 def _gen_msg_id() -> str:

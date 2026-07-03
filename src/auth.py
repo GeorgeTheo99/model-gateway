@@ -1,10 +1,11 @@
 """Inbound gateway authentication helpers.
 
 Auth is intentionally opt-in for backward compatibility with the existing local
-clients. Set CLOUD_GATEWAY_CLIENT_KEYS to protect /v1/* and
-CLOUD_GATEWAY_ADMIN_KEY to protect /admin/api/*. Both may also be configured in
-config.yaml under an ``auth`` section (``admin_keys`` / ``client_keys`` lists,
-or a comma-separated string); env vars take precedence over config.
+clients. Set MODEL_GATEWAY_CLIENT_KEYS to protect /v1/* and
+MODEL_GATEWAY_ADMIN_KEY to protect /admin/api/*. Legacy CLOUD_GATEWAY_* names
+remain accepted during migration. Both may also be configured in config.yaml
+under an ``auth`` section (``admin_keys`` / ``client_keys`` lists, or a
+comma-separated string); env vars take precedence over config.
 """
 
 from __future__ import annotations
@@ -54,18 +55,26 @@ def _config_keys(field: str) -> set[str]:
     return set()
 
 
+def _env(*names: str) -> str | None:
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return None
+
+
 def _client_keys() -> set[str]:
     # Env takes precedence so operators can override without editing config,
     # but config.yaml is the canonical home for secrets (it is gitignored and
     # already holds provider API keys).
-    keys = _split_keys(os.environ.get("CLOUD_GATEWAY_CLIENT_KEYS"))
+    keys = _split_keys(_env("MODEL_GATEWAY_CLIENT_KEYS", "CLOUD_GATEWAY_CLIENT_KEYS"))
     keys |= _config_keys("client_keys")
     return keys
 
 
 def _admin_keys() -> set[str]:
     # Allow a future comma-separated admin key list without changing the env name.
-    keys = _split_keys(os.environ.get("CLOUD_GATEWAY_ADMIN_KEY"))
+    keys = _split_keys(_env("MODEL_GATEWAY_ADMIN_KEY", "CLOUD_GATEWAY_ADMIN_KEY"))
     keys |= _config_keys("admin_keys")
     return keys
 
@@ -94,7 +103,9 @@ def _truthy_env(name: str) -> bool:
 
 
 def _unsafe_admin_without_key_enabled() -> bool:
-    return _truthy_env("CLOUD_GATEWAY_ALLOW_UNAUTHENTICATED_ADMIN")
+    return _truthy_env("MODEL_GATEWAY_ALLOW_UNAUTHENTICATED_ADMIN") or _truthy_env(
+        "CLOUD_GATEWAY_ALLOW_UNAUTHENTICATED_ADMIN"
+    )
 
 
 def auth_mode() -> AuthMode:
@@ -103,12 +114,12 @@ def auth_mode() -> AuthMode:
     unsafe_admin = _unsafe_admin_without_key_enabled()
     warning = ""
     if not client_keys:
-        warning = "/v1 client auth is disabled; set CLOUD_GATEWAY_CLIENT_KEYS before exposing beyond trusted local clients."
+        warning = "/v1 client auth is disabled; set MODEL_GATEWAY_CLIENT_KEYS before exposing beyond trusted local clients."
     if not admin_keys:
         if unsafe_admin:
-            admin_warning = "/admin/api is unauthenticated because CLOUD_GATEWAY_ALLOW_UNAUTHENTICATED_ADMIN is enabled."
+            admin_warning = "/admin/api is unauthenticated because MODEL_GATEWAY_ALLOW_UNAUTHENTICATED_ADMIN is enabled."
         else:
-            admin_warning = "/admin/api is locked; set CLOUD_GATEWAY_ADMIN_KEY or explicitly enable CLOUD_GATEWAY_ALLOW_UNAUTHENTICATED_ADMIN for local dev."
+            admin_warning = "/admin/api is locked; set MODEL_GATEWAY_ADMIN_KEY or explicitly enable MODEL_GATEWAY_ALLOW_UNAUTHENTICATED_ADMIN for local dev."
         warning = f"{warning} {admin_warning}".strip()
     return AuthMode(
         client_auth_enabled=bool(client_keys),
@@ -121,7 +132,7 @@ def auth_mode() -> AuthMode:
 
 
 def require_client_auth(request: Request) -> None:
-    """Protect /v1/* when CLOUD_GATEWAY_CLIENT_KEYS is configured.
+    """Protect /v1/* when MODEL_GATEWAY_CLIENT_KEYS is configured.
 
     Admin keys are accepted as client keys too, so the admin UI can inspect
     existing /v1 debug endpoints with one token.
@@ -132,14 +143,14 @@ def require_client_auth(request: Request) -> None:
     token = _extract_token(request)
     if _matches(token, keys) or _matches(token, _admin_keys()):
         return
-    raise HTTPException(status_code=401, detail="Missing or invalid cloud-gateway client key")
+    raise HTTPException(status_code=401, detail="Missing or invalid model-gateway client key")
 
 
 def require_admin_auth(request: Request) -> None:
     """Protect /admin/api/*.
 
-    Admin APIs fail closed unless CLOUD_GATEWAY_ADMIN_KEY is configured. For
-    local development only, set CLOUD_GATEWAY_ALLOW_UNAUTHENTICATED_ADMIN=true.
+    Admin APIs fail closed unless MODEL_GATEWAY_ADMIN_KEY is configured. For
+    local development only, set MODEL_GATEWAY_ALLOW_UNAUTHENTICATED_ADMIN=true.
     """
     keys = _admin_keys()
     if not keys:
@@ -147,8 +158,8 @@ def require_admin_auth(request: Request) -> None:
             return
         raise HTTPException(
             status_code=401,
-            detail="cloud-gateway admin API is locked until CLOUD_GATEWAY_ADMIN_KEY is set",
+            detail="model-gateway admin API is locked until MODEL_GATEWAY_ADMIN_KEY is set",
         )
     if _matches(_extract_token(request), keys):
         return
-    raise HTTPException(status_code=401, detail="Missing or invalid cloud-gateway admin key")
+    raise HTTPException(status_code=401, detail="Missing or invalid model-gateway admin key")

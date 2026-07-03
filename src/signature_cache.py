@@ -9,7 +9,7 @@ them back into outbound requests, making the fix client-agnostic.
 import time
 import logging
 
-log = logging.getLogger("cloud-gateway")
+log = logging.getLogger("model-gateway")
 
 # tool_call_id -> (thought_signature, timestamp)
 _cache: dict[str, tuple[str, float]] = {}

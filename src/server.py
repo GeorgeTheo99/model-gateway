@@ -33,7 +33,7 @@ from src import ledger
 from src.usage import extract_usage, estimate_cost
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("cloud-gateway")
+log = logging.getLogger("model-gateway")
 
 
 @asynccontextmanager
