@@ -288,7 +288,7 @@ _ADMIN_HTML = r"""
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Cloud Gateway Admin</title>
+  <title>Model Gateway Admin</title>
   <style>
     :root { color-scheme: dark; --bg:#0b1020; --panel:#121a2f; --muted:#94a3b8; --text:#e5e7eb; --ok:#34d399; --warn:#f59e0b; --bad:#fb7185; --line:#26324c; }
     * { box-sizing: border-box; }
@@ -318,7 +318,7 @@ _ADMIN_HTML = r"""
 <body>
   <header>
     <div>
-      <h1>Cloud Gateway</h1>
+      <h1>Model Gateway</h1>
       <p>Local model router admin: provider status, model inventory, config validation, and debug entry points.</p>
     </div>
     <div class="toolbar">
@@ -386,7 +386,7 @@ _ADMIN_HTML = r"""
 
     <section class="card">
       <h2>Debug</h2>
-      <p>Existing reasoning matrix: <a href="/v1/debug/thinking">/v1/debug/thinking</a>. If client auth is enabled, open it with an admin/client key-capable HTTP client.</p>
+      <p>Existing reasoning matrix: <a id="thinkingLink" href="/v1/debug/thinking">/v1/debug/thinking</a>. If client auth is enabled, open it with an admin/client key-capable HTTP client.</p>
       <pre id="errors" class="muted"></pre>
     </section>
 
@@ -415,10 +415,18 @@ _ADMIN_HTML = r"""
   </main>
 <script>
 const keyInput = document.getElementById('adminKey');
+const BASE_PATH = (() => {
+  const marker = '/admin';
+  const path = window.location.pathname;
+  const idx = path.indexOf(marker);
+  return idx > 0 ? path.slice(0, idx).replace(/\/$/, '') : '';
+})();
+function api(path){ return BASE_PATH + path; }
+document.getElementById('thinkingLink').href = api('/v1/debug/thinking');
 function headers(){ const key = keyInput.value.trim(); return key ? {'Authorization':'Bearer '+key} : {}; }
 function escapeHtml(value){ return text(value).replace(/[&<>'"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch])); }
 async function get(path){
-  const res = await fetch(path, {headers: headers()});
+  const res = await fetch(api(path), {headers: headers()});
   if(!res.ok) throw new Error(path + ' -> HTTP ' + res.status + ': ' + await res.text());
   return res.json();
 }
@@ -467,7 +475,7 @@ loadAll();
 async function send(method, path, body){
   const opts = {method, headers: headers()};
   if (body !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
-  const res = await fetch(path, opts);
+  const res = await fetch(api(path), opts);
   const txt = await res.text();
   let j = null; try { j = JSON.parse(txt); } catch(e) { j = {raw: txt}; }
   if (!res.ok) throw new Error((j && j.error && j.error.message) || txt || ('HTTP '+res.status));
