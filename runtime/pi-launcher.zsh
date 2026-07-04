@@ -1130,15 +1130,15 @@ pi-openai() {
   echo "Pi → OpenAI subscription (ChatGPT Plus/Pro via /login OAuth)"
   _ls99_with_ai_env \
     pi \
-    openai \
-    "openai-subscription" \
-    "openai" \
+    openai-codex \
+    "gpt-5.5" \
+    "openai-codex" \
     "pi-openai" \
     env \
       -u PI_CODING_AGENT_DIR \
       -u OPENAI_API_KEY \
       -u OPENAI_BASE_URL \
-      pi --provider openai "$@"
+      pi --provider openai-codex "$@"
 }
 
 # Auto-generate pi-<alias>() for each model
