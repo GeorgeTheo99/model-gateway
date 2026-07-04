@@ -2114,6 +2114,11 @@ async def _handle_streaming(
     endpoint: str, openai_req: dict, model: str, headers: dict, has_tools: bool, thinking_enabled: bool,
 ):
     openai_req["stream"] = True
+    # Request a final usage chunk so the stream translator can capture token
+    # counts for the ledger. Without this, OpenAI-compatible providers (e.g.
+    # Fireworks) omit usage from the SSE stream and every streaming request
+    # records 0 tokens / $0 cost.
+    openai_req["stream_options"] = {"include_usage": True}
 
     client = httpx.AsyncClient(timeout=300)
     try:
