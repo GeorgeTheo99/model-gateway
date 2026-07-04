@@ -250,8 +250,56 @@ def test_upsert_model_allows_local_omlx_id(tmp_config, monkeypatch):
 def client(tmp_config, monkeypatch):
     config_io.log_dir = tmp_config / "logs"
     monkeypatch.setenv("MODEL_GATEWAY_ADMIN_KEY", "admin")
+    monkeypatch.setenv("MODEL_GATEWAY_ADMIN_WRITES", "true")
     with TestClient(app) as c:
         yield c
+
+
+@pytest.fixture
+def client_readonly(tmp_config, monkeypatch):
+    """Admin auth on, but writes disabled (the default read-only dashboard)."""
+    config_io.log_dir = tmp_config / "logs"
+    monkeypatch.setenv("MODEL_GATEWAY_ADMIN_KEY", "admin")
+    monkeypatch.delenv("MODEL_GATEWAY_ADMIN_WRITES", raising=False)
+    with TestClient(app) as c:
+        yield c
+
+
+def test_admin_writes_disabled_blocks_management(client_readonly):
+    """With MODEL_GATEWAY_ADMIN_WRITES unset, mutating endpoints return 403."""
+    h = {"Authorization": "Bearer admin"}
+    # Provider writes
+    assert client_readonly.post("/admin/api/providers/openai", headers=h, json={"base_url": "u"}).status_code == 403
+    assert client_readonly.delete("/admin/api/providers/anthropic", headers=h).status_code == 403
+    assert client_readonly.post("/admin/api/providers/anthropic/validate", headers=h).status_code == 403
+    # Model writes
+    assert client_readonly.post("/admin/api/models/new", headers=h, json={"provider": "openai", "provider_model_id": "x"}).status_code == 403
+    assert client_readonly.delete("/admin/api/models/claude-test", headers=h).status_code == 403
+    assert client_readonly.post("/admin/api/models/claude-test/disable", headers=h).status_code == 403
+    assert client_readonly.post("/admin/api/models/claude-test/enable", headers=h).status_code == 403
+    # Reload is also gated
+    assert client_readonly.post("/admin/api/reload", headers=h).status_code == 403
+    # Read-only endpoints still work
+    assert client_readonly.get("/admin/api/status", headers=h).status_code == 200
+    assert client_readonly.get("/admin/api/providers", headers=h).status_code == 200
+    assert client_readonly.get("/admin/api/models", headers=h).status_code == 200
+    assert client_readonly.get("/admin/api/models/claude-test/stats", headers=h).status_code == 200
+
+
+def test_admin_status_reports_writes_enabled_true(client):
+    h = {"Authorization": "Bearer admin"}
+    assert client.get("/admin/api/status", headers=h).json()["writes_enabled"] is True
+
+
+def test_admin_status_reports_writes_enabled_false(client_readonly):
+    h = {"Authorization": "Bearer admin"}
+    assert client_readonly.get("/admin/api/status", headers=h).json()["writes_enabled"] is False
+
+
+def test_admin_writes_require_admin_auth(client_readonly):
+    """Writes gate runs after auth: no key -> 401, not 403."""
+    assert client_readonly.post("/admin/api/reload").status_code == 401
+    assert client_readonly.post("/admin/api/models/x", json={"provider": "p", "provider_model_id": "y"}).status_code == 401
 
 
 def test_admin_upsert_provider_endpoint(client):

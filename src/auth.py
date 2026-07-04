@@ -23,6 +23,7 @@ class AuthMode:
     client_key_count: int
     admin_key_configured: bool
     unsafe_admin_without_key: bool
+    writes_enabled: bool
     warning: str
 
 
@@ -97,6 +98,16 @@ def _unsafe_admin_without_key_enabled() -> bool:
     return _truthy_env("MODEL_GATEWAY_ALLOW_UNAUTHENTICATED_ADMIN")
 
 
+def admin_writes_enabled() -> bool:
+    """Whether the admin UI may mutate providers/models/config.
+
+    Defaults to False (read-only dashboard). Enable with
+    MODEL_GATEWAY_ADMIN_WRITES=true for explicit write access. This gates the
+    writeable management endpoints and hides the management UI forms.
+    """
+    return _truthy_env("MODEL_GATEWAY_ADMIN_WRITES")
+
+
 def auth_mode() -> AuthMode:
     client_keys = _client_keys()
     admin_keys = _admin_keys()
@@ -116,6 +127,7 @@ def auth_mode() -> AuthMode:
         client_key_count=len(client_keys),
         admin_key_configured=bool(admin_keys),
         unsafe_admin_without_key=unsafe_admin and not admin_keys,
+        writes_enabled=admin_writes_enabled(),
         warning=warning,
     )
 
@@ -152,3 +164,16 @@ def require_admin_auth(request: Request) -> None:
     if _matches(_extract_token(request), keys):
         return
     raise HTTPException(status_code=401, detail="Missing or invalid model-gateway admin key")
+
+
+def require_admin_writes() -> None:
+    """Gate mutating admin endpoints behind MODEL_GATEWAY_ADMIN_WRITES.
+
+    Raises 403 when writes are disabled (the default read-only dashboard).
+    Call after require_admin_auth so auth is still enforced first.
+    """
+    if not admin_writes_enabled():
+        raise HTTPException(
+            status_code=403,
+            detail="admin writes are disabled; set MODEL_GATEWAY_ADMIN_WRITES=true to manage providers/models",
+        )

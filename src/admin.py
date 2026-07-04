@@ -8,7 +8,7 @@ import time
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 
-from src.auth import auth_mode, require_admin_auth
+from src.auth import admin_writes_enabled, auth_mode, require_admin_auth, require_admin_writes
 from src.providers import (
     CONFIG_PATH,
     MODEL_INFO_PATH,
@@ -40,6 +40,7 @@ async def admin_status(request: Request):
         "uptime_seconds": round(time.time() - _STARTED_AT, 3),
         "model_info_path": str(MODEL_INFO_PATH),
         "config_path": str(CONFIG_PATH),
+        "writes_enabled": mode.writes_enabled,
         "auth": {
             "client_auth_enabled": mode.client_auth_enabled,
             "admin_auth_enabled": mode.admin_auth_enabled,
@@ -72,6 +73,7 @@ async def admin_config_validation(request: Request):
 @router.post("/admin/api/reload")
 async def admin_reload(request: Request):
     require_admin_auth(request)
+    require_admin_writes()
     reload_provider_registry()
     return {"status": "ok", "message": "provider registry reloaded"}
 
@@ -198,6 +200,7 @@ async def admin_upsert_provider(provider_id: str, request: Request):
     provider registry after writing.
     """
     require_admin_auth(request)
+    require_admin_writes()
     try:
         body = await request.json()
     except Exception:
@@ -221,6 +224,7 @@ async def admin_upsert_provider(provider_id: str, request: Request):
 async def admin_delete_provider(provider_id: str, request: Request):
     """Remove a provider. Refuses if enabled models depend on it."""
     require_admin_auth(request)
+    require_admin_writes()
     try:
         result = config_io.delete_provider(provider_id)
     except KeyError as exc:
@@ -238,6 +242,7 @@ async def admin_validate_provider(provider_id: str, request: Request):
     Read-only upstream probe. Returns {ok, status_code, model_count?, error?}.
     """
     require_admin_auth(request)
+    require_admin_writes()
     import httpx
     import src.providers as providers
 
@@ -286,6 +291,7 @@ async def admin_upsert_model(model_name: str, request: Request):
     Writes deploy to the live catalog + source-repo mirror; reloads registry.
     """
     require_admin_auth(request)
+    require_admin_writes()
     try:
         body = await request.json()
     except Exception:
@@ -303,6 +309,7 @@ async def admin_upsert_model(model_name: str, request: Request):
 async def admin_delete_model(model_name: str, request: Request):
     """Remove a model entry by name."""
     require_admin_auth(request)
+    require_admin_writes()
     try:
         result = config_io.delete_model(model_name)
     except KeyError as exc:
@@ -314,6 +321,7 @@ async def admin_delete_model(model_name: str, request: Request):
 @router.post("/admin/api/models/{model_name}/enable")
 async def admin_enable_model(model_name: str, request: Request):
     require_admin_auth(request)
+    require_admin_writes()
     try:
         result = config_io.set_model_enabled(model_name, True)
     except KeyError as exc:
@@ -325,6 +333,7 @@ async def admin_enable_model(model_name: str, request: Request):
 @router.post("/admin/api/models/{model_name}/disable")
 async def admin_disable_model(model_name: str, request: Request):
     require_admin_auth(request)
+    require_admin_writes()
     try:
         result = config_io.set_model_enabled(model_name, False)
     except KeyError as exc:
@@ -590,6 +599,12 @@ _ADMIN_HTML = r"""
     .bymodel-clickable { cursor: pointer; }
     .bymodel-clickable:hover td { background: var(--accent-soft); color: var(--text); }
     .loading-bar { font-size: 12px; color: var(--muted); padding: 8px 0; }
+
+    /* ── Read-only mode (writes disabled) ─────────────────────── */
+    body[data-writes="false"] .formset { display: none; }
+    body[data-writes="false"] [data-mgmt] { display: none; }
+    body[data-writes="false"] .mgmt-hint { display: block; }
+    .mgmt-hint { display: none; font-size: 12px; color: var(--muted); padding: 2px 0; }
   </style>
 </head>
 <body>
@@ -653,6 +668,7 @@ _ADMIN_HTML = r"""
             <p class="hint">The api_key is write-only: leave blank to keep the existing key. Provider config lives in the gitignored config.yaml and persists across deploys.</p>
           </div>
         </details>
+        <p class="mgmt-hint">Provider management is read-only. Set <code>MODEL_GATEWAY_ADMIN_WRITES=true</code> to add or edit providers.</p>
       </section>
 
       <section>
@@ -687,6 +703,7 @@ _ADMIN_HTML = r"""
             <p class="hint">Writes are hot (immediate) and mirrored to the source repo, pending a commit. Fetch pricing from the official provider via the add-model workflow. Disabled models are hidden from /v1/models.</p>
           </div>
         </details>
+        <p class="mgmt-hint">Model management is read-only. Set <code>MODEL_GATEWAY_ADMIN_WRITES=true</code> to add or edit models.</p>
       </section>
 
       <section>
@@ -799,6 +816,7 @@ _ADMIN_HTML = r"""
   }
 
   function renderHealth(status, providerRows, modelRows, validation){
+    document.body.setAttribute('data-writes', String(status.writes_enabled === true));
     document.getElementById('sService').textContent = status.status || '—';
     document.getElementById('sService').className = 'value ' + (status.status === 'ok' ? 'ok-c' : 'bad-c');
     document.getElementById('sServiceDetail').textContent = 'pid ' + status.pid + ' · admin auth ' + (status.auth.admin_auth_enabled ? 'on' : 'off') + ' · client auth ' + (status.auth.client_auth_enabled ? 'on' : 'off');
@@ -823,7 +841,7 @@ _ADMIN_HTML = r"""
       const issues = (p.issues||[]).map(i => idPill(i)).join(' ') || '<span class="muted">—</span>';
       const state = ready ? statePill('ok','ready') : statePill('warn','config');
       const keyCell = p.has_api_key ? '<span class="ok-c">present</span>' : '<span class="bad-c">missing</span>';
-      return '<tr><td>'+idPill(p.id)+'</td><td class="num">'+escapeHtml(p.enabled_models)+'</td><td>'+escapeHtml(p.protocol)+'</td><td class="id">'+escapeHtml(p.base_url)+'</td><td>'+keyCell+'</td><td>'+state+'</td><td>'+issues+'</td><td><button class="btn secondary" data-edit-provider="'+escapeHtml(p.id)+'">edit</button></td></tr>';
+      return '<tr><td>'+idPill(p.id)+'</td><td class="num">'+escapeHtml(p.enabled_models)+'</td><td>'+escapeHtml(p.protocol)+'</td><td class="id">'+escapeHtml(p.base_url)+'</td><td>'+keyCell+'</td><td>'+state+'</td><td>'+issues+'</td><td><button class="btn secondary" data-mgmt data-edit-provider="'+escapeHtml(p.id)+'">edit</button></td></tr>';
     }).join('') || '<tr class="empty"><td colspan="8">No providers configured.</td></tr>';
   }
 
@@ -849,7 +867,7 @@ _ADMIN_HTML = r"""
         const up = escapeHtml(m.provider_model_id || m.omlx_id || m.name || '');
         const th = escapeHtml(m.thinking || m.thinking_format || '');
         const state = en ? statePill('ok','on') : statePill('bad','off');
-        const toggle = '<button class="btn secondary" data-toggle-model="'+nm+'" data-enable="'+(!en)+'">'+(en?'disable':'enable')+'</button> <button class="btn secondary" data-edit-model="'+nm+'">edit</button>';
+        const toggle = '<button class="btn secondary" data-mgmt data-toggle-model="'+nm+'" data-enable="'+(!en)+'">'+(en?'disable':'enable')+'</button> <button class="btn secondary" data-mgmt data-edit-model="'+nm+'">edit</button>';
         parts.push('<tr class="clickable-row" data-open-model="'+nm+'"><td>'+idPill(m.name || m.id)+'</td><td class="id">'+up+'</td><td>'+escapeHtml(m.provider)+'</td><td class="num">'+escapeHtml(m.context)+'</td><td class="num">'+escapeHtml(m.max_output_tokens)+'</td><td>'+th+'</td><td>'+(m.vision?'yes':'no')+'</td><td>'+state+'</td><td>'+toggle+'</td></tr>');
       }
     }
@@ -1028,7 +1046,7 @@ _ADMIN_HTML = r"""
     const kv = (k, v) => '<div class="kv-item"><span class="k">'+k+'</span><span class="v">'+v+'</span></div>';
     let html = '<div class="detail-head"><h3>'+idPill(name)+'</h3>';
     html += '<div class="toolbar"><span class="meta">'+escapeHtml(m.provider||'—')+' · '+(en?statePill('ok','on'):statePill('bad','off'))+'</span>';
-    html += '<button class="btn secondary" data-edit-model="'+escapeHtml(name)+'">Edit</button>';
+    html += '<button class="btn secondary" data-mgmt data-edit-model="'+escapeHtml(name)+'">Edit</button>';
     html += '<button class="close" type="button" data-close-detail aria-label="Close">×</button></div></div>';
     // Cost callout
     html += '<div class="cost-callout"><span class="cost-value">'+cost+'</span><span class="cost-label">estimated cost · '+escapeHtml(winLabel)+' · priced rows only</span></div>';
