@@ -850,14 +850,14 @@
         "intent": "Always-hot local voice/control latency and cheapest cloud fallback.",
         "local": {
           "text_model": "qwen3.5-9b",
-          "vision_model": "qwen3.6-35b",
-          "residency_group": "local-ultra-qwen9-qwen36-35b",
-          "residency_mode": "co_resident_pair",
-          "designed_memory_gb": 45,
+          "vision_model": "qwen3.5-9b",
+          "residency_group": "local-ultra-qwen9",
+          "residency_mode": "single_model",
+          "designed_memory_gb": 10,
           "text_memory_gb": 10,
-          "vision_memory_gb": 35,
+          "vision_memory_gb": 10,
           "keep_hot": true,
-          "description": "Qwen 3.5 9B for local voice/control; Qwen 3.6 35B VL for local vision"
+          "description": "Qwen 3.5 9B VL only for local ultra-fast text and vision; no large vision fallback"
         },
         "cloud": {
           "text_model": "glm-5-zai-turbo",

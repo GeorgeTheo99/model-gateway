@@ -55,6 +55,10 @@ def test_admin_presets_endpoint_is_read_only_and_auth_protected(monkeypatch):
     body = resp.json()
     assert body["auto_models"]["cloud"]["vision_model"] == "qwen3.7-plus-fw"
     assert body["model_presets"]["presets"]["best"]["cloud"]["vision_model"] == "qwen3.7-plus-fw"
+    ultra_local = body["model_presets"]["presets"]["ultra_fast"]["local"]
+    assert ultra_local["text_model"] == "qwen3.5-9b"
+    assert ultra_local["vision_model"] == "qwen3.5-9b"
+    assert ultra_local["residency_mode"] == "single_model"
 
 
 def test_admin_provider_status_never_exposes_secret_values(monkeypatch):
