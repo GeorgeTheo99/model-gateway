@@ -625,9 +625,9 @@
     },
     "local": {
       "model": "glm-5.2-4.5bit",
-      "vision_model": "qwen3.5-397b",
+      "vision_model": "qwen3.6-27b",
       "label": "Best",
-      "description": "GLM 5.2 local 4.5-bit for agentic coding; cold-switch to Qwen 3.5 397B VL for vision"
+      "description": "GLM 5.2 local 4.5-bit for agentic coding; Qwen 3.6 27B VL for fast local vision"
     }
   },
   "model_presets": {
@@ -639,19 +639,19 @@
     "presets": {
       "best": {
         "label": "Best",
-        "intent": "Max-quality agentic chat/coding; local vision is an explicit cold modality switch.",
+        "intent": "Max-quality agentic chat/coding with fast co-resident local vision.",
         "local": {
           "text_model": "glm-5.2-4.5bit",
-          "vision_model": "qwen3.5-397b",
-          "residency_group": "local-best-exclusive",
-          "residency_mode": "exclusive_by_modality",
+          "vision_model": "qwen3.6-27b",
+          "residency_group": "local-best-glm52-qwen36-27b",
+          "residency_mode": "co_resident_pair",
           "designed_memory_gb": 422,
           "text_memory_gb": 392,
-          "vision_memory_gb": 422,
+          "vision_memory_gb": 30,
           "allow_parallel_resident": [
             "qwen3.5-9b"
           ],
-          "description": "GLM 5.2 local 4.5-bit for agentic coding; cold-switch to Qwen 3.5 397B VL for images"
+          "description": "GLM 5.2 local 4.5-bit for agentic coding; Qwen 3.6 27B VL for fast local images"
         },
         "cloud": {
           "text_model": "glm-5.2-zai",
