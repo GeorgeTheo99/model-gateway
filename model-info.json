@@ -93,7 +93,8 @@
       "alias": "qwen35tinyvl",
       "context": 262144,
       "max_output_tokens": 32768,
-      "desc": "qwen3.5-9B VL 8-bit"
+      "desc": "qwen3.5-9B VL 8-bit",
+      "vision": true
     },
     {
       "name": "qwen3.6-35b",
