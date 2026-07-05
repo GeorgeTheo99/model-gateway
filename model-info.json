@@ -790,9 +790,9 @@
     },
     "local": {
       "model": "glm-5.2-4.5bit",
-      "vision_model": "qwen3.6-27b",
+      "vision_model": "qwen3.6-35b",
       "label": "Best",
-      "description": "GLM 5.2 local 4.5-bit for agentic coding; Qwen 3.6 27B VL for fast local vision"
+      "description": "GLM 5.2 local 4.5-bit for agentic coding; Qwen 3.6 35B VL for fast local vision"
     }
   },
   "model_presets": {
@@ -807,16 +807,16 @@
         "intent": "Max-quality agentic chat/coding with fast co-resident local vision.",
         "local": {
           "text_model": "glm-5.2-4.5bit",
-          "vision_model": "qwen3.6-27b",
-          "residency_group": "local-best-glm52-qwen36-27b",
+          "vision_model": "qwen3.6-35b",
+          "residency_group": "local-best-glm52-qwen36-35b",
           "residency_mode": "co_resident_pair",
-          "designed_memory_gb": 422,
+          "designed_memory_gb": 427,
           "text_memory_gb": 392,
-          "vision_memory_gb": 30,
+          "vision_memory_gb": 35,
           "allow_parallel_resident": [
             "qwen3.5-9b"
           ],
-          "description": "GLM 5.2 local 4.5-bit for agentic coding; Qwen 3.6 27B VL for fast local images"
+          "description": "GLM 5.2 local 4.5-bit for agentic coding; Qwen 3.6 35B VL for fast local images"
         },
         "cloud": {
           "text_model": "glm-5.2-zai",
@@ -850,12 +850,14 @@
         "intent": "Always-hot local voice/control latency and cheapest cloud fallback.",
         "local": {
           "text_model": "qwen3.5-9b",
-          "vision_model": "qwen3.5-9b",
-          "residency_group": "local-ultra-qwen9",
-          "residency_mode": "single_keep_hot",
-          "designed_memory_gb": 10,
+          "vision_model": "qwen3.6-35b",
+          "residency_group": "local-ultra-qwen9-qwen36-35b",
+          "residency_mode": "co_resident_pair",
+          "designed_memory_gb": 45,
+          "text_memory_gb": 10,
+          "vision_memory_gb": 35,
           "keep_hot": true,
-          "description": "Qwen 3.5 9B VL for local voice/control and very fast chat"
+          "description": "Qwen 3.5 9B for local voice/control; Qwen 3.6 35B VL for local vision"
         },
         "cloud": {
           "text_model": "glm-5-zai-turbo",
