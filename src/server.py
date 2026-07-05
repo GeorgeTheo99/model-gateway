@@ -885,6 +885,7 @@ async def list_models(request: Request):
             "thinking_levels": caps["gateway_levels"],
             "max_reachable": caps["max_reachable"],
             "forwarded_params": caps["forwarded_params"],
+            "vision": bool(m.get("vision")),
         })
     return {"object": "list", "data": data}
 

@@ -347,6 +347,23 @@
       }
     },
     {
+      "name": "qwen3.7-plus-fw",
+      "params": "1T+",
+      "provider": "fireworks",
+      "provider_model_id": "accounts/fireworks/models/qwen3p7-plus",
+      "alias": "qwen37fw",
+      "context": 262144,
+      "max_output_tokens": 65536,
+      "thinking": "optional",
+      "vision": true,
+      "desc": "Qwen3.7 Plus on Fireworks, multimodal agent model, 262k context / 64k max output - vision fallback",
+      "pricing": {
+        "input": 0.4,
+        "output": 1.6,
+        "cache_read": 0.08
+      }
+    },
+    {
       "name": "gemini-3.1-pro",
       "provider": "openrouter",
       "provider_model_id": "google/gemini-3.1-pro-preview",
@@ -594,6 +611,93 @@
       "max_tokens": 4096,
       "temperature": 0.2,
       "thinking": true
+    }
+  },
+  "auto_models": {
+    "default_scope": "cloud",
+    "default_tier": "best",
+    "cloud": {
+      "model": "glm-5.2-zai",
+      "vision_model": "gemini-3.1-pro",
+      "label": "Best",
+      "description": "GLM 5.2 (Z.ai) for agentic chat/coding; Gemini 3.1 Pro for vision"
+    },
+    "local": {
+      "model": "glm-5.2-4.5bit",
+      "vision_model": "qwen3.5-397b",
+      "label": "Best",
+      "description": "GLM 5.2 local 4.5-bit for agentic coding; cold-switch to Qwen 3.5 397B VL for vision"
+    }
+  },
+  "model_presets": {
+    "version": 1,
+    "default_scope": "cloud",
+    "default_tier": "best",
+    "memory_budget_gb": 512,
+    "note": "Gateway-owned chat presets. Local presets describe designed residency packs; HA/voice choose presets and gateway owns load/evict behavior.",
+    "presets": {
+      "best": {
+        "label": "Best",
+        "intent": "Max-quality agentic chat/coding; local vision is an explicit cold modality switch.",
+        "local": {
+          "text_model": "glm-5.2-4.5bit",
+          "vision_model": "qwen3.5-397b",
+          "residency_group": "local-best-exclusive",
+          "residency_mode": "exclusive_by_modality",
+          "designed_memory_gb": 422,
+          "text_memory_gb": 392,
+          "vision_memory_gb": 422,
+          "allow_parallel_resident": [
+            "qwen3.5-9b"
+          ],
+          "description": "GLM 5.2 local 4.5-bit for agentic coding; cold-switch to Qwen 3.5 397B VL for images"
+        },
+        "cloud": {
+          "text_model": "glm-5.2-zai",
+          "vision_model": "gemini-3.1-pro",
+          "source_policy": "best_quality",
+          "description": "GLM 5.2 (Z.ai) for agentic chat/coding; Gemini 3.1 Pro for best cloud vision"
+        }
+      },
+      "fast": {
+        "label": "Fast",
+        "intent": "Responsive chat while staying cost/latency conscious.",
+        "local": {
+          "text_model": "deepseek-v4-flash-mlx",
+          "vision_model": "qwen3.6-35b",
+          "residency_group": "local-fast-dsv4-qwen36",
+          "residency_mode": "co_resident_pair",
+          "designed_memory_gb": 180,
+          "text_memory_gb": 145,
+          "vision_memory_gb": 35,
+          "description": "DeepSeek V4 Flash MLX for chat; Qwen 3.6 35B VL for images"
+        },
+        "cloud": {
+          "text_model": "deepseek-v4-flash-or",
+          "vision_model": "qwen3.7-plus-fw",
+          "source_policy": "latency_cost_oss",
+          "description": "DeepSeek V4 Flash via OpenRouter for cheap fast chat; Qwen3.7 Plus for OSS-first vision"
+        }
+      },
+      "ultra_fast": {
+        "label": "Ultra Fast",
+        "intent": "Always-hot local voice/control latency and cheapest cloud fallback.",
+        "local": {
+          "text_model": "qwen3.5-9b",
+          "vision_model": "qwen3.5-9b",
+          "residency_group": "local-ultra-qwen9",
+          "residency_mode": "single_keep_hot",
+          "designed_memory_gb": 10,
+          "keep_hot": true,
+          "description": "Qwen 3.5 9B VL for local voice/control and very fast chat"
+        },
+        "cloud": {
+          "text_model": "glm-5-zai-turbo",
+          "vision_model": "gemini-3-flash",
+          "source_policy": "minimum_latency_cost",
+          "description": "GLM 5 Turbo for low-latency cheap cloud chat; Gemini 3 Flash for fast cloud vision"
+        }
+      }
     }
   }
 }
