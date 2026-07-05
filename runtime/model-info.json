@@ -357,7 +357,7 @@
       "max_output_tokens": 65536,
       "thinking": "optional",
       "vision": true,
-      "desc": "Qwen3.7 Plus on Fireworks, multimodal agent model, 262k context / 64k max output - vision fallback",
+      "desc": "Qwen3.7 Plus on Fireworks, multimodal agent model, 262k context / 64k max output - dedicated cloud vision",
       "pricing": {
         "input": 0.4,
         "output": 1.6,
@@ -619,9 +619,9 @@
     "default_tier": "best",
     "cloud": {
       "model": "glm-5.2-zai",
-      "vision_model": "gemini-3.1-pro",
+      "vision_model": "qwen3.7-plus-fw",
       "label": "Best",
-      "description": "GLM 5.2 (Z.ai) for agentic chat/coding; Gemini 3.1 Pro for vision"
+      "description": "GLM 5.2 (Z.ai) for agentic chat/coding; Qwen3.7 Plus for dedicated cloud vision"
     },
     "local": {
       "model": "glm-5.2-4.5bit",
@@ -655,9 +655,9 @@
         },
         "cloud": {
           "text_model": "glm-5.2-zai",
-          "vision_model": "gemini-3.1-pro",
-          "source_policy": "best_quality",
-          "description": "GLM 5.2 (Z.ai) for agentic chat/coding; Gemini 3.1 Pro for best cloud vision"
+          "vision_model": "qwen3.7-plus-fw",
+          "source_policy": "best_quality_cost_controlled",
+          "description": "GLM 5.2 (Z.ai) for agentic chat/coding; Qwen3.7 Plus for dedicated cloud vision"
         }
       },
       "fast": {
