@@ -46,6 +46,17 @@ def test_admin_auth_requires_configured_admin_key(monkeypatch):
     assert resp.json()["auth"]["admin_auth_enabled"] is True
 
 
+def test_admin_presets_endpoint_is_read_only_and_auth_protected(monkeypatch):
+    monkeypatch.setenv("MODEL_GATEWAY_ADMIN_KEY", "admin-key")
+
+    assert client.get("/admin/api/presets").status_code == 401
+    resp = client.get("/admin/api/presets", headers={"Authorization": "Bearer admin-key"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["auto_models"]["cloud"]["vision_model"] == "qwen3.7-plus-fw"
+    assert body["model_presets"]["presets"]["best"]["cloud"]["vision_model"] == "qwen3.7-plus-fw"
+
+
 def test_admin_provider_status_never_exposes_secret_values(monkeypatch):
     monkeypatch.delenv("MODEL_GATEWAY_ADMIN_KEY", raising=False)
     monkeypatch.setenv("MODEL_GATEWAY_ALLOW_UNAUTHENTICATED_ADMIN", "true")

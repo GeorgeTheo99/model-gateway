@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
 
@@ -62,6 +63,21 @@ async def admin_providers(request: Request):
 async def admin_models(request: Request):
     require_admin_auth(request)
     return {"models": model_status()}
+
+
+@router.get("/admin/api/presets")
+async def admin_presets(request: Request):
+    """Read-only gateway-owned model aggregate/preset definitions."""
+    require_admin_auth(request)
+    if not MODEL_INFO_PATH.exists():
+        return {"auto_models": {}, "model_presets": {}, "routing_profiles": {}}
+    with open(MODEL_INFO_PATH) as f:
+        data = json.load(f)
+    return {
+        "auto_models": data.get("auto_models") or {},
+        "model_presets": data.get("model_presets") or {},
+        "routing_profiles": data.get("routing_profiles") or {},
+    }
 
 
 @router.get("/admin/api/config/validation")
@@ -554,6 +570,19 @@ _ADMIN_HTML = r"""
     .seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
     .seg button:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--accent-soft); }
 
+    /* ── Tabs ────────────────────────────────────────────────── */
+    .tabs { display: flex; gap: 6px; flex-wrap: wrap; border-bottom: 1px solid var(--rule); padding-bottom: 8px; }
+    .tab {
+      appearance: none; border: 1px solid var(--rule); background: var(--surface); color: var(--text-2);
+      border-radius: 999px; padding: 7px 12px; font: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+    }
+    .tab:hover { background: var(--surface-2); color: var(--text); }
+    .tab[aria-selected="true"] { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: grid; }
+    .linklike { appearance: none; border: 0; background: transparent; padding: 0; color: inherit; font: inherit; cursor: pointer; }
+    .linklike:hover .pill { border-color: var(--accent); color: var(--accent); }
+
     /* ── States: locked, loading, empty, error ───────────────── */
     .locked {
       display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px;
@@ -599,6 +628,10 @@ _ADMIN_HTML = r"""
     .bymodel-clickable { cursor: pointer; }
     .bymodel-clickable:hover td { background: var(--accent-soft); color: var(--text); }
     .loading-bar { font-size: 12px; color: var(--muted); padding: 8px 0; }
+    .preset-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+    .preset-card { border: 1px solid var(--rule); border-radius: var(--radius); background: var(--surface); padding: 13px 14px; display: grid; gap: 8px; }
+    .preset-card h3 { font-size: 14px; }
+    .small { font-size: 12px; color: var(--muted); }
 
     /* ── Read-only mode (writes disabled) ─────────────────────── */
     body[data-writes="false"] .formset { display: none; }
@@ -646,7 +679,15 @@ _ADMIN_HTML = r"""
         </div>
       </section>
 
-      <section>
+      <nav class="tabs" role="tablist" aria-label="Admin sections">
+        <button class="tab" role="tab" type="button" data-tab="presets" aria-selected="true">Presets</button>
+        <button class="tab" role="tab" type="button" data-tab="models" aria-selected="false">Models</button>
+        <button class="tab" role="tab" type="button" data-tab="providers" aria-selected="false">Providers</button>
+        <button class="tab" role="tab" type="button" data-tab="usage" aria-selected="false">Usage</button>
+        <button class="tab" role="tab" type="button" data-tab="debug" aria-selected="false">Debug</button>
+      </nav>
+
+      <section class="tab-panel" data-tab-panel="providers" role="tabpanel">
         <div class="sec-head"><h2>Providers</h2><span class="meta">config.yaml readiness</span></div>
         <div class="scroll">
           <table id="providers"><thead><tr><th>ID</th><th class="num">Models</th><th>Protocol</th><th>Base URL</th><th>Key</th><th>State</th><th>Issues</th><th></th></tr></thead><tbody></tbody></table>
@@ -671,7 +712,7 @@ _ADMIN_HTML = r"""
         <p class="mgmt-hint">Provider management is read-only. Set <code>MODEL_GATEWAY_ADMIN_WRITES=true</code> to add or edit providers.</p>
       </section>
 
-      <section>
+      <section class="tab-panel" data-tab-panel="models" role="tabpanel">
         <div class="sec-head"><h2>Models</h2><span class="meta" id="modelsMeta">grouped local / cloud</span></div>
         <div class="scroll">
           <table id="models"><thead><tr><th>Name</th><th>Upstream id</th><th>Provider</th><th class="num">Context</th><th class="num">Max out</th><th>Thinking</th><th>Vision</th><th>State</th><th></th></tr></thead><tbody></tbody></table>
@@ -706,7 +747,16 @@ _ADMIN_HTML = r"""
         <p class="mgmt-hint">Model management is read-only. Set <code>MODEL_GATEWAY_ADMIN_WRITES=true</code> to add or edit models.</p>
       </section>
 
-      <section>
+      <section class="tab-panel active" data-tab-panel="presets" role="tabpanel">
+        <div class="sec-head"><h2>Presets</h2><span class="meta" id="presetsMeta">read-only model aggregates</span></div>
+        <div id="presetSummary" class="preset-summary"></div>
+        <div class="scroll">
+          <table id="presets"><thead><tr><th>Tier</th><th>Scope</th><th>Text model</th><th>Vision model</th><th>Policy / residency</th><th>Memory</th><th>Description</th></tr></thead><tbody></tbody></table>
+        </div>
+        <p class="hint">Presets are gateway-owned aggregates. This page is read-only for now; consumers should choose these aggregate IDs instead of duplicating text/vision pairing logic.</p>
+      </section>
+
+      <section class="tab-panel" data-tab-panel="usage" role="tabpanel">
         <div class="sec-head"><h2>Usage &amp; cost</h2>
           <div class="toolbar">
             <div class="seg" id="winSeg" role="group" aria-label="Time window">
@@ -731,7 +781,7 @@ _ADMIN_HTML = r"""
         <div id="usageErr" class="inline-err hidden"></div>
       </section>
 
-      <section>
+      <section class="tab-panel" data-tab-panel="debug" role="tabpanel">
         <div class="sec-head"><h2>Debug</h2><span class="meta">read-only probes</span></div>
         <p class="hint">Reasoning matrix: <a id="thinkingLink" href="/v1/debug/thinking">/v1/debug/thinking</a>. If client auth is enabled, open it with a key-capable HTTP client.</p>
         <div id="dashErr" class="inline-err hidden"></div>
@@ -762,6 +812,7 @@ _ADMIN_HTML = r"""
 
   let unlocked = false;
   let currentWindow = '24h';
+  let currentTab = 'presets';
   let _modelsCache = [];  // deduped model rows, for resolving ledger dims to model names
 
   function headers(){ const key = keyInput.value.trim(); return key ? {'Authorization':'Bearer '+key} : {}; }
@@ -806,12 +857,13 @@ _ADMIN_HTML = r"""
   async function loadHealth(){
     dashErr.classList.add('hidden');
     try {
-      const [status, providers, models, validation] = await Promise.all([
-        get('/admin/api/status'), get('/admin/api/providers'), get('/admin/api/models'), get('/admin/api/config/validation')
+      const [status, providers, models, presets, validation] = await Promise.all([
+        get('/admin/api/status'), get('/admin/api/providers'), get('/admin/api/models'), get('/admin/api/presets'), get('/admin/api/config/validation')
       ]);
       renderHealth(status, providers.providers||[], models.models||[], validation);
       renderProviders(providers.providers||[]);
       renderModels(models.models||[]);
+      renderPresets(presets);
     } catch (e) { handleFatal(e); throw e; }
   }
 
@@ -885,6 +937,67 @@ _ADMIN_HTML = r"""
       if (dim === name || dim === m.alias || dim === m.provider_model_id || dim === m.omlx_id) return name;
     }
     return null;
+  }
+
+  function modelExists(name){ return !!resolveModelName(name); }
+  function modelLink(name){
+    if (!name) return '<span class="muted">—</span>';
+    const exists = modelExists(name);
+    const label = exists ? idPill(name) : '<span class="pill warn"><span class="dot"></span>'+escapeHtml(name)+' missing</span>';
+    return exists ? '<button class="linklike" type="button" data-open-model="'+escapeHtml(name)+'">'+label+'</button>' : label;
+  }
+  function compactList(values){
+    const arr = (values || []).filter(Boolean);
+    return arr.length ? arr.map(v => idPill(v)).join(' ') : '<span class="muted">—</span>';
+  }
+  function renderPresets(data){
+    data = data || {};
+    const auto = data.auto_models || {};
+    const mp = data.model_presets || {};
+    const presets = mp.presets || {};
+    const defaultScope = mp.default_scope || auto.default_scope || '—';
+    const defaultTier = mp.default_tier || auto.default_tier || '—';
+    document.getElementById('presetsMeta').textContent = 'default '+defaultScope+' / '+defaultTier+' · version '+(mp.version || '—');
+
+    const autoCards = [];
+    for (const scope of ['cloud','local']) {
+      const cfg = auto[scope] || {};
+      if (!cfg.model && !cfg.vision_model) continue;
+      autoCards.push('<div class="preset-card"><h3>'+escapeHtml((cfg.label || scope)+' · '+scope)+'</h3>'+
+        '<div class="small">auto_models default pair</div>'+
+        '<div>Text '+modelLink(cfg.model)+'</div>'+
+        '<div>Vision '+modelLink(cfg.vision_model)+'</div>'+
+        '<p class="small">'+escapeHtml(cfg.description || '—')+'</p></div>');
+    }
+    document.getElementById('presetSummary').innerHTML = autoCards.join('') || '<div class="preset-card"><h3>No auto models</h3><p class="small">No auto_models block found.</p></div>';
+
+    const rows = [];
+    const tierNames = Object.keys(presets);
+    for (const tier of tierNames) {
+      const preset = presets[tier] || {};
+      for (const scope of ['cloud','local']) {
+        const cfg = preset[scope] || {};
+        if (!cfg.text_model && !cfg.vision_model) continue;
+        const policy = cfg.source_policy || [cfg.residency_mode, cfg.residency_group].filter(Boolean).join(' · ') || '—';
+        const mem = [
+          cfg.designed_memory_gb != null ? 'designed '+cfg.designed_memory_gb+'GB' : '',
+          cfg.text_memory_gb != null ? 'text '+cfg.text_memory_gb+'GB' : '',
+          cfg.vision_memory_gb != null ? 'vision '+cfg.vision_memory_gb+'GB' : '',
+          cfg.keep_hot ? 'keep hot' : '',
+        ].filter(Boolean).join(' · ') || '—';
+        const extras = cfg.allow_parallel_resident ? '<div class="small">parallel '+compactList(cfg.allow_parallel_resident)+'</div>' : '';
+        rows.push('<tr><td>'+idPill(tier)+'<div class="small">'+escapeHtml(preset.label || '')+'</div></td>'+
+          '<td>'+escapeHtml(scope)+'</td><td>'+modelLink(cfg.text_model)+'</td><td>'+modelLink(cfg.vision_model)+'</td>'+
+          '<td>'+escapeHtml(policy)+extras+'</td><td>'+escapeHtml(mem)+'</td><td>'+escapeHtml(cfg.description || preset.intent || '—')+'</td></tr>');
+      }
+    }
+    document.querySelector('#presets tbody').innerHTML = rows.join('') || '<tr class="empty"><td colspan="7">No presets configured.</td></tr>';
+  }
+
+  function showTab(tab){
+    currentTab = tab || 'presets';
+    for (const b of document.querySelectorAll('[data-tab]')) b.setAttribute('aria-selected', String(b.dataset.tab === currentTab));
+    for (const p of document.querySelectorAll('[data-tab-panel]')) p.classList.toggle('active', p.dataset.tabPanel === currentTab);
   }
 
   // ── Usage ───────────────────────────────────────────────────
@@ -1100,6 +1213,8 @@ _ADMIN_HTML = r"""
   document.addEventListener('click', (e) => {
     const t = e.target;
     if (t.closest && t.closest('[data-close-detail]')) { closeModelDetail(); return; }
+    const tabBtn = t.closest && t.closest('[data-tab]');
+    if (tabBtn) { showTab(tabBtn.dataset.tab); return; }
     // Ignore clicks on buttons inside clickable rows (edit/toggle).
     if (t.tagName === 'BUTTON' && (t.getAttribute('data-edit-model') || t.getAttribute('data-toggle-model') || t.getAttribute('data-edit-provider'))) return;
     const openModel = (t.closest && t.closest('[data-open-model]')) || (t.getAttribute && t.getAttribute('data-open-model') ? t : null);
@@ -1154,6 +1269,7 @@ _ADMIN_HTML = r"""
   // ── Boot ────────────────────────────────────────────────────
   let stored = '';
   try { stored = sessionStorage.getItem(STORAGE_KEY) || ''; } catch(e) {}
+  showTab(currentTab);
   if (stored) { keyInput.value = stored; unlock(); }
   else showLocked();
 })();
