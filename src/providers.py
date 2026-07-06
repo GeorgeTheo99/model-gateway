@@ -75,6 +75,9 @@ _PROVIDER_SYNONYMS = {
     "zhipuai": "zhipuai",
     "zai": "zhipuai",
     "bigmodel": "zhipuai",
+    "databricks": "databricks",
+    "dbx": "databricks",
+    "dbrx": "databricks",
 }
 
 
@@ -107,10 +110,69 @@ def _provider_defaults(provider: str) -> dict:
     return {}
 
 
+def _provider_env_prefix(provider: str) -> str:
+    normalized = "".join(ch if ch.isalnum() else "_" for ch in provider.upper())
+    return f"MODEL_GATEWAY_PROVIDER_{normalized}"
+
+
+def _env_bool(value: str | None) -> bool | None:
+    if value is None:
+        return None
+    lowered = value.strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _provider_env_config(provider: str) -> dict:
+    """Provider config from environment variables.
+
+    Generic shape:
+      MODEL_GATEWAY_PROVIDER_<PROVIDER>_{BASE_URL,API_KEY,PROTOCOL,ENABLED}
+
+    Databricks additionally accepts the standard workspace env vars:
+      DATABRICKS_HOST + DATABRICKS_TOKEN, or DATABRICKS_SERVING_BASE_URL.
+    """
+    prefix = _provider_env_prefix(provider)
+    env_config: dict = {}
+    base_url = os.environ.get(f"{prefix}_BASE_URL")
+    api_key = os.environ.get(f"{prefix}_API_KEY")
+    protocol = os.environ.get(f"{prefix}_PROTOCOL")
+    enabled = _env_bool(os.environ.get(f"{prefix}_ENABLED"))
+
+    if provider == "databricks":
+        db_base_url = os.environ.get("DATABRICKS_SERVING_BASE_URL")
+        db_host = os.environ.get("DATABRICKS_HOST")
+        db_token = os.environ.get("DATABRICKS_TOKEN")
+        if not base_url:
+            if db_base_url:
+                base_url = db_base_url
+            elif db_host:
+                base_url = f"{db_host.rstrip('/')}/serving-endpoints"
+        if not api_key and db_token:
+            api_key = db_token
+        if enabled is None and (base_url or api_key):
+            enabled = True
+        protocol = protocol or "openai"
+
+    if base_url is not None:
+        env_config["base_url"] = base_url
+    if api_key is not None:
+        env_config["api_key"] = api_key
+    if protocol is not None:
+        env_config["protocol"] = protocol
+    if enabled is not None:
+        env_config["enabled"] = enabled
+    return env_config
+
+
 def _effective_provider_config(config: dict, provider: str) -> dict:
-    """Provider config with local-machine defaults overlaid by config.yaml."""
+    """Provider config with defaults + config.yaml + env overrides."""
     effective = _provider_defaults(provider)
     effective.update(_resolve_provider_config(config, provider))
+    effective.update(_provider_env_config(provider))
     return effective
 
 
@@ -231,32 +293,79 @@ def reload():
     _models = None
 
 
+def _availability_for_entry(model_id: str, entry: dict | None) -> dict:
+    if not entry:
+        return {
+            "available": False,
+            "reason": "model_not_found",
+            "message": f"Model {model_id!r} is not in model-info.json",
+        }
+
+    name = entry.get("name") or model_id
+    provider = _canonical_provider(entry.get("provider", "local"))
+    if not _is_model_enabled(name):
+        return {
+            "available": False,
+            "reason": "model_disabled",
+            "model": name,
+            "provider": provider,
+            "message": f"Model {name!r} is disabled by runtime model_overrides",
+        }
+
+    provider_config = _effective_provider_config(_load_config(), provider)
+    if provider_config.get("enabled") is False:
+        return {
+            "available": False,
+            "reason": "provider_disabled",
+            "model": name,
+            "provider": provider,
+            "message": f"Provider {provider!r} is disabled by runtime config",
+        }
+
+    missing = []
+    if not provider_config.get("base_url"):
+        missing.append("base_url")
+    if not provider_config.get("api_key"):
+        missing.append("api_key")
+    if missing:
+        return {
+            "available": False,
+            "reason": "provider_not_configured",
+            "model": name,
+            "provider": provider,
+            "missing": missing,
+            "message": f"Provider {provider!r} is missing {', '.join(missing)} in local runtime config",
+        }
+
+    return {"available": True, "reason": "", "model": name, "provider": provider, "message": ""}
+
+
+def model_availability(model_id: str) -> dict:
+    """Return availability details for a model identifier without exposing secrets."""
+    return _availability_for_entry(model_id, _load_models().get(model_id))
+
+
+def is_model_available(model_id: str) -> bool:
+    return bool(model_availability(model_id).get("available"))
+
+
 def resolve(model_id: str) -> ProviderInfo | None:
     """Resolve a model name/alias/id to provider info."""
     models = _load_models()
     entry = models.get(model_id)
-    if not entry:
-        return None
-
-    # Runtime enabled state lives in config.yaml model_overrides (not the
-    # committed catalog), so toggles survive deploys and don't dirty the repo.
-    name = entry.get("name") or model_id
-    if not _is_model_enabled(name):
-        log.info("Model %r is disabled; not routing", name)
+    availability = _availability_for_entry(model_id, entry)
+    if not availability["available"]:
+        if availability["reason"] == "model_not_found":
+            return None
+        log.info("Model %r unavailable: %s", model_id, availability["message"])
         return None
 
     provider = _canonical_provider(entry.get("provider", "local"))
-
-    config = _load_config()
-    provider_config = _effective_provider_config(config, provider)
+    provider_config = _effective_provider_config(_load_config(), provider)
 
     base_url = provider_config.get("base_url", "")
     api_key = provider_config.get("api_key", "")
     protocol = provider_config.get("protocol", "openai")
-
-    if not base_url or not api_key:
-        log.error("Provider %r missing base_url or api_key in config", provider)
-        return None
 
     provider_model_id = entry.get("provider_model_id", "")
     if not provider_model_id:
@@ -297,11 +406,11 @@ def pricing_for(model_id: str) -> dict | None:
 
 
 def list_models() -> list[dict]:
-    """Return all model identifiers accepted by the gateway for /v1/models.
+    """Return all catalog model identifiers known to the gateway.
 
-    Claude Code validates ANTHROPIC_MODEL against /v1/models before sending a
-    request, while launchers may use aliases or upstream provider IDs. Expose
-    every routable identifier so validation matches resolve().
+    This includes models whose provider is not configured locally so admin and
+    debug views can explain why they are unavailable. Client-facing /v1/models
+    should call list_available_models() instead.
     """
     models = _load_models()
     seen = set()
@@ -315,10 +424,20 @@ def list_models() -> list[dict]:
     return result
 
 
+def list_available_models() -> list[dict]:
+    """Return model identifiers that are enabled and locally usable."""
+    return [m for m in list_models() if is_model_available(m.get("id") or m.get("name", ""))]
+
+
 def _configured_provider_ids() -> set[str]:
     config = _load_config()
     providers = config.get("providers", {}) or {}
-    return {_canonical_provider(key) for key in providers}
+    configured = {_canonical_provider(key) for key in providers}
+    for entry in {id(v): v for v in _load_models().values()}.values():
+        provider = _canonical_provider(entry.get("provider", ""))
+        if _provider_defaults(provider) or _provider_env_config(provider):
+            configured.add(provider)
+    return configured
 
 
 def _safe_url(value: str) -> str:
@@ -353,7 +472,7 @@ def provider_status() -> list[dict]:
     for model in models:
         provider = _canonical_provider(model.get("provider", ""))
         name = model.get("name") or model.get("id")
-        if name:
+        if name and _is_model_enabled(name):
             model_names.setdefault(provider, set()).add(name)
     model_counts = {p: len(names) for p, names in model_names.items()}
 
@@ -361,18 +480,22 @@ def provider_status() -> list[dict]:
     result = []
     for provider in provider_ids:
         explicit_config = _resolve_provider_config(config, provider)
+        env_config = _provider_env_config(provider)
         provider_config = _effective_provider_config(config, provider)
         base_url = _safe_url(provider_config.get("base_url", ""))
         has_api_key = bool(provider_config.get("api_key"))
+        model_count = model_counts.get(provider, 0)
         issues = []
-        if model_counts.get(provider, 0) and not base_url:
+        if model_count and provider_config.get("enabled") is False:
+            issues.append("provider_disabled")
+        if model_count and provider_config.get("enabled") is not False and not base_url:
             issues.append("missing_base_url")
-        if model_counts.get(provider, 0) and not has_api_key:
+        if model_count and provider_config.get("enabled") is not False and not has_api_key:
             issues.append("missing_api_key")
         result.append({
             "id": provider,
-            "configured": bool(explicit_config or _provider_defaults(provider)),
-            "enabled_models": model_counts.get(provider, 0),
+            "configured": bool(explicit_config or _provider_defaults(provider) or env_config),
+            "enabled_models": model_count,
             "base_url": base_url,
             "protocol": provider_config.get("protocol", "openai") if provider_config else "openai",
             "has_api_key": has_api_key,
@@ -389,6 +512,7 @@ def model_status() -> list[dict]:
     result = []
     for model in list_models():
         provider = _canonical_provider(model.get("provider", ""))
+        availability = model_availability(model.get("id") or model.get("name", ""))
         result.append({
             "id": model.get("id"),
             "name": model.get("name", ""),
@@ -398,6 +522,9 @@ def model_status() -> list[dict]:
             "omlx_id": model.get("omlx_id", ""),
             "provider_configured": provider in configured,
             "provider_ready": ready.get(provider, False),
+            "availability_reason": availability.get("reason", ""),
+            "availability_message": availability.get("message", ""),
+            "available": bool(availability.get("available")),
             "context": model.get("context", 0),
             "max_output_tokens": model.get("max_output_tokens", 0),
             "thinking": model.get("thinking", ""),

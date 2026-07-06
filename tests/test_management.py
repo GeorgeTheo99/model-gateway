@@ -243,6 +243,75 @@ def test_upsert_model_allows_local_omlx_id(tmp_config, monkeypatch):
     assert info.provider_model_id == "local-created-upstream"
 
 
+def test_unconfigured_provider_models_are_hidden_from_v1_models(tmp_config, monkeypatch):
+    doc = json.loads((tmp_config / "model-info.json").read_text())
+    doc["llm"].append({
+        "name": "gpt-unconfigured",
+        "provider": "openai",
+        "provider_model_id": "gpt-test",
+        "context": 128000,
+        "max_output_tokens": 4096,
+    })
+    (tmp_config / "model-info.json").write_text(json.dumps(doc))
+    providers.reload()
+
+    assert providers.resolve("gpt-unconfigured") is None
+    assert providers.model_availability("gpt-unconfigured")["reason"] == "provider_not_configured"
+
+    with TestClient(app) as c:
+        ids = {m["id"] for m in c.get("/v1/models").json()["data"]}
+        assert "claude-test" in ids
+        assert "gpt-unconfigured" not in ids
+
+        admin = {"Authorization": "Bearer admin"}
+        row = next(
+            m for m in c.get("/admin/api/models", headers=admin).json()["models"]
+            if m["name"] == "gpt-unconfigured"
+        )
+        assert row["available"] is False
+        assert row["availability_reason"] == "provider_not_configured"
+
+
+def test_requesting_unconfigured_model_returns_clear_error(tmp_config, monkeypatch):
+    doc = json.loads((tmp_config / "model-info.json").read_text())
+    doc["llm"].append({"name": "gpt-unconfigured", "provider": "openai", "provider_model_id": "gpt-test"})
+    (tmp_config / "model-info.json").write_text(json.dumps(doc))
+    providers.reload()
+
+    with TestClient(app) as c:
+        resp = c.post("/v1/chat/completions", json={"model": "gpt-unconfigured", "messages": []})
+    assert resp.status_code == 404
+    message = resp.json()["error"]["message"]
+    assert "provider_not_configured" in message
+    assert "openai" in message
+
+
+def test_databricks_provider_can_be_configured_from_env(tmp_config, monkeypatch):
+    doc = json.loads((tmp_config / "model-info.json").read_text())
+    doc["llm"].append({
+        "name": "dbx-chat",
+        "provider": "databricks",
+        "provider_model_id": "my-serving-endpoint",
+    })
+    (tmp_config / "model-info.json").write_text(json.dumps(doc))
+    with open(tmp_config / "config.yaml", "a") as f:
+        f.write("  databricks:\n    enabled: false\n")
+    providers.reload()
+
+    assert providers.model_availability("dbx-chat")["reason"] == "provider_disabled"
+
+    monkeypatch.setenv("DATABRICKS_HOST", "https://workspace.example.databricks.com")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-placeholder")
+    providers.reload()
+
+    info = providers.resolve("dbx-chat")
+    assert info is not None
+    assert info.provider == "databricks"
+    assert info.base_url == "https://workspace.example.databricks.com/serving-endpoints"
+    assert info.api_key == "dapi-placeholder"
+    assert info.protocol == "openai"
+
+
 # ── admin API endpoints ─────────────────────────────────────────────────────
 
 

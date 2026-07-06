@@ -25,11 +25,11 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from src.admin import router as admin_router
 from src.auth import require_client_auth
-from src.providers import _is_model_enabled, list_models as list_routable_models, pricing_for, resolve
+from src.providers import list_available_models, list_models as list_routable_models, model_availability, pricing_for, resolve
 from src.responses import chat_to_responses, responses_to_chat, translate_responses_stream
 from src.signature_cache import store_from_extra_content
 from src.streaming import translate_stream
-from src.translator import anthropic_to_openai, openai_to_anthropic
+from src.translator import anthropic_to_openai, anthropic_to_openai_chat, openai_chat_to_anthropic, openai_to_anthropic
 from src import ledger
 from src.usage import extract_usage, estimate_cost
 
@@ -112,6 +112,15 @@ def _error(status: int, error_type: str, message: str) -> JSONResponse:
             "error": {"type": error_type, "message": message},
         },
     )
+
+
+def _model_error_message(model: str) -> str:
+    availability = model_availability(model)
+    if availability.get("reason") == "model_not_found":
+        return f"Model '{model}' not found in gateway"
+    reason = availability.get("reason") or "unavailable"
+    detail = availability.get("message") or "not locally available"
+    return f"Model '{model}' is unavailable ({reason}): {detail}"
 
 
 ADAPTIVE_THINKING_ANTHROPIC_MODELS = {
@@ -1031,14 +1040,11 @@ async def health():
 @app.get("/v1/models")
 async def list_models(request: Request):
     require_client_auth(request)
-    models = list_routable_models()
+    models = list_available_models()
     data = []
     for m in models:
-        # Disabled models are not exposed to clients; they remain in admin
-        # model_status() for re-enabling. Enabled state lives in config.yaml
-        # model_overrides (runtime), not the committed catalog.
-        if not _is_model_enabled(m.get("name") or m.get("id")):
-            continue
+        # Unavailable models (disabled or provider not configured locally) are
+        # hidden from clients; admin/debug APIs expose them with reasons.
         caps = _thinking_capabilities(m)
         data.append({
             "id": m.get("id") or m["name"],
@@ -1119,7 +1125,7 @@ async def create_response(request: Request):
 
     info = resolve(model)
     if not info:
-        return _error(404, "invalid_request_error", f"Model '{model}' not found in gateway")
+        return _error(404, "invalid_request_error", _model_error_message(model))
 
     _set_ledger_ctx(request, model, info, is_stream=is_stream)
     _inject_responses_instruction(body, info.system_instruction)
@@ -1476,7 +1482,7 @@ async def chat_completions(request: Request):
     if not info:
         return JSONResponse(
             status_code=404,
-            content={"error": {"message": f"Model '{model}' not found in gateway", "type": "invalid_request_error"}},
+            content={"error": {"message": _model_error_message(model), "type": "invalid_request_error"}},
         )
 
     image_handling_mode = _gateway_image_handling_mode(request, body)
@@ -1517,6 +1523,9 @@ async def chat_completions(request: Request):
 
     _inject_openai_system_instruction(body, info.system_instruction)
 
+    if info.protocol == "anthropic":
+        return await _handle_chat_anthropic(body, info, model, request, is_stream)
+
     thinking_enabled = _apply_gateway_reasoning(body, info, target_api="chat")
     _strip_fireworks_unsupported_message_fields(body, info)
     _compress_fireworks_inline_images(body, info)
@@ -1527,11 +1536,6 @@ async def chat_completions(request: Request):
     request.state.api_key = info.api_key
     fwd = _forward_headers(request, protocol=info.protocol, provider=info.provider)
 
-    # Anthropic models don't support OpenAI Chat Completions
-    if info.protocol == "anthropic":
-        return _error(400, "invalid_request_error",
-                       f"Model '{model}' uses Anthropic Messages API — use /v1/messages endpoint instead")
-
     _remap_max_tokens_for_provider(body, info.provider)
     endpoint = f"{info.base_url}/chat/completions"
 
@@ -1540,6 +1544,143 @@ async def chat_completions(request: Request):
     if is_stream:
         return await _passthrough_stream(endpoint, body, fwd)
     return await _passthrough_sync(endpoint, body, fwd)
+
+
+async def _handle_chat_anthropic(body: dict, info, model: str, request: Request, is_stream: bool):
+    """Serve OpenAI Chat Completions clients against native Anthropic models."""
+    anthropic_req = openai_chat_to_anthropic(body)
+    anthropic_req["model"] = info.provider_model_id
+    _inject_anthropic_system_instruction(anthropic_req, info.system_instruction)
+    thinking_enabled = _apply_gateway_reasoning(anthropic_req, info, target_api="messages")
+    request.state.api_key = info.api_key
+    headers = _forward_headers(request, protocol="anthropic", provider=info.provider)
+    endpoint = f"{info.base_url}/messages"
+    log.info("OpenAI chat %s -> %s native Anthropic (stream=%s, thinking=%s)", model, info.provider, is_stream, thinking_enabled)
+    if is_stream:
+        anthropic_req["stream"] = True
+        return await _chat_anthropic_stream(endpoint, anthropic_req, model, headers)
+    async with httpx.AsyncClient(timeout=300) as client:
+        try:
+            resp = await client.post(endpoint, json=anthropic_req, headers=headers)
+        except httpx.ConnectError:
+            return JSONResponse(status_code=502, content={"error": {"message": "Cannot connect to Anthropic API", "type": "api_error"}})
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(status_code=502, content={"error": {"message": f"Anthropic error: {exc}", "type": "api_error"}})
+    try:
+        content = resp.json()
+    except ValueError:
+        return JSONResponse(status_code=502, content={"error": {"message": f"Anthropic returned invalid JSON: {resp.text[:500]}", "type": "api_error"}})
+    if resp.status_code >= 400:
+        error = content.get("error") if isinstance(content, dict) else None
+        message = error.get("message") if isinstance(error, dict) else resp.text[:500]
+        error_type = error.get("type") if isinstance(error, dict) else "api_error"
+        return JSONResponse(status_code=resp.status_code, content={"error": {"message": message, "type": error_type}})
+    return JSONResponse(content=anthropic_to_openai_chat(content, model))
+
+
+async def _chat_anthropic_stream(endpoint: str, body: dict, model: str, headers: dict):
+    client = httpx.AsyncClient(timeout=300)
+    try:
+        resp = await client.send(client.build_request("POST", endpoint, json=body, headers=headers), stream=True)
+    except httpx.ConnectError:
+        await client.aclose()
+        return JSONResponse(status_code=502, content={"error": {"message": "Cannot connect to Anthropic API", "type": "api_error"}})
+    except Exception as exc:  # noqa: BLE001
+        await client.aclose()
+        return JSONResponse(status_code=502, content={"error": {"message": f"Anthropic error: {exc}", "type": "api_error"}})
+
+    if resp.status_code != 200:
+        err_body = await resp.aread()
+        await resp.aclose()
+        await client.aclose()
+        return JSONResponse(status_code=resp.status_code, content={"error": {"message": err_body.decode()[:500], "type": "api_error"}})
+
+    async def stream_generator():
+        try:
+            async for event in _anthropic_sse_to_openai_chat(resp.aiter_bytes(), model):
+                yield event
+        finally:
+            await resp.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        stream_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
+async def _anthropic_sse_to_openai_chat(byte_iter, model: str):
+    chat_id = "chatcmpl_" + secrets.token_hex(12)
+    created = int(time.time())
+    tool_block_indices: dict[int, int] = {}
+    usage: dict = {}
+
+    def chunk(delta: dict, finish_reason=None, include_usage: bool = False) -> bytes:
+        payload = {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+        if include_usage:
+            prompt = usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0) + usage.get("cache_creation_input_tokens", 0)
+            completion = usage.get("output_tokens", 0)
+            payload["usage"] = {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
+        return f"data: {json.dumps(payload)}\n\n".encode()
+
+    yield chunk({"role": "assistant"})
+    buffer = ""
+    stop_reason = "stop"
+    async for raw in byte_iter:
+        buffer += raw.decode("utf-8", errors="replace")
+        while "\n" in buffer:
+            line, buffer = buffer.split("\n", 1)
+            line = line.strip()
+            if not line.startswith("data: "):
+                continue
+            payload = line[6:]
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            event_type = data.get("type")
+            if event_type == "message_start":
+                usage.update((data.get("message") or {}).get("usage") or {})
+            elif event_type == "content_block_start":
+                idx = data.get("index", 0)
+                block = data.get("content_block") or {}
+                if block.get("type") == "tool_use":
+                    tool_index = len(tool_block_indices)
+                    tool_block_indices[idx] = tool_index
+                    yield chunk({"tool_calls": [{
+                        "index": tool_index,
+                        "id": block.get("id", ""),
+                        "type": "function",
+                        "function": {"name": block.get("name", ""), "arguments": ""},
+                    }]})
+            elif event_type == "content_block_delta":
+                idx = data.get("index", 0)
+                delta = data.get("delta") or {}
+                dtype = delta.get("type")
+                if dtype == "text_delta" and delta.get("text"):
+                    yield chunk({"content": delta["text"]})
+                elif dtype == "thinking_delta" and delta.get("thinking"):
+                    yield chunk({"reasoning_content": delta["thinking"]})
+                elif dtype == "input_json_delta" and delta.get("partial_json"):
+                    tool_index = tool_block_indices.get(idx, idx)
+                    yield chunk({"tool_calls": [{"index": tool_index, "function": {"arguments": delta["partial_json"]}}]})
+            elif event_type == "message_delta":
+                stop_reason = (data.get("delta") or {}).get("stop_reason") or stop_reason
+                usage.update(data.get("usage") or {})
+            elif event_type == "message_stop":
+                finish = "tool_calls" if stop_reason == "tool_use" else "length" if stop_reason == "max_tokens" else "stop"
+                yield chunk({}, finish_reason=finish, include_usage=True)
+                yield b"data: [DONE]\n\n"
+                return
+    yield chunk({}, finish_reason="stop", include_usage=True)
+    yield b"data: [DONE]\n\n"
 
 
 async def _passthrough_sync(endpoint: str, body: dict, headers: dict) -> JSONResponse:
@@ -1718,7 +1859,7 @@ async def messages(request: Request):
 
     info = resolve(model)
     if not info:
-        return _error(404, "invalid_request_error", f"Model '{model}' not found in gateway")
+        return _error(404, "invalid_request_error", _model_error_message(model))
 
     _set_ledger_ctx(request, model, info, is_stream=is_stream)
     _inject_anthropic_system_instruction(body, info.system_instruction)

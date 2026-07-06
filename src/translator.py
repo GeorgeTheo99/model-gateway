@@ -7,6 +7,7 @@ Adapted from !old/anthropic-proxy/translator.py — simplified for cloud provide
 import json
 import logging
 import secrets
+import time
 
 from src.signature_cache import inject_into_tool_call
 
@@ -200,6 +201,170 @@ def anthropic_to_openai(body: dict) -> dict:
                     openai_req["tool_choice"] = tc
 
     return openai_req
+
+
+def _anthropic_content_from_openai(content) -> str | list:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content) if content else ""
+
+    blocks = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type")
+        if ptype in {"text", "input_text"}:
+            blocks.append({"type": "text", "text": part.get("text", "")})
+        elif ptype in {"image_url", "input_image"} or "image_url" in part:
+            image_url = part.get("image_url")
+            url = image_url.get("url") if isinstance(image_url, dict) else image_url
+            if not isinstance(url, str) and isinstance(part.get("image"), str):
+                url = part["image"]
+            if isinstance(url, str) and url.startswith("data:image/") and ";base64," in url:
+                header, data = url.split(";base64,", 1)
+                media_type = header.removeprefix("data:") or "image/png"
+                blocks.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": media_type, "data": data},
+                })
+    return blocks or ""
+
+
+def openai_chat_to_anthropic(body: dict) -> dict:
+    """Convert an OpenAI Chat Completions request to Anthropic Messages."""
+    system_parts = []
+    messages = []
+    for msg in body.get("messages", []):
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        content = msg.get("content", "")
+        if role == "system":
+            if isinstance(content, str):
+                system_parts.append(content)
+            elif isinstance(content, list):
+                system_parts.extend(str(p.get("text", "")) for p in content if isinstance(p, dict) and p.get("type") in {"text", "input_text"})
+            continue
+        if role == "tool":
+            tool_content = content if isinstance(content, str) else json.dumps(content)
+            messages.append({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": msg.get("tool_call_id", ""),
+                    "content": tool_content,
+                }],
+            })
+            continue
+        if role == "assistant":
+            blocks = []
+            if content:
+                blocks.append({"type": "text", "text": content if isinstance(content, str) else json.dumps(content)})
+            reasoning = msg.get("reasoning_content") or msg.get("reasoning")
+            if reasoning:
+                blocks.insert(0, {"type": "thinking", "thinking": str(reasoning)})
+            for tc in msg.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                raw_args = fn.get("arguments") or "{}"
+                try:
+                    args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                except json.JSONDecodeError:
+                    args = {}
+                blocks.append({
+                    "type": "tool_use",
+                    "id": tc.get("id", "toolu_" + secrets.token_hex(12)),
+                    "name": fn.get("name", ""),
+                    "input": args if isinstance(args, dict) else {},
+                })
+            messages.append({"role": "assistant", "content": blocks or ""})
+            continue
+        if role == "user":
+            messages.append({"role": "user", "content": _anthropic_content_from_openai(content)})
+
+    req: dict = {"messages": messages}
+    if system_parts:
+        req["system"] = "\n\n".join(part for part in system_parts if part)
+    max_tokens = body.get("max_tokens") or body.get("max_completion_tokens") or body.get("max_output_tokens") or 8192
+    req["max_tokens"] = max_tokens
+    for key in ("temperature", "top_p", "stream"):
+        if key in body:
+            req[key] = body[key]
+    if "stop" in body:
+        stop = body["stop"]
+        req["stop_sequences"] = stop if isinstance(stop, list) else [stop]
+
+    tool_choice = body.get("tool_choice")
+    if tool_choice != "none":
+        tools = []
+        for tool in body.get("tools") or []:
+            if tool.get("type") != "function":
+                continue
+            fn = tool.get("function") or {}
+            tools.append({
+                "name": fn.get("name", ""),
+                "description": fn.get("description", ""),
+                "input_schema": fn.get("parameters", {}),
+            })
+        if tools:
+            req["tools"] = tools
+
+    if tool_choice:
+        if tool_choice == "required":
+            req["tool_choice"] = {"type": "any"}
+        elif tool_choice == "auto":
+            req["tool_choice"] = {"type": "auto"}
+        elif isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+            req["tool_choice"] = {"type": "tool", "name": (tool_choice.get("function") or {}).get("name", "")}
+
+    for key in ("reasoning", "reasoning_effort", "thinking", "output_config", "chat_template_kwargs"):
+        if key in body:
+            req[key] = body[key]
+
+    return req
+
+
+def anthropic_to_openai_chat(resp: dict, model: str) -> dict:
+    """Convert an Anthropic Messages response to OpenAI Chat Completions."""
+    content_parts = []
+    reasoning_parts = []
+    tool_calls = []
+    for block in resp.get("content") or []:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            content_parts.append(block.get("text", ""))
+        elif btype == "thinking":
+            reasoning_parts.append(block.get("thinking", ""))
+        elif btype == "tool_use":
+            tool_calls.append({
+                "id": block.get("id", "toolu_" + secrets.token_hex(12)),
+                "type": "function",
+                "function": {"name": block.get("name", ""), "arguments": json.dumps(block.get("input") or {})},
+            })
+
+    message: dict = {"role": "assistant", "content": "".join(content_parts) if content_parts else None}
+    if reasoning_parts:
+        message["reasoning_content"] = "".join(reasoning_parts)
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+
+    stop_reason = resp.get("stop_reason")
+    finish_reason = "tool_calls" if stop_reason == "tool_use" else "length" if stop_reason == "max_tokens" else "stop"
+    usage = resp.get("usage") or {}
+    return {
+        "id": "chatcmpl_" + secrets.token_hex(12),
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+        "usage": {
+            "prompt_tokens": usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0) + usage.get("cache_creation_input_tokens", 0),
+            "completion_tokens": usage.get("output_tokens", 0),
+            "total_tokens": usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0) + usage.get("cache_creation_input_tokens", 0) + usage.get("output_tokens", 0),
+        },
+    }
 
 
 def openai_to_anthropic(resp: dict, model: str, has_tools: bool = False, thinking_enabled: bool = False) -> dict:

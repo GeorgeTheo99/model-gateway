@@ -14,8 +14,11 @@ auth:
   #   - "cloud"
 
 providers:
-  # model-gateway intentionally routes only remote/cloud providers.
-  # Local MLX/oMLX models are served directly by oMLX on port 9110.
+  # Providers are optional and local-runtime only. model-info.json may list
+  # models for many providers, but /v1/models exposes only models whose provider
+  # is configured and enabled here (or via env). Missing providers do not block
+  # startup; requests for those models return provider_not_configured.
+  # Set enabled: false to keep a provider configured but unavailable locally.
 
   fireworks:
     base_url: https://api.fireworks.ai/inference/v1
@@ -36,3 +39,16 @@ providers:
   openai:
     base_url: https://api.openai.com/v1
     api_key: "YOUR_OPENAI_API_KEY"
+
+  # Optional Databricks Model Serving / Foundation Model APIs. Leave disabled
+  # or omit entirely on machines that should not use Databricks. You can also
+  # configure it with env only:
+  #   DATABRICKS_HOST=https://your-workspace.cloud.databricks.com
+  #   DATABRICKS_TOKEN=...
+  #   # optional explicit OpenAI-compatible base URL override:
+  #   DATABRICKS_SERVING_BASE_URL=https://your-workspace.cloud.databricks.com/serving-endpoints
+  databricks:
+    enabled: false
+    base_url: https://your-workspace.cloud.databricks.com/serving-endpoints
+    api_key: "YOUR_DATABRICKS_TOKEN"
+    protocol: openai

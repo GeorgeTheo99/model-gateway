@@ -16,6 +16,7 @@ import pytest
 from src.providers import ProviderInfo, list_models
 import src.server as server_module
 from src.server import _apply_gateway_reasoning, _infer_thinking_format, app
+from src.translator import anthropic_to_openai_chat, openai_chat_to_anthropic
 
 try:
     from fastapi.testclient import TestClient
@@ -305,6 +306,72 @@ def test_chat_completions_local_omlx_proxies_to_upstream_model(client, monkeypat
 
     assert resp.status_code == 200
     assert resp.json() == {"ok": True}
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_chat_completions_anthropic_model_uses_native_handler(client, monkeypatch):
+    info = _info("anthropic", thinking="optional", provider="anthropic", provider_model_id="claude-upstream")
+    info.protocol = "anthropic"
+
+    def fake_resolve(model):
+        return info if model == "claude-alias" else None
+
+    async def fake_handle_chat_anthropic(body, resolved_info, model, request, is_stream):
+        assert resolved_info is info
+        assert model == "claude-alias"
+        assert is_stream is False
+        assert body["model"] == "claude-upstream"
+        return server_module.JSONResponse(status_code=200, content={"ok": True})
+
+    monkeypatch.setattr(server_module, "resolve", fake_resolve)
+    monkeypatch.setattr(server_module, "_handle_chat_anthropic", fake_handle_chat_anthropic)
+
+    resp = client.post("/v1/chat/completions", json={
+        "model": "claude-alias",
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+
+
+def test_openai_chat_anthropic_translation_roundtrip_shapes():
+    req = openai_chat_to_anthropic({
+        "model": "claude-alias",
+        "messages": [
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "ping"},
+        ],
+        "tools": [{"type": "function", "function": {"name": "lookup", "description": "Lookup", "parameters": {"type": "object"}}}],
+        "tool_choice": "required",
+    })
+    assert req["system"] == "be brief"
+    assert req["messages"] == [{"role": "user", "content": "ping"}]
+    assert req["tools"][0]["name"] == "lookup"
+    assert req["tool_choice"] == {"type": "any"}
+    assert req["max_tokens"] == 8192
+
+    resp = anthropic_to_openai_chat({
+        "content": [{"type": "text", "text": "pong"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 3, "output_tokens": 2},
+    }, "claude-alias")
+    assert resp["model"] == "claude-alias"
+    assert resp["choices"][0]["message"]["content"] == "pong"
+    assert resp["choices"][0]["finish_reason"] == "stop"
+    assert resp["usage"]["total_tokens"] == 5
+
+    reasoning_req = openai_chat_to_anthropic({
+        "messages": [{"role": "user", "content": "think"}],
+        "reasoning_effort": "high",
+        "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
+        "tool_choice": "none",
+    })
+    assert reasoning_req["reasoning_effort"] == "high"
+    assert "tools" not in reasoning_req
+    enabled = _apply_gateway_reasoning(reasoning_req, _info("anthropic", thinking="optional"), target_api="messages")
+    assert enabled is True
+    assert reasoning_req["thinking"]["type"] == "enabled"
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
