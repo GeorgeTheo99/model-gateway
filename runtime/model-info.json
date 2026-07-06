@@ -402,14 +402,23 @@
     },
     {
       "name": "claude-fable-5",
-      "provider": "openrouter",
-      "provider_model_id": "anthropic/claude-fable-5",
+      "provider": "anthropic",
+      "provider_model_id": "claude-fable-5",
       "alias": "fable",
       "context": 1000000,
       "max_output_tokens": 128000,
       "thinking": "always",
       "vision": true,
-      "desc": "Claude Fable 5 on Anthropic API ($10/$50 per 1M tokens, adaptive thinking always on)"
+      "desc": "Claude Fable 5 on Anthropic API",
+      "alternate_ids": [
+        "anthropic/claude-fable-5"
+      ],
+      "pricing": {
+        "input": 10.0,
+        "output": 50.0,
+        "cache_read": 1.0,
+        "cache_write": 12.5
+      }
     },
     {
       "name": "claude-opus-4.8",

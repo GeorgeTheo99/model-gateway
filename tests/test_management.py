@@ -218,7 +218,8 @@ def test_provider_status_counts_unique_models_not_identifiers(tmp_config, monkey
     doc = json.loads((tmp_config / "model-info.json").read_text())
     doc["llm"].append({
         "name": "local-multi", "alias": "lm", "omlx_id": "lm-up",
-        "provider_model_id": "lm-pmid", "context": 4096, "max_output_tokens": 1024,
+        "provider_model_id": "lm-pmid", "alternate_ids": ["legacy/lm"],
+        "context": 4096, "max_output_tokens": 1024,
     })
     (tmp_config / "model-info.json").write_text(json.dumps(doc))
     providers.reload()
@@ -226,8 +227,9 @@ def test_provider_status_counts_unique_models_not_identifiers(tmp_config, monkey
     # omlx has exactly one unique local model (local-multi); claude-test is anthropic.
     assert counts.get("omlx") == 1
     assert counts.get("anthropic") == 1
-    # routable_ids exposes all four identifiers for the local model.
-    assert set(providers.routable_ids("local-multi")) == {"local-multi", "lm", "lm-up", "lm-pmid"}
+    # routable_ids exposes canonical identifiers plus legacy alternate IDs.
+    assert set(providers.routable_ids("local-multi")) == {"local-multi", "lm", "lm-up", "lm-pmid", "legacy/lm"}
+    assert providers.resolve("legacy/lm") is not None
 
 
 def test_upsert_model_allows_local_omlx_id(tmp_config, monkeypatch):

@@ -483,7 +483,10 @@
         "output": 50.0,
         "cache_read": 1.0,
         "cache_write": 12.5
-      }
+      },
+      "alternate_ids": [
+        "anthropic/claude-fable-5"
+      ]
     },
     {
       "name": "claude-mythos-5",

@@ -188,6 +188,26 @@ def _load_config() -> dict:
     return _config
 
 
+def _entry_routable_ids(entry: dict) -> list[str]:
+    """Return every gateway-facing identifier for a catalog entry."""
+    ids = [entry.get("name"), entry.get("alias"), entry.get("provider_model_id"), entry.get("omlx_id")]
+    extra_ids = entry.get("alternate_ids") or []
+    if isinstance(extra_ids, str):
+        ids.append(extra_ids)
+    elif isinstance(extra_ids, list):
+        ids.extend(extra_ids)
+    result = []
+    seen = set()
+    for value in ids:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text and text not in seen:
+            seen.add(text)
+            result.append(text)
+    return result
+
+
 def _load_models() -> dict[str, dict]:
     """Load routable models from model-info.json (keyed by name/alias/id)."""
     global _models
@@ -210,23 +230,8 @@ def _load_models() -> dict[str, dict]:
             continue
         normalized_entry = dict(entry)
         normalized_entry["provider"] = provider
-        name = entry.get("name")
-        if name:
-            _models[name] = normalized_entry
-
-        # Also index by alias and backend model id.
-        alias = entry.get("alias")
-        if alias:
-            _models[alias] = normalized_entry
-
-        pmid = entry.get("provider_model_id")
-        if pmid:
-            _models[pmid] = normalized_entry
-
-        # Local oMLX entries should resolve by omlx_id too.
-        omlx_id = entry.get("omlx_id")
-        if omlx_id:
-            _models[omlx_id] = normalized_entry
+        for model_id in _entry_routable_ids(normalized_entry):
+            _models[model_id] = normalized_entry
 
     log.info("Loaded %d routable model keys from model-info.json", len(_models))
     return _models
@@ -236,16 +241,13 @@ def routable_ids(name: str) -> list[str]:
     """Return every identifier that routes to the named model.
 
     Used by per-model stats to match ledger rows regardless of which alias or
-    upstream id the caller sent. Includes name, alias, provider_model_id, and
-    omlx_id, with empties/duplicates removed.
+    upstream id the caller sent. Includes name, alias, provider_model_id,
+    omlx_id, and any alternate_ids, with empties/duplicates removed.
     """
     entry = _load_models().get(name)
     if not entry:
         return [name] if name else []
-    ids = {entry.get("name"), entry.get("alias"), entry.get("provider_model_id"), entry.get("omlx_id")}
-    ids.discard(None)
-    ids.discard("")
-    return sorted(ids)
+    return sorted(_entry_routable_ids(entry))
 
 
 def auth_config() -> dict:
@@ -466,7 +468,8 @@ def provider_status() -> list[dict]:
 
     # Count unique models per provider by canonical name. list_models()
     # exposes every routable identifier (name + alias + provider_model_id +
-    # omlx_id), so counting its rows would over-count models 2-3x. Dedupe by
+    # omlx_id + alternate_ids), so counting its rows would over-count models.
+    # Dedupe by
     # the model `name`, which every identifier row for a model shares.
     model_names: dict[str, set[str]] = {}
     for model in models:

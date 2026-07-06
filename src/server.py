@@ -135,6 +135,22 @@ def _uses_adaptive_anthropic_thinking(provider_model_id: str) -> bool:
     return provider_model_id in ADAPTIVE_THINKING_ANTHROPIC_MODELS
 
 
+def _normalize_anthropic_adaptive_thinking(body: dict, info) -> None:
+    """Use Anthropic's adaptive thinking shape for Fable/Mythos/new Opus models."""
+    if not _uses_adaptive_anthropic_thinking(info.provider_model_id):
+        return
+    thinking_param = body.get("thinking")
+    if not isinstance(thinking_param, dict):
+        return
+    if thinking_param.get("type") == "enabled":
+        body["thinking"] = {"type": "adaptive"}
+        budget = thinking_param.get("budget_tokens")
+        body["output_config"] = {"effort": "high" if budget and budget >= 10000 else "medium" if budget else "high"}
+    elif thinking_param.get("type") == "disabled":
+        body["thinking"] = {"type": "adaptive"}
+        body["output_config"] = {"effort": "low"}
+
+
 def _remap_max_tokens_for_provider(req: dict, provider: str) -> None:
     """Remap max_tokens → max_completion_tokens for OpenAI models.
 
@@ -1552,6 +1568,7 @@ async def _handle_chat_anthropic(body: dict, info, model: str, request: Request,
     anthropic_req["model"] = info.provider_model_id
     _inject_anthropic_system_instruction(anthropic_req, info.system_instruction)
     thinking_enabled = _apply_gateway_reasoning(anthropic_req, info, target_api="messages")
+    _normalize_anthropic_adaptive_thinking(anthropic_req, info)
     request.state.api_key = info.api_key
     headers = _forward_headers(request, protocol="anthropic", provider=info.provider)
     endpoint = f"{info.base_url}/messages"
@@ -1878,22 +1895,9 @@ async def messages(request: Request):
     # Claude Opus 4.6 and earlier:       thinking.type = "enabled" + budget_tokens
     # Opus 4.7+, Fable 5, and Mythos 5:  thinking.type = "adaptive" + output_config.effort
     _uses_adaptive_thinking = _uses_adaptive_anthropic_thinking(info.provider_model_id)
+    _normalize_anthropic_adaptive_thinking(body, info)
 
-    if _uses_adaptive_thinking and isinstance(thinking_param, dict):
-        if thinking_param.get("type") == "enabled":
-            # Convert old-style "enabled" to "adaptive" + output_config.effort
-            body["thinking"] = {"type": "adaptive"}
-            budget = thinking_param.get("budget_tokens")
-            if budget and budget >= 10000:
-                body["output_config"] = {"effort": "high"}
-            elif budget:
-                body["output_config"] = {"effort": "medium"}
-            else:
-                body["output_config"] = {"effort": "high"}
-        elif thinking_param.get("type") == "disabled":
-            body["thinking"] = {"type": "adaptive"}
-            body["output_config"] = {"effort": "low"}
-    elif not _uses_adaptive_thinking and isinstance(thinking_param, dict) and thinking_param.get("type") == "adaptive":
+    if not _uses_adaptive_thinking and isinstance(thinking_param, dict) and thinking_param.get("type") == "adaptive":
         # Convert new-style "adaptive" back to "enabled" for older models
         effort = (body.get("output_config") or {}).get("effort", "high")
         budget_map = {"high": 10000, "medium": 5000, "low": 2000}

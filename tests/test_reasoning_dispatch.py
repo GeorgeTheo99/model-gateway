@@ -335,6 +335,26 @@ def test_chat_completions_anthropic_model_uses_native_handler(client, monkeypatc
     assert resp.json() == {"ok": True}
 
 
+def test_adaptive_anthropic_chat_uses_new_thinking_shape():
+    info = _info(
+        "anthropic",
+        provider="anthropic",
+        provider_model_id="claude-fable-5",
+        max_output_tokens=2048,
+    )
+    body = openai_chat_to_anthropic({
+        "model": "anthropic/claude-fable-5",
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 2048,
+    })
+
+    assert _apply_gateway_reasoning(body, info, target_api="messages") is True
+    server_module._normalize_anthropic_adaptive_thinking(body, info)
+
+    assert body["thinking"] == {"type": "adaptive"}
+    assert body["output_config"] == {"effort": "medium"}
+
+
 def test_openai_chat_anthropic_translation_roundtrip_shapes():
     req = openai_chat_to_anthropic({
         "model": "claude-alias",
