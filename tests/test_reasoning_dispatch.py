@@ -332,6 +332,54 @@ def test_fireworks_inline_image_compression(monkeypatch):
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_chat_completions_image_request_extracts_then_answers_with_original_model(client, monkeypatch):
+    text_info = _info("none", thinking="", provider="test", provider_model_id="text-upstream")
+    fallback_info = _info("", thinking="optional", provider="test", provider_model_id="vision-upstream", vision=True)
+
+    def fake_resolve(model):
+        if model == "text-model":
+            return text_info
+        if model == server_module.DEFAULT_VISION_FALLBACK_MODEL:
+            return fallback_info
+        return None
+
+    async def fake_extract(request, body, fallback_model, fallback):
+        assert fallback_model == server_module.DEFAULT_VISION_FALLBACK_MODEL
+        assert fallback is fallback_info
+        assert server_module._payload_has_image(body)
+        return "Visible: a concrete wall with a crack."
+
+    async def fake_passthrough_sync(endpoint, body, headers):
+        assert endpoint == "http://up/chat/completions"
+        assert body["model"] == "text-upstream"
+        assert not server_module._payload_has_image(body)
+        joined = "\n".join(str(message.get("content", "")) for message in body["messages"])
+        assert "Image observations from vision model" in joined
+        assert "Visible: a concrete wall with a crack." in joined
+        assert "gateway_image_handling" not in body
+        assert "model_gateway" not in body
+        return server_module.JSONResponse(status_code=200, content={"ok": True})
+
+    monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
+    monkeypatch.setattr(server_module, "resolve", fake_resolve)
+    monkeypatch.setattr(server_module, "_extract_image_observations", fake_extract)
+    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough_sync)
+
+    resp = client.post("/v1/chat/completions", json={
+        "model": "text-model",
+        "gateway_image_handling": "extract_then_answer",
+        "model_gateway": {"image_handling": "extract_then_answer"},
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what should I do?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]}],
+    })
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
 def test_chat_completions_image_request_uses_fireworks_default_vision_fallback(client, monkeypatch):
     text_info = _info("none", thinking="", provider="test", provider_model_id="text-upstream")
     fallback_info = _info(
