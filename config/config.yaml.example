@@ -84,9 +84,10 @@ providers:
   #     - no_stream_options
   #     - no_reasoning_params
   #
-  #   # auth_refresh: opt-in OAuth token auto-refresh on upstream 401/403.
+  #   # auth_refresh: opt-in OAuth token auto-refresh. The gateway refreshes
+  #   # short-lived OAuth JWTs before expiry and retries once after upstream
+  #   # 401/403. PATs and opaque API keys are left untouched.
   #   # Only "databricks-cli" is supported (uses `databricks auth token`).
-  #   # Only fires when api_key looks like a short-lived OAuth JWT ("eyJ...").
   #   auth_refresh: databricks-cli
   #   auth_profile: my-cli-profile   # optional; falls back to --host <base_url>
 
