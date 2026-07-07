@@ -455,7 +455,13 @@ def _pool_failover_candidates(pool: PoolContext | None) -> list[str]:
     if pool is None or not pool.model_key:
         return []
     from src.providers import pool_candidates  # runtime import: avoid cycle
-    return [c for c in pool_candidates(pool.model_key) if c != pool.provider]
+    candidates = [c for c in pool_candidates(pool.model_key) if c != pool.provider]
+    # Prefer members whose circuit is closed; a known-down workspace would
+    # block the failover on its recovery wait. Keep tripped members as a
+    # last resort (their probe may succeed) rather than dropping them.
+    healthy = [c for c in candidates if not is_tripped(c)]
+    tripped = [c for c in candidates if is_tripped(c)]
+    return healthy + tripped
 
 
 async def _send_with_pool(
