@@ -3,6 +3,7 @@
 
 Commands:
     workspace.py list
+    workspace.py repair                 # interactive: fix dead auth / dead workspaces
     workspace.py test <name>
     workspace.py add <name> --host <url> [--pools p1,p2] [--position N]
                             [--profile <cli-profile>] [--style invocations|ai-gateway]
@@ -346,6 +347,45 @@ def cmd_replace(args) -> None:
     print(f"workspace replace: DONE — {new_name} took over {args.old_name}'s pool positions")
 
 
+def cmd_repair(args) -> None:
+    """Interactive recovery pass over every OAuth-backed workspace.
+
+    For each workspace with auth_refresh: databricks-cli, escalate:
+      silent token → browser SSO → prompt to paste a replacement workspace URL
+    (the paste-a-URL flow). Static-PAT workspaces are probe-checked only.
+    """
+    config = _load_config(args.config)
+    providers = _providers_section(config)
+    broken: list[str] = []
+    for name, entry in list(providers.items()):
+        if not isinstance(entry, dict) or not entry.get("base_url"):
+            continue
+        if entry.get("auth_refresh") != "databricks-cli":
+            continue
+        host = normalize_host(str(entry.get("workspace_url") or entry["base_url"]))
+        profile = entry.get("auth_profile") or name
+        print(f"\nChecking workspace {name!r} ({host}, profile {profile})")
+        try:
+            token = ensure_auth(host, profile)
+            probe_endpoints(host, token)
+        except SystemExit as exc:
+            print(f"  {exc}")
+            broken.append(name)
+            reply = input(f"  Paste a replacement workspace URL for {name!r} (Enter to skip): ").strip()
+            if not reply:
+                print("  skipped — pooled models fail over; single-workspace models will error")
+                continue
+            ns = argparse.Namespace(
+                config=args.config, old_name=name, host=reply,
+                name=None, profile=None, allow_partial=True,
+            )
+            cmd_replace(ns)
+            broken.remove(name)
+    if broken:
+        raise _fail(f"still broken: {', '.join(broken)}")
+    print("\nworkspace repair: all OAuth-backed workspaces healthy")
+
+
 def cmd_remove(args) -> None:
     config = _load_config(args.config)
     providers = _providers_section(config)
@@ -376,6 +416,7 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("list")
+    sub.add_parser("repair")
 
     p = sub.add_parser("test")
     p.add_argument("name")
@@ -400,7 +441,7 @@ def main() -> None:
     p.add_argument("name")
 
     args = parser.parse_args()
-    {"list": cmd_list, "test": cmd_test, "add": cmd_add,
+    {"list": cmd_list, "repair": cmd_repair, "test": cmd_test, "add": cmd_add,
      "replace": cmd_replace, "remove": cmd_remove}[args.command](args)
 
 
