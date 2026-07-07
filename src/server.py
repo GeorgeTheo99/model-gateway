@@ -28,6 +28,7 @@ from src.auth import require_client_auth
 from src.errors import upstream_error, upstream_error_openai
 from src.providers import list_available_models, list_models as list_routable_models, model_availability, pricing_for, provider_quirks, resolve
 from src.upstream import (
+    PoolContext,
     _retry_post,
     _retry_post_with_model_fallback,
     _retry_send_stream,
@@ -979,6 +980,16 @@ def _set_ledger_ctx(request: Request, model: str, info, is_stream: bool = False)
         "provider_model_id": info.provider_model_id,
         "is_stream": bool(is_stream),
     }
+    # Workspace-pool failover context: lets src.upstream retry the request
+    # against the next pool member (other workspace serving the same model)
+    # when this provider fails hard. Set alongside ledger ctx so every
+    # protocol handler gets pooling without per-call-site wiring.
+    request.state.pool_ctx = PoolContext(
+        model_key=model,
+        provider=info.provider,
+        base_url=info.base_url,
+        api_key=info.api_key,
+    )
 
 
 def _usage_from_sse_line(line: str) -> dict | None:

@@ -14,6 +14,7 @@ import email.utils
 import logging
 import random
 import time
+from dataclasses import dataclass
 
 import httpx
 from fastapi import Request
@@ -25,7 +26,7 @@ from src.circuit import (
     record_success,
     wait_for_recovery,
 )
-from src.model_fallback import fallback_after_error
+from src.model_fallback import SATURATION_STATUSES, fallback_after_error
 from src.providers import ensure_fresh_oauth_token, refresh_oauth_token
 
 log = logging.getLogger("model-gateway")
@@ -386,6 +387,141 @@ async def _retry_send_stream(
     return resp  # unreachable
 
 
+@dataclass
+class PoolContext:
+    """Workspace-pool failover context for a single upstream request.
+
+    Pool members must be protocol-compatible for the routed model (same body
+    and response shape, same header style, same endpoint suffix relative to
+    base_url) — config guarantees this by pooling only like-kind workspace
+    entries. Failover then reduces to swapping base_url + credentials.
+    """
+    model_key: str          # any routable id for the model (used to re-resolve)
+    provider: str           # provider the request was originally resolved to
+    base_url: str           # that provider's resolved base_url (prefix of endpoint)
+    api_key: str            # that provider's credential as sent in headers
+
+
+def _pool_eligible_status(status_code: int) -> bool:
+    """Statuses that justify trying the next workspace in the pool."""
+    if status_code in SATURATION_STATUSES:
+        return True
+    return status_code in (401, 403, 404)
+
+
+def _rewire_for_provider(
+    pool: PoolContext, endpoint: str, headers: dict, info,
+) -> tuple[str, dict]:
+    """Rebuild endpoint + auth headers for another pool member.
+
+    Handles kind differences between pool members: ``endpoint_style:
+    invocations`` members resolve to a complete URL (suffix ""), while
+    path-prefix members need the protocol suffix appended. All pooled
+    members are Databricks workspaces, which accept Bearer auth everywhere.
+    """
+    original_suffix = endpoint[len(pool.base_url):] if endpoint.startswith(pool.base_url) else ""
+    cand_suffix = getattr(info, "endpoint_suffix", None)
+    if cand_suffix is None:
+        # Path-prefix member: reuse the original suffix, or derive the
+        # protocol default when the original was a complete invocation URL.
+        cand_suffix = original_suffix or (
+            "/messages" if "anthropic-version" in headers else "/chat/completions"
+        )
+    new_endpoint = f"{info.base_url}{cand_suffix}"
+    new_headers = dict(headers)
+    # Databricks accepts Bearer on both AI-gateway and invocations endpoints.
+    new_headers["Authorization"] = f"Bearer {info.api_key}"
+    if "x-api-key" in new_headers:
+        new_headers["x-api-key"] = info.api_key
+    return new_endpoint, new_headers
+
+
+def _pool_ctx(pool: PoolContext | None, request: Request | None, provider: str) -> PoolContext | None:
+    """Explicit pool arg wins; otherwise use the handler-set request.state.pool_ctx.
+
+    The state ctx is only honored when it matches the provider actually being
+    called — a vision-fallback or model-fallback resolve may have changed the
+    route after the ctx was stashed.
+    """
+    if pool is not None:
+        return pool
+    ctx = getattr(request.state, "pool_ctx", None) if request is not None else None
+    if ctx is not None and ctx.provider == provider:
+        return ctx
+    return None
+
+
+def _pool_failover_candidates(pool: PoolContext | None) -> list[str]:
+    if pool is None or not pool.model_key:
+        return []
+    from src.providers import pool_candidates  # runtime import: avoid cycle
+    return [c for c in pool_candidates(pool.model_key) if c != pool.provider]
+
+
+async def _send_with_pool(
+    send,
+    client: httpx.AsyncClient,
+    endpoint: str,
+    *,
+    json: dict,
+    headers: dict,
+    provider: str,
+    request: Request | None,
+    pool: PoolContext | None,
+) -> httpx.Response:
+    """Run one send (post or stream-open) with ordered workspace-pool failover.
+
+    Transport exceptions and pool-eligible statuses (429/5xx exhausted, 404,
+    401/403 after refresh) advance to the next pool member. The last
+    response/exception is returned/raised when every member fails.
+    """
+    candidates = _pool_failover_candidates(pool)
+    try:
+        resp = await send(
+            client, endpoint, json=json, headers=headers, provider=provider, request=request,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        if not candidates:
+            raise
+        resp = None
+
+    if resp is not None and (not candidates or not _pool_eligible_status(resp.status_code)):
+        return resp
+
+    from src.providers import resolve  # runtime import: avoid cycle
+    for candidate in candidates:
+        info = resolve(pool.model_key, provider_override=candidate)
+        if info is None:
+            continue
+        if resp is not None:
+            await resp.aread()
+            await resp.aclose()
+        cand_endpoint, cand_headers = _rewire_for_provider(pool, endpoint, headers, info)
+        log.warning(
+            "pool-failover: %s → workspace %r after failure on %r",
+            pool.model_key, candidate, provider,
+        )
+        try:
+            resp = await send(
+                client, cand_endpoint, json=json, headers=cand_headers,
+                provider=candidate, request=request,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if candidate == candidates[-1]:
+                raise
+            resp = None
+            continue
+        if not _pool_eligible_status(resp.status_code):
+            return resp
+    if resp is None:  # every candidate raised; surface a connect error
+        raise httpx.ConnectError(f"all pool workspaces failed for {pool.model_key}")
+    return resp
+
+
 async def _retry_post_with_model_fallback(
     client: httpx.AsyncClient,
     endpoint: str,
@@ -394,9 +530,12 @@ async def _retry_post_with_model_fallback(
     headers: dict,
     provider: str = "",
     request: Request | None = None,
+    pool: PoolContext | None = None,
 ) -> httpx.Response:
-    resp = await _retry_post(
-        client, endpoint, json=json, headers=headers, provider=provider, request=request,
+    resp = await _send_with_pool(
+        _retry_post, client, endpoint,
+        json=json, headers=headers, provider=provider, request=request,
+        pool=_pool_ctx(pool, request, provider),
     )
 
     requested_model = json.get("model", "")
@@ -432,9 +571,12 @@ async def _retry_send_stream_with_model_fallback(
     headers: dict,
     provider: str = "",
     request: Request | None = None,
+    pool: PoolContext | None = None,
 ) -> httpx.Response:
-    resp = await _retry_send_stream(
-        client, endpoint, json=json, headers=headers, provider=provider, request=request,
+    resp = await _send_with_pool(
+        _retry_send_stream, client, endpoint,
+        json=json, headers=headers, provider=provider, request=request,
+        pool=_pool_ctx(pool, request, provider),
     )
 
     requested_model = json.get("model", "")

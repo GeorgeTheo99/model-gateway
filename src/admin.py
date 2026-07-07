@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import sys
 import time
+from pathlib import Path
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
@@ -91,7 +94,27 @@ async def admin_reload(request: Request):
     require_admin_auth(request)
     require_admin_writes()
     reload_provider_registry()
-    return {"status": "ok", "message": "provider registry reloaded"}
+    catalogs = await _regenerate_catalogs()
+    return {"status": "ok", "message": "provider registry reloaded", "catalogs": catalogs}
+
+
+async def _regenerate_catalogs() -> str:
+    """Re-render downstream catalogs (pi-list aliases, Pi models.json) after a
+    config change. Best-effort: catalog drift is never allowed to fail a reload."""
+    script = Path(__file__).resolve().parents[1] / "scripts" / "export_catalogs.py"
+    if not script.exists():
+        return "skipped (script missing)"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(script),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+        if proc.returncode == 0:
+            return "regenerated"
+        return f"failed: {out.decode(errors='replace')[:200]}"
+    except Exception as exc:  # noqa: BLE001 — reload must survive catalog errors
+        return f"failed: {exc}"
 
 
 @router.get("/admin/api/usage")

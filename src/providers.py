@@ -107,15 +107,55 @@ def _canonical_provider(provider: str | None) -> str:
 
 
 def _find_provider_entry(config: dict, provider: str) -> tuple[str, dict] | None:
-    """Return (config_key, entry) for a provider, matching canonical synonyms."""
-    providers = config.get("providers", {}) or {}
-    direct = providers.get(provider)
-    if direct:
-        return provider, direct
-    for key, value in providers.items():
-        if _canonical_provider(key) == provider:
-            return key, value or {}
+    """Return (config_key, entry) for a provider, matching canonical synonyms.
+
+    Searches both the ``providers:`` section and the ``workspaces:`` alias
+    section (same schema; "workspace" is the operator-facing name for a
+    Databricks upstream in the pools design).
+    """
+    for section in ("providers", "workspaces"):
+        providers = config.get(section, {}) or {}
+        if not isinstance(providers, dict):
+            continue
+        direct = providers.get(provider)
+        if direct:
+            return provider, direct
+        for key, value in providers.items():
+            if _canonical_provider(key) == provider:
+                return key, value or {}
     return None
+
+
+def _pools(config: dict) -> dict[str, list[str]]:
+    """Ordered workspace-failover pools: pool name -> [provider names]."""
+    raw = config.get("pools") or {}
+    if not isinstance(raw, dict):
+        return {}
+    pools: dict[str, list[str]] = {}
+    for name, members in raw.items():
+        if isinstance(members, str):
+            members = [members]
+        if isinstance(members, list):
+            cleaned = [str(m).strip() for m in members if str(m).strip()]
+            if cleaned:
+                pools[str(name)] = cleaned
+    return pools
+
+
+def _pool_members(entry: dict, config: dict) -> list[str]:
+    """Ordered candidate providers for a model entry.
+
+    A ``pool:`` reference expands to the pool's member list; a plain
+    ``provider:`` is a single-member pool. Unknown pool names fall back to the
+    entry's provider so a config typo degrades to current behavior.
+    """
+    pool_name = entry.get("pool")
+    if pool_name:
+        members = _pools(config).get(str(pool_name))
+        if members:
+            return [_canonical_provider(m) for m in members]
+        log.warning("Model %r references unknown pool %r", entry.get("name"), pool_name)
+    return [_canonical_provider(entry.get("provider", "local"))]
 
 
 def _resolve_provider_config(config: dict, provider: str) -> dict:
@@ -239,12 +279,13 @@ def _load_models() -> dict[str, dict]:
         return _models
 
     _models = {}
-    if not MODEL_INFO_PATH.exists():
+    if MODEL_INFO_PATH.exists():
+        with open(MODEL_INFO_PATH) as f:
+            data = json.load(f)
+    else:
+        # config.yaml overlay models below still route without the catalog.
         log.warning("model-info.json not found at %s", MODEL_INFO_PATH)
-        return _models
-
-    with open(MODEL_INFO_PATH) as f:
-        data = json.load(f)
+        data = {}
 
     for entry in data.get("llm", []):
         provider = _canonical_provider(entry.get("provider", "local"))
@@ -510,6 +551,18 @@ async def ensure_fresh_oauth_token(provider: str, *, min_valid_seconds: int = 30
     return await refresh_oauth_token(provider, force=True)
 
 
+def _configured_pool_members(entry: dict, config: dict) -> list[str]:
+    """Pool members that have usable local config (base_url + api_key, enabled)."""
+    members = []
+    for member in _pool_members(entry, config):
+        provider_config = _effective_provider_config(config, member)
+        if provider_config.get("enabled") is False:
+            continue
+        if provider_config.get("base_url") and provider_config.get("api_key"):
+            members.append(member)
+    return members
+
+
 def _availability_for_entry(model_id: str, entry: dict | None) -> dict:
     if not entry:
         return {
@@ -519,7 +572,7 @@ def _availability_for_entry(model_id: str, entry: dict | None) -> dict:
         }
 
     name = entry.get("name") or model_id
-    provider = _canonical_provider(entry.get("provider", "local"))
+    provider = _pool_members(entry, _load_config())[0]
     if not _is_model_enabled(name):
         return {
             "available": False,
@@ -529,7 +582,13 @@ def _availability_for_entry(model_id: str, entry: dict | None) -> dict:
             "message": f"Model {name!r} is disabled by runtime model_overrides",
         }
 
-    provider_config = _effective_provider_config(_load_config(), provider)
+    config = _load_config()
+    configured = _configured_pool_members(entry, config)
+    if configured:
+        return {"available": True, "reason": "", "model": name, "provider": configured[0], "message": ""}
+
+    # Nothing in the pool is usable — report why using the first member.
+    provider_config = _effective_provider_config(config, provider)
     if provider_config.get("enabled") is False:
         return {
             "available": False,
@@ -544,17 +603,14 @@ def _availability_for_entry(model_id: str, entry: dict | None) -> dict:
         missing.append("base_url")
     if not provider_config.get("api_key"):
         missing.append("api_key")
-    if missing:
-        return {
-            "available": False,
-            "reason": "provider_not_configured",
-            "model": name,
-            "provider": provider,
-            "missing": missing,
-            "message": f"Provider {provider!r} is missing {', '.join(missing)} in local runtime config",
-        }
-
-    return {"available": True, "reason": "", "model": name, "provider": provider, "message": ""}
+    return {
+        "available": False,
+        "reason": "provider_not_configured",
+        "model": name,
+        "provider": provider,
+        "missing": missing,
+        "message": f"Provider {provider!r} is missing {', '.join(missing)} in local runtime config",
+    }
 
 
 def model_availability(model_id: str) -> dict:
@@ -566,8 +622,26 @@ def is_model_available(model_id: str) -> bool:
     return bool(model_availability(model_id).get("available"))
 
 
-def resolve(model_id: str) -> ProviderInfo | None:
-    """Resolve a model name/alias/id to provider info."""
+def pool_candidates(model_id: str) -> list[str]:
+    """Ordered, locally-configured pool member providers for a model id.
+
+    Accepts any routable id (name, alias, provider_model_id). Single-provider
+    models return a one-element list. Unknown models return [].
+    """
+    entry = _load_models().get(model_id)
+    if not entry:
+        return []
+    return _configured_pool_members(entry, _load_config())
+
+
+def resolve(model_id: str, provider_override: str | None = None) -> ProviderInfo | None:
+    """Resolve a model name/alias/id to provider info.
+
+    Pooled models route to the first configured pool member whose circuit is
+    not open (per-workspace failover happens here for new requests; in-flight
+    failover lives in src.upstream). ``provider_override`` pins a specific
+    pool member, bypassing circuit state — used by upstream failover.
+    """
     models = _load_models()
     entry = models.get(model_id)
     availability = _availability_for_entry(model_id, entry)
@@ -577,8 +651,23 @@ def resolve(model_id: str) -> ProviderInfo | None:
         log.info("Model %r unavailable: %s", model_id, availability["message"])
         return None
 
-    provider = _canonical_provider(entry.get("provider", "local"))
-    provider_config = _effective_provider_config(_load_config(), provider)
+    config = _load_config()
+    candidates = _configured_pool_members(entry, config)
+    if provider_override:
+        provider = _canonical_provider(provider_override)
+        if provider not in candidates:
+            return None
+    else:
+        provider = candidates[0]
+        if len(candidates) > 1:
+            from src import circuit  # local import: circuit has no src imports
+            for member in candidates:
+                if not circuit.is_tripped(member):
+                    provider = member
+                    break
+            if provider != candidates[0]:
+                log.warning("pool: %r routing to %r (circuit open on %r)", model_id, provider, candidates[0])
+    provider_config = _effective_provider_config(config, provider)
 
     base_url = provider_config.get("base_url", "")
     api_key = provider_config.get("api_key", "")
