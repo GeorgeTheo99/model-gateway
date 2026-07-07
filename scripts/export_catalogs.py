@@ -11,6 +11,15 @@ from the ``models:`` overlay in the gateway runtime config.yaml. Never hand-edit
 the generated files; edit config.yaml and re-run (or let the gateway deploy hook
 run it).
 
+Exports are OPT-IN via config.yaml — machines without Pi (or that don't want
+shell launchers) simply omit the section and this script is a no-op::
+
+    exports:
+      pi_models: ~/local_code/pi-local/config/pi-models/models.json
+      pi_launchers: ~/local_code/model-gateway-runtime/pi-launchers.zsh
+
+CLI flags (--pi-out / --launchers-out) override config for ad-hoc runs.
+
 Per-model export controls in config.yaml (all optional)::
 
     models:
@@ -43,8 +52,28 @@ except ImportError:  # uv run from repo root always has it; bare python3 may not
 
 HOME = Path.home()
 DEFAULT_CONFIG = HOME / "local_code" / "model-gateway-runtime" / "config" / "config.yaml"
-DEFAULT_PI_OUT = HOME / "local_code" / "pi-local" / "config" / "pi-models" / "models.json"
-DEFAULT_LAUNCHERS_OUT = HOME / "local_code" / "model-gateway-runtime" / "pi-launchers.zsh"
+
+
+def _export_targets(config: dict, args) -> dict[str, Path | None]:
+    """Resolve export destinations: CLI flag > config.yaml `exports:` > disabled.
+
+    Machines without Pi simply have no `exports:` section — nothing is written
+    and the gateway keeps serving normally.
+    """
+    exports = config.get("exports") or {}
+    if not isinstance(exports, dict):
+        exports = {}
+
+    def _target(flag_value: Path | None, key: str) -> Path | None:
+        if flag_value is not None:
+            return flag_value
+        raw = exports.get(key)
+        return Path(str(raw)).expanduser() if raw else None
+
+    return {
+        "pi_models": _target(args.pi_out, "pi_models"),
+        "pi_launchers": _target(args.launchers_out, "pi_launchers"),
+    }
 
 # Pi provider templates. Keys are Pi provider names; the gateway is always the
 # endpoint. Kept in one place so a schema change lands everywhere at once.
@@ -199,8 +228,10 @@ def _check_one(path: Path, rendered: str, label: str) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument("--pi-out", type=Path, default=DEFAULT_PI_OUT)
-    parser.add_argument("--launchers-out", type=Path, default=DEFAULT_LAUNCHERS_OUT)
+    parser.add_argument("--pi-out", type=Path, default=None,
+                        help="override exports.pi_models from config")
+    parser.add_argument("--launchers-out", type=Path, default=None,
+                        help="override exports.pi_launchers from config")
     parser.add_argument("--check", action="store_true", help="drift check only; exit 1 when stale")
     args = parser.parse_args()
 
@@ -209,26 +240,30 @@ def main() -> int:
     with open(args.config) as f:
         config = yaml.safe_load(f) or {}
 
+    targets = _export_targets(config, args)
+    if not any(targets.values()):
+        print("export_catalogs: no exports configured (config.yaml `exports:` section absent) — nothing to do")
+        return 0
+
     exported = _exported_models(config)
     if not exported:
         sys.exit("export_catalogs: refusing to render an empty catalog (no exportable models in config)")
 
-    pi_models = _dump(render_pi_models(config))
-    launchers = render_pi_launchers(config)
+    renders: list[tuple[Path, str, str]] = []
+    if targets["pi_models"]:
+        renders.append((targets["pi_models"], _dump(render_pi_models(config)), "pi models.json"))
+    if targets["pi_launchers"]:
+        renders.append((targets["pi_launchers"], render_pi_launchers(config), "pi-launchers.zsh"))
 
     if args.check:
-        ok = _check_one(args.pi_out, pi_models, "pi models.json")
-        ok = _check_one(args.launchers_out, launchers, "pi-launchers.zsh") and ok
+        ok = all(_check_one(path, content, label) for path, content, label in renders)
         if not ok:
             print("export_catalogs: DRIFT — regenerate with scripts/export_catalogs.py", file=sys.stderr)
             return 1
-        print(f"export_catalogs: in sync ({len(exported)} models)")
+        print(f"export_catalogs: in sync ({len(exported)} models, {len(renders)} exports)")
         return 0
 
-    for path, content, label in (
-        (args.pi_out, pi_models, "pi models.json"),
-        (args.launchers_out, launchers, "pi-launchers.zsh"),
-    ):
+    for path, content, label in renders:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(content)

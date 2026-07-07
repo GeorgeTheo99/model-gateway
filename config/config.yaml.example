@@ -113,3 +113,10 @@ providers:
 # body). Never hardcoded in the repo — workspace-specific pairs live here.
 # model_fallbacks:
 #   my-primary-endpoint: my-fallback-endpoint
+
+# Optional downstream catalog exports (omit entirely on machines without Pi).
+# Regenerated on gateway start and /admin/api/reload; drift-checked via
+# scripts/export_catalogs.py --check.
+# exports:
+#   pi_models: ~/local_code/pi-local/config/pi-models/models.json
+#   pi_launchers: ~/local_code/model-gateway-runtime/pi-launchers.zsh
