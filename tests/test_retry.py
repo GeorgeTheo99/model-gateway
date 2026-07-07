@@ -82,8 +82,9 @@ def test_retry_post_401_refreshes_token_and_retries(fast_retries, clean_circuit,
     provider = clean_circuit("retry-prov-b")
     calls = []
 
-    async def fake_refresh(prov: str) -> str | None:
+    async def fake_refresh(prov: str, *, force: bool = False) -> str | None:
         assert prov == provider
+        assert force is True
         return "eyJnew"
 
     # src.upstream binds refresh_oauth_token by value at import; patch both.
@@ -109,6 +110,34 @@ def test_retry_post_401_refreshes_token_and_retries(fast_retries, clean_circuit,
     assert len(calls) == 2
     assert calls[0].headers["Authorization"] == "Bearer eyJold"
     assert calls[1].headers["Authorization"] == "Bearer eyJnew"
+
+
+def test_retry_post_preflight_refreshes_near_expiry_token(fast_retries, clean_circuit, monkeypatch):
+    provider = clean_circuit("retry-prov-preflight")
+    calls = []
+
+    async def fake_ensure(prov: str) -> str | None:
+        assert prov == provider
+        return "eyJfresh"
+
+    monkeypatch.setattr(upstream, "ensure_fresh_oauth_token", fake_ensure)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={"ok": True})
+
+    async def run():
+        async with _client(handler) as client:
+            return await upstream._retry_post(
+                client, "https://up.example.com/v1/chat/completions",
+                json={"model": "m"}, headers={"Authorization": "Bearer eyJold"},
+                provider=provider,
+            )
+
+    resp = asyncio.run(run())
+    assert resp.status_code == 200
+    assert len(calls) == 1
+    assert calls[0].headers["Authorization"] == "Bearer eyJfresh"
 
 
 # ── (c) _retry_send_stream: 503 then 200 stream ──────────────────────────────

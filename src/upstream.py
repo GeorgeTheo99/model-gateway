@@ -26,7 +26,7 @@ from src.circuit import (
     wait_for_recovery,
 )
 from src.model_fallback import fallback_after_error
-from src.providers import refresh_oauth_token
+from src.providers import ensure_fresh_oauth_token, refresh_oauth_token
 
 log = logging.getLogger("model-gateway")
 
@@ -109,6 +109,17 @@ def _apply_refreshed_token(headers: dict, token: str, request: Request | None) -
     return headers
 
 
+async def _preflight_oauth_token(provider: str, headers: dict, request: Request | None) -> dict:
+    """Refresh nearly-expired OAuth tokens before the upstream request."""
+    if not provider:
+        return headers
+    token = await ensure_fresh_oauth_token(provider)
+    if not token:
+        return headers
+    log.warning("Preflight refreshed OAuth token for provider %r", provider)
+    return _apply_refreshed_token(headers, token, request)
+
+
 def _is_circuit_breaker_status(status_code: int) -> bool:
     """Status codes that indicate the provider is down (not just rate-limited)."""
     return status_code in (502, 503, 504)
@@ -149,6 +160,7 @@ async def _retry_post(
     max_attempts = _RETRY_MAX
     attempt = 0
     auth_retried = False
+    headers = await _preflight_oauth_token(provider, headers, request)
     while attempt < max_attempts:
         try:
             resp = await client.post(endpoint, json=json, headers=headers)
@@ -175,7 +187,7 @@ async def _retry_post(
         if _is_auth_status(resp.status_code) and not auth_retried and provider:
             auth_retried = True
             await resp.aread()
-            token = await refresh_oauth_token(provider)
+            token = await refresh_oauth_token(provider, force=True)
             if token:
                 headers = _apply_refreshed_token(headers, token, request)
                 log.warning(
@@ -248,6 +260,7 @@ async def _retry_send_stream(
     max_attempts = _RETRY_MAX
     attempt = 0
     auth_retried = False
+    headers = await _preflight_oauth_token(provider, headers, request)
     while attempt < max_attempts:
         try:
             resp = await client.send(
@@ -278,7 +291,7 @@ async def _retry_send_stream(
             auth_retried = True
             await resp.aread()
             await resp.aclose()
-            token = await refresh_oauth_token(provider)
+            token = await refresh_oauth_token(provider, force=True)
             if token:
                 headers = _apply_refreshed_token(headers, token, request)
                 log.warning(

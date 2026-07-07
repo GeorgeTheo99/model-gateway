@@ -407,6 +407,15 @@ def test_persist_api_key_rewrites_own_block_only(tmp_config):
     assert "keep-me" in text
 
 
+def test_jwt_expiry_epoch_parses_exp():
+    import base64
+    import json
+
+    payload = base64.urlsafe_b64encode(json.dumps({"exp": 12345}).encode()).decode().rstrip("=")
+    assert providers._jwt_expiry_epoch(f"header.{payload}.sig") == 12345
+    assert providers._jwt_expiry_epoch("dapi-static-pat") is None
+
+
 def test_anthropic_bearer_auth_quirk(tmp_path, monkeypatch):
     """anthropic_bearer_auth quirk switches Anthropic-protocol headers to Bearer."""
     from src import providers

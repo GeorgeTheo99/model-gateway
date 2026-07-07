@@ -1,6 +1,7 @@
 """Provider registry — resolve model name to endpoint + credentials."""
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -353,6 +354,23 @@ def _databricks_cli() -> str:
     return which("databricks") or "/opt/homebrew/bin/databricks"
 
 
+def _jwt_expiry_epoch(token: str) -> float | None:
+    """Return JWT ``exp`` as epoch seconds, or None when the token is opaque."""
+    parts = token.split(".")
+    if len(parts) < 2:
+        return None
+    payload = parts[1]
+    payload += "=" * (-len(payload) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(payload.encode())
+        exp = json.loads(decoded).get("exp")
+    except Exception:
+        return None
+    if isinstance(exp, (int, float)):
+        return float(exp)
+    return None
+
+
 def _persist_api_key(config_key: str, token: str) -> None:
     """Write a rotated api_key back to config.yaml, preserving comments.
 
@@ -396,7 +414,7 @@ def _persist_api_key(config_key: str, token: str) -> None:
         log.warning("Failed to persist refreshed api_key for %r: %s", config_key, exc)
 
 
-async def refresh_oauth_token(provider: str) -> str | None:
+async def refresh_oauth_token(provider: str, *, force: bool = False) -> str | None:
     """Refresh an expired OAuth token via an external CLI token cache.
 
     Opt-in per provider with config.yaml::
@@ -431,7 +449,7 @@ async def refresh_oauth_token(provider: str) -> str | None:
             return latest
 
         now = time.monotonic()
-        if now - _last_token_refresh_attempt.get(provider, 0.0) < _AUTH_REFRESH_MIN_INTERVAL:
+        if not force and now - _last_token_refresh_attempt.get(provider, 0.0) < _AUTH_REFRESH_MIN_INTERVAL:
             return None
         _last_token_refresh_attempt[provider] = now
 
@@ -467,6 +485,29 @@ async def refresh_oauth_token(provider: str) -> str | None:
         _persist_api_key(config_key, token)
         log.warning("Refreshed expired OAuth token for provider %r via CLI token cache", provider)
         return token
+
+
+async def ensure_fresh_oauth_token(provider: str, *, min_valid_seconds: int = 300) -> str | None:
+    """Refresh a configured OAuth JWT before it expires.
+
+    PAT-backed providers and opaque API keys are left untouched. This is a
+    lightweight preflight used by request routing so OAuth-backed Databricks
+    workspaces do not depend on an external timer job.
+    """
+    config = _load_config()
+    found = _find_provider_entry(config, provider)
+    if not found:
+        return None
+    _config_key, entry = found
+    if (entry.get("auth_refresh") or "") != "databricks-cli":
+        return None
+    current = entry.get("api_key", "")
+    if not current.startswith("eyJ"):
+        return None
+    exp = _jwt_expiry_epoch(current)
+    if exp is None or exp - time.time() > min_valid_seconds:
+        return None
+    return await refresh_oauth_token(provider, force=True)
 
 
 def _availability_for_entry(model_id: str, entry: dict | None) -> dict:
