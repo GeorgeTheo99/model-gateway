@@ -402,6 +402,19 @@ class PoolContext:
     api_key: str            # that provider's credential as sent in headers
 
 
+def _fallback_endpoint(endpoint: str, requested_model: str, fallback_model: str) -> str:
+    """Rebuild the endpoint for a model fallback.
+
+    ``endpoint_style: invocations`` providers embed the model in the URL
+    (/serving-endpoints/<model>/invocations), so switching json["model"]
+    alone would keep hitting the failed primary endpoint.
+    """
+    return endpoint.replace(
+        f"/serving-endpoints/{requested_model}/",
+        f"/serving-endpoints/{fallback_model}/",
+    )
+
+
 def _pool_eligible_status(status_code: int) -> bool:
     """Statuses that justify trying the next workspace in the pool."""
     if status_code in SATURATION_STATUSES:
@@ -565,7 +578,8 @@ async def _retry_post_with_model_fallback(
         requested_model, decision.fallback_model, decision.reason,
     )
     return await _retry_post(
-        client, endpoint, json=retry_json, headers=headers, provider=provider, request=request,
+        client, _fallback_endpoint(endpoint, requested_model, decision.fallback_model),
+        json=retry_json, headers=headers, provider=provider, request=request,
     )
 
 
@@ -606,5 +620,6 @@ async def _retry_send_stream_with_model_fallback(
         requested_model, decision.fallback_model, decision.reason,
     )
     return await _retry_send_stream(
-        client, endpoint, json=retry_json, headers=headers, provider=provider, request=request,
+        client, _fallback_endpoint(endpoint, requested_model, decision.fallback_model),
+        json=retry_json, headers=headers, provider=provider, request=request,
     )

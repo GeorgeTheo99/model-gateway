@@ -106,7 +106,7 @@ async def _regenerate_catalogs() -> str:
         return "skipped (script missing)"
     try:
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, str(script),
+            sys.executable, str(script), "--config", str(CONFIG_PATH),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         )
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)

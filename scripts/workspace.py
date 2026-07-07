@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import os
 import json
 import shutil
 import subprocess
@@ -42,9 +43,13 @@ from pathlib import Path
 import yaml
 
 HOME = Path.home()
-DEFAULT_CONFIG = HOME / "local_code" / "model-gateway-runtime" / "config" / "config.yaml"
-GATEWAY_URL = "http://localhost:9111"
-ADMIN_KEY = "admin"
+# Same resolution as the gateway: MODEL_GATEWAY_CONFIG env, else checkout-local.
+DEFAULT_CONFIG = Path(
+    os.environ.get("MODEL_GATEWAY_CONFIG")
+    or Path(__file__).resolve().parents[1] / "config" / "config.yaml"
+)
+GATEWAY_URL = os.environ.get("MODEL_GATEWAY_URL", "http://localhost:9111")
+ADMIN_KEY = os.environ.get("MODEL_GATEWAY_ADMIN_KEY", "admin")
 
 
 def _fail(msg: str) -> "SystemExit":

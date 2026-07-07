@@ -340,3 +340,14 @@ def test_single_member_pool_no_failover(pooled_registry, clean_circuits, fast_re
 
     resp = asyncio.run(run())
     assert resp.status_code == 503
+
+def test_model_fallback_rewrites_invocations_endpoint():
+    assert upstream._fallback_endpoint(
+        "https://ws.example.com/serving-endpoints/databricks-gpt-5-5/invocations",
+        "databricks-gpt-5-5", "databricks-gpt-5-4",
+    ) == "https://ws.example.com/serving-endpoints/databricks-gpt-5-4/invocations"
+    # Path-prefix endpoints (model only in body) are unchanged.
+    assert upstream._fallback_endpoint(
+        "https://gw.example.com/mlflow/v1/chat/completions",
+        "databricks-gpt-5-5", "databricks-gpt-5-4",
+    ) == "https://gw.example.com/mlflow/v1/chat/completions"

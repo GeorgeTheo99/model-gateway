@@ -47,12 +47,17 @@ log = logging.getLogger("model-gateway")
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    """Initialize the request ledger on startup."""
+    """Initialize the request ledger and regenerate downstream catalogs on startup."""
     try:
         ledger.init()
         log.info("ledger ready at %s", ledger.ledger_path())
     except Exception as exc:  # noqa: BLE001
         log.warning("ledger init failed (ledger disabled): %s", exc)
+    # Best-effort catalog regeneration (no-op unless config.yaml has exports:).
+    # In-process so it runs on every deploy layout, not just launchers that
+    # call scripts/export_catalogs.py themselves.
+    from src.admin import _regenerate_catalogs
+    log.info("catalog exports: %s", await _regenerate_catalogs())
     yield
 
 

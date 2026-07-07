@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -51,7 +52,13 @@ except ImportError:  # uv run from repo root always has it; bare python3 may not
     sys.exit("export_catalogs: pyyaml is required (run via `uv run` from the gateway repo)")
 
 HOME = Path.home()
-DEFAULT_CONFIG = HOME / "local_code" / "model-gateway-runtime" / "config" / "config.yaml"
+# Same resolution as the gateway itself: MODEL_GATEWAY_CONFIG env, else the
+# checkout-local config (repo/config/config.yaml, symlinked to shared config
+# in deployed layouts).
+DEFAULT_CONFIG = Path(
+    os.environ.get("MODEL_GATEWAY_CONFIG")
+    or Path(__file__).resolve().parents[1] / "config" / "config.yaml"
+)
 
 
 def _export_targets(config: dict, args) -> dict[str, Path | None]:
