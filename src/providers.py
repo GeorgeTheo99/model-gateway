@@ -1,8 +1,11 @@
 """Provider registry — resolve model name to endpoint + credentials."""
 
+import asyncio
 import json
 import logging
 import os
+import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -49,6 +52,14 @@ class ProviderInfo:
     api_key: str
     provider_model_id: str
     protocol: str = "openai"  # "openai" (Chat Completions) or "anthropic" (Messages API)
+    # Path appended to base_url for chat/messages requests. None => server default
+    # ("/chat/completions" or "/messages"). "" => base_url is already a complete
+    # invocation URL (e.g. endpoint_style: invocations providers).
+    endpoint_suffix: str | None = None
+    # Provider quirk flags from config (e.g. "no_stream_options",
+    # "no_reasoning_params"). Generic mechanism; which providers need which
+    # quirks is runtime config, not code.
+    quirks: frozenset = frozenset()
     context: int = 0
     max_output_tokens: int = 0
     thinking: str = ""  # "", "optional", or "always"
@@ -60,6 +71,12 @@ class ProviderInfo:
 
 _config: dict | None = None
 _models: dict[str, dict] | None = None
+
+# OAuth token auto-refresh via an external CLI token cache (opt-in per provider
+# with `auth_refresh:` in config.yaml). See refresh_oauth_token().
+_AUTH_REFRESH_MIN_INTERVAL = 60.0  # seconds between CLI refresh attempts per provider
+_token_refresh_locks: dict[str, "asyncio.Lock"] = {}
+_last_token_refresh_attempt: dict[str, float] = {}
 
 _PROVIDER_SYNONYMS = {
     "local": "omlx",
@@ -88,15 +105,21 @@ def _canonical_provider(provider: str | None) -> str:
     return _PROVIDER_SYNONYMS.get(raw, raw)
 
 
-def _resolve_provider_config(config: dict, provider: str) -> dict:
+def _find_provider_entry(config: dict, provider: str) -> tuple[str, dict] | None:
+    """Return (config_key, entry) for a provider, matching canonical synonyms."""
     providers = config.get("providers", {}) or {}
     direct = providers.get(provider)
     if direct:
-        return direct
+        return provider, direct
     for key, value in providers.items():
         if _canonical_provider(key) == provider:
-            return value or {}
-    return {}
+            return key, value or {}
+    return None
+
+
+def _resolve_provider_config(config: dict, provider: str) -> dict:
+    found = _find_provider_entry(config, provider)
+    return found[1] if found else {}
 
 
 def _provider_defaults(provider: str) -> dict:
@@ -233,7 +256,22 @@ def _load_models() -> dict[str, dict]:
         for model_id in _entry_routable_ids(normalized_entry):
             _models[model_id] = normalized_entry
 
-    log.info("Loaded %d routable model keys from model-info.json", len(_models))
+    # Runtime-local model overlay: config.yaml `models:` entries are merged on
+    # top of the committed catalog. This keeps machine-specific model routes
+    # (e.g. a private workspace's serving endpoints) out of the repo entirely.
+    # Same schema as model-info.json `llm` entries; overlay wins on id clash.
+    overlay = _load_config().get("models") or []
+    if isinstance(overlay, list):
+        for entry in overlay:
+            if not isinstance(entry, dict):
+                continue
+            provider = _canonical_provider(entry.get("provider", "local"))
+            normalized_entry = dict(entry)
+            normalized_entry["provider"] = provider
+            for model_id in _entry_routable_ids(normalized_entry):
+                _models[model_id] = normalized_entry
+
+    log.info("Loaded %d routable model keys (catalog + config overlay)", len(_models))
     return _models
 
 
@@ -248,6 +286,20 @@ def routable_ids(name: str) -> list[str]:
     if not entry:
         return [name] if name else []
     return sorted(_entry_routable_ids(entry))
+
+
+def provider_quirks(provider: str) -> frozenset:
+    """Return the quirk set for a provider from live runtime config.
+
+    Used by header construction and other call sites that only have the
+    provider name (no resolved ProviderInfo).
+    """
+    config = _load_config()
+    provider_config = _effective_provider_config(config, _canonical_provider(provider))
+    quirks_raw = provider_config.get("quirks") or []
+    if isinstance(quirks_raw, str):
+        quirks_raw = [q.strip() for q in quirks_raw.split(",") if q.strip()]
+    return frozenset(quirks_raw)
 
 
 def auth_config() -> dict:
@@ -293,6 +345,128 @@ def reload():
     global _config, _models
     _config = None
     _models = None
+
+
+def _databricks_cli() -> str:
+    """Path to the databricks CLI (launchd PATH may not include homebrew)."""
+    from shutil import which
+    return which("databricks") or "/opt/homebrew/bin/databricks"
+
+
+def _persist_api_key(config_key: str, token: str) -> None:
+    """Write a rotated api_key back to config.yaml, preserving comments.
+
+    Keeps the on-disk config consistent with the in-memory one so gateway
+    restarts and any external token-refresh job agree on the token.
+    """
+    if not CONFIG_PATH.exists():
+        return
+    try:
+        lines = CONFIG_PATH.read_text().splitlines(keepends=True)
+
+        # Locate the provider's own key line and its indent.
+        key_re = re.compile(rf"^([ \t]*){re.escape(config_key)}:[ \t]*(#.*)?$")
+        start = None
+        provider_indent = ""
+        for i, line in enumerate(lines):
+            m = key_re.match(line.rstrip("\n"))
+            if m:
+                start = i
+                provider_indent = m.group(1)
+                break
+        if start is None:
+            log.warning("Could not persist refreshed api_key for %r to %s", config_key, CONFIG_PATH)
+            return
+
+        # Replace api_key only within this provider's block: lines strictly
+        # more indented than the provider key. Stop at the next sibling/parent
+        # so a missing api_key line can never clobber the NEXT provider's.
+        api_key_re = re.compile(r"^([ \t]*api_key:[ \t]*)(\S+)(.*)$")
+        for i in range(start + 1, len(lines)):
+            stripped = lines[i].strip()
+            if stripped and not lines[i].startswith(provider_indent + " ") and not lines[i].startswith(provider_indent + "\t"):
+                break  # left the provider block (sibling or parent)
+            m = api_key_re.match(lines[i].rstrip("\n"))
+            if m:
+                lines[i] = f"{m.group(1)}{token}{m.group(3)}\n"
+                CONFIG_PATH.write_text("".join(lines))
+                return
+        log.warning("Could not persist refreshed api_key for %r to %s", config_key, CONFIG_PATH)
+    except OSError as exc:
+        log.warning("Failed to persist refreshed api_key for %r: %s", config_key, exc)
+
+
+async def refresh_oauth_token(provider: str) -> str | None:
+    """Refresh an expired OAuth token via an external CLI token cache.
+
+    Opt-in per provider with config.yaml::
+
+        providers:
+          my_workspace:
+            auth_refresh: databricks-cli   # only supported refresher today
+            auth_profile: my-cli-profile   # optional; falls back to --host <base_url>
+
+    Called by the server when an upstream returns 401/403 (e.g. a short-lived
+    OAuth JWT expired). Providers without ``auth_refresh`` are untouched.
+    Returns the new token if one was obtained, else None.
+    """
+    config = _load_config()
+    found = _find_provider_entry(config, provider)
+    if not found:
+        return None
+    config_key, entry = found
+    if (entry.get("auth_refresh") or "") != "databricks-cli":
+        return None
+    base_url = (entry.get("base_url") or "").rstrip("/")
+    current = entry.get("api_key", "")
+    # Only short-lived OAuth JWTs ("eyJ...") benefit; PATs never expire this way.
+    if not current.startswith("eyJ"):
+        return None
+
+    lock = _token_refresh_locks.setdefault(provider, asyncio.Lock())
+    async with lock:
+        # A concurrent request may have refreshed while we waited on the lock.
+        latest = entry.get("api_key", "")
+        if latest != current:
+            return latest
+
+        now = time.monotonic()
+        if now - _last_token_refresh_attempt.get(provider, 0.0) < _AUTH_REFRESH_MIN_INTERVAL:
+            return None
+        _last_token_refresh_attempt[provider] = now
+
+        profile = entry.get("auth_profile", "")
+        # --host wants the workspace origin, not a path under it.
+        host = base_url.split("/serving-endpoints")[0] if base_url else ""
+        cli_args = ["--profile", profile] if profile else ["--host", host]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                _databricks_cli(), "auth", "token", *cli_args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except (OSError, asyncio.TimeoutError) as exc:
+            log.error("OAuth token refresh for %r failed: %s", provider, exc)
+            return None
+        if proc.returncode != 0:
+            log.error(
+                "OAuth token refresh for %r failed (exit %d): %s",
+                provider, proc.returncode, stderr.decode(errors="replace")[:300],
+            )
+            return None
+        try:
+            token = json.loads(stdout).get("access_token", "")
+        except json.JSONDecodeError:
+            log.error("OAuth token refresh for %r: unparseable CLI output", provider)
+            return None
+        if not token or token == current:
+            return None
+
+        entry["api_key"] = token
+        _persist_api_key(config_key, token)
+        log.warning("Refreshed expired OAuth token for provider %r via CLI token cache", provider)
+        return token
 
 
 def _availability_for_entry(model_id: str, entry: dict | None) -> dict:
@@ -375,12 +549,39 @@ def resolve(model_id: str) -> ProviderInfo | None:
     if not provider_model_id:
         provider_model_id = entry.get("name", "") or model_id
 
+    # Per-model protocol override (e.g. an AI-gateway provider that serves both
+    # Anthropic- and OpenAI-protocol models under one host).
+    entry_protocol = entry.get("protocol")
+    if entry_protocol:
+        protocol = entry_protocol
+
+    endpoint_suffix: str | None = None
+    endpoint_style = provider_config.get("endpoint_style", "")
+    if endpoint_style == "invocations":
+        # base_url is a workspace host; each model has its own full invocation
+        # URL: <base>/serving-endpoints/<provider_model_id>/invocations.
+        base_url = base_url.rstrip("/") + f"/serving-endpoints/{provider_model_id}/invocations"
+        endpoint_suffix = ""
+    else:
+        # Optional per-protocol path prefixes appended to base_url, e.g.
+        # path_prefixes: {anthropic: /anthropic/v1, openai: /mlflow/v1}.
+        path_prefixes = provider_config.get("path_prefixes") or {}
+        prefix = path_prefixes.get(protocol) if isinstance(path_prefixes, dict) else None
+        if prefix:
+            base_url = base_url.rstrip("/") + "/" + str(prefix).strip("/")
+
+    quirks_raw = provider_config.get("quirks") or []
+    if isinstance(quirks_raw, str):
+        quirks_raw = [q.strip() for q in quirks_raw.split(",") if q.strip()]
+
     return ProviderInfo(
         provider=provider,
         base_url=base_url,
         api_key=api_key,
         provider_model_id=provider_model_id,
         protocol=protocol,
+        endpoint_suffix=endpoint_suffix,
+        quirks=frozenset(quirks_raw),
         context=entry.get("context", 0),
         max_output_tokens=entry.get("max_output_tokens", 0),
         thinking=entry.get("thinking", ""),

@@ -52,3 +52,63 @@ providers:
     base_url: https://your-workspace.cloud.databricks.com/serving-endpoints
     api_key: "YOUR_DATABRICKS_TOKEN"
     protocol: openai
+
+  # ── Advanced provider keys (all optional, all runtime-local) ───────────────
+  # Everything provider- or workspace-specific stays in this file — the repo
+  # never hardcodes hostnames, endpoint names, or model lists. A generic
+  # "my_workspace" example for an AI-gateway / model-serving style provider:
+  #
+  # my_workspace:
+  #   base_url: https://your-workspace.example.com
+  #   api_key: "YOUR_TOKEN_OR_OAUTH_JWT"
+  #   protocol: openai            # provider default; models may override below
+  #
+  #   # endpoint_style: invocations
+  #   #   Each model gets its own complete invocation URL:
+  #   #     <base_url>/serving-endpoints/<provider_model_id>/invocations
+  #   #   (endpoint_suffix becomes "" — no /chat/completions is appended).
+  #   endpoint_style: invocations
+  #
+  #   # path_prefixes: per-protocol path appended to base_url (mutually
+  #   # exclusive with endpoint_style in practice). Lets one host serve both
+  #   # Anthropic- and OpenAI-protocol models under different base paths.
+  #   path_prefixes:
+  #     anthropic: /gateway/anthropic/v1
+  #     openai: /gateway/openai/v1
+  #
+  #   # quirks: generic upstream compatibility flags (config, not code):
+  #   #   no_stream_options   -> upstream 400s on OpenAI stream_options; drop it
+  #   #   no_reasoning_params -> upstream rejects reasoning_effort/thinking;
+  #   #                          never inject or forward reasoning controls
+  #   quirks:
+  #     - no_stream_options
+  #     - no_reasoning_params
+  #
+  #   # auth_refresh: opt-in OAuth token auto-refresh on upstream 401/403.
+  #   # Only "databricks-cli" is supported (uses `databricks auth token`).
+  #   # Only fires when api_key looks like a short-lived OAuth JWT ("eyJ...").
+  #   auth_refresh: databricks-cli
+  #   auth_profile: my-cli-profile   # optional; falls back to --host <base_url>
+
+# Runtime-local model overlay. Same schema as model-info.json `llm` entries;
+# merged on top of the committed catalog (overlay wins on id clash). Keeps
+# machine/workspace-specific model routes out of the repo entirely.
+# Per-model `protocol` overrides the provider default (useful when one
+# gateway host serves both Anthropic- and OpenAI-protocol models).
+# models:
+#   - name: my-hosted-model
+#     alias: mhm
+#     provider: my_workspace
+#     provider_model_id: my-serving-endpoint-name
+#     protocol: anthropic
+#     context: 200000
+#     max_output_tokens: 64000
+#     thinking: optional
+#     pricing: {input: 3.0, output: 15.0}
+
+# Config-driven model fallback: after a retryable upstream failure
+# (429/502/503/504, or 404 "model not found"), retry once with the mapped
+# model. Keys/values are upstream provider model ids (as sent in the request
+# body). Never hardcoded in the repo — workspace-specific pairs live here.
+# model_fallbacks:
+#   my-primary-endpoint: my-fallback-endpoint

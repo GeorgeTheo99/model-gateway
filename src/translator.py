@@ -379,6 +379,18 @@ def openai_to_anthropic(resp: dict, model: str, has_tools: bool = False, thinkin
     content = []
     text = message.get("content")
     reasoning_content = message.get("reasoning_content") or message.get("reasoning")
+
+    # Some upstreams (e.g. native serving invocations for reasoning models)
+    # return message.content as a list of OpenAI content-part blocks rather
+    # than a string, mixing reasoning and text. Flatten so downstream string
+    # operations are safe. Shape-safe: only triggers when content is a list.
+    if isinstance(text, list):
+        from src.streaming import _flatten_list_content
+        flat_text, flat_reasoning = _flatten_list_content(text)
+        text = flat_text
+        if flat_reasoning and not reasoning_content:
+            reasoning_content = flat_reasoning
+
     if not reasoning_content and message.get("reasoning_details"):
         parts = []
         for item in message.get("reasoning_details") or []:
