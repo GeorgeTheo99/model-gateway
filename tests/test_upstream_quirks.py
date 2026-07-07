@@ -405,3 +405,38 @@ def test_persist_api_key_rewrites_own_block_only(tmp_config):
     assert "api_key: eyJnew" in text
     assert "eyJold" not in text
     assert "keep-me" in text
+
+
+def test_anthropic_bearer_auth_quirk(tmp_path, monkeypatch):
+    """anthropic_bearer_auth quirk switches Anthropic-protocol headers to Bearer."""
+    from src import providers
+    from src.server import _forward_headers
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "providers:\n"
+        "  gwprov:\n"
+        "    base_url: https://gw.example.com\n"
+        "    api_key: k\n"
+        "    quirks: [anthropic_bearer_auth]\n"
+        "  plainprov:\n"
+        "    base_url: https://plain.example.com\n"
+        "    api_key: k\n"
+    )
+    monkeypatch.setattr(providers, "CONFIG_PATH", cfg)
+    providers.reload()
+
+    class FakeState:
+        api_key = "sekret"
+
+    class FakeRequest:
+        state = FakeState()
+
+    h = _forward_headers(FakeRequest(), protocol="anthropic", provider="gwprov")
+    assert h["Authorization"] == "Bearer sekret"
+    assert "x-api-key" not in h
+
+    h2 = _forward_headers(FakeRequest(), protocol="anthropic", provider="plainprov")
+    assert h2["x-api-key"] == "sekret"
+    assert "Authorization" not in h2
+    providers.reload()

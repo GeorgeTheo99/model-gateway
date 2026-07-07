@@ -288,6 +288,20 @@ def routable_ids(name: str) -> list[str]:
     return sorted(_entry_routable_ids(entry))
 
 
+def provider_quirks(provider: str) -> frozenset:
+    """Return the quirk set for a provider from live runtime config.
+
+    Used by header construction and other call sites that only have the
+    provider name (no resolved ProviderInfo).
+    """
+    config = _load_config()
+    provider_config = _effective_provider_config(config, _canonical_provider(provider))
+    quirks_raw = provider_config.get("quirks") or []
+    if isinstance(quirks_raw, str):
+        quirks_raw = [q.strip() for q in quirks_raw.split(",") if q.strip()]
+    return frozenset(quirks_raw)
+
+
 def auth_config() -> dict:
     """Return the live ``auth`` section from config.yaml.
 

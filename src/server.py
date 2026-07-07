@@ -26,7 +26,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from src.admin import router as admin_router
 from src.auth import require_client_auth
 from src.errors import upstream_error, upstream_error_openai
-from src.providers import list_available_models, list_models as list_routable_models, model_availability, pricing_for, resolve
+from src.providers import list_available_models, list_models as list_routable_models, model_availability, pricing_for, provider_quirks, resolve
 from src.upstream import (
     _retry_post,
     _retry_post_with_model_fallback,
@@ -98,11 +98,17 @@ def _forward_headers(request: Request, protocol: str = "openai", provider: str =
     Uses x-api-key + anthropic-version for Anthropic native API.
     """
     if protocol == "anthropic":
-        return {
-            "x-api-key": request.state.api_key,
+        headers = {
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
+        # Some Anthropic-protocol upstreams (e.g. AI gateways fronting Claude)
+        # require Bearer auth instead of x-api-key. Config quirk: anthropic_bearer_auth.
+        if "anthropic_bearer_auth" in provider_quirks(provider):
+            headers["Authorization"] = f"Bearer {request.state.api_key}"
+        else:
+            headers["x-api-key"] = request.state.api_key
+        return headers
     headers = {
         "Authorization": f"Bearer {request.state.api_key}",
     }
