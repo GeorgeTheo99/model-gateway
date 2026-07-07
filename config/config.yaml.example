@@ -9,7 +9,7 @@
 # Env vars MODEL_GATEWAY_ADMIN_KEY / MODEL_GATEWAY_CLIENT_KEYS override these.
 auth:
   admin_keys:
-    - "YOUR_MODEL_GATEWAY_ADMIN_KEY"
+    - "admin"
   # client_keys:
   #   - "cloud"
 
