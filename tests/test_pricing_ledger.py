@@ -72,7 +72,7 @@ def test_non_streaming_request_records_ledger_with_cost(tmp_ledger, monkeypatch)
     def fake_resolve(model):
         return info if model == "priced-model" else None
 
-    async def fake_passthrough_sync(endpoint, body, headers):
+    async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
         return server_module.JSONResponse(status_code=200, content={
             "choices": [{"message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
             "usage": {
@@ -120,7 +120,7 @@ def test_unpriced_model_records_unknown_cost(tmp_ledger, monkeypatch):
     def fake_resolve(model):
         return info if model == "unpriced" else None
 
-    async def fake_passthrough_sync(endpoint, body, headers):
+    async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
         return server_module.JSONResponse(status_code=200, content={
             "usage": {"prompt_tokens": 100, "completion_tokens": 50},
         })

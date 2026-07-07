@@ -289,6 +289,9 @@ def test_requesting_unconfigured_model_returns_clear_error(tmp_config, monkeypat
 
 
 def test_databricks_provider_can_be_configured_from_env(tmp_config, monkeypatch):
+    # Isolate from ambient Databricks env (dev shells often export these).
+    for var in ("DATABRICKS_HOST", "DATABRICKS_TOKEN", "DATABRICKS_SERVING_BASE_URL"):
+        monkeypatch.delenv(var, raising=False)
     doc = json.loads((tmp_config / "model-info.json").read_text())
     doc["llm"].append({
         "name": "dbx-chat",

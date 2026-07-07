@@ -256,7 +256,7 @@ def test_chat_completions_text_request_does_not_500_on_vision_fallback_env(clien
     def fake_resolve(model):
         return info if model == "text-model" else None
 
-    async def fake_passthrough_sync(endpoint, body, headers):
+    async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
         assert endpoint == "http://up/chat/completions"
         assert body["model"] == "upstream-model"
         return server_module.JSONResponse(status_code=200, content={"ok": True})
@@ -284,7 +284,7 @@ def test_chat_completions_local_omlx_proxies_to_upstream_model(client, monkeypat
     def fake_resolve(model):
         return info if model == "local-alias" else None
 
-    async def fake_passthrough_sync(endpoint, body, headers):
+    async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
         assert endpoint == "http://up/chat/completions"
         assert headers["Authorization"] == "Bearer k"
         assert body["model"] == "local-upstream"
@@ -436,7 +436,7 @@ def test_chat_completions_image_request_extracts_then_answers_with_original_mode
         assert server_module._payload_has_image(body)
         return "Visible: a concrete wall with a crack."
 
-    async def fake_passthrough_sync(endpoint, body, headers):
+    async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
         assert endpoint == "http://up/chat/completions"
         assert body["model"] == "text-upstream"
         assert not server_module._payload_has_image(body)
@@ -484,7 +484,7 @@ def test_chat_completions_image_request_uses_fireworks_default_vision_fallback(c
             return fallback_info
         return None
 
-    async def fake_passthrough_sync(endpoint, body, headers):
+    async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
         assert endpoint == "http://up/chat/completions"
         assert body["model"] == "accounts/fireworks/models/qwen3p7-plus"
         assert "prompt_cache_key" not in body

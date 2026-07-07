@@ -25,10 +25,17 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from src.admin import router as admin_router
 from src.auth import require_client_auth
+from src.errors import upstream_error, upstream_error_openai
 from src.providers import list_available_models, list_models as list_routable_models, model_availability, pricing_for, resolve
+from src.upstream import (
+    _retry_post,
+    _retry_post_with_model_fallback,
+    _retry_send_stream,
+    _retry_send_stream_with_model_fallback,
+)
 from src.responses import chat_to_responses, responses_to_chat, translate_responses_stream
 from src.signature_cache import store_from_extra_content
-from src.streaming import translate_stream
+from src.streaming import _flatten_list_content, translate_stream
 from src.translator import anthropic_to_openai, anthropic_to_openai_chat, openai_chat_to_anthropic, openai_to_anthropic
 from src import ledger
 from src.usage import extract_usage, estimate_cost
@@ -114,6 +121,14 @@ def _error(status: int, error_type: str, message: str) -> JSONResponse:
     )
 
 
+def _error_openai(status: int, error_type: str, message: str) -> JSONResponse:
+    """OpenAI-shaped error envelope for OpenAI-native routes (/v1/responses)."""
+    return JSONResponse(
+        status_code=status,
+        content={"error": {"type": error_type, "message": message}},
+    )
+
+
 def _model_error_message(model: str) -> str:
     availability = model_availability(model)
     if availability.get("reason") == "model_not_found":
@@ -149,6 +164,31 @@ def _normalize_anthropic_adaptive_thinking(body: dict, info) -> None:
     elif thinking_param.get("type") == "disabled":
         body["thinking"] = {"type": "adaptive"}
         body["output_config"] = {"effort": "low"}
+
+
+def _upstream_endpoint(info, default_suffix: str) -> str:
+    """Build the upstream URL for a request.
+
+    Most providers want base_url + a fixed suffix ("/chat/completions" or
+    "/messages"). Providers whose base_url is already a complete invocation
+    URL (config ``endpoint_style: invocations``) set endpoint_suffix="".
+    """
+    suffix = getattr(info, "endpoint_suffix", None)
+    if suffix is None:
+        suffix = default_suffix
+    return f"{info.base_url}{suffix}"
+
+
+def _maybe_stream_options(req: dict, info) -> None:
+    """Set stream_options.include_usage unless the provider rejects it.
+
+    Providers with the ``no_stream_options`` quirk (config-driven) return
+    400 for OpenAI's stream_options flag; pop it for those instead.
+    """
+    if "no_stream_options" in getattr(info, "quirks", frozenset()):
+        req.pop("stream_options", None)
+        return
+    req["stream_options"] = {"include_usage": True}
 
 
 def _remap_max_tokens_for_provider(req: dict, provider: str) -> None:
@@ -655,7 +695,7 @@ async def _extract_image_observations(request: Request, body: dict, fallback_mod
     headers = _forward_headers(request, protocol=fallback_info.protocol, provider=fallback_info.provider)
     if original_api_key is not None:
         request.state.api_key = original_api_key
-    endpoint = f"{fallback_info.base_url}/chat/completions"
+    endpoint = _upstream_endpoint(fallback_info, "/chat/completions")
     start = time.time()
     async with httpx.AsyncClient(timeout=300) as client:
         try:
@@ -693,6 +733,17 @@ def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat") -> bool:
     """
     control = _extract_reasoning_control(req, info)
     enabled = control["enabled"]
+
+    # Config-driven quirk: some upstreams (e.g. native serving invocations for
+    # reasoning models) auto-reason internally and reject OpenAI reasoning
+    # params. Never inject or forward reasoning controls into OpenAI-shaped
+    # upstream requests for those providers. Native Anthropic Messages
+    # requests (target_api="messages") keep their thinking params.
+    if target_api != "messages" and "no_reasoning_params" in getattr(info, "quirks", frozenset()):
+        _strip_reasoning_controls(req)
+        req.pop("reasoning", None)
+        return bool(enabled)
+
     if enabled is None:
         return False
 
@@ -1134,14 +1185,14 @@ async def create_response(request: Request):
     try:
         body = await request.json()
     except Exception:
-        return _error(400, "invalid_request_error", "Invalid JSON body")
+        return _error_openai(400, "invalid_request_error", "Invalid JSON body")
 
     model = body.get("model", "")
     is_stream = body.get("stream", False)
 
     info = resolve(model)
     if not info:
-        return _error(404, "invalid_request_error", _model_error_message(model))
+        return _error_openai(404, "invalid_request_error", _model_error_message(model))
 
     _set_ledger_ctx(request, model, info, is_stream=is_stream)
     _inject_responses_instruction(body, info.system_instruction)
@@ -1159,16 +1210,16 @@ async def create_response(request: Request):
         _apply_gateway_reasoning(body, info, target_api="responses")
         request.state.api_key = info.api_key
         fwd = _forward_headers(request, provider=info.provider)
-        endpoint = f"{info.base_url}/responses"
+        endpoint = _upstream_endpoint(info, "/responses")
         log.info("Responses %s -> openai native (stream=%s)", model, is_stream)
-        return await _handle_openai_responses_passthrough(endpoint, body, fwd, is_stream)
+        return await _handle_openai_responses_passthrough(endpoint, body, fwd, is_stream, provider=info.provider, request=request)
 
     # Translate Responses → Chat Completions
     chat_req = responses_to_chat(body)
     _inject_openai_system_instruction(chat_req, info.system_instruction)
     chat_req["model"] = info.provider_model_id
     _remap_max_tokens_for_provider(chat_req, info.provider)
-    endpoint = f"{info.base_url}/chat/completions"
+    endpoint = _upstream_endpoint(info, "/chat/completions")
 
     for key in ("reasoning", "reasoning_effort", "thinking", "output_config", "chat_template_kwargs"):
         if key in body and key not in chat_req:
@@ -1209,25 +1260,28 @@ async def create_response(request: Request):
     if is_stream and not google_with_tools:
         # Force streaming for the upstream request
         chat_req["stream"] = True
-        return await _handle_responses_stream(endpoint, chat_req, model, fwd)
+        return await _handle_responses_stream(endpoint, chat_req, model, fwd, info=info, request=request)
     if is_stream and google_with_tools:
         # Use non-streaming upstream to capture thought_signatures reliably
         chat_req.pop("stream", None)
-        return await _handle_responses_stream_google(endpoint, chat_req, model, fwd)
+        return await _handle_responses_stream_google(endpoint, chat_req, model, fwd, info=info, request=request)
 
     # Non-streaming client response
     if google_with_tools:
         # Non-streaming upstream for Google+tools to capture thought_signatures
         async with httpx.AsyncClient(timeout=300) as client:
             try:
-                resp = await client.post(endpoint, json=chat_req, headers=fwd)
+                resp = await _retry_post_with_model_fallback(
+                    client, endpoint, json=chat_req, headers=fwd,
+                    provider=info.provider, request=request,
+                )
             except httpx.ConnectError:
-                return _error(502, "api_error", "Cannot connect to Google API")
+                return _error_openai(502, "api_error", "Cannot connect to Google API")
             except Exception as e:
-                return _error(502, "api_error", f"Google error: {e}")
+                return _error_openai(502, "api_error", f"Google error: {e}")
 
         if resp.status_code != 200:
-            return _error(502, "api_error", f"Google returned {resp.status_code}: {resp.text[:500]}")
+            return upstream_error_openai(resp, resp.text, "Google")
 
         openai_resp = resp.json()
 
@@ -1243,31 +1297,31 @@ async def create_response(request: Request):
     else:
         # Stream from Fireworks (required for max_tokens > 4096)
         chat_req["stream"] = True
-        chat_req["stream_options"] = {"include_usage": True}
+        _maybe_stream_options(chat_req, info)
 
         client = httpx.AsyncClient(timeout=300)
         try:
-            resp = await client.send(
-                client.build_request("POST", endpoint, json=chat_req, headers=fwd),
-                stream=True,
+            resp = await _retry_send_stream_with_model_fallback(
+                client, endpoint, json=chat_req, headers=fwd,
+                provider=info.provider, request=request,
             )
         except httpx.ConnectError:
             await client.aclose()
-            return _error(502, "api_error", "Cannot connect to cloud provider")
+            return _error_openai(502, "api_error", "Cannot connect to cloud provider")
         except Exception as e:
             await client.aclose()
-            return _error(502, "api_error", f"Provider error: {e}")
+            return _error_openai(502, "api_error", f"Provider error: {e}")
 
         if resp.status_code != 200:
             err_body = await resp.aread()
             await resp.aclose()
             await client.aclose()
-            return _error(502, "api_error", f"Provider returned {resp.status_code}: {err_body.decode()[:500]}")
+            return upstream_error_openai(resp, err_body.decode(errors="replace"), "Provider")
 
         try:
             openai_resp = await _collect_stream(resp)
         except Exception as e:
-            return _error(502, "api_error", f"Stream collection failed: {e}")
+            return _error_openai(502, "api_error", f"Stream collection failed: {e}")
         finally:
             await resp.aclose()
             await client.aclose()
@@ -1284,27 +1338,27 @@ async def create_response(request: Request):
     return JSONResponse(content=result)
 
 
-async def _handle_openai_responses_passthrough(endpoint: str, body: dict, headers: dict, is_stream: bool):
+async def _handle_openai_responses_passthrough(endpoint: str, body: dict, headers: dict, is_stream: bool, provider: str = "", request: Request | None = None):
     """Forward Responses API requests directly to OpenAI."""
     if is_stream:
         client = httpx.AsyncClient(timeout=300)
         try:
-            resp = await client.send(
-                client.build_request("POST", endpoint, json=body, headers=headers),
-                stream=True,
+            resp = await _retry_send_stream(
+                client, endpoint, json=body, headers=headers,
+                provider=provider, request=request,
             )
         except httpx.ConnectError:
             await client.aclose()
-            return _error(502, "api_error", "Cannot connect to OpenAI API")
+            return _error_openai(502, "api_error", "Cannot connect to OpenAI API")
         except Exception as e:
             await client.aclose()
-            return _error(502, "api_error", f"OpenAI error: {e}")
+            return _error_openai(502, "api_error", f"OpenAI error: {e}")
 
         if resp.status_code != 200:
             err_body = await resp.aread()
             await resp.aclose()
             await client.aclose()
-            return _error(502, "api_error", f"OpenAI returned {resp.status_code}: {err_body.decode()[:500]}")
+            return upstream_error_openai(resp, err_body.decode(errors="replace"), "OpenAI")
 
         async def event_generator():
             try:
@@ -1322,40 +1376,44 @@ async def _handle_openai_responses_passthrough(endpoint: str, body: dict, header
 
     async with httpx.AsyncClient(timeout=300) as client:
         try:
-            resp = await client.post(endpoint, json=body, headers=headers)
+            resp = await _retry_post(
+                client, endpoint, json=body, headers=headers,
+                provider=provider, request=request,
+            )
         except httpx.ConnectError:
-            return _error(502, "api_error", "Cannot connect to OpenAI API")
+            return _error_openai(502, "api_error", "Cannot connect to OpenAI API")
         except Exception as e:
-            return _error(502, "api_error", f"OpenAI error: {e}")
+            return _error_openai(502, "api_error", f"OpenAI error: {e}")
 
     try:
         content = resp.json()
     except ValueError:
-        return _error(502, "api_error", f"OpenAI returned invalid JSON: {resp.text[:500]}")
+        return _error_openai(502, "api_error", f"OpenAI returned invalid JSON: {resp.text[:500]}")
 
     return JSONResponse(status_code=resp.status_code, content=content)
 
 
-async def _handle_responses_stream(endpoint: str, chat_req: dict, model: str, headers: dict):
+async def _handle_responses_stream(endpoint: str, chat_req: dict, model: str, headers: dict, info=None, request: Request | None = None):
     """Handle streaming Responses API request."""
+    provider = getattr(info, "provider", "") if info is not None else ""
     client = httpx.AsyncClient(timeout=300)
     try:
-        resp = await client.send(
-            client.build_request("POST", endpoint, json=chat_req, headers=headers),
-            stream=True,
+        resp = await _retry_send_stream_with_model_fallback(
+            client, endpoint, json=chat_req, headers=headers,
+            provider=provider, request=request,
         )
     except httpx.ConnectError:
         await client.aclose()
-        return _error(502, "api_error", "Cannot connect to cloud provider")
+        return _error_openai(502, "api_error", "Cannot connect to cloud provider")
     except Exception as e:
         await client.aclose()
-        return _error(502, "api_error", f"Provider error: {e}")
+        return _error_openai(502, "api_error", f"Provider error: {e}")
 
     if resp.status_code != 200:
         err_body = await resp.aread()
         await resp.aclose()
         await client.aclose()
-        return _error(502, "api_error", f"Provider returned {resp.status_code}: {err_body.decode()[:500]}")
+        return upstream_error_openai(resp, err_body.decode(errors="replace"), "Provider")
 
     async def event_generator():
         try:
@@ -1372,19 +1430,23 @@ async def _handle_responses_stream(endpoint: str, chat_req: dict, model: str, he
     )
 
 
-async def _handle_responses_stream_google(endpoint: str, chat_req: dict, model: str, headers: dict):
+async def _handle_responses_stream_google(endpoint: str, chat_req: dict, model: str, headers: dict, info=None, request: Request | None = None):
     """Handle streaming Responses API for Google+tools: non-streaming upstream
     to guarantee thought_signature capture, then generate Responses SSE events."""
+    provider = getattr(info, "provider", "") if info is not None else ""
     async with httpx.AsyncClient(timeout=300) as client:
         try:
-            resp = await client.post(endpoint, json=chat_req, headers=headers)
+            resp = await _retry_post_with_model_fallback(
+                client, endpoint, json=chat_req, headers=headers,
+                provider=provider, request=request,
+            )
         except httpx.ConnectError:
-            return _error(502, "api_error", "Cannot connect to Google API")
+            return _error_openai(502, "api_error", "Cannot connect to Google API")
         except Exception as e:
-            return _error(502, "api_error", f"Google error: {e}")
+            return _error_openai(502, "api_error", f"Google error: {e}")
 
     if resp.status_code != 200:
-        return _error(502, "api_error", f"Google returned {resp.status_code}: {resp.text[:500]}")
+        return upstream_error_openai(resp, resp.text, "Google")
 
     openai_resp = resp.json()
 
@@ -1553,13 +1615,13 @@ async def chat_completions(request: Request):
     fwd = _forward_headers(request, protocol=info.protocol, provider=info.provider)
 
     _remap_max_tokens_for_provider(body, info.provider)
-    endpoint = f"{info.base_url}/chat/completions"
+    endpoint = _upstream_endpoint(info, "/chat/completions")
 
     log.info("OpenAI %s -> %s (stream=%s, thinking=%s)", model, info.provider, is_stream, thinking_enabled)
 
     if is_stream:
-        return await _passthrough_stream(endpoint, body, fwd)
-    return await _passthrough_sync(endpoint, body, fwd)
+        return await _passthrough_stream(endpoint, body, fwd, provider=info.provider, request=request)
+    return await _passthrough_sync(endpoint, body, fwd, provider=info.provider, request=request)
 
 
 async def _handle_chat_anthropic(body: dict, info, model: str, request: Request, is_stream: bool):
@@ -1571,34 +1633,37 @@ async def _handle_chat_anthropic(body: dict, info, model: str, request: Request,
     _normalize_anthropic_adaptive_thinking(anthropic_req, info)
     request.state.api_key = info.api_key
     headers = _forward_headers(request, protocol="anthropic", provider=info.provider)
-    endpoint = f"{info.base_url}/messages"
+    endpoint = _upstream_endpoint(info, "/messages")
     log.info("OpenAI chat %s -> %s native Anthropic (stream=%s, thinking=%s)", model, info.provider, is_stream, thinking_enabled)
     if is_stream:
         anthropic_req["stream"] = True
-        return await _chat_anthropic_stream(endpoint, anthropic_req, model, headers)
+        return await _chat_anthropic_stream(endpoint, anthropic_req, model, headers, provider=info.provider, request=request)
     async with httpx.AsyncClient(timeout=300) as client:
         try:
-            resp = await client.post(endpoint, json=anthropic_req, headers=headers)
+            resp = await _retry_post_with_model_fallback(
+                client, endpoint, json=anthropic_req, headers=headers,
+                provider=info.provider, request=request,
+            )
         except httpx.ConnectError:
             return JSONResponse(status_code=502, content={"error": {"message": "Cannot connect to Anthropic API", "type": "api_error"}})
         except Exception as exc:  # noqa: BLE001
             return JSONResponse(status_code=502, content={"error": {"message": f"Anthropic error: {exc}", "type": "api_error"}})
+    if resp.status_code >= 400:
+        return upstream_error_openai(resp, resp.text, "Anthropic")
     try:
         content = resp.json()
     except ValueError:
         return JSONResponse(status_code=502, content={"error": {"message": f"Anthropic returned invalid JSON: {resp.text[:500]}", "type": "api_error"}})
-    if resp.status_code >= 400:
-        error = content.get("error") if isinstance(content, dict) else None
-        message = error.get("message") if isinstance(error, dict) else resp.text[:500]
-        error_type = error.get("type") if isinstance(error, dict) else "api_error"
-        return JSONResponse(status_code=resp.status_code, content={"error": {"message": message, "type": error_type}})
     return JSONResponse(content=anthropic_to_openai_chat(content, model))
 
 
-async def _chat_anthropic_stream(endpoint: str, body: dict, model: str, headers: dict):
+async def _chat_anthropic_stream(endpoint: str, body: dict, model: str, headers: dict, provider: str = "", request: Request | None = None):
     client = httpx.AsyncClient(timeout=300)
     try:
-        resp = await client.send(client.build_request("POST", endpoint, json=body, headers=headers), stream=True)
+        resp = await _retry_send_stream_with_model_fallback(
+            client, endpoint, json=body, headers=headers,
+            provider=provider, request=request,
+        )
     except httpx.ConnectError:
         await client.aclose()
         return JSONResponse(status_code=502, content={"error": {"message": "Cannot connect to Anthropic API", "type": "api_error"}})
@@ -1610,7 +1675,7 @@ async def _chat_anthropic_stream(endpoint: str, body: dict, model: str, headers:
         err_body = await resp.aread()
         await resp.aclose()
         await client.aclose()
-        return JSONResponse(status_code=resp.status_code, content={"error": {"message": err_body.decode()[:500], "type": "api_error"}})
+        return upstream_error_openai(resp, err_body.decode(errors="replace"), "Anthropic")
 
     async def stream_generator():
         try:
@@ -1700,13 +1765,12 @@ async def _anthropic_sse_to_openai_chat(byte_iter, model: str):
     yield b"data: [DONE]\n\n"
 
 
-async def _passthrough_sync(endpoint: str, body: dict, headers: dict) -> JSONResponse:
+async def _passthrough_sync(endpoint: str, body: dict, headers: dict, provider: str = "", request: Request | None = None) -> JSONResponse:
     async with httpx.AsyncClient(timeout=300) as client:
         try:
-            resp = await client.post(
-                endpoint,
-                json=body,
-                headers=headers,
+            resp = await _retry_post_with_model_fallback(
+                client, endpoint, json=body, headers=headers,
+                provider=provider, request=request,
             )
         except httpx.ConnectError:
             return JSONResponse(
@@ -1719,20 +1783,17 @@ async def _passthrough_sync(endpoint: str, body: dict, headers: dict) -> JSONRes
                 content={"error": {"message": str(e), "type": "api_error"}},
             )
 
+    if resp.status_code != 200:
+        return upstream_error_openai(resp, resp.text, "Provider")
     return JSONResponse(status_code=resp.status_code, content=resp.json())
 
 
-async def _passthrough_stream(endpoint: str, body: dict, headers: dict):
+async def _passthrough_stream(endpoint: str, body: dict, headers: dict, provider: str = "", request: Request | None = None):
     client = httpx.AsyncClient(timeout=300)
     try:
-        resp = await client.send(
-            client.build_request(
-                "POST",
-                endpoint,
-                json=body,
-                headers=headers,
-            ),
-            stream=True,
+        resp = await _retry_send_stream_with_model_fallback(
+            client, endpoint, json=body, headers=headers,
+            provider=provider, request=request,
         )
     except httpx.ConnectError:
         await client.aclose()
@@ -1751,10 +1812,7 @@ async def _passthrough_stream(endpoint: str, body: dict, headers: dict):
         err_body = await resp.aread()
         await resp.aclose()
         await client.aclose()
-        return JSONResponse(
-            status_code=resp.status_code,
-            content={"error": {"message": err_body.decode()[:500], "type": "api_error"}},
-        )
+        return upstream_error_openai(resp, err_body.decode(errors="replace"), "Provider")
 
     async def stream_generator():
         try:
@@ -1811,8 +1869,15 @@ async def _collect_stream(resp: httpx.Response) -> dict:
             if fr:
                 finish_reason = fr
 
-            if delta.get("content"):
-                content += delta["content"]
+            delta_content = delta.get("content")
+            if isinstance(delta_content, list):
+                # Some upstreams emit content as a list of OpenAI content-part
+                # blocks instead of a string. Flatten text + reasoning.
+                flat_text, flat_reasoning = _flatten_list_content(delta_content)
+                content += flat_text
+                reasoning_content += flat_reasoning
+            elif delta_content:
+                content += delta_content
             reasoning_delta = delta.get("reasoning_content") or delta.get("reasoning")
             if not reasoning_delta and delta.get("reasoning_details"):
                 parts = []
@@ -1911,7 +1976,7 @@ async def messages(request: Request):
     if info.protocol == "anthropic":
         body["model"] = info.provider_model_id
         fwd = _forward_headers(request, protocol="anthropic", provider=info.provider)
-        endpoint = f"{info.base_url}/messages"
+        endpoint = _upstream_endpoint(info, "/messages")
 
         log.info("Messages %s -> %s native (stream=%s, tools=%s, thinking=%s)", model, info.provider, is_stream, has_tools, thinking_enabled)
         if has_tools:
@@ -1919,8 +1984,8 @@ async def messages(request: Request):
             log.info("  Tools: %s", tool_names)
 
         if is_stream:
-            return await _passthrough_anthropic_stream(endpoint, body, fwd)
-        return await _passthrough_anthropic_sync(endpoint, body, fwd)
+            return await _passthrough_anthropic_stream(endpoint, body, fwd, provider=info.provider, request=request)
+        return await _passthrough_anthropic_sync(endpoint, body, fwd, provider=info.provider, request=request)
 
     # Non-Anthropic providers: translate Anthropic → OpenAI → forward → translate back
     openai_req = anthropic_to_openai(body)
@@ -1938,7 +2003,7 @@ async def messages(request: Request):
     if _is_openrouter_gemini(info):
         _enable_openrouter_gemini_prompt_cache(openai_req)
 
-    endpoint = f"{info.base_url}/chat/completions"
+    endpoint = _upstream_endpoint(info, "/chat/completions")
     fwd = _forward_headers(request, protocol=info.protocol, provider=info.provider)
 
     log.info("Messages %s -> %s (stream=%s, tools=%s, thinking=%s)", model, info.provider, is_stream, has_tools, thinking_enabled)
@@ -1952,35 +2017,40 @@ async def messages(request: Request):
     google_with_tools = (info.provider == "google" or _is_openrouter_gemini(info)) and has_tools
 
     if is_stream and not google_with_tools:
-        return await _handle_streaming(endpoint, openai_req, model, fwd, has_tools, thinking_enabled)
+        return await _handle_streaming(endpoint, openai_req, model, fwd, has_tools, thinking_enabled, info=info, request=request)
     if is_stream and google_with_tools:
-        return await _handle_streaming_google(endpoint, openai_req, model, fwd, has_tools, thinking_enabled)
-    return await _handle_sync(endpoint, openai_req, model, fwd, has_tools, thinking_enabled)
+        return await _handle_streaming_google(endpoint, openai_req, model, fwd, has_tools, thinking_enabled, info=info, request=request)
+    return await _handle_sync(endpoint, openai_req, model, fwd, has_tools, thinking_enabled, info=info, request=request)
 
 
 # ── Anthropic native passthrough helpers ─────────────────────────────────────
 
 
-async def _passthrough_anthropic_sync(endpoint: str, body: dict, headers: dict) -> JSONResponse:
+async def _passthrough_anthropic_sync(endpoint: str, body: dict, headers: dict, provider: str = "", request: Request | None = None) -> JSONResponse:
     """Forward request directly to Anthropic Messages API (non-streaming)."""
     async with httpx.AsyncClient(timeout=300) as client:
         try:
-            resp = await client.post(endpoint, json=body, headers=headers)
+            resp = await _retry_post_with_model_fallback(
+                client, endpoint, json=body, headers=headers,
+                provider=provider, request=request,
+            )
         except httpx.ConnectError:
             return _error(502, "api_error", "Cannot connect to Anthropic API")
         except Exception as e:
             return _error(502, "api_error", f"Anthropic error: {e}")
 
+    if resp.status_code != 200:
+        return upstream_error(resp, resp.text, "Anthropic")
     return JSONResponse(status_code=resp.status_code, content=resp.json())
 
 
-async def _passthrough_anthropic_stream(endpoint: str, body: dict, headers: dict):
+async def _passthrough_anthropic_stream(endpoint: str, body: dict, headers: dict, provider: str = "", request: Request | None = None):
     """Forward streaming request directly to Anthropic Messages API."""
     client = httpx.AsyncClient(timeout=300)
     try:
-        resp = await client.send(
-            client.build_request("POST", endpoint, json=body, headers=headers),
-            stream=True,
+        resp = await _retry_send_stream_with_model_fallback(
+            client, endpoint, json=body, headers=headers,
+            provider=provider, request=request,
         )
     except httpx.ConnectError:
         await client.aclose()
@@ -1993,7 +2063,7 @@ async def _passthrough_anthropic_stream(endpoint: str, body: dict, headers: dict
         err_body = await resp.aread()
         await resp.aclose()
         await client.aclose()
-        return _error(502, "api_error", f"Anthropic returned {resp.status_code}: {err_body.decode()[:500]}")
+        return upstream_error(resp, err_body.decode(errors="replace"), "Anthropic")
 
     async def stream_generator():
         try:
@@ -2036,26 +2106,29 @@ async def _handle_responses_anthropic(body: dict, info, model: str, request: Req
     is_stream = body.get("stream", False)
     request.state.api_key = info.api_key
     fwd = _forward_headers(request, protocol="anthropic", provider=info.provider)
-    endpoint = f"{info.base_url}/messages"
+    endpoint = _upstream_endpoint(info, "/messages")
 
     log.info("Responses %s -> %s anthropic (stream=%s)", model, info.provider, is_stream)
 
     if is_stream:
         # Stream from Anthropic, collect, translate to Responses stream format
         messages_req["stream"] = True
-        return await _handle_responses_anthropic_stream(endpoint, messages_req, model, fwd)
+        return await _handle_responses_anthropic_stream(endpoint, messages_req, model, fwd, provider=info.provider, request=request)
 
     # Non-streaming: forward to Anthropic, translate response to Responses format
     async with httpx.AsyncClient(timeout=300) as client:
         try:
-            resp = await client.post(endpoint, json=messages_req, headers=fwd)
+            resp = await _retry_post_with_model_fallback(
+                client, endpoint, json=messages_req, headers=fwd,
+                provider=info.provider, request=request,
+            )
         except httpx.ConnectError:
-            return _error(502, "api_error", "Cannot connect to Anthropic API")
+            return _error_openai(502, "api_error", "Cannot connect to Anthropic API")
         except Exception as e:
-            return _error(502, "api_error", f"Anthropic error: {e}")
+            return _error_openai(502, "api_error", f"Anthropic error: {e}")
 
     if resp.status_code != 200:
-        return _error(502, "api_error", f"Anthropic returned {resp.status_code}: {resp.text[:500]}")
+        return upstream_error_openai(resp, resp.text, "Anthropic")
 
     anthropic_resp = resp.json()
     result = _anthropic_messages_to_responses(anthropic_resp, model)
@@ -2235,35 +2308,35 @@ def _anthropic_messages_to_responses(resp: dict, model: str) -> dict:
     }
 
 
-async def _handle_responses_anthropic_stream(endpoint: str, messages_req: dict, model: str, headers: dict):
+async def _handle_responses_anthropic_stream(endpoint: str, messages_req: dict, model: str, headers: dict, provider: str = "", request: Request | None = None):
     """Handle streaming Responses API for Anthropic models.
 
     Collects Anthropic's SSE stream, then emits it as Responses API events.
     """
     client = httpx.AsyncClient(timeout=300)
     try:
-        resp = await client.send(
-            client.build_request("POST", endpoint, json=messages_req, headers=headers),
-            stream=True,
+        resp = await _retry_send_stream_with_model_fallback(
+            client, endpoint, json=messages_req, headers=headers,
+            provider=provider, request=request,
         )
     except httpx.ConnectError:
         await client.aclose()
-        return _error(502, "api_error", "Cannot connect to Anthropic API")
+        return _error_openai(502, "api_error", "Cannot connect to Anthropic API")
     except Exception as e:
         await client.aclose()
-        return _error(502, "api_error", f"Anthropic error: {e}")
+        return _error_openai(502, "api_error", f"Anthropic error: {e}")
 
     if resp.status_code != 200:
         err_body = await resp.aread()
         await resp.aclose()
         await client.aclose()
-        return _error(502, "api_error", f"Anthropic returned {resp.status_code}: {err_body.decode()[:500]}")
+        return upstream_error_openai(resp, err_body.decode(errors="replace"), "Anthropic")
 
     # Collect the full Anthropic response from the SSE stream
     try:
         anthropic_resp = await _collect_anthropic_stream(resp)
     except Exception as e:
-        return _error(502, "api_error", f"Anthropic stream collection failed: {e}")
+        return _error_openai(502, "api_error", f"Anthropic stream collection failed: {e}")
     finally:
         await resp.aclose()
         await client.aclose()
@@ -2360,20 +2433,22 @@ async def _collect_anthropic_stream(resp: httpx.Response) -> dict:
 
 async def _handle_sync(
     endpoint: str, openai_req: dict, model: str, headers: dict, has_tools: bool, thinking_enabled: bool,
+    info=None, request: Request | None = None,
 ) -> JSONResponse:
     """Handle non-streaming Anthropic request.
 
     Fireworks requires stream=true for max_tokens > 4096, so we always stream
     from the provider and reassemble into a single response.
     """
+    provider = getattr(info, "provider", "") if info is not None else ""
     openai_req["stream"] = True
-    openai_req["stream_options"] = {"include_usage": True}
+    _maybe_stream_options(openai_req, info if info is not None else SimpleNamespace(quirks=frozenset()))
 
     client = httpx.AsyncClient(timeout=300)
     try:
-        resp = await client.send(
-            client.build_request("POST", endpoint, json=openai_req, headers=headers),
-            stream=True,
+        resp = await _retry_send_stream_with_model_fallback(
+            client, endpoint, json=openai_req, headers=headers,
+            provider=provider, request=request,
         )
     except httpx.ConnectError:
         await client.aclose()
@@ -2386,7 +2461,7 @@ async def _handle_sync(
         err_body = await resp.aread()
         await resp.aclose()
         await client.aclose()
-        return _error(502, "api_error", f"Provider returned {resp.status_code}: {err_body.decode()[:500]}")
+        return upstream_error(resp, err_body.decode(errors="replace"), "Provider")
 
     # Consume SSE stream and reassemble into a single OpenAI-shaped response
     try:
@@ -2411,24 +2486,21 @@ async def _handle_sync(
 
 async def _handle_streaming(
     endpoint: str, openai_req: dict, model: str, headers: dict, has_tools: bool, thinking_enabled: bool,
+    info=None, request: Request | None = None,
 ):
+    provider = getattr(info, "provider", "") if info is not None else ""
     openai_req["stream"] = True
     # Request a final usage chunk so the stream translator can capture token
     # counts for the ledger. Without this, OpenAI-compatible providers (e.g.
     # Fireworks) omit usage from the SSE stream and every streaming request
-    # records 0 tokens / $0 cost.
-    openai_req["stream_options"] = {"include_usage": True}
+    # records 0 tokens / $0 cost. Skipped for no_stream_options providers.
+    _maybe_stream_options(openai_req, info if info is not None else SimpleNamespace(quirks=frozenset()))
 
     client = httpx.AsyncClient(timeout=300)
     try:
-        resp = await client.send(
-            client.build_request(
-                "POST",
-                endpoint,
-                json=openai_req,
-                headers=headers,
-            ),
-            stream=True,
+        resp = await _retry_send_stream_with_model_fallback(
+            client, endpoint, json=openai_req, headers=headers,
+            provider=provider, request=request,
         )
     except httpx.ConnectError:
         await client.aclose()
@@ -2441,7 +2513,7 @@ async def _handle_streaming(
         err_body = await resp.aread()
         await resp.aclose()
         await client.aclose()
-        return _error(502, "api_error", f"Provider returned {resp.status_code}: {err_body.decode()[:500]}")
+        return upstream_error(resp, err_body.decode(errors="replace"), "Provider")
 
     async def event_generator():
         try:
@@ -2462,22 +2534,27 @@ async def _handle_streaming(
 
 async def _handle_streaming_google(
     endpoint: str, openai_req: dict, model: str, headers: dict, has_tools: bool, thinking_enabled: bool,
+    info=None, request: Request | None = None,
 ):
     """Handle streaming for Google+tools: use non-streaming upstream to guarantee
     thought_signature capture, then generate Anthropic SSE events from the response."""
+    provider = getattr(info, "provider", "") if info is not None else ""
     # Force non-streaming upstream to capture extra_content reliably
     openai_req.pop("stream", None)
 
     async with httpx.AsyncClient(timeout=300) as client:
         try:
-            resp = await client.post(endpoint, json=openai_req, headers=headers)
+            resp = await _retry_post_with_model_fallback(
+                client, endpoint, json=openai_req, headers=headers,
+                provider=provider, request=request,
+            )
         except httpx.ConnectError:
             return _error(502, "api_error", "Cannot connect to Google API")
         except Exception as e:
             return _error(502, "api_error", f"Google error: {e}")
 
     if resp.status_code != 200:
-        return _error(502, "api_error", f"Google returned {resp.status_code}: {resp.text[:500]}")
+        return upstream_error(resp, resp.text, "Google")
 
     openai_resp = resp.json()
 

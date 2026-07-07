@@ -26,6 +26,30 @@ def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
+def _flatten_list_content(parts: list) -> tuple[str, str]:
+    """Flatten list-valued OpenAI delta content into (text, reasoning).
+
+    Some upstreams (e.g. native serving invocations for reasoning models) emit
+    delta.content as a list of OpenAI content-part blocks instead of a string.
+    Shape-safe: only called when content is a list, so applied unconditionally.
+    """
+    text_segments: list[str] = []
+    reasoning_segments: list[str] = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type")
+        if ptype == "text":
+            text_segments.append(part.get("text", ""))
+        elif ptype == "reasoning":
+            for s in part.get("summary", []) or []:
+                if isinstance(s, dict):
+                    reasoning_segments.append(s.get("text", ""))
+        elif ptype == "reasoning_content":
+            reasoning_segments.append(part.get("text", ""))
+    return "".join(text_segments), "".join(reasoning_segments)
+
+
 async def translate_stream(
     openai_stream: AsyncIterator[bytes],
     model: str,
@@ -99,6 +123,13 @@ async def translate_stream(
                 if isinstance(item, dict):
                     parts.append(item.get("text") or item.get("summary") or "")
             reasoning_delta = "".join(parts)
+        # Some upstreams emit delta.content as a list of content-part blocks
+        # (mixing text and reasoning). Flatten before string handling below.
+        text_delta = delta.get("content")
+        if isinstance(text_delta, list):
+            text_delta, list_reasoning = _flatten_list_content(text_delta)
+            if list_reasoning:
+                reasoning_delta = (reasoning_delta or "") + list_reasoning
         if reasoning_delta and thinking_enabled:
             if not thinking_block_open:
                 thinking_block_open = True
@@ -114,7 +145,6 @@ async def translate_stream(
             })
 
         # Text content
-        text_delta = delta.get("content")
         if text_delta:
             # Close thinking block if it was open
             if thinking_block_open:
