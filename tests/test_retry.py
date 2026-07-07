@@ -50,6 +50,16 @@ def _client(handler) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
 
+class _DisconnectedRequest:
+    def __init__(self, disconnected_after: int = 0):
+        self._checks = 0
+        self._disconnected_after = disconnected_after
+
+    async def is_disconnected(self) -> bool:
+        self._checks += 1
+        return self._checks > self._disconnected_after
+
+
 # ── (a) _retry_post: 503 then 200 ────────────────────────────────────────────
 
 
@@ -73,6 +83,27 @@ def test_retry_post_retries_503_then_succeeds(fast_retries, clean_circuit):
     resp = asyncio.run(run())
     assert resp.status_code == 200
     assert len(calls) == 2
+
+
+def test_retry_post_stops_on_disconnect_before_retry(fast_retries, clean_circuit):
+    provider = clean_circuit("retry-prov-disconnect-post")
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(503, text="unavailable")
+
+    async def run():
+        async with _client(handler) as client:
+            await upstream._retry_post(
+                client, "https://up.example.com/v1/chat/completions",
+                json={"model": "m"}, headers={}, provider=provider,
+                request=_DisconnectedRequest(disconnected_after=1),
+            )
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(run())
+    assert len(calls) == 1
 
 
 # ── (b) _retry_post: 401 → OAuth refresh → retried with new bearer ──────────
@@ -186,6 +217,27 @@ def test_retry_send_stream_retries_503_then_streams(fast_retries, clean_circuit)
     chunks = asyncio.run(run())
     assert b"[DONE]" in b"".join(chunks)
     assert len(calls) == 2
+
+
+def test_retry_send_stream_stops_on_disconnect_before_retry(fast_retries, clean_circuit):
+    provider = clean_circuit("retry-prov-disconnect-stream")
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(503, text="unavailable")
+
+    async def run():
+        async with _client(handler) as client:
+            await upstream._retry_send_stream(
+                client, "https://up.example.com/v1/chat/completions",
+                json={"model": "m", "stream": True}, headers={}, provider=provider,
+                request=_DisconnectedRequest(disconnected_after=1),
+            )
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(run())
+    assert len(calls) == 1
 
 
 # ── (d) model fallback wrapper: model-a exhausted → model-b served ───────────

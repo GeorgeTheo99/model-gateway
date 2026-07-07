@@ -41,6 +41,27 @@ _RETRY_TRANSPORT_ATTEMPTS = 4
 _RETRY_TRANSPORT_MAX_DELAY = 15.0  # seconds
 
 
+async def _raise_if_disconnected(request: Request | None) -> None:
+    """Stop upstream work promptly when the downstream client has gone away."""
+    if request is not None and await request.is_disconnected():
+        raise asyncio.CancelledError("client disconnected")
+
+
+async def _sleep_or_disconnect(delay: float, request: Request | None) -> None:
+    """Backoff sleep that wakes early on client disconnect checks."""
+    if delay <= 0:
+        await _raise_if_disconnected(request)
+        await asyncio.sleep(0)
+        return
+    deadline = time.monotonic() + delay
+    while True:
+        await _raise_if_disconnected(request)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        await asyncio.sleep(min(remaining, 0.25))
+
+
 def _circuit_key(provider: str) -> str:
     return provider or ""
 
@@ -162,6 +183,7 @@ async def _retry_post(
     auth_retried = False
     headers = await _preflight_oauth_token(provider, headers, request)
     while attempt < max_attempts:
+        await _raise_if_disconnected(request)
         try:
             resp = await client.post(endpoint, json=json, headers=headers)
         except Exception as exc:
@@ -180,7 +202,7 @@ async def _retry_post(
                 "Transient upstream transport error %s on POST (attempt %d/%d), retrying in %.1fs",
                 type(exc).__name__, attempt + 1, max_attempts, delay,
             )
-            await asyncio.sleep(delay)
+            await _sleep_or_disconnect(delay, request)
             attempt += 1
             continue
 
@@ -232,7 +254,7 @@ async def _retry_post(
 
         delay = _compute_retry_delay(resp, attempt)
         log.warning("Transient upstream status %d on POST (attempt %d/%d), retrying in %.1fs", resp.status_code, attempt + 1, max_attempts, delay)
-        await asyncio.sleep(delay)
+        await _sleep_or_disconnect(delay, request)
         attempt += 1
     return resp  # unreachable, but satisfies type checkers
 
@@ -262,6 +284,7 @@ async def _retry_send_stream(
     auth_retried = False
     headers = await _preflight_oauth_token(provider, headers, request)
     while attempt < max_attempts:
+        await _raise_if_disconnected(request)
         try:
             resp = await client.send(
                 client.build_request("POST", endpoint, json=json, headers=headers),
@@ -283,7 +306,7 @@ async def _retry_send_stream(
                 "Transient upstream transport error %s on stream (attempt %d/%d), retrying in %.1fs",
                 type(exc).__name__, attempt + 1, max_attempts, delay,
             )
-            await asyncio.sleep(delay)
+            await _sleep_or_disconnect(delay, request)
             attempt += 1
             continue
 
@@ -358,7 +381,7 @@ async def _retry_send_stream(
 
         delay = _compute_retry_delay(resp, attempt)
         log.warning("Transient upstream status %d on stream (attempt %d/%d), retrying in %.1fs", resp.status_code, attempt + 1, max_attempts, delay)
-        await asyncio.sleep(delay)
+        await _sleep_or_disconnect(delay, request)
         attempt += 1
     return resp  # unreachable
 
