@@ -2,6 +2,10 @@
 config/config.yaml
 config/config.yaml.bak-*
 
+# Machine-local model catalog (per-machine; committed in error previously)
+model-info.json
+model-info.json.bak-*
+
 # Python
 __pycache__/
 *.py[cod]
