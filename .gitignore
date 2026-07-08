@@ -1,5 +1,6 @@
 # Real provider credentials — never commit
 config/config.yaml
+config/config.yaml.bak-*
 
 # Python
 __pycache__/

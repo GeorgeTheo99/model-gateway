@@ -151,12 +151,13 @@ Failovers are logged + counted in the ledger (`failover_from`,
 - `auth: oauth-cli` → generalize today's `refresh_oauth_token()`:
   preflight (<5 min JWT validity) + reactive on 401/403, using
   `databricks auth token --profile <auth_profile>`, persisting back to
-  config.yaml. This already exists for e2; it just becomes per-workspace.
+  config.yaml. If the CLI cache is broken, the gateway launches
+  `databricks auth login` once per cooldown window, retries token minting,
+  and then continues the original request with the fresh token.
 - `auth: pat` → static; validation warns if the PAT fails a probe.
-- Browser SSO (dead refresh token) stays an interactive concern: the
-  `workspace add/auth` CLI (below) and the zsh launcher preflight
-  (`_ensure_e2_auth`, generalized to `_ensure_ws_auth <profile>`) own it.
-  The gateway itself never blocks on a browser.
+- Browser SSO can still be disabled per provider with `auth_login: false`
+  for headless deployments; local Pi desktop deployments leave it enabled so
+  dead refresh tokens self-heal.
 
 ---
 

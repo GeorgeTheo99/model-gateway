@@ -9,6 +9,7 @@ No workspace-specific values appear here — providers/models use placeholder
 hosts and ids, exactly as real deployments configure them via config.yaml.
 """
 
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -405,6 +406,84 @@ def test_persist_api_key_rewrites_own_block_only(tmp_config):
     assert "api_key: eyJnew" in text
     assert "eyJold" not in text
     assert "keep-me" in text
+
+
+def test_refresh_oauth_token_runs_browser_sso_when_cli_cache_is_broken(tmp_config, monkeypatch):
+    _write_config(tmp_config, """providers:
+  ws:
+    base_url: https://workspace.example.com/serving-endpoints
+    api_key: eyJold
+    auth_refresh: databricks-cli
+    auth_profile: ws-profile
+""")
+    providers._last_token_refresh_attempt.clear()
+    providers._last_auth_login_attempt.clear()
+    monkeypatch.setattr(providers, "_databricks_cli", lambda: "databricks")
+    calls = []
+
+    class Proc:
+        def __init__(self, returncode: int, stdout: bytes = b"", stderr: bytes = b""):
+            self.returncode = returncode
+            self._stdout = stdout
+            self._stderr = stderr
+
+        async def communicate(self):
+            return self._stdout, self._stderr
+
+    async def fake_exec(*args, **kwargs):
+        calls.append(args)
+        if args[:3] == ("databricks", "auth", "token"):
+            if len([c for c in calls if c[:3] == ("databricks", "auth", "token")]) == 1:
+                return Proc(1, stderr=b"OAuth is not configured for this host")
+            return Proc(0, stdout=b'{"access_token":"eyJnew"}')
+        if args[:3] == ("databricks", "auth", "login"):
+            return Proc(0)
+        raise AssertionError(f"unexpected subprocess args: {args}")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    token = asyncio.run(providers.refresh_oauth_token("ws", force=True))
+
+    assert token == "eyJnew"
+    assert calls == [
+        ("databricks", "auth", "token", "--profile", "ws-profile"),
+        ("databricks", "auth", "login", "--host", "https://workspace.example.com", "--profile", "ws-profile"),
+        ("databricks", "auth", "token", "--profile", "ws-profile"),
+    ]
+    text = (tmp_config / "config.yaml").read_text()
+    assert "api_key: eyJnew" in text
+
+
+def test_refresh_oauth_token_respects_auth_login_false(tmp_config, monkeypatch):
+    _write_config(tmp_config, """providers:
+  ws:
+    base_url: https://workspace.example.com
+    api_key: eyJold
+    auth_refresh: databricks-cli
+    auth_profile: ws-profile
+    auth_login: false
+""")
+    providers._last_token_refresh_attempt.clear()
+    providers._last_auth_login_attempt.clear()
+    monkeypatch.setattr(providers, "_databricks_cli", lambda: "databricks")
+    calls = []
+
+    class Proc:
+        returncode = 1
+
+        async def communicate(self):
+            return b"", b"OAuth is not configured for this host"
+
+    async def fake_exec(*args, **kwargs):
+        calls.append(args)
+        return Proc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    token = asyncio.run(providers.refresh_oauth_token("ws", force=True))
+
+    assert token is None
+    assert calls == [("databricks", "auth", "token", "--profile", "ws-profile")]
 
 
 def test_jwt_expiry_epoch_parses_exp():

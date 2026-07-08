@@ -78,8 +78,11 @@ _models: dict[str, dict] | None = None
 # OAuth token auto-refresh via an external CLI token cache (opt-in per provider
 # with `auth_refresh:` in config.yaml). See refresh_oauth_token().
 _AUTH_REFRESH_MIN_INTERVAL = 60.0  # seconds between CLI refresh attempts per provider
+_AUTH_LOGIN_MIN_INTERVAL = 300.0  # seconds between browser SSO attempts per provider
+_AUTH_LOGIN_TIMEOUT = 300.0  # seconds to wait for the browser SSO callback
 _token_refresh_locks: dict[str, "asyncio.Lock"] = {}
 _last_token_refresh_attempt: dict[str, float] = {}
+_last_auth_login_attempt: dict[str, float] = {}
 
 # Provider synonym table lives in ``src.catalog`` (the single source shared with
 # the downstream catalog generator). ``tests/test_catalog.py`` guards drift.
@@ -412,9 +415,11 @@ async def refresh_oauth_token(provider: str, *, force: bool = False) -> str | No
             auth_refresh: databricks-cli   # only supported refresher today
             auth_profile: my-cli-profile   # optional; falls back to --host <base_url>
 
-    Called by the server when an upstream returns 401/403 (e.g. a short-lived
-    OAuth JWT expired). Providers without ``auth_refresh`` are untouched.
-    Returns the new token if one was obtained, else None.
+    Called by the server before expiry and when an upstream returns 401/403
+    (e.g. a short-lived OAuth JWT expired). If the CLI token cache itself is
+    broken, the gateway runs ``databricks auth login`` once per cooldown window,
+    then retries token minting. Providers without ``auth_refresh`` are
+    untouched. Returns the new token if one was obtained, else None.
     """
     config = _load_config()
     found = _find_provider_entry(config, provider)
@@ -445,20 +450,72 @@ async def refresh_oauth_token(provider: str, *, force: bool = False) -> str | No
         # --host wants the workspace origin, not a path under it.
         host = base_url.split("/serving-endpoints")[0] if base_url else ""
         cli_args = ["--profile", profile] if profile else ["--host", host]
-        try:
+
+        async def run_token() -> tuple[int, bytes, bytes]:
             proc = await asyncio.create_subprocess_exec(
                 _databricks_cli(), "auth", "token", *cli_args,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+            return proc.returncode, stdout, stderr
+
+        try:
+            returncode, stdout, stderr = await run_token()
         except (OSError, asyncio.TimeoutError) as exc:
             log.error("OAuth token refresh for %r failed: %s", provider, exc)
             return None
-        if proc.returncode != 0:
+
+        if returncode != 0 and entry.get("auth_login", True) is not False:
             log.error(
                 "OAuth token refresh for %r failed (exit %d): %s",
-                provider, proc.returncode, stderr.decode(errors="replace")[:300],
+                provider, returncode, stderr.decode(errors="replace")[:300],
+            )
+            login_now = time.monotonic()
+            if not host:
+                log.error("Cannot launch Databricks browser SSO for %r: missing base_url", provider)
+            elif login_now - _last_auth_login_attempt.get(provider, 0.0) >= _AUTH_LOGIN_MIN_INTERVAL:
+                _last_auth_login_attempt[provider] = login_now
+                login_args = ["auth", "login", "--host", host]
+                if profile:
+                    login_args.extend(["--profile", profile])
+                log.warning(
+                    "Launching Databricks browser SSO for provider %r (%s, profile %r)",
+                    provider, host, profile or "<host>",
+                )
+                try:
+                    login = await asyncio.create_subprocess_exec(
+                        _databricks_cli(), *login_args,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    login_stdout, login_stderr = await asyncio.wait_for(
+                        login.communicate(), timeout=_AUTH_LOGIN_TIMEOUT,
+                    )
+                except (OSError, asyncio.TimeoutError) as exc:
+                    log.error("Databricks browser SSO for %r failed: %s", provider, exc)
+                    return None
+                if login.returncode != 0:
+                    detail = (login_stderr or login_stdout).decode(errors="replace")[:300]
+                    log.error(
+                        "Databricks browser SSO for %r failed (exit %d): %s",
+                        provider, login.returncode, detail,
+                    )
+                    return None
+                try:
+                    returncode, stdout, stderr = await run_token()
+                except (OSError, asyncio.TimeoutError) as exc:
+                    log.error("OAuth token refresh for %r failed after SSO: %s", provider, exc)
+                    return None
+            else:
+                log.warning(
+                    "Skipping Databricks browser SSO for %r; attempted within the last %.0fs",
+                    provider, _AUTH_LOGIN_MIN_INTERVAL,
+                )
+        if returncode != 0:
+            log.error(
+                "OAuth token refresh for %r failed (exit %d): %s",
+                provider, returncode, stderr.decode(errors="replace")[:300],
             )
             return None
         try:

@@ -7,8 +7,21 @@ Tests that need to inspect the ledger can still override the path.
 
 import pytest
 
+import src.providers as providers
+
 
 @pytest.fixture(autouse=True)
 def _isolate_ledger(tmp_path, monkeypatch):
     monkeypatch.setenv("MODEL_GATEWAY_LEDGER_PATH", str(tmp_path / "test-ledger.db"))
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_runtime_config(tmp_path, monkeypatch):
+    """Keep gitignored local provider config from changing test behavior."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("providers: {}\n")
+    monkeypatch.setattr(providers, "CONFIG_PATH", cfg)
+    providers.reload()
+    yield
+    providers.reload()
