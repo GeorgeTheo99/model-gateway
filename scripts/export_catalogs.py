@@ -147,10 +147,57 @@ _ALIAS_FIELDS = (
     "max_output_tokens",
     "omlx_id",
     "provider_model_id",
+    "pi",
 )
 
 
-def render_model_aliases(entries: list[dict]) -> dict:
+def _effective_provider(entry: dict, config: dict) -> str:
+    """The provider a model actually routes to.
+
+    Pooled models (``pool:`` with no meaningful ``provider:``) resolve to the
+    pool's first member — the same primary the router picks. Without this,
+    pooled entries fall back to the merge default (``omlx``) and get dropped
+    from the alias file as local models with no ``omlx_id``.
+    """
+    pool_name = entry.get("pool")
+    if pool_name:
+        members = (config.get("pools") or {}).get(str(pool_name)) or []
+        if isinstance(members, str):
+            members = [members]
+        if members:
+            return str(members[0])
+    return entry.get("provider", "omlx")
+
+
+def _effective_protocol(entry: dict, provider: str, config: dict) -> str:
+    """Request-shape protocol for a model: entry override, else provider config."""
+    if entry.get("protocol"):
+        return str(entry["protocol"])
+    provider_config = (config.get("providers") or {}).get(provider) or {}
+    return str(provider_config.get("protocol") or "openai")
+
+
+def _provider_serveable(provider: str, config: dict) -> bool:
+    """Can THIS gateway serve models routed to ``provider``?
+
+    Mirrors the router's usable-member rule (enabled + base_url + api_key,
+    with the built-in omlx default). Machines export only the models they can
+    actually serve, so downstream launchers never list dead models. When the
+    config has no ``providers:`` section at all (ad-hoc/test renders), the
+    filter is skipped — serveability cannot be determined.
+    """
+    providers = config.get("providers")
+    if not isinstance(providers, dict) or not providers:
+        return True
+    provider_config = dict(providers.get(provider) or {})
+    if provider_config.get("enabled") is False:
+        return False
+    if provider in ("omlx", "local") and not provider_config:
+        return True  # omlx has built-in defaults (local oMLX on :9110)
+    return bool(provider_config.get("base_url")) and bool(provider_config.get("api_key"))
+
+
+def render_model_aliases(entries: list[dict], config: dict | None = None) -> dict:
     """Render ~/.claude/model-aliases.json from merged catalog entries.
 
     Local models (provider ``omlx``/``local``) are keyed by ``omlx_id``; cloud
@@ -160,6 +207,7 @@ def render_model_aliases(entries: list[dict]) -> dict:
 
     Hard-fails (sys.exit 2) on duplicate aliases, matching fan_out_settings.py.
     """
+    config = config or {}
     aliases: dict[str, dict] = {}
     seen: dict[str, str] = {}
     collisions: list[tuple[str, str, str]] = []
@@ -168,7 +216,9 @@ def render_model_aliases(entries: list[dict]) -> dict:
             continue  # gateway-only model; not exposed to any downstream launcher
         alias = entry.get("alias")
         supported = entry.get("supported", True)
-        provider = entry.get("provider", "omlx")
+        provider = _effective_provider(entry, config)
+        if not _provider_serveable(provider, config):
+            continue  # this machine's gateway cannot route the model
         is_cloud = provider not in ("omlx", "local") and bool(provider)
 
         if is_cloud:
@@ -205,6 +255,7 @@ def render_model_aliases(entries: list[dict]) -> dict:
                 alias_entry["support_note"] = entry.get("support_note")
         if is_cloud:
             alias_entry["provider"] = provider
+            alias_entry["protocol"] = _effective_protocol(entry, provider, config)
             alias_entry["provider_model_id"] = entry.get("provider_model_id", "")
             alias_entry["context"] = entry.get("context", 32768)
             alias_entry["max_output_tokens"] = entry.get("max_output_tokens", 32768)
@@ -284,8 +335,12 @@ def main() -> int:
         sys.exit("export_catalogs: refusing to render an empty catalog (no exportable models in model-info.json + config overlay)")
 
     renders: list[tuple[Path, str, str]] = []
+    alias_doc: dict | None = None
     if targets["model_aliases"]:
-        renders.append((targets["model_aliases"], _dump(render_model_aliases(entries)), "model-aliases.json"))
+        alias_doc = render_model_aliases(entries, config)
+        if not alias_doc:
+            sys.exit("export_catalogs: refusing to render an empty alias catalog (no serveable exportable models)")
+        renders.append((targets["model_aliases"], _dump(alias_doc), "model-aliases.json"))
 
     if args.check:
         ok = all(_check_one(path, content, label) for path, content, label in renders)
@@ -305,7 +360,7 @@ def main() -> int:
         tmp.replace(target)
         shown = path if path == target else f"{path} → {target}"
         print(f"export_catalogs: wrote {label} → {shown}")
-    print(f"export_catalogs: {len(exported)} models exported")
+    print(f"export_catalogs: {len(alias_doc) if alias_doc is not None else len(exported)} models exported")
     return 0
 
 

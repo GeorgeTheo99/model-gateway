@@ -102,6 +102,59 @@ def test_overlay_merge_used_by_generator(tmp_path):
     assert aliases["cloud:accounts/fireworks/models/glm-5p2"]["context"] == 2000
 
 
+def test_pooled_model_exported_with_effective_provider(tmp_path):
+    """Pooled models (pool:, no provider:) must not be dropped as omlx-locals.
+
+    Regression: pooled entries defaulted to provider 'omlx' in the merge and
+    were then skipped for lacking an omlx_id, so every pooled databricks model
+    vanished from the alias file (and downstream Pi launchers).
+    """
+    mi = tmp_path / "model-info.json"
+    _write_model_info(mi, [])
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "providers:\n"
+        "  db-west:\n"
+        "    base_url: https://west.example.com\n"
+        "    api_key: k\n"
+        "    protocol: openai\n"
+        "  db-east:\n"
+        "    base_url: https://east.example.com\n"
+        "    api_key: k\n"
+        "    protocol: openai\n"
+        "pools:\n"
+        "  my-pool:\n"
+        "  - db-west\n"
+        "  - db-east\n"
+        "models:\n"
+        "  - name: claude-fable-5\n"
+        "    pool: my-pool\n"
+        "    alias: fable\n"
+        "    provider_model_id: databricks-claude-fable-5\n"
+        "    protocol: anthropic\n"
+        "    context: 1000000\n"
+        "    pi:\n"
+        "      name: Fable via Databricks\n"
+        "  - name: gpt-5.5\n"
+        "    pool: my-pool\n"
+        "    alias: gpt\n"
+        "    provider_model_id: databricks-gpt-5-5\n"
+        f"exports:\n  model_aliases: {tmp_path}/aliases.json\n"
+    )
+    r = _run(cfg, mi)
+    assert r.returncode == 0, r.stderr
+    aliases = json.loads((tmp_path / "aliases.json").read_text())
+    fable = aliases["cloud:databricks-claude-fable-5"]
+    # Effective provider = first pool member; protocol from entry override.
+    assert fable["provider"] == "db-west"
+    assert fable["protocol"] == "anthropic"
+    assert fable["alias"] == "fable"
+    assert fable["pi"] == {"name": "Fable via Databricks"}
+    gpt = aliases["cloud:databricks-gpt-5-5"]
+    # Protocol falls back to the provider config's protocol.
+    assert gpt["protocol"] == "openai"
+
+
 def test_duplicate_alias_hard_fails(tmp_path):
     mi = tmp_path / "model-info.json"
     _write_model_info(
