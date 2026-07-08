@@ -114,12 +114,13 @@ providers:
 # model_fallbacks:
 #   my-primary-endpoint: my-fallback-endpoint
 
-# Optional downstream catalog exports (omit entirely on machines without Pi or
-# shell launchers). Regenerated on gateway start and /admin/api/reload from the
-# SAME merge the gateway router uses (model-info.json + the `models:` overlay
+# Optional downstream catalog export (omit entirely on machines that don't need
+# an alias file). The alias file is the gateway's PUBLIC CONTRACT — Pi-side
+# renderers (pi-shared/bin/pi-catalog) and other tools read it to build Pi
+# models.json / pi-launchers.zsh. The gateway itself does not render Pi-specific
+# artifacts. Regenerated on gateway start and /admin/api/reload from the SAME
+# merge the gateway router uses (model-info.json + the `models:` overlay
 # above); drift-checked via `scripts/export_catalogs.py --check`. Never
-# hand-edit the generated files — edit model-info.json / config.yaml instead.
+# hand-edit the generated file — edit model-info.json / config.yaml instead.
 # exports:
 #   model_aliases: ~/.claude/model-aliases.json
-#   pi_models: ~/local_code/pi-local/config/pi-models/models.json
-#   pi_launchers: ~/local_code/model-gateway-runtime/pi-launchers.zsh

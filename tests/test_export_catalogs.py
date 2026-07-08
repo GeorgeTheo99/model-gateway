@@ -1,8 +1,9 @@
-"""Tests for scripts/export_catalogs.py — the single downstream catalog generator.
+"""Tests for scripts/export_catalogs.py — the downstream alias catalog generator.
 
 Covers: merge with model-info.json + overlay, alias rendering (full schema incl.
-omlx_id), duplicate-alias hard failure, symlink-safe writes, pi-models and
-pi-launchers output, --check drift detection, opt-in exports.
+omlx_id), duplicate-alias hard failure, symlink-safe writes, --check drift
+detection, opt-in exports. (Pi-specific models.json/launcher rendering lives in
+pi-shared/lib/pi_catalog.py and has its own test suite.)
 """
 
 from __future__ import annotations
@@ -46,7 +47,7 @@ def test_no_exports_is_noop(tmp_path):
     assert "no exports configured" in r.stdout
 
 
-def test_renders_all_three_outputs(tmp_path):
+def test_renders_alias_file(tmp_path):
     mi = tmp_path / "model-info.json"
     _write_model_info(
         mi,
@@ -59,8 +60,6 @@ def test_renders_all_three_outputs(tmp_path):
     cfg.write_text(
         f"exports:\n"
         f"  model_aliases: {tmp_path}/aliases.json\n"
-        f"  pi_models: {tmp_path}/pi-models.json\n"
-        f"  pi_launchers: {tmp_path}/pi-launchers.zsh\n"
     )
     r = _run(cfg, mi)
     assert r.returncode == 0, r.stderr
@@ -78,14 +77,6 @@ def test_renders_all_three_outputs(tmp_path):
     cloud_entry = aliases["cloud:glm-5.2-zai"]
     assert cloud_entry["provider"] == "zhipuai"  # canonicalized from zai
     assert cloud_entry["provider_model_id"] == "glm-5.2-zai"
-    pi = json.loads((tmp_path / "pi-models.json").read_text())
-    assert sum(len(p["models"]) for p in pi["providers"].values()) == 2
-    launchers = (tmp_path / "pi-launchers.zsh").read_text()
-    assert "pi-qwen36()" in launchers
-    assert "pi-glm52()" in launchers
-    assert "pi-list()" in launchers
-    assert "pi-restart()" in launchers
-    assert "server-ci restart" in launchers
 
 
 def test_overlay_merge_used_by_generator(tmp_path):
@@ -202,8 +193,6 @@ def test_real_repo_catalog_renders(tmp_path):
     cfg.write_text(
         f"exports:\n"
         f"  model_aliases: {tmp_path}/aliases.json\n"
-        f"  pi_models: {tmp_path}/pi-models.json\n"
-        f"  pi_launchers: {tmp_path}/pi-launchers.zsh\n"
     )
     r = _run(cfg, mi)
     assert r.returncode == 0, r.stderr

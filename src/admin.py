@@ -99,7 +99,7 @@ async def admin_reload(request: Request):
 
 
 async def _regenerate_catalogs() -> str:
-    """Re-render downstream catalogs (pi-list aliases, Pi models.json) after a
+    """Re-render the downstream alias catalog (model-aliases.json) after a
     config change. Best-effort: catalog drift is never allowed to fail a reload."""
     script = Path(__file__).resolve().parents[1] / "scripts" / "export_catalogs.py"
     if not script.exists():

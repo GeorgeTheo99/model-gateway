@@ -162,6 +162,12 @@ Failovers are logged + counted in the ledger (`failover_from`,
 
 ## 2. Catalog generation: gateway is the single source of truth
 
+> **Update (post-C1):** the gateway now renders only the generic alias file
+> (`model-aliases.json`) — its public contract. Pi-specific rendering
+> (`models.json`, `pi-launchers.zsh`) has moved to `pi-shared/bin/pi-catalog`,
+> which reads the alias file. The diagram and mapping rules below describe the
+> original C1 design; the alias-file contract and merge logic still hold.
+
 ```
 config.yaml (curated, hand-edited via admin UI or CLI)
         │

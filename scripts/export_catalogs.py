@@ -1,30 +1,26 @@
 #!/usr/bin/env python3
-"""Generate downstream model catalogs from the gateway catalog (single source of truth).
+"""Generate the downstream model catalog (alias file) from the gateway catalog.
 
 Renders:
-  1. model-aliases.json — ~/.claude/model-aliases.json (claude-*, codex-*, pi-*
-     launchers and the legacy pi-launcher.zsh read this).
-  2. pi-local/config/pi-models/models.json — Pi /model picker (via the
-     ~/.pi/agent/models.json symlink)
-  3. model-gateway-runtime/pi-launchers.zsh — pi-<alias>() shell functions
-     (pi-fable, pi-glm52, …) + pi-list, sourced from ~/.zshrc
+  1. model-aliases.json — ~/.claude/model-aliases.json, the PUBLIC CONTRACT
+     consumed by Pi-side renderers (pi-shared/bin/pi-catalog) and any other
+     tool that needs the model catalog. The gateway owns this generic catalog;
+     Pi-specific artifacts (models.json, pi-launchers.zsh) are rendered by
+     pi-shared from this file, not here.
 
-All three are rendered from the SAME merge the gateway router uses:
-``model-info.json`` (committed catalog) with the ``config.yaml`` ``models:``
-overlay applied on top (overlay wins on id clash). The merge lives in
+Rendered from the SAME merge the gateway router uses: ``model-info.json``
+(committed catalog) with the ``config.yaml`` ``models:`` overlay applied on
+top (overlay wins on id clash). The merge lives in
 ``src.catalog.load_catalog_entries`` and is shared with ``src.providers``, so
 the generator and the router can never drift.
 
-Exports are OPT-IN via config.yaml — machines without Pi (or that don't want
-shell launchers) simply omit the section and this script is a no-op::
+Exports are OPT-IN via config.yaml — machines that don't need an alias file
+simply omit the section and this script is a no-op::
 
     exports:
       model_aliases: ~/.claude/model-aliases.json
-      pi_models: ~/local_code/pi-local/config/pi-models/models.json
-      pi_launchers: ~/local_code/model-gateway-runtime/pi-launchers.zsh
 
-CLI flags (--aliases-out / --pi-out / --launchers-out) override config for
-ad-hoc runs.
+The ``--aliases-out`` CLI flag overrides config for ad-hoc runs.
 
 Per-model export controls in config.yaml (all optional)::
 
@@ -32,15 +28,11 @@ Per-model export controls in config.yaml (all optional)::
     - name: claude-opus-4.8
       alias: opus48
       ...
-      export: true            # false = gateway-only model, skip all catalogs
-      pi:
-        name: pi-opus48       # display name override in Pi
-        reasoning: false      # Pi thinking-param toggle (default: true)
-        id: some-alternate-id # Pi model id override (default: provider_model_id)
+      export: true            # false = gateway-only model, skip the alias catalog
 
 Modes:
-    export_catalogs.py                 # write all configured catalogs
-    export_catalogs.py --check         # drift check: exit 1 if outputs are stale
+    export_catalogs.py                 # write the configured alias catalog
+    export_catalogs.py --check         # drift check: exit 1 if output is stale
 """
 
 from __future__ import annotations
@@ -103,62 +95,7 @@ def _export_targets(config: dict, args) -> dict[str, Path | None]:
 
     return {
         "model_aliases": _target(args.aliases_out, "model_aliases"),
-        "pi_models": _target(args.pi_out, "pi_models"),
-        "pi_launchers": _target(args.launchers_out, "pi_launchers"),
     }
-
-# Pi provider templates. Keys are Pi provider names; the gateway is always the
-# endpoint. Kept in one place so a schema change lands everywhere at once.
-PI_PROVIDER_TEMPLATES = {
-    "databricks": {
-        "baseUrl": "http://localhost:9111/v1",
-        "apiKey": "cloud",
-        "api": "openai-completions",
-        "compat": {
-            "supportsStore": False,
-            "supportsDeveloperRole": False,
-            "supportsReasoningEffort": True,
-            "maxTokensField": "max_tokens",
-        },
-    },
-    "databricks-anthropic": {
-        "baseUrl": "http://localhost:9111",
-        "apiKey": "cloud",
-        "api": "anthropic-messages",
-        "compat": {
-            "supportsEagerToolInputStreaming": False,
-        },
-    },
-    "google": {
-        "baseUrl": "http://localhost:9111/v1",
-        "apiKey": "cloud",
-        "api": "openai-completions",
-        "compat": {
-            "supportsStore": False,
-            "supportsDeveloperRole": False,
-            "maxTokensField": "max_tokens",
-        },
-    },
-}
-
-
-def _pi_provider_for(entry: dict) -> str:
-    # Anthropic-protocol models (and any claude-* model behind an invocations
-    # endpoint) talk anthropic-messages to the gateway from Pi.
-    if (entry.get("protocol") or "") == "anthropic" or str(entry.get("name", "")).startswith("claude"):
-        return "databricks-anthropic"
-    if str(entry.get("name", "")).startswith("gemini"):
-        return "google"
-    return "databricks"
-
-
-def _display_name(entry: dict) -> str:
-    pi = entry.get("pi") or {}
-    if pi.get("name"):
-        return str(pi["name"])
-    name = str(entry.get("name", ""))
-    pretty = name.replace("-", " ").title().replace("Gpt", "GPT").replace("Glm", "GLM")
-    return f"{pretty} via Databricks"
 
 
 def _merged_entries(model_info_path: Path, config: dict) -> list[dict]:
@@ -195,129 +132,9 @@ def _exported_models(entries: list[dict]) -> list[dict]:
     return out
 
 
-def render_pi_models(entries: list[dict]) -> dict:
-    """Pi models.json (providers → models) targeting the gateway."""
-    providers: dict = {}
-    for entry in _exported_models(entries):
-        pi_provider = _pi_provider_for(entry)
-        if pi_provider not in providers:
-            providers[pi_provider] = dict(PI_PROVIDER_TEMPLATES[pi_provider], models=[])
-        pi = entry.get("pi") or {}
-        model: dict = {
-            "id": pi.get("id") or entry.get("provider_model_id", entry["name"]),
-            "name": _display_name(entry),
-            "reasoning": bool(pi.get("reasoning", True)),
-        }
-        if entry.get("vision"):
-            model["input"] = ["text", "image"]
-        model["contextWindow"] = entry.get("context", 32768)
-        model["maxTokens"] = entry.get("max_output_tokens", 32768)
-        providers[pi_provider]["models"].append(model)
-    return {"providers": providers}
-
-
-def render_pi_launchers(entries: list[dict]) -> str:
-    """zsh snippet defining pi-<alias>() quick-start functions + pi-list."""
-    lines = [
-        "# Generated by model-gateway scripts/export_catalogs.py — do not hand-edit.",
-        "# Source from ~/.zshrc. Regenerated on gateway start / admin reload.",
-        "",
-        "_pi_gw_launch() {",
-        "  local pi_provider=\"$1\" model=\"$2\" alias_name=\"$3\"; shift 3",
-        "  if ! curl -sf --max-time 2 http://localhost:9111/health >/dev/null 2>&1; then",
-        "    echo \"WARNING: model-gateway not healthy on :9111 — try: launchctl kickstart -k gui/$(id -u)/com.local.model-gateway (or mg-workspace repair)\"",
-        "  fi",
-        "  echo \"Pi → model-gateway (${alias_name} → ${model})\"",
-        "  pi --provider \"$pi_provider\" --model \"$model\" \"$@\"",
-        "}",
-        "",
-    ]
-    entries_out = []
-    for entry in _exported_models(entries):
-        alias = str(entry["alias"])
-        pi = entry.get("pi") or {}
-        model_id = pi.get("id") or entry.get("provider_model_id", entry["name"])
-        pi_provider = _pi_provider_for(entry)
-        entries_out.append((alias, pi_provider, model_id, str(entry.get("name", ""))))
-        lines.append(
-            f"pi-{alias}() {{ _pi_gw_launch {pi_provider!r} {model_id!r} {alias!r} \"$@\"; }}"
-        )
-    lines += [
-        "",
-        "pi-list() {",
-        '  echo "Pi quick-start commands (via model-gateway :9111):"',
-    ]
-    width = max(len(a) for a, *_ in entries_out) + 3
-    for alias, _prov, model_id, name in entries_out:
-        lines.append(f'  printf "  %-{width}s %s\\n" "pi-{alias}" {name + " (" + model_id + ")"!r}')
-    lines += [
-        '  echo ""',
-        '  echo "  mg-workspace list|repair|test    gateway workspace management"',
-        '  echo "  pi-restart [service]           restart gateway/oMLX/services (default: model-gw)"',
-        "}",
-        "",
-        "pi-restart() {",
-        "  # Restart model-gateway (and other services) via the canonical server-ci",
-        "  # interface, which maps flags to launchd labels. Defaults to model-gw.",
-        '  local svc="${1:-model-gw}"',
-        '  if [ "$svc" = "-h" ] || [ "$svc" = "--help" ]; then',
-        '    echo "Usage: pi-restart [service]   (default: model-gw)"',
-        '    echo ""',
-        r'    echo "Wraps \`server-ci restart --<service>\`. Common services:"',
-        '    echo "  model-gw  Cloud LLM gateway (port 9111)  [default]"',
-        '    echo "  omlx      oMLX inference server (port 9110)"',
-        '    echo "  all       All services"',
-        '    echo "  status    Show status of all services (no restart)"',
-        '    echo "Full list: server-ci restart --help"',
-        "    return 0",
-        "  fi",
-        '  if [ "$svc" = "status" ]; then',
-        "    server-ci restart --status",
-        "    return $?",
-        "  fi",
-        '  if ! command -v server-ci >/dev/null 2>&1; then',
-        '    echo "Error: server-ci not found on PATH" >&2',
-        "    return 1",
-        "  fi",
-        '  server-ci restart --"$svc"',
-        "  local rc=$?",
-        '  if [ $rc -eq 0 ] && [ "$svc" != "all" ] && [ "$svc" != "status" ]; then',
-        "    # Poll until the service port reports UP (or ~25s elapse).",
-        '    local port=""',
-        '    case "$svc" in',
-        "      model-gw) port=9111 ;;",
-        "      omlx) port=9110 ;;",
-        "    esac",
-        '    if [ -n "$port" ]; then',
-        "      local elapsed=0 line=\"\"",
-        "      while [ $elapsed -lt 25 ]; do",
-        '        line=$(server-ci restart --status 2>/dev/null | grep -E "^[[:space:]]*$port " | head -1)',
-        '        if echo "$line" | grep -qi "UP"; then',
-        "          break",
-        "        fi",
-        "        sleep 2",
-        "        elapsed=$((elapsed + 2))",
-        "      done",
-        '      echo ""',
-        '      if [ -n "$line" ]; then',
-        "        echo \"$line\"",
-        "      else",
-        '        echo "  $port ($svc): status unknown"',
-        "      fi",
-        '      if [ $elapsed -ge 25 ]; then',
-        '        echo "WARNING: $svc did not report UP within 25s"',
-        "      fi",
-        "    fi",
-        "  fi",
-        "  return $rc",
-        "}",
-        "",
-    ]
-    return "\n".join(lines)
-
-
-# Fields carried through to the alias file so Pi/Codex/Claude launchers can make
-# UI/request-shape decisions without calling the gateway. Mirrors
+# Fields carried through to the alias file so downstream consumers (pi-shared
+# pi-catalog, the legacy pi-launcher.zsh, etc.) can make UI/request-shape
+# decisions without calling the gateway. Mirrors
 # runtime/omlx-config/fan_out_settings.py::build_aliases — keep in sync.
 _ALIAS_FIELDS = (
     "thinking",
@@ -446,10 +263,6 @@ def main() -> int:
                         help="override model-info.json path (default: MODEL_GATEWAY_MODEL_INFO env or checkout catalog)")
     parser.add_argument("--aliases-out", type=Path, default=None,
                         help="override exports.model_aliases from config")
-    parser.add_argument("--pi-out", type=Path, default=None,
-                        help="override exports.pi_models from config")
-    parser.add_argument("--launchers-out", type=Path, default=None,
-                        help="override exports.pi_launchers from config")
     parser.add_argument("--check", action="store_true", help="drift check only; exit 1 when stale")
     args = parser.parse_args()
 
@@ -473,10 +286,6 @@ def main() -> int:
     renders: list[tuple[Path, str, str]] = []
     if targets["model_aliases"]:
         renders.append((targets["model_aliases"], _dump(render_model_aliases(entries)), "model-aliases.json"))
-    if targets["pi_models"]:
-        renders.append((targets["pi_models"], _dump(render_pi_models(entries)), "pi models.json"))
-    if targets["pi_launchers"]:
-        renders.append((targets["pi_launchers"], render_pi_launchers(entries), "pi-launchers.zsh"))
 
     if args.check:
         ok = all(_check_one(path, content, label) for path, content, label in renders)

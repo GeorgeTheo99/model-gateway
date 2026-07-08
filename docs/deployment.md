@@ -35,19 +35,20 @@ Manual deploy:
 
 ## Downstream catalog exports
 
-`scripts/export_catalogs.py` renders three downstream artifacts from the same
+`scripts/export_catalogs.py` renders the downstream alias catalog from the same
 merge the router uses (`model-info.json` + the `config.yaml` `models:` overlay,
 overlay wins on id clash):
 
-- `exports.model_aliases` → `~/.claude/model-aliases.json` (read by the legacy
-  `runtime/pi-launcher.zsh` for `claude-*` / `codex-*` / `pi-*` launchers).
-- `exports.pi_models` → Pi `/model` picker `models.json` (via the
-  `~/.pi/agent/models.json` symlink).
-- `exports.pi_launchers` → a `pi-launchers.zsh` snippet (`pi-<alias>()` +
-  `pi-list`) to source from `~/.zshrc`.
+- `exports.model_aliases` → `~/.claude/model-aliases.json`, the **public
+  contract** consumed by Pi-side renderers (`pi-shared/bin/pi-catalog`) and any
+  other tool that needs the model catalog.
 
-Exports are **opt-in** via the gitignored `config.yaml`. Machines without Pi or
-shell launchers omit the `exports:` section and the generator is a no-op.
+Pi-specific artifacts (Pi `models.json` and `pi-launchers.zsh`) are NO LONGER
+rendered by the gateway — they live in `pi-shared/bin/pi-catalog`, which reads
+the alias file. The gateway stays generic (no Pi config-schema knowledge).
+
+Exports are **opt-in** via the gitignored `config.yaml`. Machines that don't
+need an alias file omit the `exports:` section and the generator is a no-op.
 Generation runs on gateway start (`src/server.py` lifespan) and on
 `/admin/api/reload`; drift is checked with `scripts/export_catalogs.py --check`.
 
@@ -72,10 +73,11 @@ There is no one-shot installer; a new machine is wired by hand plus `server-ci`:
    configured, so a fresh config exposes 0 models until secrets are added.
 4. `server-ci install-launchagents --reload` installs `com.local.model-gateway`
    (port 9111).
-5. (Optional) add an `exports:` section to `config.yaml` to turn on aliases +
-   Pi launchers; they regenerate on gateway start.
-6. (Optional) source a launcher from `~/.zshrc` (e.g. the generated
-   `pi-launchers.zsh` or the legacy `runtime/pi-launcher.zsh`).
+5. (Optional) add an `exports:` section to `config.yaml` to turn on the alias
+   catalog; it regenerates on gateway start.
+6. (Optional) source a Pi launcher from `~/.zshrc` — generate one with
+   `pi-shared/bin/pi-catalog --aliases ~/.claude/model-aliases.json ...`
+   (the legacy `runtime/pi-launcher.zsh` also still works).
 
 Onboarding gaps (no templated first-run config, no automated `~/.zshrc`
 sourcing, alias symlink owned by the `local-directory` service) are tracked as
