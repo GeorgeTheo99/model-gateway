@@ -1,4 +1,13 @@
-# ── Pi / Claude Code / Codex Launcher (oMLX + model-gateway) ──
+# ── DEPRECATED — legacy Pi / Claude Code / Codex Launcher ──
+# Superseded 2026-07-07 by pi-shared/bin/pi-catalog, which renders pi-*
+# launchers + models.json from the model-gateway alias catalog (clean
+# separation: the gateway stays generic, Pi rendering lives in pi-shared).
+# This file is NO LONGER sourced by ~/.zshrc on ls99 and is retained only for
+# reference / old compat shims. It defines claude-*/codex-*/pi-* functions;
+# the new launcher standardizes on pi-* only. Do not wire new machines to
+# this — use `pi-catalog` (see pi-shared README).
+#
+# Original: Pi / Claude Code / Codex Launcher (oMLX + model-gateway).
 # Interactive sessions route through model-gateway (port 9111); local MLX
 # requests are proxied onward to oMLX (port 9110). oMLX still handles model
 # loading, SSD KV cache, and local inference. Model metadata comes from oMLX

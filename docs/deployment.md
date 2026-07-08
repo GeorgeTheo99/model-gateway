@@ -77,7 +77,8 @@ There is no one-shot installer; a new machine is wired by hand plus `server-ci`:
    catalog; it regenerates on gateway start.
 6. (Optional) source a Pi launcher from `~/.zshrc` — generate one with
    `pi-shared/bin/pi-catalog --aliases ~/.claude/model-aliases.json ...`
-   (the legacy `runtime/pi-launcher.zsh` also still works).
+   (the legacy `runtime/pi-launcher.zsh` is DEPRECATED; it defines
+   claude-*/codex-* and is retained only for reference).
 
 Onboarding gaps (no templated first-run config, no automated `~/.zshrc`
 sourcing, alias symlink owned by the `local-directory` service) are tracked as
