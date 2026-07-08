@@ -84,6 +84,8 @@ def test_renders_all_three_outputs(tmp_path):
     assert "pi-qwen36()" in launchers
     assert "pi-glm52()" in launchers
     assert "pi-list()" in launchers
+    assert "pi-restart()" in launchers
+    assert "server-ci restart" in launchers
 
 
 def test_overlay_merge_used_by_generator(tmp_path):
