@@ -11,7 +11,7 @@ CLOUD_GW_PORT=9111
 CLOUD_GW_URL="http://localhost:$CLOUD_GW_PORT"
 CLOUD_GW_API_KEY="cloud"
 _ALIAS_FILE="${HOME}/.claude/model-aliases.json"
-_MODEL_INFO_FILE="${MODEL_INFO_PATH:-${MODEL_GATEWAY_RUNTIME_MODEL_INFO:-${HOME}/local_code/model-gateway/runtime/model-info.json}}"
+_MODEL_INFO_FILE="${MODEL_INFO_PATH:-${MODEL_GATEWAY_MODEL_INFO:-${HOME}/local_code/model-gateway/model-info.json}}"
 
 # ── Load models from oMLX API + alias file ──────────────────────────
 
@@ -461,7 +461,7 @@ claude-list() {
     for _mid in "${_OMLX_UNKNOWN[@]}"; do
       printf "    %s\n" "$_mid"
     done
-    echo "    Fix: add an entry in ~/local_code/model-gateway/runtime/model-info.json then run"
+    echo "    Fix: add an entry in ~/local_code/model-gateway/model-info.json then run"
     echo "         python3 ~/local_code/model-gateway/runtime/omlx-config/fan_out_settings.py && claude-reload"
   fi
   echo ""

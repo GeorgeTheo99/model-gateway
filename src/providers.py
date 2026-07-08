@@ -13,6 +13,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 import yaml
 
+from src import catalog
+
 log = logging.getLogger("model-gateway")
 
 
@@ -79,31 +81,12 @@ _AUTH_REFRESH_MIN_INTERVAL = 60.0  # seconds between CLI refresh attempts per pr
 _token_refresh_locks: dict[str, "asyncio.Lock"] = {}
 _last_token_refresh_attempt: dict[str, float] = {}
 
-_PROVIDER_SYNONYMS = {
-    "local": "omlx",
-    "omlx": "omlx",
-    "mlx": "omlx",
-    "openai": "openai",
-    "gpt": "openai",
-    "anthropic": "anthropic",
-    "anthropci": "anthropic",
-    "claude": "anthropic",
-    "google": "google",
-    "gemini": "google",
-    "zhipuai": "zhipuai",
-    "zai": "zhipuai",
-    "bigmodel": "zhipuai",
-    "databricks": "databricks",
-    "dbx": "databricks",
-    "dbrx": "databricks",
-}
+# Provider synonym table lives in ``src.catalog`` (the single source shared with
+# the downstream catalog generator). ``tests/test_catalog.py`` guards drift.
 
 
 def _canonical_provider(provider: str | None) -> str:
-    raw = (provider or "local").strip().lower()
-    if not raw:
-        return "omlx"
-    return _PROVIDER_SYNONYMS.get(raw, raw)
+    return catalog.canonical_provider(provider)
 
 
 def _find_provider_entry(config: dict, provider: str) -> tuple[str, dict] | None:
@@ -254,64 +237,28 @@ def _load_config() -> dict:
 
 def _entry_routable_ids(entry: dict) -> list[str]:
     """Return every gateway-facing identifier for a catalog entry."""
-    ids = [entry.get("name"), entry.get("alias"), entry.get("provider_model_id"), entry.get("omlx_id")]
-    extra_ids = entry.get("alternate_ids") or []
-    if isinstance(extra_ids, str):
-        ids.append(extra_ids)
-    elif isinstance(extra_ids, list):
-        ids.extend(extra_ids)
-    result = []
-    seen = set()
-    for value in ids:
-        if value is None:
-            continue
-        text = str(value).strip()
-        if text and text not in seen:
-            seen.add(text)
-            result.append(text)
-    return result
+    return catalog.entry_routable_ids(entry)
 
 
 def _load_models() -> dict[str, dict]:
-    """Load routable models from model-info.json (keyed by name/alias/id)."""
+    """Load routable models from model-info.json (keyed by name/alias/id).
+
+    The catalog + config.yaml ``models:`` overlay merge lives in
+    :func:`src.catalog.load_catalog_entries` and is shared with the downstream
+    catalog generator so the router and the generator can never drift.
+    """
     global _models
     if _models is not None:
         return _models
 
     _models = {}
-    if MODEL_INFO_PATH.exists():
-        with open(MODEL_INFO_PATH) as f:
-            data = json.load(f)
-    else:
-        # config.yaml overlay models below still route without the catalog.
+    if not MODEL_INFO_PATH.exists():
         log.warning("model-info.json not found at %s", MODEL_INFO_PATH)
-        data = {}
-
-    for entry in data.get("llm", []):
-        provider = _canonical_provider(entry.get("provider", "local"))
-        # GGUF/llama.cpp serving has been retired on this machine. Local MLX
-        # entries are routable through model-gateway as a thin proxy to oMLX.
-        if provider in {"gguf", "llama", "llama_cpp", "llama.cpp"}:
-            continue
-        normalized_entry = dict(entry)
-        normalized_entry["provider"] = provider
-        for model_id in _entry_routable_ids(normalized_entry):
-            _models[model_id] = normalized_entry
-
-    # Runtime-local model overlay: config.yaml `models:` entries are merged on
-    # top of the committed catalog. This keeps machine-specific model routes
-    # (e.g. a private workspace's serving endpoints) out of the repo entirely.
-    # Same schema as model-info.json `llm` entries; overlay wins on id clash.
     overlay = _load_config().get("models") or []
-    if isinstance(overlay, list):
-        for entry in overlay:
-            if not isinstance(entry, dict):
-                continue
-            provider = _canonical_provider(entry.get("provider", "local"))
-            normalized_entry = dict(entry)
-            normalized_entry["provider"] = provider
-            for model_id in _entry_routable_ids(normalized_entry):
-                _models[model_id] = normalized_entry
+    entries = catalog.load_catalog_entries(MODEL_INFO_PATH, overlay=overlay if isinstance(overlay, list) else [])
+    for entry in entries:
+        for model_id in _entry_routable_ids(entry):
+            _models[model_id] = entry
 
     log.info("Loaded %d routable model keys (catalog + config overlay)", len(_models))
     return _models

@@ -1,16 +1,26 @@
 #!/usr/bin/env python3
-"""Fan out model metadata from model-info.json into derived configs and restart oMLX.
+"""Fan out model metadata from model-info.json into oMLX settings and restart oMLX.
 
-Reads the authoritative model-info.json and:
+Reads the authoritative repo-root model-info.json and:
   1. Syncs oMLX model_settings.json — context windows, max output tokens,
      optional thinking budgets, sampling defaults, and chat-template controls
      (preserves oMLX-managed fields like is_default, is_pinned, etc.)
-  2. Regenerates model-aliases.json — short aliases and descriptions for ~/.zshrc launcher
+  2. Regenerates model-aliases.json by delegating to
+     ``scripts/export_catalogs.py`` (the single downstream catalog generator)
+     with ``--aliases-out``. This keeps aliases in sync with the same merge the
+     gateway router uses (model-info.json + config.yaml ``models:`` overlay).
   3. Restarts oMLX so it rescans model directories and picks up changes
+
+Alias generation previously lived here (build_aliases/diff_aliases); it moved
+to ``scripts/export_catalogs.py`` so the alias file, Pi models.json, and
+pi-launchers.zsh all come from one source of truth. This script keeps the
+genuinely oMLX-local concerns (model_settings.json sync + oMLX restart) and
+just triggers the shared generator for aliases.
 
 Usage:
     python3 fan_out_settings.py                  # auto-detect paths
     python3 fan_out_settings.py --dry-run        # preview without writing
+    python3 fan_out_settings.py --skip-aliases   # only sync oMLX settings
 """
 
 import argparse
@@ -20,10 +30,14 @@ import sys
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parent
+# Repo root (parent of runtime/). The authoritative model-info.json lives at
+# the repo root; ``runtime/model-info.json`` is a legacy symlink to it.
+REPO_ROOT = SCRIPT_DIR.parent.parent
 MODEL_INFO_DEFAULT = REPO_ROOT / "model-info.json"
 OMLX_SETTINGS_DEFAULT = Path.home() / ".omlx" / "model_settings.json"
 MODEL_ALIASES_DEFAULT = Path.home() / ".claude" / "model-aliases.json"
+# The shared downstream catalog generator (lives at scripts/export_catalogs.py).
+EXPORT_CATALOGS_SCRIPT = REPO_ROOT / "scripts" / "export_catalogs.py"
 
 
 def load_json(path: Path) -> dict:
@@ -134,104 +148,41 @@ def sync_omlx_settings(llm_entries: list, omlx_path: Path, dry_run: bool) -> Non
             print(f"  Wrote {len(models)} entries ({len(updated)} updated, {len(stale)} removed).")
 
 
-def build_aliases(llm_entries: list) -> dict:
-    """Build alias map from model-info entries, enforcing uniqueness.
+def regenerate_aliases(model_info: Path, aliases_path: Path, dry_run: bool) -> bool:
+    """Regenerate model-aliases.json via the shared export_catalogs.py generator.
 
-    Local models are keyed by omlx_id.
-    Cloud models (provider != "local") are keyed by "cloud:<provider_model_id>".
+    Delegates to ``scripts/export_catalogs.py --aliases-out`` so the alias file
+    is produced from the same model-info.json + config.yaml ``models:`` overlay
+    merge the gateway router uses. ``--aliases-out`` overrides any
+    ``exports.model_aliases`` in config.yaml so this manual run always targets
+    the expected path.
+
+    Returns True on success (or skipped/dry-run), False on generator failure so
+    the caller can exit non-zero and the operator notices.
     """
-    aliases: dict = {}
-    seen: dict = {}
-    collisions: list = []
-    for entry in llm_entries:
-        alias = entry.get("alias")
-        supported = entry.get("supported", True)
-
-        # Determine the key: omlx_id for local, "cloud:<provider_model_id>" for cloud
-        provider = entry.get("provider", "local")
-        if provider != "local" and provider:
-            if not alias:
-                continue
-            key = f"cloud:{entry.get('provider_model_id', alias)}"
-        else:
-            key = entry.get("omlx_id")
-            if not key:
-                continue
-            if not alias and supported is not False:
-                continue
-
-        if alias:
-            if alias in seen:
-                collisions.append((alias, seen[alias], key))
-                continue
-            seen[alias] = key
-
-        alias_entry = {
-            "desc": entry.get("desc", ""),
-            "name": entry.get("name", ""),
-        }
-        if alias:
-            alias_entry["alias"] = alias
-
-        # Carry non-secret capability metadata through to generated launcher
-        # configs.  This lets Pi/Codex/Claude launchers make UI/request-shape
-        # decisions without changing model-gateway itself.
-        for field in (
-            "thinking",
-            "thinking_format",
-            "enable_thinking",
-            "chat_template_kwargs",
-            "vision",
-            "format",
-            "context",
-            "max_output_tokens",
-            "omlx_id",
-            "provider_model_id",
-        ):
-            if entry.get(field) is not None:
-                alias_entry[field] = entry.get(field)
-
-        if supported is False:
-            alias_entry["supported"] = False
-            if entry.get("support_note"):
-                alias_entry["support_note"] = entry.get("support_note")
-        if provider != "local" and provider:
-            alias_entry["provider"] = provider
-            alias_entry["provider_model_id"] = entry.get("provider_model_id", "")
-            alias_entry["context"] = entry.get("context", 32768)
-            alias_entry["max_output_tokens"] = entry.get("max_output_tokens", 32768)
-        aliases[key] = alias_entry
-
-    if collisions:
-        print("\nERROR: duplicate aliases in model-info.json:", file=sys.stderr)
-        for alias, first, second in collisions:
-            print(f"  '{alias}' used by both '{first}' and '{second}'", file=sys.stderr)
-        sys.exit(2)
-
-    return aliases
-
-
-def diff_aliases(label: str, path: Path, aliases: dict, dry_run: bool) -> None:
-    """Write aliases to path, printing a summary of changes."""
-    existing = load_json(path) if path.exists() else {}
-
-    print(f"\n[{label}] {path}")
-    if aliases == existing:
-        print(f"  No changes ({len(aliases)} aliases).")
-        return
-
-    added = set(aliases) - set(existing)
-    removed = set(existing) - set(aliases)
-    changed = {k for k in set(aliases) & set(existing) if aliases[k] != existing[k]}
-    if added:
-        print(f"  Added:   {', '.join(sorted(added))}")
-    if removed:
-        print(f"  Removed: {', '.join(sorted(removed))}")
-    if changed:
-        print(f"  Changed: {', '.join(sorted(changed))}")
-    if not dry_run:
-        save_json(path, aliases)
-        print(f"  Wrote {len(aliases)} aliases.")
+    print(f"\n[model-aliases] {aliases_path}")
+    if not EXPORT_CATALOGS_SCRIPT.exists():
+        print(f"  skipped (generator missing: {EXPORT_CATALOGS_SCRIPT})", file=sys.stderr)
+        return True
+    if dry_run:
+        print("  [dry-run] Would run: export_catalogs.py --aliases-out", aliases_path)
+        return True
+    cmd = [
+        sys.executable, str(EXPORT_CATALOGS_SCRIPT),
+        "--aliases-out", str(aliases_path),
+        "--model-info", str(model_info),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode == 0:
+        for line in proc.stdout.strip().splitlines():
+            print(f"  {line}")
+        return True
+    print(f"  export_catalogs failed (rc={proc.returncode}):", file=sys.stderr)
+    if proc.stdout:
+        print(proc.stdout, file=sys.stderr)
+    if proc.stderr:
+        print(proc.stderr, file=sys.stderr)
+    return False
 
 
 def restart_omlx(dry_run: bool) -> None:
@@ -256,6 +207,8 @@ def main():
                         help=f"Path to oMLX model_settings.json (default: {OMLX_SETTINGS_DEFAULT})")
     parser.add_argument("--model-aliases", type=Path, default=MODEL_ALIASES_DEFAULT,
                         help=f"Path to model-aliases.json (default: {MODEL_ALIASES_DEFAULT})")
+    parser.add_argument("--skip-aliases", action="store_true",
+                        help="Only sync oMLX settings; do not regenerate model-aliases.json")
     parser.add_argument("--dry-run", action="store_true",
                         help="Preview changes without writing")
     args = parser.parse_args()
@@ -273,13 +226,16 @@ def main():
 
     sync_omlx_settings(llm_entries, args.omlx_settings, args.dry_run)
 
-    aliases = build_aliases(llm_entries)
-    diff_aliases("model-aliases", args.model_aliases, aliases, args.dry_run)
+    aliases_ok = True
+    if not args.skip_aliases:
+        aliases_ok = regenerate_aliases(args.model_info, args.model_aliases, args.dry_run)
 
     restart_omlx(args.dry_run)
 
     if not args.dry_run:
         print("Reload claude-launcher aliases:    claude-reload")
+    if not aliases_ok:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

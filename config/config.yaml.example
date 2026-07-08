@@ -114,9 +114,12 @@ providers:
 # model_fallbacks:
 #   my-primary-endpoint: my-fallback-endpoint
 
-# Optional downstream catalog exports (omit entirely on machines without Pi).
-# Regenerated on gateway start and /admin/api/reload; drift-checked via
-# scripts/export_catalogs.py --check.
+# Optional downstream catalog exports (omit entirely on machines without Pi or
+# shell launchers). Regenerated on gateway start and /admin/api/reload from the
+# SAME merge the gateway router uses (model-info.json + the `models:` overlay
+# above); drift-checked via `scripts/export_catalogs.py --check`. Never
+# hand-edit the generated files — edit model-info.json / config.yaml instead.
 # exports:
+#   model_aliases: ~/.claude/model-aliases.json
 #   pi_models: ~/local_code/pi-local/config/pi-models/models.json
 #   pi_launchers: ~/local_code/model-gateway-runtime/pi-launchers.zsh
