@@ -154,9 +154,9 @@ def render_model_aliases(entries: list[dict]) -> dict:
     """Render ~/.claude/model-aliases.json from merged catalog entries.
 
     Local models (provider ``omlx``/``local``) are keyed by ``omlx_id``; cloud
-    models by ``cloud:<provider_model_id>`` — exactly the schema the legacy
-    ``runtime/pi-launcher.zsh`` and ``fan_out_settings.py`` produce, so all
-    existing ``claude-*`` / ``codex-*`` / ``pi-*`` consumers keep working.
+    models by ``cloud:<provider_model_id>`` — the schema consumed by
+    ``pi-shared/bin/pi-catalog`` (which renders the Pi ``models.json`` and
+    ``pi-launchers.zsh``) and the legacy ``runtime/pi-launcher.zsh``.
 
     Hard-fails (sys.exit 2) on duplicate aliases, matching fan_out_settings.py.
     """
