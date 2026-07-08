@@ -1,0 +1,401 @@
+#!/usr/bin/env bash
+# model-gateway — portable macOS launchd operator CLI.
+#
+# Self-contained installer/control surface for consumer machines that run this
+# repo directly (git clone + install), without ls99's server-ci deployment
+# infrastructure.
+#
+# Usage:
+#   model-gateway install [--no-start] [--force]  bootstrap venv + plist + start + verify
+#   model-gateway uninstall                      stop service, remove plist (keeps repo/venv)
+#   model-gateway start | stop | restart
+#   model-gateway status                         launchd state + /health probe
+#   model-gateway verify                         /health smoke check
+#   model-gateway logs [-f|lines]                tail service log
+#   model-gateway update                         git pull + uv sync + restart + verify
+#   model-gateway env                            print resolved config
+set -euo pipefail
+
+# --------------------------------------------------------------------------- #
+# Config resolution.
+# --------------------------------------------------------------------------- #
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+LABEL="${MODEL_GATEWAY_LAUNCHD_LABEL:-com.local.model-gateway}"
+PLIST_DIR="${MODEL_GATEWAY_PLIST_DIR:-$HOME/Library/LaunchAgents}"
+LOG_DIR="${MODEL_GATEWAY_LOG_DIR:-$HOME/Library/Logs/model-gateway}"
+LOG_FILE="${MODEL_GATEWAY_LOG_FILE:-$LOG_DIR/model-gateway.log}"
+BIN_DIR="${MODEL_GATEWAY_BIN_DIR:-$HOME/.local/bin}"
+FORCE="${MODEL_GATEWAY_FORCE:-0}"
+
+HOST="${MODEL_GATEWAY_HOST:-127.0.0.1}"
+PORT="${MODEL_GATEWAY_PORT:-9111}"
+CONFIG_PATH="${MODEL_GATEWAY_CONFIG:-$ROOT_DIR/config/config.yaml}"
+MODEL_INFO_PATH="${MODEL_GATEWAY_MODEL_INFO:-$ROOT_DIR/model-info.json}"
+MODEL_INFO_SOURCE_PATH="${MODEL_GATEWAY_MODEL_INFO_SOURCE:-$ROOT_DIR/model-info.json}"
+LEDGER_PATH="${MODEL_GATEWAY_LEDGER_PATH:-$HOME/srv/model-gateway/shared/ledger.db}"
+UV_BIN="${UV_BIN:-$(command -v uv 2>/dev/null || true)}"
+
+# Colors (disabled when not a TTY).
+if [ -t 1 ]; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'
+else
+  C_RESET=""; C_BOLD=""; C_GREEN=""; C_YELLOW=""; C_RED=""
+fi
+
+log()  { printf '%s▶%s %s\n' "$C_BOLD" "$C_RESET" "$*"; }
+ok()   { printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn() { printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+die()  { printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+
+require_cmd() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1 (install it and retry)"; }
+
+check_macos() {
+  [ "$(uname -s)" = "Darwin" ] || die "model-gateway installer currently supports macOS launchd only"
+}
+
+check_prereqs() {
+  check_macos
+  require_cmd git
+  require_cmd curl
+  require_cmd python3
+  require_cmd uv
+  require_cmd launchctl
+  UV_BIN="${UV_BIN:-$(command -v uv)}"
+  [ -n "$UV_BIN" ] || die "uv not found"
+}
+
+# --------------------------------------------------------------------------- #
+# Bootstrap.
+# --------------------------------------------------------------------------- #
+ensure_config() {
+  if [ -f "$CONFIG_PATH" ]; then
+    log "Config exists: $CONFIG_PATH"
+    return 0
+  fi
+  mkdir -p "$(dirname "$CONFIG_PATH")"
+  cat >"$CONFIG_PATH" <<EOF
+# model-gateway runtime config.
+# Created by bin/model-gateway install. See config/config.yaml.example for the
+# full provider/auth/export template. Add provider secrets here; this file is
+# gitignored and should never be committed.
+
+auth:
+  # admin_keys protects /admin/api/*. Add a real key before using admin APIs.
+  admin_keys: []
+  # client_keys protects /v1/*. Leave empty only when MODEL_GATEWAY_HOST is
+  # loopback/private; add keys for any externally reachable gateway.
+  client_keys: []
+
+providers: {}
+
+# Optional downstream alias export consumed by pi-shared/bin/pi-catalog:
+# exports:
+#   model_aliases: ~/.claude/model-aliases.json
+EOF
+  warn "Created empty config at $CONFIG_PATH; add provider secrets/auth before expecting models to route"
+}
+
+sync_venv() {
+  log "Syncing Python environment"
+  uv sync --project "$ROOT_DIR" >/dev/null
+  ok "uv environment ready"
+}
+
+install_cli_symlink() {
+  mkdir -p "$BIN_DIR"
+  local dest="$BIN_DIR/model-gateway"
+  if [ -e "$dest" ] && [ ! -L "$dest" ]; then
+    if [ "$FORCE" = "1" ]; then
+      rm -f "$dest"
+    else
+      warn "$dest exists and is not a symlink; leaving it untouched (use --force to replace)"
+      return 0
+    fi
+  fi
+  ln -sfn "$SCRIPT_DIR/model-gateway" "$dest"
+  ok "Installed $dest → $SCRIPT_DIR/model-gateway"
+}
+
+# --------------------------------------------------------------------------- #
+# Launchd plist management.
+# --------------------------------------------------------------------------- #
+plist_path() { printf '%s/%s.plist' "$PLIST_DIR" "$LABEL"; }
+
+plist_working_dir() {
+  local path="$1"
+  [ -f "$path" ] || return 1
+  if [ -x /usr/libexec/PlistBuddy ]; then
+    /usr/libexec/PlistBuddy -c 'Print :WorkingDirectory' "$path" 2>/dev/null || true
+  else
+    awk '/<key>WorkingDirectory<\/key>/ {getline; gsub(/^[[:space:]]*<string>|<\/string>[[:space:]]*$/, ""); print; exit}' "$path" 2>/dev/null || true
+  fi
+}
+
+xml_escape() {
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
+ensure_label_safe() {
+  local action="$1" plist wd
+  plist="$(plist_path)"
+  [ -f "$plist" ] || return 0
+  wd="$(plist_working_dir "$plist")"
+  if [ "$wd" = "$ROOT_DIR" ]; then
+    return 0
+  fi
+  if [ "$FORCE" = "1" ]; then
+    warn "Adopting existing $LABEL plist for $action (WorkingDirectory was: ${wd:-unknown})"
+    return 0
+  fi
+  die "Refusing to $action $LABEL: existing plist belongs to '${wd:-unknown}', not '$ROOT_DIR'. Re-run with --force (or MODEL_GATEWAY_FORCE=1) to adopt it."
+}
+
+write_plist() {
+  ensure_label_safe "overwrite"
+  mkdir -p "$PLIST_DIR" "$LOG_DIR" "$(dirname "$LEDGER_PATH")"
+  local plist e_label e_uv e_root e_host e_port e_config e_model_info e_model_info_source e_ledger e_log
+  plist="$(plist_path)"
+  e_label="$(xml_escape "$LABEL")"
+  e_uv="$(xml_escape "$UV_BIN")"
+  e_root="$(xml_escape "$ROOT_DIR")"
+  e_host="$(xml_escape "$HOST")"
+  e_port="$(xml_escape "$PORT")"
+  e_config="$(xml_escape "$CONFIG_PATH")"
+  e_model_info="$(xml_escape "$MODEL_INFO_PATH")"
+  e_model_info_source="$(xml_escape "$MODEL_INFO_SOURCE_PATH")"
+  e_ledger="$(xml_escape "$LEDGER_PATH")"
+  e_log="$(xml_escape "$LOG_FILE")"
+  cat >"$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>${e_label}</string>
+<key>ProgramArguments</key><array>
+  <string>${e_uv}</string><string>run</string><string>python</string><string>-m</string><string>src.main</string>
+</array>
+<key>WorkingDirectory</key><string>${e_root}</string>
+<key>EnvironmentVariables</key><dict>
+  <key>MODEL_GATEWAY_HOST</key><string>${e_host}</string>
+  <key>MODEL_GATEWAY_PORT</key><string>${e_port}</string>
+  <key>MODEL_GATEWAY_CONFIG</key><string>${e_config}</string>
+  <key>MODEL_GATEWAY_MODEL_INFO</key><string>${e_model_info}</string>
+  <key>MODEL_GATEWAY_MODEL_INFO_SOURCE</key><string>${e_model_info_source}</string>
+  <key>MODEL_GATEWAY_LEDGER_PATH</key><string>${e_ledger}</string>
+</dict>
+<key>StandardOutPath</key><string>${e_log}</string>
+<key>StandardErrorPath</key><string>${e_log}</string>
+<key>KeepAlive</key><true/>
+<key>RunAtLoad</key><true/>
+<key>ThrottleInterval</key><integer>5</integer>
+</dict></plist>
+EOF
+  if command -v plutil >/dev/null 2>&1; then
+    plutil -lint "$plist" >/dev/null
+  fi
+  ok "Wrote $plist"
+}
+
+service_target() { printf 'gui/%s/%s' "$(id -u)" "$LABEL"; }
+service_loaded() { launchctl print "$(service_target)" >/dev/null 2>&1; }
+
+bootout_service() {
+  ensure_label_safe "stop"
+  if service_loaded; then
+    launchctl bootout "$(service_target)" >/dev/null 2>&1 || die "failed to unload launchd service: $LABEL"
+  fi
+  if service_loaded; then
+    die "launchd service is still loaded after bootout: $LABEL"
+  fi
+}
+
+bootstrap_service() {
+  local plist
+  plist="$(plist_path)"
+  [ -f "$plist" ] || die "missing plist $plist; run 'model-gateway install' first"
+  ensure_label_safe "start"
+  if service_loaded; then
+    launchctl kickstart -k "$(service_target)" >/dev/null 2>&1 || die "failed to kickstart launchd service: $LABEL"
+  else
+    launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null \
+      || launchctl load "$plist" 2>/dev/null \
+      || die "failed to load launchd service: $LABEL"
+  fi
+  launchctl enable "$(service_target)" 2>/dev/null || warn "could not enable launchd service: $LABEL"
+  service_loaded || die "launchd service did not load: $LABEL"
+}
+
+start_service() { bootstrap_service; }
+stop_service() { bootout_service; }
+
+_wait_port_free() { # port [timeout]
+  local port="$1" t="${2:-15}" i=0
+  while [ $i -lt $t ]; do
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 || return 0
+    sleep 1; i=$((i+1))
+  done
+  lsof -nP -iTCP:"$port" -sTCP:LISTEN >&2 || true
+  return 1
+}
+
+restart_service() {
+  stop_service
+  if ! _wait_port_free "$PORT"; then
+    die "port $PORT is still bound; refusing to start a second gateway"
+  fi
+  start_service
+}
+
+remove_plist() {
+  ensure_label_safe "remove"
+  stop_service
+  rm -f "$(plist_path)"
+  ok "Removed $(plist_path)"
+}
+
+# --------------------------------------------------------------------------- #
+# Health / verification.
+# --------------------------------------------------------------------------- #
+health_url() { printf 'http://127.0.0.1:%s/health' "$PORT"; }
+
+health_ok() {
+  python3 -c 'import json,sys
+try:
+    data=json.load(sys.stdin)
+except json.JSONDecodeError:
+    raise SystemExit(1)
+raise SystemExit(0 if data.get("status") == "ok" and data.get("service") == "model-gateway" else 1)'
+}
+
+wait_http() { # url timeout
+  local url="$1" t="${2:-30}" i=0 body
+  while [ $i -lt $t ]; do
+    body="$(curl -fsS --max-time 3 "$url" 2>/dev/null || true)"
+    if [ -n "$body" ] && echo "$body" | health_ok; then ok "$url → model-gateway ok"; return 0; fi
+    sleep 1; i=$((i+1))
+  done
+  warn "timeout waiting for $url"
+  return 1
+}
+
+verify() { wait_http "$(health_url)" 30; }
+
+status() {
+  local state health
+  state="$(launchctl print "$(service_target)" 2>/dev/null | awk -F' = ' '/^[[:space:]]*state/ {print $2; exit}' || echo 'not-loaded')"
+  health="$(curl -fsS --max-time 3 "$(health_url)" 2>/dev/null || echo 'DOWN')"
+  printf '%-24s %s\n' "launchd:" "${state:-unknown}"
+  printf '%-24s %s\n' "health:" "$health"
+  printf '%-24s %s\n' "config:" "$CONFIG_PATH"
+  printf '%-24s %s\n' "model-info:" "$MODEL_INFO_PATH"
+  printf '%-24s %s\n' "log:" "$LOG_FILE"
+}
+
+cmd_logs() {
+  mkdir -p "$LOG_DIR"
+  local arg="${1:--50}"
+  case "$arg" in
+    -f|--follow) tail -f "$LOG_FILE" ;;
+    -*) tail "$arg" "$LOG_FILE" 2>/dev/null || warn "no log yet: $LOG_FILE" ;;
+    ''|all) tail -50 "$LOG_FILE" 2>/dev/null || warn "no log yet: $LOG_FILE" ;;
+    *[!0-9]*) die "usage: model-gateway logs [-f|lines]" ;;
+    *) tail -"$arg" "$LOG_FILE" 2>/dev/null || warn "no log yet: $LOG_FILE" ;;
+  esac
+}
+
+cmd_env() {
+  cat <<EOF
+ROOT_DIR=$ROOT_DIR
+LABEL=$LABEL
+PLIST=$(plist_path)
+LOG_FILE=$LOG_FILE
+BIN_DIR=$BIN_DIR
+UV_BIN=$UV_BIN
+MODEL_GATEWAY_HOST=$HOST
+MODEL_GATEWAY_PORT=$PORT
+MODEL_GATEWAY_CONFIG=$CONFIG_PATH
+MODEL_GATEWAY_MODEL_INFO=$MODEL_INFO_PATH
+MODEL_GATEWAY_MODEL_INFO_SOURCE=$MODEL_INFO_SOURCE_PATH
+MODEL_GATEWAY_LEDGER_PATH=$LEDGER_PATH
+HEALTH_URL=$(health_url)
+EOF
+}
+
+# --------------------------------------------------------------------------- #
+# Subcommands.
+# --------------------------------------------------------------------------- #
+cmd_install() {
+  local start=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-start) start=0 ;;
+      --force) FORCE=1 ;;
+      *) die "usage: model-gateway install [--no-start] [--force]" ;;
+    esac
+    shift
+  done
+  check_prereqs
+  log "Installing model-gateway from $ROOT_DIR"
+  ensure_config
+  sync_venv
+  install_cli_symlink
+  write_plist
+  if [ $start -eq 1 ]; then
+    restart_service
+    log "Waiting for model-gateway to come up..."
+    verify || die "verification failed; check 'model-gateway logs'"
+  fi
+  ok "model-gateway installed"
+}
+
+cmd_uninstall() {
+  log "Uninstalling model-gateway service"
+  remove_plist
+  local dest="$BIN_DIR/model-gateway"
+  if [ -L "$dest" ] && [ "$(readlink "$dest")" = "$SCRIPT_DIR/model-gateway" ]; then
+    rm -f "$dest"
+    ok "Removed $dest"
+  fi
+  ok "Uninstalled (repo and venv retained; rerun 'install' to restore)"
+}
+
+cmd_update() {
+  check_prereqs
+  log "Pulling model-gateway repo"
+  git -C "$ROOT_DIR" pull --ff-only
+  sync_venv
+  write_plist
+  restart_service
+  verify || die "verification failed after update"
+  ok "model-gateway updated"
+}
+
+usage() {
+  sed -n '2,/^set -euo/p' "$0" | grep -E '^#   ' | sed 's/^#   /  /'
+  exit 1
+}
+
+main() {
+  while [ "${1:-}" = "--force" ]; do
+    FORCE=1
+    shift
+  done
+  [ $# -ge 1 ] || usage
+  case "$1" in
+    install|bootstrap) shift; cmd_install "$@" ;;
+    uninstall) cmd_uninstall ;;
+    start) check_prereqs; start_service; verify; ok "started" ;;
+    stop) stop_service; ok "stopped" ;;
+    restart) check_prereqs; restart_service; verify; ok "restarted" ;;
+    status) status ;;
+    verify) verify ;;
+    logs) shift; cmd_logs "$@" ;;
+    update) cmd_update ;;
+    env) cmd_env ;;
+    -h|--help|help) usage ;;
+    *) die "unknown command: $1" ;;
+  esac
+}
+
+main "$@"
