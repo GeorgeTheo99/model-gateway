@@ -45,6 +45,23 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("model-gateway")
 
 
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+def _stream_error_event(message: str) -> str:
+    return _sse(
+        "error",
+        {
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": message,
+            },
+        },
+    )
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     """Initialize the request ledger and regenerate downstream catalogs on startup."""
@@ -69,6 +86,7 @@ DEFAULT_FIREWORKS_IMAGE_MAX_BYTES = 1_000_000
 DEFAULT_FIREWORKS_IMAGE_MAX_DIMENSION = 1600
 DEFAULT_FIREWORKS_IMAGE_TOTAL_MAX_BYTES = 8_000_000
 IMAGE_HANDLING_EXTRACT_THEN_ANSWER = "extract_then_answer"
+STREAM_READ_TIMEOUT_SECONDS = int(os.environ.get("MODEL_GATEWAY_STREAM_READ_TIMEOUT_SECONDS", "900"))
 VISION_OBSERVATION_PROMPT = """You extract visual observations for a separate reasoning model.
 
 Return concise, structured observations only. Do not answer the user's question, do not make recommendations, and do not infer beyond what is visible. Include these sections when applicable:
@@ -709,7 +727,7 @@ async def _extract_image_observations(request: Request, body: dict, fallback_mod
         request.state.api_key = original_api_key
     endpoint = _upstream_endpoint(fallback_info, "/chat/completions")
     start = time.time()
-    async with httpx.AsyncClient(timeout=300) as client:
+    async with httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS) as client:
         try:
             resp = await client.post(endpoint, json=extraction_body, headers=headers)
         except httpx.ConnectError:
@@ -1291,7 +1309,7 @@ async def create_response(request: Request):
     # Non-streaming client response
     if google_with_tools:
         # Non-streaming upstream for Google+tools to capture thought_signatures
-        async with httpx.AsyncClient(timeout=300) as client:
+        async with httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS) as client:
             try:
                 resp = await _retry_post_with_model_fallback(
                     client, endpoint, json=chat_req, headers=fwd,
@@ -1321,7 +1339,7 @@ async def create_response(request: Request):
         chat_req["stream"] = True
         _maybe_stream_options(chat_req, info)
 
-        client = httpx.AsyncClient(timeout=300)
+        client = httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS)
         try:
             resp = await _retry_send_stream_with_model_fallback(
                 client, endpoint, json=chat_req, headers=fwd,
@@ -1363,7 +1381,7 @@ async def create_response(request: Request):
 async def _handle_openai_responses_passthrough(endpoint: str, body: dict, headers: dict, is_stream: bool, provider: str = "", request: Request | None = None):
     """Forward Responses API requests directly to OpenAI."""
     if is_stream:
-        client = httpx.AsyncClient(timeout=300)
+        client = httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS)
         try:
             resp = await _retry_send_stream(
                 client, endpoint, json=body, headers=headers,
@@ -1386,6 +1404,12 @@ async def _handle_openai_responses_passthrough(endpoint: str, body: dict, header
             try:
                 async for chunk in resp.aiter_bytes():
                     yield chunk
+            except httpx.TimeoutException as exc:
+                log.warning("OpenAI Responses stream timed out: %s", exc)
+                yield _stream_error_event("Provider stream timed out before completing")
+            except httpx.HTTPError as exc:
+                log.warning("OpenAI Responses stream failed: %s", exc)
+                yield _stream_error_event(f"Provider stream failed: {type(exc).__name__}")
             finally:
                 await resp.aclose()
                 await client.aclose()
@@ -1396,7 +1420,7 @@ async def _handle_openai_responses_passthrough(endpoint: str, body: dict, header
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
 
-    async with httpx.AsyncClient(timeout=300) as client:
+    async with httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS) as client:
         try:
             resp = await _retry_post(
                 client, endpoint, json=body, headers=headers,
@@ -1418,7 +1442,7 @@ async def _handle_openai_responses_passthrough(endpoint: str, body: dict, header
 async def _handle_responses_stream(endpoint: str, chat_req: dict, model: str, headers: dict, info=None, request: Request | None = None):
     """Handle streaming Responses API request."""
     provider = getattr(info, "provider", "") if info is not None else ""
-    client = httpx.AsyncClient(timeout=300)
+    client = httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS)
     try:
         resp = await _retry_send_stream_with_model_fallback(
             client, endpoint, json=chat_req, headers=headers,
@@ -1441,6 +1465,12 @@ async def _handle_responses_stream(endpoint: str, chat_req: dict, model: str, he
         try:
             async for event in translate_responses_stream(resp.aiter_bytes(), model):
                 yield event
+        except httpx.TimeoutException as exc:
+            log.warning("Responses stream timed out for %s: %s", model, exc)
+            yield _stream_error_event("Provider stream timed out before completing")
+        except httpx.HTTPError as exc:
+            log.warning("Responses stream failed for %s: %s", model, exc)
+            yield _stream_error_event(f"Provider stream failed: {type(exc).__name__}")
         finally:
             await resp.aclose()
             await client.aclose()
@@ -1456,7 +1486,7 @@ async def _handle_responses_stream_google(endpoint: str, chat_req: dict, model: 
     """Handle streaming Responses API for Google+tools: non-streaming upstream
     to guarantee thought_signature capture, then generate Responses SSE events."""
     provider = getattr(info, "provider", "") if info is not None else ""
-    async with httpx.AsyncClient(timeout=300) as client:
+    async with httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS) as client:
         try:
             resp = await _retry_post_with_model_fallback(
                 client, endpoint, json=chat_req, headers=headers,
@@ -1486,9 +1516,6 @@ async def _handle_responses_stream_google(endpoint: str, chat_req: dict, model: 
     result = chat_to_responses(openai_resp, model)
 
     # Generate Responses API SSE events from the complete response
-    def _sse(event: str, data: dict) -> str:
-        return f"event: {event}\ndata: {json.dumps(data)}\n\n"
-
     def generate_sse():
         # response.created
         yield _sse("response.created", {"type": "response.created", "response": result})
@@ -1660,7 +1687,7 @@ async def _handle_chat_anthropic(body: dict, info, model: str, request: Request,
     if is_stream:
         anthropic_req["stream"] = True
         return await _chat_anthropic_stream(endpoint, anthropic_req, model, headers, provider=info.provider, request=request)
-    async with httpx.AsyncClient(timeout=300) as client:
+    async with httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS) as client:
         try:
             resp = await _retry_post_with_model_fallback(
                 client, endpoint, json=anthropic_req, headers=headers,
@@ -1680,7 +1707,7 @@ async def _handle_chat_anthropic(body: dict, info, model: str, request: Request,
 
 
 async def _chat_anthropic_stream(endpoint: str, body: dict, model: str, headers: dict, provider: str = "", request: Request | None = None):
-    client = httpx.AsyncClient(timeout=300)
+    client = httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS)
     try:
         resp = await _retry_send_stream_with_model_fallback(
             client, endpoint, json=body, headers=headers,
@@ -1703,6 +1730,12 @@ async def _chat_anthropic_stream(endpoint: str, body: dict, model: str, headers:
         try:
             async for event in _anthropic_sse_to_openai_chat(resp.aiter_bytes(), model):
                 yield event
+        except httpx.TimeoutException as exc:
+            log.warning("Anthropic-to-OpenAI chat stream timed out for %s: %s", model, exc)
+            yield _stream_error_event("Provider stream timed out before completing")
+        except httpx.HTTPError as exc:
+            log.warning("Anthropic-to-OpenAI chat stream failed for %s: %s", model, exc)
+            yield _stream_error_event(f"Provider stream failed: {type(exc).__name__}")
         finally:
             await resp.aclose()
             await client.aclose()
@@ -1788,7 +1821,7 @@ async def _anthropic_sse_to_openai_chat(byte_iter, model: str):
 
 
 async def _passthrough_sync(endpoint: str, body: dict, headers: dict, provider: str = "", request: Request | None = None) -> JSONResponse:
-    async with httpx.AsyncClient(timeout=300) as client:
+    async with httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS) as client:
         try:
             resp = await _retry_post_with_model_fallback(
                 client, endpoint, json=body, headers=headers,
@@ -1811,7 +1844,7 @@ async def _passthrough_sync(endpoint: str, body: dict, headers: dict, provider: 
 
 
 async def _passthrough_stream(endpoint: str, body: dict, headers: dict, provider: str = "", request: Request | None = None):
-    client = httpx.AsyncClient(timeout=300)
+    client = httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS)
     try:
         resp = await _retry_send_stream_with_model_fallback(
             client, endpoint, json=body, headers=headers,
@@ -1840,6 +1873,12 @@ async def _passthrough_stream(endpoint: str, body: dict, headers: dict, provider
         try:
             async for line in resp.aiter_lines():
                 yield (line + "\n").encode()
+        except httpx.TimeoutException as exc:
+            log.warning("OpenAI passthrough stream timed out: %s", exc)
+            yield _stream_error_event("Provider stream timed out before completing")
+        except httpx.HTTPError as exc:
+            log.warning("OpenAI passthrough stream failed: %s", exc)
+            yield _stream_error_event(f"Provider stream failed: {type(exc).__name__}")
         finally:
             await resp.aclose()
             await client.aclose()
@@ -2050,7 +2089,7 @@ async def messages(request: Request):
 
 async def _passthrough_anthropic_sync(endpoint: str, body: dict, headers: dict, provider: str = "", request: Request | None = None) -> JSONResponse:
     """Forward request directly to Anthropic Messages API (non-streaming)."""
-    async with httpx.AsyncClient(timeout=300) as client:
+    async with httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS) as client:
         try:
             resp = await _retry_post_with_model_fallback(
                 client, endpoint, json=body, headers=headers,
@@ -2068,7 +2107,7 @@ async def _passthrough_anthropic_sync(endpoint: str, body: dict, headers: dict, 
 
 async def _passthrough_anthropic_stream(endpoint: str, body: dict, headers: dict, provider: str = "", request: Request | None = None):
     """Forward streaming request directly to Anthropic Messages API."""
-    client = httpx.AsyncClient(timeout=300)
+    client = httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS)
     try:
         resp = await _retry_send_stream_with_model_fallback(
             client, endpoint, json=body, headers=headers,
@@ -2091,6 +2130,12 @@ async def _passthrough_anthropic_stream(endpoint: str, body: dict, headers: dict
         try:
             async for line in resp.aiter_lines():
                 yield (line + "\n").encode()
+        except httpx.TimeoutException as exc:
+            log.warning("Anthropic passthrough stream timed out: %s", exc)
+            yield _stream_error_event("Provider stream timed out before completing")
+        except httpx.HTTPError as exc:
+            log.warning("Anthropic passthrough stream failed: %s", exc)
+            yield _stream_error_event(f"Provider stream failed: {type(exc).__name__}")
         finally:
             await resp.aclose()
             await client.aclose()
@@ -2138,7 +2183,7 @@ async def _handle_responses_anthropic(body: dict, info, model: str, request: Req
         return await _handle_responses_anthropic_stream(endpoint, messages_req, model, fwd, provider=info.provider, request=request)
 
     # Non-streaming: forward to Anthropic, translate response to Responses format
-    async with httpx.AsyncClient(timeout=300) as client:
+    async with httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS) as client:
         try:
             resp = await _retry_post_with_model_fallback(
                 client, endpoint, json=messages_req, headers=fwd,
@@ -2335,7 +2380,7 @@ async def _handle_responses_anthropic_stream(endpoint: str, messages_req: dict, 
 
     Collects Anthropic's SSE stream, then emits it as Responses API events.
     """
-    client = httpx.AsyncClient(timeout=300)
+    client = httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS)
     try:
         resp = await _retry_send_stream_with_model_fallback(
             client, endpoint, json=messages_req, headers=headers,
@@ -2466,7 +2511,7 @@ async def _handle_sync(
     openai_req["stream"] = True
     _maybe_stream_options(openai_req, info if info is not None else SimpleNamespace(quirks=frozenset()))
 
-    client = httpx.AsyncClient(timeout=300)
+    client = httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS)
     try:
         resp = await _retry_send_stream_with_model_fallback(
             client, endpoint, json=openai_req, headers=headers,
@@ -2518,7 +2563,7 @@ async def _handle_streaming(
     # records 0 tokens / $0 cost. Skipped for no_stream_options providers.
     _maybe_stream_options(openai_req, info if info is not None else SimpleNamespace(quirks=frozenset()))
 
-    client = httpx.AsyncClient(timeout=300)
+    client = httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS)
     try:
         resp = await _retry_send_stream_with_model_fallback(
             client, endpoint, json=openai_req, headers=headers,
@@ -2543,6 +2588,12 @@ async def _handle_streaming(
                 resp.aiter_bytes(), model, has_tools=has_tools, thinking_enabled=thinking_enabled,
             ):
                 yield event
+        except httpx.TimeoutException as exc:
+            log.warning("Messages stream timed out for %s: %s", model, exc)
+            yield _stream_error_event("Provider stream timed out before completing")
+        except httpx.HTTPError as exc:
+            log.warning("Messages stream failed for %s: %s", model, exc)
+            yield _stream_error_event(f"Provider stream failed: {type(exc).__name__}")
         finally:
             await resp.aclose()
             await client.aclose()
@@ -2564,7 +2615,7 @@ async def _handle_streaming_google(
     # Force non-streaming upstream to capture extra_content reliably
     openai_req.pop("stream", None)
 
-    async with httpx.AsyncClient(timeout=300) as client:
+    async with httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS) as client:
         try:
             resp = await _retry_post_with_model_fallback(
                 client, endpoint, json=openai_req, headers=headers,
