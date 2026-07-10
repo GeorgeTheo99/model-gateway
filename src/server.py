@@ -769,7 +769,22 @@ def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat") -> bool:
     # params. Never inject or forward reasoning controls into OpenAI-shaped
     # upstream requests for those providers. Native Anthropic Messages
     # requests (target_api="messages") keep their thinking params.
-    if target_api != "messages" and "no_reasoning_params" in getattr(info, "quirks", frozenset()):
+    quirks = getattr(info, "quirks", frozenset())
+    # Some upstreams (e.g. gpt-5.6-sol on the Databricks AI gateway) reject
+    # function tools whenever reasoning is active on /chat/completions and
+    # demand an explicit reasoning_effort="none". Stripping the param is not
+    # enough because the endpoint auto-enables reasoning for the model, so we
+    # must send "none" explicitly when the request carries tools.
+    if (
+        target_api != "messages"
+        and "reasoning_none_with_tools" in quirks
+        and (req.get("tools") or req.get("functions"))
+    ):
+        _strip_reasoning_controls(req)
+        req.pop("reasoning", None)
+        req["reasoning_effort"] = "none"
+        return False
+    if target_api != "messages" and "no_reasoning_params" in quirks:
         _strip_reasoning_controls(req)
         req.pop("reasoning", None)
         return bool(enabled)

@@ -707,6 +707,15 @@ def resolve(model_id: str, provider_override: str | None = None) -> ProviderInfo
     quirks_raw = provider_config.get("quirks") or []
     if isinstance(quirks_raw, str):
         quirks_raw = [q.strip() for q in quirks_raw.split(",") if q.strip()]
+    quirks_set = set(quirks_raw)
+    # Per-model quirks merge on top of provider quirks so a single model can
+    # opt into a quirk (e.g. "no_reasoning_params" for gpt-5.6-sol which rejects
+    # reasoning_effort + function tools on /v1/chat/completions) without
+    # affecting other models routed through the same shared provider.
+    model_quirks_raw = entry.get("quirks") or []
+    if isinstance(model_quirks_raw, str):
+        model_quirks_raw = [q.strip() for q in model_quirks_raw.split(",") if q.strip()]
+    quirks_set.update(model_quirks_raw)
 
     return ProviderInfo(
         provider=provider,
@@ -715,7 +724,7 @@ def resolve(model_id: str, provider_override: str | None = None) -> ProviderInfo
         provider_model_id=provider_model_id,
         protocol=protocol,
         endpoint_suffix=endpoint_suffix,
-        quirks=frozenset(quirks_raw),
+        quirks=frozenset(quirks_set),
         context=entry.get("context", 0),
         max_output_tokens=entry.get("max_output_tokens", 0),
         thinking=entry.get("thinking", ""),

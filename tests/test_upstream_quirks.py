@@ -156,6 +156,59 @@ def test_maybe_stream_options_sets_include_usage_otherwise():
     assert req["stream_options"] == {"include_usage": True}
 
 
+def test_per_model_quirks_merge_with_provider_quirks(tmp_config):
+    _write_config(tmp_config, """
+providers:
+  shared_gw:
+    base_url: https://gateway.example.com
+    api_key: placeholder
+    quirks:
+      - no_stream_options
+""")
+    _write_models(tmp_config, [
+        {"name": "plain", "provider": "shared_gw", "provider_model_id": "plain-up"},
+        {"name": "picky", "provider": "shared_gw", "provider_model_id": "picky-up",
+         "quirks": ["reasoning_none_with_tools"]},
+    ])
+    plain = providers.resolve("plain")
+    picky = providers.resolve("picky")
+    # Provider quirk applies to both; per-model quirk only to the model that declares it.
+    assert plain.quirks == frozenset({"no_stream_options"})
+    assert picky.quirks == frozenset({"no_stream_options", "reasoning_none_with_tools"})
+
+
+def test_reasoning_none_with_tools_forces_none_when_tools_present():
+    from src.server import _apply_gateway_reasoning
+    info = SimpleNamespace(
+        provider="shared_gw", provider_model_id="gpt-5-6-sol",
+        thinking="optional", thinking_format="", max_output_tokens=32768,
+        quirks=frozenset({"reasoning_none_with_tools"}),
+    )
+    req = {
+        "messages": [],
+        "reasoning_effort": "high",
+        "tools": [{"type": "function", "function": {"name": "t"}}],
+    }
+    enabled = _apply_gateway_reasoning(req, info, target_api="chat")
+    assert enabled is False
+    assert req["reasoning_effort"] == "none"
+    assert "thinking" not in req and "reasoning" not in req
+
+
+def test_reasoning_none_with_tools_leaves_reasoning_when_no_tools():
+    from src.server import _apply_gateway_reasoning
+    info = SimpleNamespace(
+        provider="shared_gw", provider_model_id="gpt-5-6-sol",
+        thinking="optional", thinking_format="", max_output_tokens=32768,
+        quirks=frozenset({"reasoning_none_with_tools"}),
+    )
+    req = {"messages": [], "reasoning_effort": "high"}
+    enabled = _apply_gateway_reasoning(req, info, target_api="chat")
+    # No tools -> quirk does not fire; normal reasoning path keeps effort active.
+    assert enabled is True
+    assert req.get("reasoning_effort") == "high"
+
+
 def test_no_reasoning_params_quirk_strips_reasoning_controls():
     from src.server import _apply_gateway_reasoning
     info = SimpleNamespace(
