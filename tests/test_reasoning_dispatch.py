@@ -430,7 +430,7 @@ def test_chat_completions_image_request_extracts_then_answers_with_original_mode
             return fallback_info
         return None
 
-    async def fake_extract(request, body, fallback_model, fallback):
+    async def fake_extract(request, body, fallback_model, fallback, error_factory):
         assert fallback_model == server_module.DEFAULT_VISION_FALLBACK_MODEL
         assert fallback is fallback_info
         assert server_module._payload_has_image(body)
@@ -517,6 +517,206 @@ def test_chat_completions_image_request_uses_fireworks_default_vision_fallback(c
 
     assert resp.status_code == 200
     assert resp.json() == {"ok": True}
+
+
+def test_replace_image_preserves_order_and_all_content():
+    body = {"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "before"},
+        {"type": "image_url", "image_url": {"url": "one"}},
+        {"type": "custom", "value": 7},
+        {"type": "text", "text": "after"},
+    ]}]}
+    result = server_module._replace_images_with_extracted_text(body, "visible detail", "vision")
+    parts = result["messages"][0]["content"]
+    assert [part["type"] for part in parts] == ["text", "text", "custom", "text"]
+    assert "image 1" in parts[1]["text"]
+    assert parts[0]["text"] == "before" and parts[3]["text"] == "after"
+    assert body["messages"][0]["content"][1]["type"] == "image_url"
+
+
+def test_replace_images_rejects_multiple_images():
+    with pytest.raises(ValueError, match="exactly one"):
+        server_module._replace_images_with_extracted_text(
+            {"messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "one"}},
+                {"type": "image_url", "image_url": {"url": "two"}},
+            ]}]},
+            "visible detail", "vision",
+        )
+
+
+def test_replace_images_rejects_empty_observations():
+    with pytest.raises(ValueError, match="empty observations"):
+        server_module._replace_images_with_extracted_text(
+            {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]},
+            "  ", "vision",
+        )
+
+
+def test_responses_input_image_translates_to_real_image_block():
+    from src.responses import responses_to_chat
+    result = responses_to_chat({"input": [{"type": "message", "role": "user", "content": [
+        {"type": "input_text", "text": "inspect"},
+        {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+    ]}]})
+    assert result["messages"][0]["content"][1] == {
+        "type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"},
+    }
+
+
+def test_responses_input_image_translates_to_anthropic_image_block():
+    result = server_module._responses_to_anthropic_messages({
+        "input": [{"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "inspect"},
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+            {"type": "input_image", "image_url": "https://example.test/image.png"},
+        ]}],
+    })
+    parts = result["messages"][0]["content"]
+    assert parts[1] == {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+    assert parts[2] == {"type": "image", "source": {"type": "url", "url": "https://example.test/image.png"}}
+
+
+def test_anthropic_image_translation_preserves_interleaved_order():
+    from src.translator import anthropic_to_openai
+    result = anthropic_to_openai({"model": "m", "messages": [{"role": "user", "content": [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "ONE"}},
+        {"type": "text", "text": "between"},
+        {"type": "image", "source": {"type": "url", "url": "https://example.test/two.png"}},
+    ]}]})
+    parts = result["messages"][0]["content"]
+    assert [part["type"] for part in parts] == ["image_url", "text", "image_url"]
+    assert parts[2]["image_url"]["url"] == "https://example.test/two.png"
+
+
+def test_anthropic_tool_results_preserve_block_sequence():
+    from src.translator import anthropic_to_openai
+    result = anthropic_to_openai({"model": "m", "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "before"},
+        {"type": "tool_result", "tool_use_id": "call_1", "content": "result"},
+        {"type": "text", "text": "after"},
+    ]}]})
+    assert [(message["role"], message["content"]) for message in result["messages"]] == [
+        ("user", "before"), ("tool", "result"), ("user", "after"),
+    ]
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_responses_file_id_rejected_on_translated_route(client, monkeypatch):
+    monkeypatch.setattr(server_module, "resolve", lambda model: _info("none", provider="test", vision=False))
+    response = client.post("/v1/responses", json={
+        "model": "text-model", "input": [{"type": "message", "role": "user", "content": [
+            {"type": "input_image", "file_id": "file_123"},
+        ]}],
+    })
+    assert response.status_code == 400
+    assert "file_id" in response.json()["error"]["message"]
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_responses_native_openai_preserves_file_id(client, monkeypatch):
+    native = _info("none", provider="openai", provider_model_id="native-responses", vision=False)
+    monkeypatch.setattr(server_module, "resolve", lambda model: native)
+
+    async def fake_passthrough(endpoint, body, headers, is_stream, **kwargs):
+        assert body["model"] == "native-responses"
+        assert body["input"][0]["content"][0]["file_id"] == "file_123"
+        return server_module.JSONResponse(status_code=200, content={"ok": True})
+
+    monkeypatch.setattr(server_module, "_handle_openai_responses_passthrough", fake_passthrough)
+    response = client.post("/v1/responses", json={
+        "model": "vision-model", "input": [{"type": "message", "role": "user", "content": [
+            {"type": "input_image", "file_id": "file_123"},
+        ]}],
+    })
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+@pytest.mark.parametrize("mode", ["typo", "extract_then_answer"])
+def test_responses_native_file_id_rejects_non_native_handling(client, monkeypatch, mode):
+    native = _info("none", provider="openai", provider_model_id="native-responses", vision=False)
+    monkeypatch.setattr(server_module, "resolve", lambda model: native)
+    response = client.post("/v1/responses", json={
+        "model": "vision-model", "gateway_image_handling": mode,
+        "input": [{"type": "message", "role": "user", "content": [
+            {"type": "input_image", "file_id": "file_123"},
+        ]}],
+    })
+    assert response.status_code == 400
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_invalid_image_handling_mode_is_rejected(client, monkeypatch):
+    monkeypatch.setattr(server_module, "resolve", lambda model: _info("none", provider="test", vision=False))
+    response = client.post("/v1/chat/completions", json={
+        "model": "text-model", "gateway_image_handling": "typo", "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "x"}},
+        ]}],
+    })
+    assert response.status_code == 400
+    assert "Unsupported" in response.json()["error"]["message"]
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_chat_text_only_image_fails_closed_when_fallback_empty(client, monkeypatch):
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "")
+    monkeypatch.setattr(server_module, "resolve", lambda model: _info("none", provider="test", vision=False))
+    response = client.post("/v1/chat/completions", json={
+        "model": "text-model", "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "x"}},
+        ]}],
+    })
+    assert response.status_code == 400
+    assert set(response.json()) == {"error"}
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+@pytest.mark.parametrize("path,payload", [
+    ("/v1/responses", {
+        "model": "text-model", "input": [{"type": "message", "role": "user", "content": [
+            {"type": "input_image", "image_url": "x"},
+        ]}],
+    }),
+    ("/v1/messages", {
+        "model": "text-model", "max_tokens": 32, "messages": [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+        ]}],
+    }),
+])
+def test_other_endpoints_text_only_image_fail_closed_when_fallback_empty(client, monkeypatch, path, payload):
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "")
+    monkeypatch.setattr(server_module, "resolve", lambda model: _info("none", provider="test", vision=False))
+    response = client.post(path, json=payload)
+    assert response.status_code == 400
+    error = response.json()
+    if path == "/v1/messages":
+        assert error["type"] == "error"
+        assert error["error"]["type"] == "invalid_request_error"
+    else:
+        assert set(error) == {"error"}
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_chat_native_vision_image_bypasses_fallback(client, monkeypatch):
+    native = _info("none", thinking="", provider="test", provider_model_id="native-vision", vision=True)
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "missing-fallback")
+    monkeypatch.setattr(server_module, "resolve", lambda model: native if model == "vision-model" else None)
+
+    async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
+        assert body["model"] == "native-vision"
+        assert server_module._payload_has_image(body)
+        return server_module.JSONResponse(status_code=200, content={"model": body["model"]})
+
+    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough_sync)
+    response = client.post("/v1/chat/completions", json={
+        "model": "vision-model", "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "x"}},
+        ]}],
+    })
+    assert response.status_code == 200
+    assert response.json()["model"] == "native-vision"
 
 
 # ── format inference ─────────────────────────────────────────────────────────

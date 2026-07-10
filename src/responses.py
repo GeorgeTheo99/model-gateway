@@ -73,20 +73,27 @@ def responses_to_chat(body: dict) -> dict:
                     messages.append({"role": role, "content": content})
                 elif isinstance(content, list):
                     # Array of content parts (input_text, input_image, etc.)
-                    text_parts = []
+                    chat_parts = []
                     for part in content:
                         part_type = part.get("type", "")
                         if part_type == "input_text":
-                            text_parts.append(part.get("text", ""))
+                            chat_parts.append({"type": "text", "text": part.get("text", "")})
                         elif part_type == "input_image":
-                            # Pass through image URL or file_id
+                            # Preserve images as multimodal blocks; never turn them into prompt text.
                             url = part.get("image_url")
                             if url:
-                                text_parts.append(f"[image: {url}]")
+                                chat_parts.append({"type": "image_url", "image_url": {"url": url}})
+                            elif part.get("file_id"):
+                                # Translated Chat paths cannot dereference OpenAI file IDs safely.
+                                # Preserve a sentinel so the endpoint can reject explicitly.
+                                chat_parts.append({"type": "unsupported_input_image_file", "file_id": part["file_id"]})
                         elif part_type == "input_file":
-                            text_parts.append(f"[file: {part.get('filename', 'unknown')}]")
-                    if text_parts:
-                        messages.append({"role": role, "content": "\n".join(text_parts)})
+                            chat_parts.append({"type": "text", "text": f"[file: {part.get('filename', 'unknown')}]"})
+                    if chat_parts:
+                        if all(part["type"] == "text" for part in chat_parts):
+                            messages.append({"role": role, "content": "\n".join(part["text"] for part in chat_parts)})
+                        else:
+                            messages.append({"role": role, "content": chat_parts})
 
             elif item_type == "function_call":
                 # Previous function call from the model

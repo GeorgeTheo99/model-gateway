@@ -54,46 +54,53 @@ def anthropic_to_openai(body: dict) -> dict:
 
         # Content is an array of blocks
         if role == "user":
-            # Filter out cache_control-only blocks, keep text and tool_result
-            tool_results = [b for b in content if b.get("type") == "tool_result"]
-            other_blocks = [b for b in content if b.get("type") != "tool_result"]
+            # Preserve block order, flushing contiguous text/image content around
+            # tool_result blocks so translated conversation sequencing is stable.
+            pending_parts = []
+            pending_has_image = False
 
-            if other_blocks:
-                text_parts = []
-                image_parts = []
-                for block in other_blocks:
-                    if block.get("type") == "text":
-                        text_parts.append({"type": "text", "text": block["text"]})
-                    elif block.get("type") == "image":
-                        source = block.get("source", {})
+            def flush_pending():
+                nonlocal pending_parts, pending_has_image
+                if not pending_parts:
+                    return
+                if pending_has_image:
+                    messages.append({"role": "user", "content": pending_parts})
+                else:
+                    messages.append({"role": "user", "content": "\n".join(p["text"] for p in pending_parts)})
+                pending_parts = []
+                pending_has_image = False
+
+            for block in content:
+                block_type = block.get("type")
+                if block_type == "text":
+                    pending_parts.append({"type": "text", "text": block["text"]})
+                elif block_type == "image":
+                    source = block.get("source", {})
+                    source_type = source.get("type", "base64")
+                    if source_type == "url" and source.get("url"):
+                        image_url = source["url"]
+                    else:
                         media_type = source.get("media_type", "image/png")
                         data = source.get("data", "")
-                        image_parts.append({
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{media_type};base64,{data}"
-                            }
-                        })
-
-                all_parts = text_parts + image_parts
-                if all_parts:
-                    # Use content array when there are images; plain string for text-only
-                    if image_parts:
-                        messages.append({"role": "user", "content": all_parts})
-                    elif text_parts:
-                        messages.append({"role": "user", "content": "\n".join(p["text"] for p in text_parts)})
-
-            for tr in tool_results:
-                tr_content = tr.get("content", "")
-                if isinstance(tr_content, list):
-                    tr_content = " ".join(
-                        b.get("text", "") for b in tr_content if b.get("type") == "text"
-                    )
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tr["tool_use_id"],
-                    "content": str(tr_content),
-                })
+                        image_url = f"data:{media_type};base64,{data}"
+                    pending_parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": image_url},
+                    })
+                    pending_has_image = True
+                elif block_type == "tool_result":
+                    flush_pending()
+                    tr_content = block.get("content", "")
+                    if isinstance(tr_content, list):
+                        tr_content = " ".join(
+                            item.get("text", "") for item in tr_content if item.get("type") == "text"
+                        )
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": block["tool_use_id"],
+                        "content": str(tr_content),
+                    })
+            flush_pending()
 
         elif role == "assistant":
             text_parts = []
