@@ -237,8 +237,8 @@ def test_refuses_empty_catalog(tmp_path):
     assert "empty catalog" in r.stderr
 
 
-def test_real_repo_catalog_renders(tmp_path):
-    """Smoke test against the actual committed model-info.json."""
+def test_machine_catalog_renders(tmp_path):
+    """Smoke test against this machine's optional, gitignored catalog."""
     mi = REPO_ROOT / "model-info.json"
     if not mi.exists():
         pytest.skip("model-info.json not present")
@@ -250,7 +250,11 @@ def test_real_repo_catalog_renders(tmp_path):
     r = _run(cfg, mi)
     assert r.returncode == 0, r.stderr
     aliases = json.loads((tmp_path / "aliases.json").read_text())
-    assert len(aliases) >= 30
-    # local entries keyed by omlx_id, cloud by cloud:...
-    assert any(not k.startswith("cloud:") for k in aliases)
+    assert aliases
+    catalog = json.loads(mi.read_text())
+    has_local = any(
+        str(entry.get("provider") or "omlx").lower() in {"local", "omlx"}
+        for entry in catalog.get("llm", [])
+    )
     assert any(k.startswith("cloud:") for k in aliases)
+    assert any(not k.startswith("cloud:") for k in aliases) is has_local

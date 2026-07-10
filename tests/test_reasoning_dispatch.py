@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import src.providers as providers
 from src.providers import ProviderInfo, list_models
 import src.server as server_module
 from src.server import _apply_gateway_reasoning, _infer_thinking_format, app
@@ -785,7 +786,16 @@ def client():
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
-def test_models_endpoint_exposes_thinking_fields(client):
+def test_models_endpoint_exposes_thinking_fields(client, monkeypatch):
+    monkeypatch.setattr(providers, "_config", {
+        "providers": {
+            "openrouter": {
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key": "test-key",
+            }
+        }
+    })
+    providers._models = None
     resp = client.get("/v1/models")
     assert resp.status_code == 200
     data = resp.json()["data"]

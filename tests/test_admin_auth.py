@@ -53,12 +53,11 @@ def test_admin_presets_endpoint_is_read_only_and_auth_protected(monkeypatch):
     resp = client.get("/admin/api/presets", headers={"Authorization": "Bearer admin-key"})
     assert resp.status_code == 200
     body = resp.json()
-    assert body["auto_models"]["cloud"]["vision_model"] == "qwen3.7-plus-fw"
-    assert body["model_presets"]["presets"]["best"]["cloud"]["vision_model"] == "qwen3.7-plus-fw"
-    ultra_local = body["model_presets"]["presets"]["ultra_fast"]["local"]
-    assert ultra_local["text_model"] == "qwen3.5-9b"
-    assert ultra_local["vision_model"] == "qwen3.5-9b"
-    assert ultra_local["residency_mode"] == "single_model"
+    auto = body["auto_models"]
+    presets = body["model_presets"]["presets"]
+    assert auto["default_scope"] in {"cloud", "local"}
+    assert auto[auto["default_scope"]]["model"]
+    assert presets[body["model_presets"]["default_tier"]][auto["default_scope"]]["text_model"]
 
 
 def test_admin_provider_status_never_exposes_secret_values(monkeypatch):
