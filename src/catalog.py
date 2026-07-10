@@ -1,10 +1,11 @@
 """Shared catalog merge — the single source of truth for model entries.
 
 Both the gateway router (``src.providers``) and the downstream catalog generator
-(``scripts/export_catalogs.py``) read the same way: the committed
+(``scripts/export_catalogs.py``) read the same way: the machine-specific
 ``model-info.json`` ``llm`` list with the per-machine ``config.yaml`` ``models:``
-overlay merged on top (overlay wins on any routable-id clash). Keeping the merge
-in one place means the generator and the router can never drift.
+overlay merged on top. On a routable-id clash, overlay fields override the base
+entry while omitted capability metadata is inherited. Keeping the merge in one
+place means the generator and the router cannot drift.
 
 This module is pure: it only reads files and returns data. It has no dependency
 on the provider registry, logging config, or runtime state, so it is safe to
@@ -107,11 +108,12 @@ def load_catalog_entries(
 ) -> list[dict]:
     """Return merged, deduplicated catalog entries (overlay wins on id clash).
 
-    Reads ``model-info.json`` (committed catalog) and merges the ``models:``
-    overlay from ``config_path`` on top. Entries are deduplicated by routable id
-    (name / alias / provider_model_id / omlx_id / alternate_ids); when an
-    overlay entry shares any id with a catalog entry, the overlay entry wins
-    completely (it replaces the catalog entry for every id it claims).
+    Reads the machine-specific ``model-info.json`` catalog and merges the
+    ``models:`` overlay from ``config_path`` on top. Entries are deduplicated by
+    routable id (name / alias / provider_model_id / omlx_id / alternate_ids).
+    When an overlay entry shares an id with one catalog entry, its fields
+    override that entry while omitted fields (notably capabilities such as
+    ``vision``) are inherited.
 
     The returned list is ordered: catalog entries (in file order) that survive
     the overlay, followed by overlay-only entries (in overlay order). Each
@@ -155,23 +157,36 @@ def load_catalog_entries(
     # catalog entry that shared one. The overlay entry's primary id is appended
     # to the order list if it is new.
     for entry in overlay_entries:
-        provider = canonical_provider(entry.get("provider", "local"))
-        if not include_retired and provider in _RETIRED_LOCAL_PROVIDERS:
-            continue
-        normalized = dict(entry)
-        normalized["provider"] = provider
-        ids = entry_routable_ids(normalized)
-        # If any overlay id collides with an existing catalog entry, evict all
-        # of that catalog entry's ids first so the overlay fully replaces it.
+        overlay_ids = entry_routable_ids(entry)
         collided_primaries: set[str] = set()
-        for model_id in ids:
+        for model_id in overlay_ids:
             existing = by_id.get(model_id)
-            if existing is not None and existing is not normalized:
-                # find the existing entry's primary id (first id in order that maps to it)
+            if existing is not None:
                 for prim in order:
                     if by_id.get(prim) is existing:
                         collided_primaries.add(prim)
                         break
+        # Prefer the same-name base for capability inheritance. Other collisions
+        # are still evicted because the overlay claims those identifiers (for
+        # example an alternate id retiring an older logical catalog entry).
+        named_primary = str(entry.get("name") or "")
+        base_primary = named_primary if named_primary in collided_primaries else None
+        if base_primary is None and len(collided_primaries) == 1:
+            base_primary = next(iter(collided_primaries))
+        if base_primary is None and len(collided_primaries) > 1:
+            raise ValueError(
+                f"overlay model {entry.get('name')!r} ambiguously collides with "
+                f"multiple catalog models: {sorted(collided_primaries)}"
+            )
+        base = by_id.get(base_primary) if base_primary else None
+        normalized = {**base, **entry} if base else dict(entry)
+        provider = canonical_provider(normalized.get("provider", "local"))
+        if not include_retired and provider in _RETIRED_LOCAL_PROVIDERS:
+            continue
+        normalized["provider"] = provider
+        ids = entry_routable_ids(normalized)
+        # Evict the base entry's old identifier index, then index the merged
+        # entry under its inherited and overridden routable identifiers.
         for prim in collided_primaries:
             existing = by_id.get(prim)
             if existing is None:

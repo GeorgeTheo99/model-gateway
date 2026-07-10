@@ -213,6 +213,21 @@ def test_resolve_local_omlx_model_uses_builtin_proxy_defaults(tmp_config, monkey
     assert omlx_status["issues"] == []
 
 
+def test_effective_inventory_has_one_row_with_all_routable_ids(tmp_config):
+    config_io.upsert_model(
+        "inventory-model", provider="anthropic", provider_model_id="inventory-upstream",
+        alias="inventory-alias", vision=True,
+    )
+    providers.reload()
+    rows = [m for m in providers.effective_model_inventory() if m["name"] == "inventory-model"]
+    assert len(rows) == 1
+    assert rows[0]["vision"] is True
+    assert set(rows[0]["routable_ids"]) >= {"inventory-model", "inventory-alias", "inventory-upstream"}
+    assert providers.resolve("inventory-alias").vision is True
+    discovered = [m["id"] for m in providers.list_models() if m["name"] == "inventory-model"]
+    assert set(discovered) >= {"inventory-model", "inventory-alias", "inventory-upstream"}
+
+
 def test_provider_status_counts_unique_models_not_identifiers(tmp_config, monkeypatch):
     """A model with name + alias + provider_model_id + omlx_id must count as 1."""
     doc = json.loads((tmp_config / "model-info.json").read_text())

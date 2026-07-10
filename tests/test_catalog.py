@@ -43,6 +43,21 @@ def test_merge_overlay_wins_on_name_clash(tmp_path):
     assert entries[0]["context"] == 2000
 
 
+def test_merge_overlay_inherits_omitted_capabilities(tmp_path):
+    mi = tmp_path / "model-info.json"
+    _write_model_info(
+        mi,
+        [{"name": "gpt-vision", "alias": "gv", "provider": "openai", "vision": True, "context": 1000}],
+    )
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("models:\n  - name: gpt-vision\n    provider: databricks\n    context: 2000\n")
+    entry = catalog.load_catalog_entries(mi, cfg)[0]
+    assert entry["provider"] == "databricks"
+    assert entry["context"] == 2000
+    assert entry["vision"] is True
+    assert entry["alias"] == "gv"
+
+
 def test_merge_overlay_evicts_all_ids_of_replaced_entry(tmp_path):
     mi = tmp_path / "model-info.json"
     _write_model_info(
@@ -59,6 +74,43 @@ def test_merge_overlay_evicts_all_ids_of_replaced_entry(tmp_path):
     # The old alias must not produce a second entry.
     names = [e["name"] for e in entries]
     assert names == ["glm-5.2"]
+
+
+def test_overlay_same_name_inherits_when_other_ids_collide(tmp_path):
+    mi = tmp_path / "model-info.json"
+    _write_model_info(
+        mi,
+        [
+            {"name": "new-model", "alias": "new", "provider": "openai", "vision": True},
+            {"name": "old-model", "alias": "old", "alternate_ids": ["shared"], "provider": "openai"},
+        ],
+    )
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "models:\n  - name: new-model\n    alias: shared\n    provider: databricks\n"
+    )
+    entries = catalog.load_catalog_entries(mi, cfg)
+    assert [e["name"] for e in entries] == ["new-model"]
+    assert entries[0]["vision"] is True
+    assert entries[0]["alias"] == "shared"
+
+
+def test_overlay_ambiguous_multi_collision_without_name_match_fails(tmp_path):
+    mi = tmp_path / "model-info.json"
+    _write_model_info(
+        mi,
+        [
+            {"name": "first", "alias": "first-alias", "provider": "openai", "vision": True},
+            {"name": "second", "provider_model_id": "second-upstream", "provider": "openai"},
+        ],
+    )
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "models:\n  - name: replacement\n    alias: first-alias\n"
+        "    provider_model_id: second-upstream\n    provider: databricks\n"
+    )
+    with pytest.raises(ValueError, match="ambiguously collides"):
+        catalog.load_catalog_entries(mi, cfg)
 
 
 def test_overlay_only_entry_added(tmp_path):

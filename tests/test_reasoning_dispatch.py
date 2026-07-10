@@ -700,6 +700,27 @@ def test_other_endpoints_text_only_image_fail_closed_when_fallback_empty(client,
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+@pytest.mark.parametrize("model", ["gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "gpt-5.6"])
+def test_configured_gpt_vision_models_bypass_fallback(client, monkeypatch, model):
+    native = _info("openai-responses", provider="databricks", provider_model_id=f"upstream-{model}", vision=True)
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "unavailable-fallback")
+    monkeypatch.setattr(server_module, "resolve", lambda requested: native if requested == model else None)
+
+    async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
+        assert body["model"] == f"upstream-{model}"
+        return server_module.JSONResponse(status_code=200, content={"served": model})
+
+    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough_sync)
+    response = client.post("/v1/chat/completions", json={
+        "model": model,
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+        ]}],
+    })
+    assert response.status_code == 200
+    assert response.json()["served"] == model
+
+
 def test_chat_native_vision_image_bypasses_fallback(client, monkeypatch):
     native = _info("none", thinking="", provider="test", provider_model_id="native-vision", vision=True)
     monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "missing-fallback")

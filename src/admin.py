@@ -957,7 +957,7 @@ _ADMIN_HTML = r"""
     for (const m of _modelsCache) {
       const name = m.name || m.id;
       if (!name) continue;
-      if (dim === name || dim === m.alias || dim === m.provider_model_id || dim === m.omlx_id) return name;
+      if (dim === name || dim === m.alias || dim === m.provider_model_id || dim === m.omlx_id || (m.routable_ids || []).includes(dim)) return name;
     }
     return null;
   }

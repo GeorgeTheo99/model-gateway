@@ -751,28 +751,49 @@ def pricing_for(model_id: str) -> dict | None:
     return pricing
 
 
-def list_models() -> list[dict]:
-    """Return all catalog model identifiers known to the gateway.
+def effective_model_inventory() -> list[dict]:
+    """Return one effective runtime row per logical model.
 
-    This includes models whose provider is not configured locally so admin and
-    debug views can explain why they are unavailable. Client-facing /v1/models
-    should call list_available_models() instead.
+    This is the shared discovery/admin inventory: merged catalog capabilities,
+    runtime enablement, pool-aware availability, and the effective provider are
+    computed once. Routing still accepts every identifier indexed by
+    :func:`_load_models`.
     """
-    models = _load_models()
-    seen = set()
     result = []
-    for model_id, entry in models.items():
-        if model_id and model_id not in seen:
-            seen.add(model_id)
-            model_entry = dict(entry)
-            model_entry["id"] = model_id
-            result.append(model_entry)
+    seen_entries: set[int] = set()
+    for entry in _load_models().values():
+        identity = id(entry)
+        if identity in seen_entries:
+            continue
+        seen_entries.add(identity)
+        row = dict(entry)
+        name = row.get("name") or next(iter(_entry_routable_ids(row)), "")
+        availability = model_availability(name)
+        row["id"] = name
+        row["routable_ids"] = _entry_routable_ids(row)
+        row["enabled"] = _is_model_enabled(name)
+        row["available"] = bool(availability.get("available"))
+        row["availability_reason"] = availability.get("reason", "")
+        row["availability_message"] = availability.get("message", "")
+        row["effective_provider"] = availability.get("provider") or _pool_members(row, _load_config())[0]
+        result.append(row)
+    return result
+
+
+def list_models() -> list[dict]:
+    """Return all routable identifiers, preserving discovery compatibility."""
+    result = []
+    for model in effective_model_inventory():
+        for model_id in model["routable_ids"]:
+            row = dict(model)
+            row["id"] = model_id
+            result.append(row)
     return result
 
 
 def list_available_models() -> list[dict]:
-    """Return model identifiers that are enabled and locally usable."""
-    return [m for m in list_models() if is_model_available(m.get("id") or m.get("name", ""))]
+    """Return routable identifiers for enabled, locally usable models."""
+    return [m for m in list_models() if m["available"]]
 
 
 def _configured_provider_ids() -> set[str]:
@@ -808,20 +829,12 @@ def provider_status() -> list[dict]:
     """Return masked provider configuration status for admin/observability APIs."""
     config = _load_config()
     configured = config.get("providers", {}) or {}
-    models = list_models()
-
-    # Count unique models per provider by canonical name. list_models()
-    # exposes every routable identifier (name + alias + provider_model_id +
-    # omlx_id + alternate_ids), so counting its rows would over-count models.
-    # Dedupe by
-    # the model `name`, which every identifier row for a model shares.
-    model_names: dict[str, set[str]] = {}
+    models = effective_model_inventory()
+    model_counts: dict[str, int] = {}
     for model in models:
-        provider = _canonical_provider(model.get("provider", ""))
-        name = model.get("name") or model.get("id")
-        if name and _is_model_enabled(name):
-            model_names.setdefault(provider, set()).add(name)
-    model_counts = {p: len(names) for p, names in model_names.items()}
+        provider = _canonical_provider(model.get("effective_provider") or model.get("provider", ""))
+        if model.get("enabled"):
+            model_counts[provider] = model_counts.get(provider, 0) + 1
 
     provider_ids = sorted(set(model_counts) | {_canonical_provider(key) for key in configured})
     result = []
@@ -853,32 +866,33 @@ def provider_status() -> list[dict]:
 
 
 def model_status() -> list[dict]:
-    """Return routable model metadata with provider-config status."""
+    """Return the shared effective inventory in the admin API shape."""
     ready = {p["id"]: p["ready"] for p in provider_status()}
     configured = _configured_provider_ids() | {"omlx"}
     result = []
-    for model in list_models():
-        provider = _canonical_provider(model.get("provider", ""))
-        availability = model_availability(model.get("id") or model.get("name", ""))
+    for model in effective_model_inventory():
+        provider = _canonical_provider(model.get("effective_provider") or model.get("provider", ""))
         result.append({
             "id": model.get("id"),
             "name": model.get("name", ""),
             "alias": model.get("alias", ""),
+            "routable_ids": model.get("routable_ids", []),
             "provider": provider,
+            "configured_provider": _canonical_provider(model.get("provider", "")),
             "provider_model_id": model.get("provider_model_id") or model.get("omlx_id") or model.get("name", ""),
             "omlx_id": model.get("omlx_id", ""),
             "provider_configured": provider in configured,
             "provider_ready": ready.get(provider, False),
-            "availability_reason": availability.get("reason", ""),
-            "availability_message": availability.get("message", ""),
-            "available": bool(availability.get("available")),
+            "availability_reason": model.get("availability_reason", ""),
+            "availability_message": model.get("availability_message", ""),
+            "available": model.get("available", False),
             "context": model.get("context", 0),
             "max_output_tokens": model.get("max_output_tokens", 0),
             "thinking": model.get("thinking", ""),
             "thinking_format": model.get("thinking_format", ""),
             "vision": bool(model.get("vision", False)),
             "pricing": model.get("pricing"),
-            "enabled": _is_model_enabled(model.get("name") or model.get("id")),
+            "enabled": model.get("enabled", True),
         })
     return result
 
