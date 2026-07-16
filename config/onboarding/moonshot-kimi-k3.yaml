@@ -1,0 +1,29 @@
+schema_version: 1
+id: moonshot-kimi-k3
+
+provider:
+  id: moonshot
+  base_url: https://api.moonshot.ai/v1
+  protocol: openai
+  secret_name: moonshot.api-key
+
+models:
+  - name: kimi-k3
+    provider: moonshot
+    provider_model_id: kimi-k3
+    alias: kimi3
+    context: 1048576
+    max_output_tokens: 131072
+    thinking: always
+    thinking_format: openai
+    vision: true
+    quirks:
+      - force_reasoning_effort_max
+      - use_max_completion_tokens
+      - drop_fixed_sampling_fields
+      - inline_image_urls_only
+    desc: Kimi K3 via Moonshot; always-thinking multimodal and tool-capable model with a 1M-token context
+
+retire:
+  models:
+    - kimi-k2.7-code-fw

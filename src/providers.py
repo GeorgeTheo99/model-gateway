@@ -14,6 +14,7 @@ from urllib.parse import urlsplit, urlunsplit
 import yaml
 
 from src import catalog
+from src.secret_files import read_api_key_file
 
 log = logging.getLogger("model-gateway")
 
@@ -219,10 +220,20 @@ def _provider_env_config(provider: str) -> dict:
 
 
 def _effective_provider_config(config: dict, provider: str) -> dict:
-    """Provider config with defaults + config.yaml + env overrides."""
+    """Provider config with defaults + config.yaml + env overrides.
+
+    ``api_key_file`` keeps long-lived secrets out of YAML. Relative paths are
+    resolved beside config.yaml; an explicit environment API key still wins.
+    """
     effective = _provider_defaults(provider)
     effective.update(_resolve_provider_config(config, provider))
     effective.update(_provider_env_config(provider))
+    if not effective.get("api_key") and effective.get("api_key_file"):
+        try:
+            effective["api_key"] = read_api_key_file(effective["api_key_file"], CONFIG_PATH)
+        except OSError as exc:
+            log.warning("Provider %r api_key_file is unusable: %s", provider, exc)
+            effective["api_key"] = ""
     return effective
 
 

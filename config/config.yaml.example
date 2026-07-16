@@ -23,6 +23,9 @@ providers:
   fireworks:
     base_url: https://api.fireworks.ai/inference/v1
     api_key: "YOUR_FIREWORKS_API_KEY"
+    # Prefer a mode-0600 file for new providers; relative paths resolve beside
+    # this config file and MODEL_GATEWAY_PROVIDER_*_API_KEY still overrides it.
+    # api_key_file: secrets/fireworks.api-key
   zhipuai:
     base_url: https://open.bigmodel.cn/api/paas/v4
     api_key: "YOUR_ZHIPUAI_API_KEY"
@@ -77,9 +80,12 @@ providers:
   #     openai: /gateway/openai/v1
   #
   #   # quirks: generic upstream compatibility flags (config, not code):
-  #   #   no_stream_options   -> upstream 400s on OpenAI stream_options; drop it
-  #   #   no_reasoning_params -> upstream rejects reasoning_effort/thinking;
-  #   #                          never inject or forward reasoning controls
+  #   #   no_stream_options            -> drop OpenAI stream_options
+  #   #   no_reasoning_params          -> strip reasoning controls
+  #   #   force_reasoning_effort_max   -> always send literal max
+  #   #   use_max_completion_tokens    -> normalize completion-token field
+  #   #   drop_fixed_sampling_fields   -> omit fixed sampling parameters
+  #   #   inline_image_urls_only       -> reject public HTTP(S) image URLs
   #   quirks:
   #     - no_stream_options
   #     - no_reasoning_params

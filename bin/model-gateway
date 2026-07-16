@@ -13,6 +13,7 @@
 #   model-gateway verify                         /health smoke check
 #   model-gateway logs [-f|lines]                tail service log
 #   model-gateway update                         git pull + uv sync + restart + verify
+#   model-gateway onboard PROFILE [options]      add provider/model + retire replacements
 #   model-gateway env                            print resolved config
 set -euo pipefail
 
@@ -137,6 +138,19 @@ xml_escape() {
   printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
 }
 
+plist_env_value() {
+  local path="$1" key="$2"
+  [ -f "$path" ] || return 1
+  /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:$key" "$path" 2>/dev/null || true
+}
+
+canonical_path() {
+  python3 - "$1" <<'PY'
+import os, sys
+print(os.path.realpath(os.path.expanduser(sys.argv[1])))
+PY
+}
+
 ensure_label_safe() {
   local action="$1" plist wd
   plist="$(plist_path)"
@@ -150,6 +164,26 @@ ensure_label_safe() {
     return 0
   fi
   die "Refusing to $action $LABEL: existing plist belongs to '${wd:-unknown}', not '$ROOT_DIR'. Re-run with --force (or MODEL_GATEWAY_FORCE=1) to adopt it."
+}
+
+ensure_runtime_paths_safe() {
+  ensure_label_safe "onboard"
+  service_loaded || die "refusing onboarding: launchd service is not loaded: $LABEL"
+  local plist actual expected key value
+  plist="$(plist_path)"
+  for key in MODEL_GATEWAY_CONFIG MODEL_GATEWAY_MODEL_INFO MODEL_GATEWAY_MODEL_INFO_SOURCE; do
+    case "$key" in
+      MODEL_GATEWAY_CONFIG) value="$CONFIG_PATH" ;;
+      MODEL_GATEWAY_MODEL_INFO) value="$MODEL_INFO_PATH" ;;
+      MODEL_GATEWAY_MODEL_INFO_SOURCE) value="$MODEL_INFO_SOURCE_PATH" ;;
+    esac
+    [ -n "$value" ] || continue
+    actual="$(plist_env_value "$plist" "$key")"
+    [ -n "$actual" ] || die "refusing onboarding: $plist does not define $key"
+    expected="$(canonical_path "$value")"
+    [ "$(canonical_path "$actual")" = "$expected" ] \
+      || die "refusing onboarding: $key targets '$actual', not '$value'"
+  done
 }
 
 write_plist() {
@@ -371,6 +405,26 @@ cmd_update() {
   ok "model-gateway updated"
 }
 
+cmd_onboard() {
+  [ $# -ge 1 ] || die "usage: model-gateway onboard PROFILE [--dry-run] [--api-key-env NAME | --api-key-keychain-service SERVICE]"
+  check_prereqs
+  local dry_run=0 arg
+  for arg in "$@"; do
+    [ "$arg" = "--dry-run" ] && dry_run=1
+  done
+  [ "$dry_run" = 1 ] || ensure_runtime_paths_safe
+  local cmd=("$UV_BIN" run --project "$ROOT_DIR" python "$ROOT_DIR/scripts/onboard_provider.py" "$@"
+    --config "$CONFIG_PATH" --model-info "$MODEL_INFO_PATH"
+    --launchd-label "$LABEL" --health-url "$(health_url)")
+  if [ -n "$MODEL_INFO_SOURCE_PATH" ]; then
+    cmd+=(--model-info-source "$MODEL_INFO_SOURCE_PATH")
+  fi
+  "${cmd[@]}"
+  if [ "$dry_run" = 0 ]; then
+    ok "provider onboarding complete"
+  fi
+}
+
 usage() {
   sed -n '2,/^set -euo/p' "$0" | grep -E '^#   ' | sed 's/^#   /  /'
   exit 1
@@ -392,6 +446,7 @@ main() {
     verify) verify ;;
     logs) shift; cmd_logs "$@" ;;
     update) cmd_update ;;
+    onboard) shift; cmd_onboard "$@" ;;
     env) cmd_env ;;
     -h|--help|help) usage ;;
     *) die "unknown command: $1" ;;

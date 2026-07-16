@@ -20,7 +20,7 @@ import src.circuit as circuit
 import src.model_fallback as model_fallback
 import src.providers as providers
 from src import errors
-from src.server import _maybe_stream_options, _upstream_endpoint
+from src.server import _apply_openai_request_quirks, _maybe_stream_options, _upstream_endpoint
 
 
 @pytest.fixture
@@ -154,6 +154,85 @@ def test_maybe_stream_options_sets_include_usage_otherwise():
     req = {"stream": True}
     _maybe_stream_options(req, info)
     assert req["stream_options"] == {"include_usage": True}
+
+
+def test_api_key_file_resolves_relative_to_config(tmp_config):
+    secret = tmp_config / "secrets" / "provider.key"
+    secret.parent.mkdir()
+    secret.write_text("file-secret\n")
+    secret.chmod(0o600)
+    _write_config(tmp_config, """
+providers:
+  file_auth:
+    base_url: https://api.example.com/v1
+    api_key_file: secrets/provider.key
+""")
+    _write_models(tmp_config, [
+        {"name": "file-model", "provider": "file_auth", "provider_model_id": "file-up"},
+    ])
+    info = providers.resolve("file-model")
+    assert info is not None
+    assert info.api_key == "file-secret"
+
+
+def test_api_key_file_rejects_group_or_world_permissions(tmp_config):
+    secret = tmp_config / "unsafe.key"
+    secret.write_text("secret\n")
+    secret.chmod(0o644)
+    _write_config(tmp_config, f"""
+providers:
+  file_auth:
+    base_url: https://api.example.com/v1
+    api_key_file: {secret}
+""")
+    _write_models(tmp_config, [
+        {"name": "file-model", "provider": "file_auth", "provider_model_id": "file-up"},
+    ])
+    assert providers.resolve("file-model") is None
+    assert providers.model_availability("file-model")["reason"] == "provider_not_configured"
+
+
+def test_openai_request_quirks_normalize_new_provider_shape():
+    info = SimpleNamespace(quirks=frozenset({
+        "force_reasoning_effort_max",
+        "use_max_completion_tokens",
+        "drop_fixed_sampling_fields",
+    }))
+    req = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning": {"effort": "low"},
+        "max_tokens": 42,
+        "temperature": 0.2,
+        "top_p": 0.8,
+        "n": 1,
+        "presence_penalty": 0,
+        "frequency_penalty": 0,
+        "tools": [{"type": "function", "function": {"name": "lookup"}}],
+    }
+    assert _apply_openai_request_quirks(req, info) is None
+    assert req["reasoning_effort"] == "max"
+    assert req["max_completion_tokens"] == 42
+    assert "max_tokens" not in req
+    for field in ("temperature", "top_p", "n", "presence_penalty", "frequency_penalty"):
+        assert field not in req
+    assert req["tools"][0]["function"]["name"] == "lookup"
+
+
+def test_inline_image_only_quirk_rejects_public_url_and_accepts_data_url():
+    info = SimpleNamespace(quirks=frozenset({"inline_image_urls_only"}))
+    public = {"messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+    ]}]}
+    assert "inline data:image" in _apply_openai_request_quirks(public, info)
+    for invalid_url in ("file:///tmp/a.png", "ftp://example.com/a.png", "data:text/plain;base64,QQ==", "data:image/png,raw", "data:image/png;base64,not@@base64"):
+        invalid = {"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": invalid_url}},
+        ]}]}
+        assert "inline data:image" in _apply_openai_request_quirks(invalid, info)
+    inline = {"messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+    ]}]}
+    assert _apply_openai_request_quirks(inline, info) is None
 
 
 def test_per_model_quirks_merge_with_provider_quirks(tmp_config):

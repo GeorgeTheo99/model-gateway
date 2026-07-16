@@ -325,6 +325,59 @@ def _strip_fireworks_unsupported_message_fields(req: dict, info) -> None:
         log.info("Fireworks request cleanup: stripped %d unsupported field(s)", removed)
 
 
+def _apply_openai_request_quirks(req: dict, info) -> str | None:
+    """Apply declarative OpenAI-compatible request fixes.
+
+    Returns a client-facing validation message when the request cannot be made
+    compatible without changing its meaning. Quirks may be set per provider or
+    per model, so onboarding a new compatible API does not require a new code
+    branch for that provider.
+    """
+    quirks = getattr(info, "quirks", frozenset())
+
+    if "force_reasoning_effort_max" in quirks:
+        _strip_reasoning_controls(req)
+        req.pop("reasoning", None)
+        req["reasoning_effort"] = "max"
+
+    if "use_max_completion_tokens" in quirks:
+        value = req.get("max_completion_tokens")
+        if value is None:
+            value = req.get("max_tokens")
+        if value is None:
+            value = req.get("max_output_tokens")
+        for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+            req.pop(key, None)
+        if value is not None:
+            req["max_completion_tokens"] = value
+
+    if "drop_fixed_sampling_fields" in quirks:
+        for key in ("temperature", "top_p", "n", "presence_penalty", "frequency_penalty"):
+            req.pop(key, None)
+
+    if "inline_image_urls_only" in quirks:
+        messages = req.get("messages")
+        if isinstance(messages, list):
+            for message in messages:
+                content = message.get("content") if isinstance(message, dict) else None
+                if not isinstance(content, list):
+                    continue
+                for part in content:
+                    url = _image_url_value(part) if isinstance(part, dict) else None
+                    if not url:
+                        continue
+                    valid_inline = url.lower().startswith("data:image/") and ";base64," in url.lower()
+                    if valid_inline:
+                        try:
+                            encoded = url.split(",", 1)[1]
+                            base64.b64decode(encoded, validate=True)
+                        except (IndexError, ValueError):
+                            valid_inline = False
+                    if not valid_inline:
+                        return "This model accepts inline data:image URLs only; external or malformed image URLs are not supported."
+    return None
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         value = int(os.environ.get(name, ""))
@@ -1398,6 +1451,9 @@ async def create_response(request: Request):
         if key in body and key not in chat_req:
             chat_req[key] = body[key]
     thinking_enabled = _apply_gateway_reasoning(chat_req, info, target_api="chat")
+    quirk_error = _apply_openai_request_quirks(chat_req, info)
+    if quirk_error:
+        return _error_openai(400, "invalid_request_error", quirk_error)
     _strip_fireworks_unsupported_message_fields(chat_req, info)
     _compress_fireworks_inline_images(chat_req, info)
     if _is_openrouter_gemini(info):
@@ -1762,6 +1818,9 @@ async def chat_completions(request: Request):
         return await _handle_chat_anthropic(body, info, model, request, is_stream)
 
     thinking_enabled = _apply_gateway_reasoning(body, info, target_api="chat")
+    quirk_error = _apply_openai_request_quirks(body, info)
+    if quirk_error:
+        return _error_openai(400, "invalid_request_error", quirk_error)
     _strip_fireworks_unsupported_message_fields(body, info)
     _compress_fireworks_inline_images(body, info)
     if _is_openrouter_gemini(info):
@@ -2181,6 +2240,9 @@ async def messages(request: Request):
         if key in body and key not in openai_req:
             openai_req[key] = body[key]
     thinking_enabled = _apply_gateway_reasoning(openai_req, info, target_api="chat") or thinking_enabled
+    quirk_error = _apply_openai_request_quirks(openai_req, info)
+    if quirk_error:
+        return _error(400, "invalid_request_error", quirk_error)
     _strip_fireworks_unsupported_message_fields(openai_req, info)
     _compress_fireworks_inline_images(openai_req, info)
     if _is_openrouter_gemini(info):

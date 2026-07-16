@@ -58,8 +58,10 @@ if str(_REPO_ROOT) not in sys.path:
 
 try:
     from src import catalog as catalog_mod
+    from src.secret_files import read_api_key_file
 except ImportError:  # bare python3 outside the repo / without the venv
     catalog_mod = None  # type: ignore[assignment]
+    read_api_key_file = None  # type: ignore[assignment]
 
 HOME = Path.home()
 # Same resolution as the gateway itself: MODEL_GATEWAY_CONFIG env, else the
@@ -175,7 +177,7 @@ def _effective_protocol(entry: dict, provider: str, config: dict) -> str:
     return str(provider_config.get("protocol") or "openai")
 
 
-def _provider_serveable(provider: str, config: dict) -> bool:
+def _provider_serveable(provider: str, config: dict, config_path: Path = DEFAULT_CONFIG) -> bool:
     """Can THIS gateway serve models routed to ``provider``?
 
     Mirrors the router's usable-member rule (enabled + base_url + api_key,
@@ -192,10 +194,18 @@ def _provider_serveable(provider: str, config: dict) -> bool:
         return False
     if provider in ("omlx", "local") and not provider_config:
         return True  # omlx has built-in defaults (local oMLX on :9110)
-    return bool(provider_config.get("base_url")) and bool(provider_config.get("api_key"))
+    has_key = bool(provider_config.get("api_key"))
+    if not has_key and provider_config.get("api_key_file") and read_api_key_file is not None:
+        try:
+            has_key = bool(read_api_key_file(provider_config["api_key_file"], config_path))
+        except OSError:
+            has_key = False
+    return bool(provider_config.get("base_url")) and has_key
 
 
-def render_model_aliases(entries: list[dict], config: dict | None = None) -> dict:
+def render_model_aliases(
+    entries: list[dict], config: dict | None = None, config_path: Path = DEFAULT_CONFIG,
+) -> dict:
     """Render ~/.claude/model-aliases.json from merged catalog entries.
 
     Local models (provider ``omlx``/``local``) are keyed by ``omlx_id``; cloud
@@ -215,7 +225,7 @@ def render_model_aliases(entries: list[dict], config: dict | None = None) -> dic
         alias = entry.get("alias")
         supported = entry.get("supported", True)
         provider = _effective_provider(entry, config)
-        if not _provider_serveable(provider, config):
+        if not _provider_serveable(provider, config, config_path):
             continue  # this machine's gateway cannot route the model
         is_cloud = provider not in ("omlx", "local") and bool(provider)
 
@@ -335,7 +345,7 @@ def main() -> int:
     renders: list[tuple[Path, str, str]] = []
     alias_doc: dict | None = None
     if targets["model_aliases"]:
-        alias_doc = render_model_aliases(entries, config)
+        alias_doc = render_model_aliases(entries, config, args.config)
         if not alias_doc:
             sys.exit("export_catalogs: refusing to render an empty alias catalog (no serveable exportable models)")
         renders.append((targets["model_aliases"], _dump(alias_doc), "model-aliases.json"))

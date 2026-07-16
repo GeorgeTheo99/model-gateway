@@ -1,6 +1,8 @@
 """Tests for writeable provider/model management (milestones 4 & 5)."""
 
 import json
+import threading
+import time
 
 import pytest
 
@@ -51,6 +53,43 @@ def test_upsert_provider_creates_new(tmp_config, monkeypatch):
     import yaml
     cfg = yaml.safe_load((tmp_config / "config.yaml").read_text())
     assert cfg["providers"]["openai"]["api_key"] == "sk-new"
+
+
+def test_provider_write_lock_covers_full_read_modify_write(tmp_config, monkeypatch):
+    config_io.log_dir = tmp_config / "logs"
+    original_load = config_io.load_config_full
+    active = 0
+    max_active = 0
+    guard = threading.Lock()
+
+    def slow_load():
+        nonlocal active, max_active
+        with guard:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.03)
+        try:
+            return original_load()
+        finally:
+            with guard:
+                active -= 1
+
+    monkeypatch.setattr(config_io, "load_config_full", slow_load)
+    threads = [
+        threading.Thread(target=config_io.upsert_provider, args=(name,), kwargs={
+            "base_url": f"https://{name}.example.com/v1", "api_key": "secret",
+        })
+        for name in ("one", "two")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+    assert all(not thread.is_alive() for thread in threads)
+    assert max_active == 1
+    import yaml
+    providers_config = yaml.safe_load((tmp_config / "config.yaml").read_text())["providers"]
+    assert {"one", "two"}.issubset(providers_config)
 
 
 def test_upsert_provider_preserves_existing_key(tmp_config, monkeypatch):

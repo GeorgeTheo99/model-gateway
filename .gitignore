@@ -1,6 +1,8 @@
 # Real provider credentials — never commit
 config/config.yaml
 config/config.yaml.bak-*
+config/secrets/
+config/*.onboard.lock
 
 # Machine-local model catalog (per-machine; committed in error previously)
 model-info.json

@@ -79,6 +79,32 @@ def test_renders_alias_file(tmp_path):
     assert cloud_entry["provider_model_id"] == "glm-5.2-zai"
 
 
+def test_relative_api_key_file_uses_selected_config_target(tmp_path):
+    real_dir = tmp_path / "shared"
+    real_dir.mkdir()
+    secret_dir = real_dir / "secrets"
+    secret_dir.mkdir()
+    secret = secret_dir / "provider.key"
+    secret.write_text("secret\n")
+    secret.chmod(0o600)
+    cfg_target = real_dir / "config.yaml"
+    cfg_link = tmp_path / "config.yaml"
+    cfg_link.unlink()
+    cfg_link.symlink_to(cfg_target)
+    mi = tmp_path / "model-info.json"
+    _write_model_info(mi, [
+        {"name": "cloud-model", "alias": "cloud", "provider": "cloud", "provider_model_id": "cloud-up"},
+    ])
+    cfg_target.write_text(
+        "providers:\n  cloud:\n    base_url: https://api.example.com/v1\n"
+        "    api_key_file: secrets/provider.key\n"
+        f"exports:\n  model_aliases: {tmp_path}/aliases.json\n"
+    )
+    r = _run(cfg_link, mi)
+    assert r.returncode == 0, r.stderr
+    assert "cloud:cloud-up" in json.loads((tmp_path / "aliases.json").read_text())
+
+
 def test_overlay_merge_used_by_generator(tmp_path):
     mi = tmp_path / "model-info.json"
     _write_model_info(mi, [{"name": "glm-5.2", "alias": "glm52zai", "provider": "zai", "provider_model_id": "glm-5.2-zai", "context": 1000}])

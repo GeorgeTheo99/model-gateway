@@ -21,14 +21,25 @@ import json
 import os
 import shutil
 import time
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from src.config_lock import config_write_lock
 from src.providers import CONFIG_PATH, MODEL_INFO_PATH, MODEL_INFO_SOURCE_PATH
 
 log_dir = Path(os.environ.get("MODEL_GATEWAY_LOG_DIR", str(Path.home() / ".claude")))
+
+
+def _write_transaction(function):
+    """Hold the shared lock across a complete read-modify-write operation."""
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        with config_write_lock(CONFIG_PATH):
+            return function(*args, **kwargs)
+    return wrapped
 
 
 # ── provider config (config.yaml) ───────────────────────────────────────────
@@ -79,6 +90,7 @@ def _backup(path: Path) -> Path | None:
     return bak
 
 
+@_write_transaction
 def upsert_provider(
     provider_id: str,
     *,
@@ -124,6 +136,7 @@ def upsert_provider(
     return _masked_block(provider_id, block)
 
 
+@_write_transaction
 def delete_provider(provider_id: str) -> dict:
     """Remove a provider from config.yaml. Refuses if models depend on it."""
     from src.providers import _load_models  # local import to avoid cycle at load
@@ -205,11 +218,12 @@ def _write_model_info(doc: dict) -> list[str]:
 # config.yaml model_overrides, not the committed catalog.
 _MODEL_FIELDS = [
     "name", "provider", "provider_model_id", "omlx_id", "alias", "context",
-    "max_output_tokens", "thinking", "thinking_format", "vision",
+    "max_output_tokens", "thinking", "thinking_format", "vision", "quirks",
     "system_instruction", "pricing", "desc",
 ]
 
 
+@_write_transaction
 def upsert_model(name: str, **fields) -> dict:
     """Create or update a model entry in model-info.json.
 
@@ -248,7 +262,7 @@ def upsert_model(name: str, **fields) -> dict:
     if omlx_id:
         entry["omlx_id"] = omlx_id
     for f in ("alias", "context", "max_output_tokens", "thinking",
-              "thinking_format", "system_instruction", "pricing", "desc"):
+              "thinking_format", "quirks", "system_instruction", "pricing", "desc"):
         if f in fields and fields[f] is not None:
             entry[f] = fields[f]
     if "vision" in fields and fields["vision"] is not None:
@@ -260,6 +274,7 @@ def upsert_model(name: str, **fields) -> dict:
     return {"name": name, "entry": _model_summary(entry), "written_to": paths}
 
 
+@_write_transaction
 def delete_model(name: str) -> dict:
     """Remove a model entry by name. Also clears any runtime override."""
     name = (name or "").strip()
@@ -283,6 +298,7 @@ def delete_model(name: str) -> dict:
     return {"name": name, "deleted": True, "written_to": paths}
 
 
+@_write_transaction
 def set_model_enabled(name: str, enabled: bool) -> dict:
     """Toggle a model's runtime enabled state in config.yaml model_overrides.
 

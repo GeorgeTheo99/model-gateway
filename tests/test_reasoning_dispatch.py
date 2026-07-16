@@ -275,6 +275,53 @@ def test_chat_completions_text_request_does_not_500_on_vision_fallback_env(clien
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_chat_completions_applies_declarative_provider_onboarding_quirks(client, monkeypatch):
+    info = _info("openai", provider="new-provider", provider_model_id="new-upstream", vision=True)
+    info.quirks = frozenset({
+        "force_reasoning_effort_max",
+        "use_max_completion_tokens",
+        "drop_fixed_sampling_fields",
+        "inline_image_urls_only",
+    })
+
+    monkeypatch.setattr(server_module, "resolve", lambda model: info if model == "new-model" else None)
+
+    async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
+        assert endpoint == "http://up/chat/completions"
+        assert body["model"] == "new-upstream"
+        assert body["reasoning_effort"] == "max"
+        assert body["max_completion_tokens"] == 123
+        assert body["tools"][0]["function"]["name"] == "lookup"
+        for field in ("max_tokens", "temperature", "top_p", "n", "presence_penalty", "frequency_penalty"):
+            assert field not in body
+        return server_module.JSONResponse(status_code=200, content={"ok": True})
+
+    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough_sync)
+    response = client.post("/v1/chat/completions", json={
+        "model": "new-model",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 123,
+        "temperature": 0.2,
+        "top_p": 0.8,
+        "n": 1,
+        "presence_penalty": 0,
+        "frequency_penalty": 0,
+        "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
+    })
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+
+    public_image = client.post("/v1/chat/completions", json={
+        "model": "new-model",
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}},
+        ]}],
+    })
+    assert public_image.status_code == 400
+    assert "inline data:image" in public_image.json()["error"]["message"]
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
 def test_chat_completions_local_omlx_proxies_to_upstream_model(client, monkeypatch):
     info = _info(
         "glm-chat-template",
