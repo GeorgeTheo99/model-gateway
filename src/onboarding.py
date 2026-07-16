@@ -21,7 +21,7 @@ import httpx
 import yaml
 
 from src.config_lock import config_write_lock
-from src.secret_files import read_api_key_file
+from src.secret_files import read_api_key_file, resolve_api_key_file
 
 
 class OnboardingError(ValueError):
@@ -42,8 +42,17 @@ def load_profile(path: Path) -> dict:
     if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", provider_id):
         raise OnboardingError("provider id must contain only lowercase letters, digits, underscores, and hyphens")
     parsed_url = urlsplit(str(provider["base_url"]))
-    if parsed_url.scheme != "https" or not parsed_url.netloc or parsed_url.username or parsed_url.password:
-        raise OnboardingError("provider base_url must be an HTTPS URL without embedded credentials")
+    if (
+        parsed_url.scheme != "https"
+        or not parsed_url.netloc
+        or parsed_url.username
+        or parsed_url.password
+        or parsed_url.query
+        or parsed_url.fragment
+    ):
+        raise OnboardingError(
+            "provider base_url must be an HTTPS URL without credentials, query, or fragment"
+        )
     if not isinstance(models, list) or not models:
         raise OnboardingError("profile requires at least one model")
     names: set[str] = set()
@@ -73,6 +82,9 @@ def load_profile(path: Path) -> dict:
         for field in ("context", "max_output_tokens"):
             if field in model and (not isinstance(model[field], int) or model[field] <= 0):
                 raise OnboardingError(f"model {model['name']!r} {field} must be a positive integer")
+    provenance = data.get("provenance")
+    if provenance is not None and not isinstance(provenance, dict):
+        raise OnboardingError("profile provenance must be an object")
     retire = data.get("retire") or {}
     retired = retire.get("models") or []
     if not isinstance(retired, list) or any(not isinstance(name, str) or not name for name in retired):
@@ -81,6 +93,10 @@ def load_profile(path: Path) -> dict:
         raise OnboardingError("retire.models contains duplicates")
     if set(retired) & names:
         raise OnboardingError("a model cannot be both added and retired")
+    if provenance is not None:
+        from src.onboarding_generation import generated_safety
+
+        generated_safety(data)
     return data
 
 
@@ -100,7 +116,7 @@ def _read_json(path: Path) -> dict:
     return json.loads(path.read_text())
 
 
-def _secret_path(config_path: Path, provider: dict) -> Path:
+def secret_path_for_provider(config_path: Path, provider: dict) -> Path:
     del config_path  # secrets intentionally live outside checkout/config trees
     name = str(provider.get("secret_name") or f"{provider['id']}.api-key")
     if Path(name).name != name or not re.fullmatch(r"[a-zA-Z0-9_.-]+", name):
@@ -115,8 +131,15 @@ def _secret_path(config_path: Path, provider: dict) -> Path:
     return _real_target(intended)
 
 
-def _load_existing_secret(config: dict, provider_id: str, config_path: Path) -> str:
+def _load_existing_secret(
+    config: dict,
+    provider_id: str,
+    config_path: Path,
+    expected_base_url: str,
+) -> str:
     block = (config.get("providers") or {}).get(provider_id) or {}
+    if str(block.get("base_url") or "").rstrip("/") != expected_base_url.rstrip("/"):
+        return ""
     if block.get("api_key"):
         return str(block["api_key"]).strip()
     raw = block.get("api_key_file")
@@ -167,9 +190,15 @@ def _build_candidates(profile: dict, config: dict, model_doc: dict, *, secret_fi
     current_llm = model_doc.get("llm") or []
     if not isinstance(current_llm, list):
         raise OnboardingError("model-info.json llm must be a list")
-    current_names = {str(row.get("name")) for row in current_llm if isinstance(row, dict)}
+    current_by_name = {
+        str(row["name"]): row
+        for row in current_llm
+        if isinstance(row, dict) and row.get("name")
+    }
+    current_names = set(current_by_name)
     missing_retired = retired - current_names
-    if missing_retired and not new_names.issubset(current_names):
+    already_applied = all(current_by_name.get(str(model["name"])) == model for model in models)
+    if missing_retired and not already_applied:
         raise OnboardingError(
             "expected retired model(s) not found: " + ", ".join(sorted(missing_retired))
         )
@@ -285,6 +314,9 @@ def _apply_profile_unlocked(
     dry_run: bool = False,
     check_upstream: bool = True,
     upstream_validator: Callable[[dict, str], list[str]] = validate_upstream_models,
+    allow_metadata_removal: bool = False,
+    confirmed_replacements: set[str] | None = None,
+    confirmed_retirements: set[str] | None = None,
     post_apply: Callable[[], None] | None = None,
     post_rollback: Callable[[], None] | None = None,
 ) -> dict:
@@ -295,20 +327,108 @@ def _apply_profile_unlocked(
     config = _read_yaml(config_path)
     model_doc = _read_json(model_info_path)
     provider_id = str(profile["provider"]["id"]).strip().lower()
-    secret_file = _secret_path(config_path, profile["provider"])
+    secret_file = secret_path_for_provider(config_path, profile["provider"])
+    configured_providers = config.get("providers") or {}
+    if not isinstance(configured_providers, dict):
+        raise OnboardingError("config providers must be an object")
+    for owner, block in configured_providers.items():
+        if owner == provider_id or not isinstance(block, dict) or not block.get("api_key_file"):
+            continue
+        owned_secret = resolve_api_key_file(block["api_key_file"], config_path)
+        if owned_secret == secret_file:
+            raise OnboardingError(
+                f"provider secret target is already owned by provider {owner!r}: {secret_file}"
+            )
     canonical_targets = [config_path, model_info_path, secret_file]
     if source_path and source_path != model_info_path:
         canonical_targets.append(source_path)
     if len(set(canonical_targets)) != len(canonical_targets):
         raise OnboardingError("config, model catalog, source mirror, and secret targets must be distinct")
-    key = (api_key or _load_existing_secret(config, provider_id, config_path)).strip()
+    key = (
+        api_key
+        or _load_existing_secret(
+            config,
+            provider_id,
+            config_path,
+            str(profile["provider"]["base_url"]),
+        )
+    ).strip()
 
     candidate_config, candidate_doc, summary = _build_candidates(
         profile, config, model_doc, secret_file=secret_file
     )
+    from src.onboarding_generation import (
+        current_metadata_removals,
+        generated_safety,
+        validate_generated_approvals,
+        validate_generated_catalog_state,
+    )
+
+    metadata_removals = current_metadata_removals(profile, model_doc)
+    generated = bool(generated_safety(profile))
+    current_rows = {
+        str(row["name"]): row
+        for row in model_doc.get("llm") or []
+        if isinstance(row, dict) and row.get("name")
+    }
+    replacements = {
+        str(model["name"])
+        for model in profile["models"]
+        if str(model["name"]) in current_rows
+        and current_rows[str(model["name"])] != model
+    }
+    retirements = set((profile.get("retire") or {}).get("models") or [])
     summary["dry_run"] = bool(dry_run)
+    summary["metadata_removals"] = metadata_removals
+    summary["replaced_models"] = sorted(replacements)
+    summary["requires_metadata_removal_approval"] = bool(metadata_removals)
+    summary["requires_replacement_confirmation"] = bool(replacements)
+    summary["requires_retirement_confirmation"] = bool(retirements)
     if dry_run:
+        if generated:
+            validate_generated_approvals(
+                profile,
+                current_model_doc=model_doc,
+                allow_metadata_removal=True,
+                confirmed_retirements=set((profile.get("retire") or {}).get("models") or []),
+            )
         return summary
+    if generated:
+        validate_generated_catalog_state(profile, model_doc)
+    if metadata_removals and not allow_metadata_removal:
+        details = "; ".join(
+            f"{name}: {', '.join(fields)}"
+            for name, fields in sorted(metadata_removals.items())
+        )
+        raise OnboardingError(
+            "profile would remove existing metadata; rerun with explicit approval: " + details
+        )
+    confirmed_replacement_set = set(confirmed_replacements or set())
+    identical_models = {
+        str(model["name"])
+        for model in profile["models"]
+        if current_rows.get(str(model["name"])) == model
+    }
+    if (
+        not replacements.issubset(confirmed_replacement_set)
+        or not confirmed_replacement_set.issubset(replacements | identical_models)
+    ):
+        raise OnboardingError(
+            "model replacements require exact confirmation: "
+            + ", ".join(sorted(replacements))
+        )
+    if retirements != set(confirmed_retirements or set()):
+        raise OnboardingError(
+            "model retirements require exact confirmation: "
+            + ", ".join(sorted(retirements))
+        )
+    if generated:
+        validate_generated_approvals(
+            profile,
+            current_model_doc=model_doc,
+            allow_metadata_removal=allow_metadata_removal,
+            confirmed_retirements=confirmed_retirements or set(),
+        )
     if not key:
         raise OnboardingError("API key is required (use a hidden prompt, environment variable, or Keychain)")
     if check_upstream:
@@ -366,6 +486,9 @@ def apply_profile(
     dry_run: bool = False,
     check_upstream: bool = True,
     upstream_validator: Callable[[dict, str], list[str]] = validate_upstream_models,
+    allow_metadata_removal: bool = False,
+    confirmed_replacements: set[str] | None = None,
+    confirmed_retirements: set[str] | None = None,
     post_apply: Callable[[], None] | None = None,
     post_rollback: Callable[[], None] | None = None,
 ) -> dict:
@@ -378,6 +501,9 @@ def apply_profile(
         dry_run=dry_run,
         check_upstream=check_upstream,
         upstream_validator=upstream_validator,
+        allow_metadata_removal=allow_metadata_removal,
+        confirmed_replacements=confirmed_replacements,
+        confirmed_retirements=confirmed_retirements,
         post_apply=post_apply,
         post_rollback=post_rollback,
     )

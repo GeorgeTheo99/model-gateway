@@ -94,6 +94,7 @@ def test_apply_profile_retires_old_model_and_uses_secret_file(tmp_path):
         _profile(), config_path=config, model_info_path=model_info,
         model_info_source_path=source, api_key="new-secret",
         upstream_validator=validator,
+        confirmed_retirements={"old-model"},
     )
     assert validated == [("new-provider-model", "new-secret")]
     assert result["retired_models"] == ["old-model"]
@@ -116,6 +117,7 @@ def test_apply_profile_is_idempotent(tmp_path):
     kwargs = dict(
         config_path=config, model_info_path=model_info,
         model_info_source_path=source, api_key="secret", check_upstream=False,
+        confirmed_retirements={"old-model"},
     )
     onboarding.apply_profile(_profile(), **kwargs)
     result = onboarding.apply_profile(_profile(), **kwargs)
@@ -130,6 +132,54 @@ def test_apply_profile_requires_expected_retirement_on_first_run(tmp_path):
         onboarding.apply_profile(
             _profile(), config_path=config, model_info_path=model_info,
             model_info_source_path=source, dry_run=True,
+        )
+
+
+def test_existing_replacement_name_does_not_fake_retirement_idempotency(tmp_path):
+    config, model_info, source = _files(tmp_path)
+    profile = _profile()
+    model_info.write_text(json.dumps({"llm": [{
+        "name": "new-model",
+        "provider": "different-provider",
+        "provider_model_id": "different-upstream",
+    }]}))
+    with pytest.raises(onboarding.OnboardingError, match="expected retired"):
+        onboarding.apply_profile(
+            profile,
+            config_path=config,
+            model_info_path=model_info,
+            model_info_source_path=source,
+            dry_run=True,
+        )
+
+
+def test_existing_secret_is_not_reused_for_changed_base_url(tmp_path):
+    config, model_info, source = _files(tmp_path)
+    profile = _profile()
+    profile["provider"]["id"] = "old-provider"
+    profile["provider"]["base_url"] = "https://different.example/v1"
+    profile["models"][0]["provider"] = "old-provider"
+    with pytest.raises(onboarding.OnboardingError, match="API key is required"):
+        onboarding.apply_profile(
+            profile,
+            config_path=config,
+            model_info_path=model_info,
+            model_info_source_path=source,
+            check_upstream=False,
+            confirmed_retirements={"old-model"},
+        )
+
+
+def test_direct_apply_requires_exact_retirement_confirmation(tmp_path):
+    config, model_info, source = _files(tmp_path)
+    with pytest.raises(onboarding.OnboardingError, match="retirements require exact confirmation"):
+        onboarding.apply_profile(
+            _profile(),
+            config_path=config,
+            model_info_path=model_info,
+            model_info_source_path=source,
+            api_key="secret",
+            check_upstream=False,
         )
 
 
@@ -151,6 +201,7 @@ def test_apply_profile_rolls_back_all_written_files(tmp_path, monkeypatch):
         onboarding.apply_profile(
             _profile(), config_path=config, model_info_path=model_info,
             model_info_source_path=source, api_key="secret", check_upstream=False,
+            confirmed_retirements={"old-model"},
         )
     assert before == {path: path.read_bytes() for path in (config, model_info, source)}
     assert not (tmp_path / "secrets" / "new-provider.api-key").exists()
@@ -170,6 +221,7 @@ def test_apply_profile_rolls_back_when_post_apply_verification_fails(tmp_path):
             model_info_source_path=source, api_key="secret", check_upstream=False,
             post_apply=fail_verification,
             post_rollback=lambda: rollback_calls.append(True),
+            confirmed_retirements={"old-model"},
         )
     assert rollback_calls == [True]
     assert before == {path: path.read_bytes() for path in (config, model_info, source)}
@@ -217,6 +269,34 @@ def test_apply_profile_rejects_overlapping_targets(tmp_path, monkeypatch):
         )
 
 
+def test_provider_secret_target_cannot_be_owned_by_another_provider(tmp_path):
+    config, model_info, source = _files(tmp_path)
+    target = tmp_path / "secrets" / "new-provider.api-key"
+    target.parent.mkdir()
+    target.write_text("old-secret\n")
+    target.chmod(0o600)
+    alias = tmp_path / "other-provider.key"
+    alias.symlink_to(target)
+    for raw_path in (str(target), "secrets/new-provider.api-key", str(alias)):
+        config.write_text(yaml.safe_dump({
+            "providers": {
+                "other-provider": {
+                    "base_url": "https://other.example/v1",
+                    "api_key_file": raw_path,
+                },
+            },
+        }))
+        with pytest.raises(onboarding.OnboardingError, match="already owned"):
+            onboarding.apply_profile(
+                _profile(),
+                config_path=config,
+                model_info_path=model_info,
+                model_info_source_path=source,
+                dry_run=True,
+            )
+        assert target.read_text() == "old-secret\n"
+
+
 def test_apply_profile_rolls_back_when_directory_fsync_fails_after_replace(tmp_path, monkeypatch):
     config, model_info, source = _files(tmp_path)
     before = {path: path.read_bytes() for path in (config, model_info, source)}
@@ -235,6 +315,7 @@ def test_apply_profile_rolls_back_when_directory_fsync_fails_after_replace(tmp_p
         onboarding.apply_profile(
             _profile(), config_path=config, model_info_path=model_info,
             model_info_source_path=source, api_key="secret", check_upstream=False,
+            confirmed_retirements={"old-model"},
         )
     assert before == {path: path.read_bytes() for path in (config, model_info, source)}
     assert not (tmp_path / "secrets" / "new-provider.api-key").exists()
@@ -258,6 +339,7 @@ def test_apply_profile_reports_incomplete_rollback(tmp_path, monkeypatch):
             _profile(), config_path=config, model_info_path=model_info,
             model_info_source_path=source, api_key="secret", check_upstream=False,
             post_apply=lambda: (_ for _ in ()).throw(RuntimeError("verify failed")),
+            confirmed_retirements={"old-model"},
         )
     assert failed is True
 
