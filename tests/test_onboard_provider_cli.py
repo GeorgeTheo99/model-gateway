@@ -1,4 +1,6 @@
 import importlib.util
+import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +14,16 @@ SPEC = importlib.util.spec_from_file_location("onboard_provider_cli", SCRIPT)
 CLI = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(CLI)
+
+
+def test_operator_cli_resolves_its_installed_symlink(tmp_path):
+    link = tmp_path / "model-gateway"
+    link.symlink_to(SCRIPT.parents[1] / "bin" / "model-gateway")
+    env = dict(os.environ)
+    env["MODEL_GATEWAY_PLIST_DIR"] = str(tmp_path / "plists")
+    result = subprocess.run([str(link), "env"], capture_output=True, text=True, env=env)
+    assert result.returncode == 0, result.stderr
+    assert f"ROOT_DIR={SCRIPT.parents[1]}" in result.stdout
 
 
 def test_prompt_secret_fails_clearly_without_tty(monkeypatch):
