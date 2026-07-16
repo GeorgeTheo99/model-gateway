@@ -34,7 +34,11 @@ HOST="${MODEL_GATEWAY_HOST:-127.0.0.1}"
 PORT="${MODEL_GATEWAY_PORT:-9111}"
 CONFIG_PATH="${MODEL_GATEWAY_CONFIG:-$ROOT_DIR/config/config.yaml}"
 MODEL_INFO_PATH="${MODEL_GATEWAY_MODEL_INFO:-$ROOT_DIR/model-info.json}"
-MODEL_INFO_SOURCE_PATH="${MODEL_GATEWAY_MODEL_INFO_SOURCE:-$ROOT_DIR/model-info.json}"
+ACTIVE_MODEL_INFO_SOURCE=""
+if [ -f "$PLIST_DIR/$LABEL.plist" ] && [ -x /usr/libexec/PlistBuddy ]; then
+  ACTIVE_MODEL_INFO_SOURCE="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:MODEL_GATEWAY_MODEL_INFO_SOURCE' "$PLIST_DIR/$LABEL.plist" 2>/dev/null || true)"
+fi
+MODEL_INFO_SOURCE_PATH="${MODEL_GATEWAY_MODEL_INFO_SOURCE:-${ACTIVE_MODEL_INFO_SOURCE:-$ROOT_DIR/model-info.json}}"
 LEDGER_PATH="${MODEL_GATEWAY_LEDGER_PATH:-$HOME/srv/model-gateway/shared/ledger.db}"
 UV_BIN="${UV_BIN:-$(command -v uv 2>/dev/null || true)}"
 
