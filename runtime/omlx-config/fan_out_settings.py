@@ -12,10 +12,11 @@ Reads the authoritative repo-root model-info.json and:
   3. Restarts oMLX so it rescans model directories and picks up changes
 
 Alias generation previously lived here (build_aliases/diff_aliases); it moved
-to ``scripts/export_catalogs.py`` so the alias file, Pi models.json, and
-pi-launchers.zsh all come from one source of truth. This script keeps the
-genuinely oMLX-local concerns (model_settings.json sync + oMLX restart) and
-just triggers the shared generator for aliases.
+to ``scripts/export_catalogs.py`` so the generic alias file has one source of
+truth. Pi-specific ``models.json`` and launchers are rendered separately by
+``pi-shared/bin/pi-catalog``. This script keeps the genuinely oMLX-local
+concerns (model_settings.json sync + oMLX restart) and just triggers the shared
+generator for aliases.
 
 Usage:
     python3 fan_out_settings.py                  # auto-detect paths

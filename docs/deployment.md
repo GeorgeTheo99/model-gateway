@@ -109,6 +109,4 @@ exports:
   model_aliases: ~/.claude/model-aliases.json
 ```
 
-The gateway regenerates that generic alias file on startup. Render Pi-specific artifacts separately with `pi-shared/bin/pi-catalog`; generated launchers define `pi-restart model-gw`, which now delegates to the portable `model-gateway restart` command when available and falls back to `server-ci restart --model-gw` on ls99/dev-server installs.
-
-The legacy `runtime/pi-launcher.zsh` is DEPRECATED; it defines `claude-*`/`codex-*` and is retained only for reference.
+The gateway regenerates that generic alias file on startup. Render Pi-specific artifacts separately with `pi-shared/bin/pi-catalog`; generated launchers define `pi-restart model-gw`, which now delegates to the portable `model-gateway restart` command when available and falls back to `server-ci restart --model-gw` on ls99/dev-server installs. Pi-owned generated artifacts should live under `~/.pi/` (for example, `~/.pi/generated/pi-launchers.zsh`), never under this repository or a model-gateway runtime directory.

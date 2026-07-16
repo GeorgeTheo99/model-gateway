@@ -161,49 +161,37 @@ Failovers are logged + counted in the ledger (`failover_from`,
 
 ---
 
-## 2. Catalog generation: gateway is the single source of truth
+## 2. Catalog generation: generic gateway contract, consumer-owned rendering
 
-> **Update (post-C1):** the gateway now renders only the generic alias file
-> (`model-aliases.json`) — its public contract. Pi-specific rendering
-> (`models.json`, `pi-launchers.zsh`) has moved to `pi-shared/bin/pi-catalog`,
-> which reads the alias file. The diagram and mapping rules below describe the
-> original C1 design; the alias-file contract and merge logic still hold.
+The gateway owns the routable model inventory and exports one generic public
+contract. Consumers own their tool-specific rendering:
 
 ```
-config.yaml (curated, hand-edited via admin UI or CLI)
+model-info.json + config.yaml
         │
         ▼
-GET /v1/models  ──(or direct YAML read)──►  scripts/export_catalogs.py
+scripts/export_catalogs.py
         │
-        ├──► isaac_manage/local_claude/model-aliases.json   (pi-list, claude-*, codex-*, pi-*)
-        ├──► pi-local/config/pi-models/models.json          (Pi /model via ~/.pi/agent symlink)
-        └──► drift check (fails loudly if targets were hand-edited)
+        ├──► model-aliases.json                     (generic public contract)
+        │         │
+        │         └──► pi-shared/bin/pi-catalog
+        │                   ├──► ~/.pi-omlx/agent/models.json
+        │                   └──► ~/.pi/generated/pi-launchers.zsh
+        └──► alias-catalog drift check
 ```
 
-- **`scripts/export_catalogs.py`** renders both downstream files from the
-  gateway catalog. Mapping rules:
-  - gateway `protocol: anthropic` → Pi provider `databricks-anthropic`
-    (anthropic-messages, `baseUrl http://localhost:9111`);
-  - everything else Databricks → Pi provider `databricks`
-    (openai-completions, `baseUrl http://localhost:9111/v1`);
-  - google models → Pi provider `google`;
-  - `alias` → `cloud:<name>` keys in model-aliases.json;
-  - context/max_output/vision/thinking copied verbatim.
-  Output files get a `"_generated": "by model-gateway export_catalogs — do not hand-edit"` header key.
-- **Triggers:** run automatically on gateway start (`run.sh`), on
-  `/admin/api/reload`, and from `manage.sh models sync`. `pi-list` reloads via
-  the existing `_load_cloud_models` re-eval (`reload-cloud-models` alias);
-  Pi picks the new catalog up next session (models.json is read at startup).
-- **Drift check** (mirrors `aidk_drift_check.py`): compares generated files
-  against a fresh render; wired into `manage.sh status` and the admin
-  dashboard config-readiness panel.
-- pi-launcher note: `_pi_cloud` currently derives Pi provider from the
-  `cloud:` id prefix (`claude-*` → databricks-anthropic). Generation makes
-  this explicit instead: model-aliases.json entries carry a
-  `pi_provider` field the launcher reads directly. Fable's entry gets
-  `pi_provider: databricks-anthropic` (it's a claude model behind an
-  invocations endpoint — the prefix heuristic already handled it, but
-  explicit beats implicit).
+- **`scripts/export_catalogs.py`** merges `model-info.json` with the local
+  `config.yaml` model overlay and renders only `model-aliases.json`.
+- The alias contract carries canonical ids, aliases, provider/protocol,
+  context, output, vision, thinking capabilities, and optional opaque consumer
+  hints. It does not own Pi output paths or render Pi configuration schemas.
+- **`pi-shared/bin/pi-catalog`** consumes that contract and owns Pi provider
+  selection, compatibility mapping, `models.json`, and `pi-*` launchers.
+- Gateway startup and `/admin/api/reload` refresh the alias export when
+  configured. Pi-specific artifacts are regenerated separately and are loaded
+  by Pi on its next session.
+- Drift checks compare the generic alias export against a fresh gateway render;
+  consumer-specific drift checks remain with each consumer.
 
 ---
 
@@ -318,10 +306,10 @@ If a routed workspace is deleted *right now*:
   the workspace is trusted with traffic.
 - Pools can't be emptied; partial coverage requires an explicit flag.
 - Downstream catalogs can't drift (generated + drift-checked).
-- The zsh launcher's e2-specific auth hack (`_E2_BACKED_ALIASES=(fable)`)
+- The former launcher's e2-specific auth hack (`_E2_BACKED_ALIASES=(fable)`)
   is replaced by generic per-workspace preflight derived from the generated
   aliases file (`ws_auth: <profile>` field), so a workspace swap does not
-  require editing zshrc-launcher.zsh at all.
+  require editing Pi launchers at all.
 
 ---
 

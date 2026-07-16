@@ -132,10 +132,8 @@ def _exported_models(entries: list[dict]) -> list[dict]:
     return out
 
 
-# Fields carried through to the alias file so downstream consumers (pi-shared
-# pi-catalog, the legacy pi-launcher.zsh, etc.) can make UI/request-shape
-# decisions without calling the gateway. Mirrors
-# runtime/omlx-config/fan_out_settings.py::build_aliases — keep in sync.
+# Fields carried through to the generic alias contract so downstream consumers
+# can make UI and request-shape decisions without calling the gateway.
 _ALIAS_FIELDS = (
     "thinking",
     "thinking_format",
@@ -201,9 +199,9 @@ def render_model_aliases(entries: list[dict], config: dict | None = None) -> dic
     """Render ~/.claude/model-aliases.json from merged catalog entries.
 
     Local models (provider ``omlx``/``local``) are keyed by ``omlx_id``; cloud
-    models by ``cloud:<provider_model_id>`` — the schema consumed by
-    ``pi-shared/bin/pi-catalog`` (which renders the Pi ``models.json`` and
-    ``pi-launchers.zsh``) and the legacy ``runtime/pi-launcher.zsh``.
+    models by ``cloud:<provider_model_id>`` — the public schema consumed by
+    downstream renderers such as ``pi-shared/bin/pi-catalog`` (which owns Pi
+    ``models.json`` and ``pi-launchers.zsh`` rendering).
 
     Hard-fails (sys.exit 2) on duplicate aliases, matching fan_out_settings.py.
     """

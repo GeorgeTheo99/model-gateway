@@ -237,6 +237,11 @@ def test_refuses_empty_catalog(tmp_path):
     assert "empty catalog" in r.stderr
 
 
+def test_gateway_does_not_own_pi_launchers():
+    assert not (REPO_ROOT / "runtime" / "pi-launcher.zsh").exists()
+    assert not (REPO_ROOT / "runtime" / "local_claude" / "zshrc-launcher.zsh").exists()
+
+
 def test_machine_catalog_renders(tmp_path):
     """Smoke test against this machine's optional, gitignored catalog."""
     mi = REPO_ROOT / "model-info.json"
