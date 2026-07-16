@@ -8,7 +8,8 @@ model-gateway onboard moonshot-kimi-k3 --dry-run
 model-gateway onboard moonshot-kimi-k3
 ```
 
-The non-dry run prompts for the API key with hidden input, validates that the
+The second command is the recommended path on headless/SSH machines. It prompts
+for the API key with hidden input, validates that the
 provider's authenticated `/models` endpoint advertises every requested model,
 then:
 
@@ -27,23 +28,18 @@ provider/model without requiring the retired model to still exist.
 
 ## Supplying secrets safely
 
-Never put a key in a command argument. For automation, use an environment
-variable or macOS Keychain:
+Never put a key in a command argument. The default hidden prompt works without
+Keychain and stores the secret in the gateway's mode-`0600` secret directory.
+For non-interactive automation, use an environment variable:
 
 ```bash
 model-gateway onboard PROFILE --api-key-env PROVIDER_API_KEY
-model-gateway onboard PROFILE \
-  --api-key-keychain-service model-gateway-provider
 ```
 
-To load a key into Keychain without shell history or terminal echo:
-
-```bash
-read -s PROVIDER_API_KEY
-security add-generic-password -U -a "$USER" \
-  -s model-gateway-provider -w "$PROVIDER_API_KEY"
-unset PROVIDER_API_KEY
-```
+An existing macOS Keychain item may also be read with
+`--api-key-keychain-service SERVICE`. Keychain creation can fail with
+`User interaction is not allowed` in SSH/headless sessions; in an interactive
+terminal the CLI automatically falls back to its hidden prompt.
 
 ## Profile format
 

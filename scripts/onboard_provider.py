@@ -34,6 +34,21 @@ def _profile_path(value: str) -> Path:
     raise argparse.ArgumentTypeError(f"onboarding profile not found: {value}")
 
 
+def _prompt_secret() -> str:
+    if not sys.stdin.isatty():
+        raise OnboardingError(
+            "API key is not configured and no interactive terminal is available; "
+            "rerun from a terminal or use --api-key-env NAME"
+        )
+    try:
+        key = getpass.getpass("Provider API key (hidden; stored in a mode-0600 file): ").strip()
+    except (EOFError, KeyboardInterrupt) as exc:
+        raise OnboardingError("API key prompt was cancelled") from exc
+    if not key:
+        raise OnboardingError("API key cannot be empty")
+    return key
+
+
 def _keychain_secret(service: str, account: str | None) -> str:
     command = ["security", "find-generic-password", "-w", "-s", service]
     if account:
@@ -134,9 +149,18 @@ def main() -> int:
             if not key:
                 raise OnboardingError(f"environment variable {args.api_key_env!r} is empty or unset")
         elif args.api_key_keychain_service:
-            key = _keychain_secret(args.api_key_keychain_service, args.keychain_account)
+            try:
+                key = _keychain_secret(args.api_key_keychain_service, args.keychain_account)
+            except OnboardingError:
+                if not sys.stdin.isatty():
+                    raise
+                print(
+                    "Keychain item is unavailable in this session; falling back to the secure terminal prompt.",
+                    file=sys.stderr,
+                )
+                key = _prompt_secret()
         elif not args.dry_run:
-            key = getpass.getpass("Provider API key (input hidden; never stored in shell history): ").strip()
+            key = _prompt_secret()
 
         new_models = {str(model["name"]) for model in profile["models"]}
         retired_models = set((profile.get("retire") or {}).get("models") or [])
