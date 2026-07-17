@@ -101,6 +101,27 @@ x-api-key: cloud
 
 Admin keys are also accepted on `/v1/*`, so an admin token can be used for debugging.
 
+## Federation peer auth
+
+Federation authentication is separate from ordinary client/admin auth and is
+configured only under `federation.peers`. It always fails closed—even when
+`MODEL_GATEWAY_CLIENT_KEYS` is unset and ordinary `/v1` client access is open.
+
+- `GET /v1/federation/catalog` requires `X-Model-Gateway-Source` plus the
+  configured source peer credential as a Bearer token.
+- Peer-forwarded model requests additionally require the configured owner and a
+  single direct `Via` hop.
+- The importer never forwards a client's authorization header; it constructs a
+  new request with the peer credential.
+- Peer credentials are not admin keys and grant no `/admin/api/*` access.
+- Use a unique secret for each node pair. Possession authorizes catalog reads and
+  direct model invocation as that pair's configured peer; it does not authorize
+  admin APIs, ordinary client identity, or another peer relationship. Never
+  reuse client/admin/provider keys or one pair's secret for another pair.
+
+Prefer reciprocal mode-`0600` `api_key_file` entries and HTTPS peer URLs. See
+[federation.md](federation.md) for setup and loop-protection details.
+
 ## Known consumer compatibility
 
 Known clients that already send the default `cloud` token and should continue working if `MODEL_GATEWAY_CLIENT_KEYS=cloud` is enabled:

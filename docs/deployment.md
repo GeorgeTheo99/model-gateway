@@ -67,6 +67,22 @@ The dev-server pipeline updates the runtime checkout, keeps `config/config.yaml`
 
 Databricks is optional and disabled/unconfigured on this machine. A work machine can enable Databricks model serving with gitignored config or env (`DATABRICKS_HOST`, `DATABRICKS_TOKEN`, optional `DATABRICKS_SERVING_BASE_URL`) without changing the committed catalog.
 
+## Optional federation
+
+Nodes may import direct routes from explicitly configured peer gateways. Add a
+`federation:` block to the gitignored `config/config.yaml`; no deploy-time
+secrets or node-specific routes belong in the repository. Imported IDs are
+always namespaced as `<owner_node>/<direct_model_id>`, local routing wins, and
+imports are never included in downstream catalog exports.
+
+Startup loads the atomic last-known-good cache, performs an initial peer catalog
+refresh, and starts periodic refreshes. The default cache is
+`config/federation-cache.json` (Git-ignored). Service shutdown cleans up the
+refresh task. An authenticated, write-enabled `POST /admin/api/reload`
+reconfigures federation after manual config edits; there are no federation
+admin write APIs. See [federation.md](federation.md) for the full config,
+security, discovery, and forwarding contract.
+
 Manual deploy:
 
 ```bash

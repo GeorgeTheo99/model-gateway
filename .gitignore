@@ -3,6 +3,7 @@ config/config.yaml
 config/config.yaml.bak-*
 config/secrets/
 config/*.onboard.lock
+config/federation-cache.json
 
 # Machine-local model catalog (per-machine; committed in error previously)
 model-info.json

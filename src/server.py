@@ -20,7 +20,7 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from src.admin import router as admin_router
@@ -38,7 +38,7 @@ from src.responses import chat_to_responses, responses_to_chat, translate_respon
 from src.signature_cache import store_from_extra_content
 from src.streaming import _flatten_list_content, translate_stream
 from src.translator import anthropic_to_openai, anthropic_to_openai_chat, openai_chat_to_anthropic, openai_to_anthropic
-from src import ledger
+from src import federation, ledger
 from src.usage import extract_usage, estimate_cost
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -75,7 +75,11 @@ async def _lifespan(_app: FastAPI):
     # call scripts/export_catalogs.py themselves.
     from src.admin import _regenerate_catalogs
     log.info("catalog exports: %s", await _regenerate_catalogs())
-    yield
+    await federation.start()
+    try:
+        yield
+    finally:
+        await federation.stop()
 
 
 app = FastAPI(title="Model Gateway", lifespan=_lifespan)
@@ -166,6 +170,59 @@ def _model_error_message(model: str) -> str:
     reason = availability.get("reason") or "unavailable"
     detail = availability.get("message") or "not locally available"
     return f"Model '{model}' is unavailable ({reason}): {detail}"
+
+
+def _peer_forward_error(path: str, exc: HTTPException) -> JSONResponse:
+    """Return structural/auth peer failures in the target API's envelope."""
+    error_type = "authentication_error" if exc.status_code == 401 else "invalid_request_error"
+    message = str(exc.detail)
+    if path == "/v1/messages":
+        return _error(exc.status_code, error_type, message)
+    return _error_openai(exc.status_code, error_type, message)
+
+
+def _require_model_request_auth(request: Request, path: str) -> JSONResponse | None:
+    """Authenticate either a direct client request or a one-hop peer request."""
+    manager = federation.manager()
+    if manager.has_forwarding_headers(request):
+        try:
+            manager.authenticate_forwarded_request(request)
+        except HTTPException as exc:
+            return _peer_forward_error(path, exc)
+    else:
+        # Preserve the ordinary direct-client authentication contract, including
+        # its existing FastAPI {detail} error response.
+        require_client_auth(request)
+    return None
+
+
+def _validate_inbound_peer_model(request: Request, path: str, model: object) -> JSONResponse | None:
+    if not getattr(request.state, "federation_source", None):
+        return None
+    try:
+        federation.manager().validate_inbound_direct_model(model)
+    except HTTPException as exc:
+        return _peer_forward_error(path, exc)
+    return None
+
+
+async def _forward_imported_if_known(request: Request, path: str, body: dict) -> Response | None:
+    """Resolve an exact namespaced import and relay it to its direct owner."""
+    model = body.get("model")
+    # A known-but-disabled/unconfigured local route still owns its identifier;
+    # federation is considered only when local resolution truly has no entry.
+    if isinstance(model, str) and model_availability(model).get("reason") != "model_not_found":
+        return None
+    route = federation.manager().resolve_imported(model)
+    if route is None:
+        return None
+    request.state.ledger_ctx = {
+        "model": route.route_id,
+        "provider": f"federation:{route.owner_node}",
+        "provider_model_id": route.direct_model_id,
+        "is_stream": body.get("stream") is True,
+    }
+    return await federation.manager().forward(request, path, body, route)
 
 
 ADAPTIVE_THINKING_ANTHROPIC_MODELS = {
@@ -1308,12 +1365,10 @@ async def health():
     return {"status": "ok", "service": "model-gateway"}
 
 
-@app.get("/v1/models")
-async def list_models(request: Request):
-    require_client_auth(request)
-    models = list_available_models()
+def _direct_model_rows() -> list[dict]:
+    """Return the existing local discovery rows, field-for-field compatible."""
     data = []
-    for m in models:
+    for m in list_available_models():
         # Unavailable models (disabled or provider not configured locally) are
         # hidden from clients; admin/debug APIs expose them with reasons.
         caps = _thinking_capabilities(m)
@@ -1329,7 +1384,25 @@ async def list_models(request: Request):
             "forwarded_params": caps["forwarded_params"],
             "vision": bool(m.get("vision")),
         })
+    return data
+
+
+@app.get("/v1/models")
+async def list_models(request: Request):
+    require_client_auth(request)
+    data = _direct_model_rows()
+    local_ids = {m.get("id") for m in list_routable_models()}
+    data.extend(row for row in federation.manager().imported_rows() if row["id"] not in local_ids)
     return {"object": "list", "data": data}
+
+
+@app.get("/v1/federation/catalog")
+async def federation_catalog(request: Request):
+    """Return direct local routes to an explicitly configured peer."""
+    manager = federation.manager()
+    manager.authenticate_catalog_request(request)
+    payload = manager.build_catalog(_direct_model_rows())
+    return JSONResponse(content=payload, headers={federation.SOURCE_HEADER: manager.config.node_id})
 
 
 @app.get("/v1/debug/thinking")
@@ -1385,7 +1458,9 @@ async def create_response(request: Request):
     Translates Responses API requests to Chat Completions, forwards to cloud
     provider, then translates results back to Responses format.
     """
-    require_client_auth(request)
+    auth_error = _require_model_request_auth(request, "/v1/responses")
+    if auth_error is not None:
+        return auth_error
     try:
         body = await request.json()
     except Exception:
@@ -1394,7 +1469,16 @@ async def create_response(request: Request):
     model = body.get("model", "")
     is_stream = body.get("stream", False)
 
+    inbound_source = getattr(request.state, "federation_source", None)
+    if inbound_source:
+        model_error = _validate_inbound_peer_model(request, "/v1/responses", model)
+        if model_error is not None:
+            return model_error
     info = resolve(model)
+    if not inbound_source and not info:
+        forwarded = await _forward_imported_if_known(request, "/v1/responses", body)
+        if forwarded is not None:
+            return forwarded
     if not info:
         return _error_openai(404, "invalid_request_error", _model_error_message(model))
 
@@ -1784,7 +1868,9 @@ async def _handle_responses_stream_google(endpoint: str, chat_req: dict, model: 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """OpenAI-compatible passthrough — forward to resolved provider with auth."""
-    require_client_auth(request)
+    auth_error = _require_model_request_auth(request, "/v1/chat/completions")
+    if auth_error is not None:
+        return auth_error
     try:
         body = await request.json()
     except Exception:
@@ -1794,7 +1880,16 @@ async def chat_completions(request: Request):
         )
 
     model = body.get("model", "")
+    inbound_source = getattr(request.state, "federation_source", None)
+    if inbound_source:
+        model_error = _validate_inbound_peer_model(request, "/v1/chat/completions", model)
+        if model_error is not None:
+            return model_error
     info = resolve(model)
+    if not inbound_source and not info:
+        forwarded = await _forward_imported_if_known(request, "/v1/chat/completions", body)
+        if forwarded is not None:
+            return forwarded
     if not info:
         return JSONResponse(
             status_code=404,
@@ -2157,7 +2252,9 @@ async def messages(request: Request):
     Anthropic models: passthrough directly to Anthropic's native Messages API.
     Other providers: translate to OpenAI, forward, translate back.
     """
-    require_client_auth(request)
+    auth_error = _require_model_request_auth(request, "/v1/messages")
+    if auth_error is not None:
+        return auth_error
     try:
         body = await request.json()
     except Exception:
@@ -2167,7 +2264,16 @@ async def messages(request: Request):
     is_stream = body.get("stream", False)
     has_tools = bool(body.get("tools"))
 
+    inbound_source = getattr(request.state, "federation_source", None)
+    if inbound_source:
+        model_error = _validate_inbound_peer_model(request, "/v1/messages", model)
+        if model_error is not None:
+            return model_error
     info = resolve(model)
+    if not inbound_source and not info:
+        forwarded = await _forward_imported_if_known(request, "/v1/messages", body)
+        if forwarded is not None:
+            return forwarded
     if not info:
         return _error(404, "invalid_request_error", _model_error_message(model))
 

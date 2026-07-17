@@ -13,6 +13,31 @@ auth:
   # client_keys:
   #   - "cloud"
 
+# Optional explicit one-hop federation. Omit this entire block on standalone
+# nodes. Node/peer IDs are lowercase DNS labels and become the route prefix:
+#   edge/model-id
+# Configure the reciprocal peer block on each node with the same shared peer
+# credential. Prefer a mode-0600 api_key_file; relative paths resolve beside
+# this config file. Federation catalog/forward auth is independent of auth above
+# and always fails closed.
+# federation:
+#   node_id: main
+#   refresh_interval_seconds: 30
+#   stale_after_seconds: 300
+#   # Hard catalog and initial/full non-stream forwarding deadline.
+#   request_timeout_seconds: 10
+#   # Streaming response-body inactivity timeout after headers arrive.
+#   stream_idle_timeout_seconds: 900
+#   # Must not resolve to this config or any peer/provider/workspace api_key_file.
+#   cache_path: federation-cache.json
+#   max_catalog_bytes: 1048576
+#   max_models_per_peer: 1000
+#   peers:
+#     edge:
+#       base_url: https://edge-gateway.example.com
+#       api_key_file: secrets/main-edge.api-key
+#       # api_key: "SHARED_PEER_KEY"  # exactly one of api_key/api_key_file
+
 providers:
   # Providers are optional and local-runtime only. model-info.json may list
   # models for many providers, but /v1/models exposes only models whose provider

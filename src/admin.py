@@ -22,7 +22,7 @@ from src.providers import (
     reload as reload_provider_registry,
     routable_ids,
 )
-from src import config_io, ledger
+from src import config_io, federation, ledger
 
 router = APIRouter()
 _STARTED_AT = time.time()
@@ -93,9 +93,21 @@ async def admin_config_validation(request: Request):
 async def admin_reload(request: Request):
     require_admin_auth(request)
     require_admin_writes()
+    # Validate federation before invalidating the live provider registry. A
+    # malformed shared YAML/federation block must leave both registries intact.
+    try:
+        federation_config = federation.load_config(CONFIG_PATH)
+    except federation.FederationConfigError as exc:
+        return _bad_request(str(exc))
     reload_provider_registry()
+    federation_status = await federation.reconfigure(config=federation_config)
     catalogs = await _regenerate_catalogs()
-    return {"status": "ok", "message": "provider registry reloaded", "catalogs": catalogs}
+    return {
+        "status": "ok",
+        "message": "provider registry and federation reloaded",
+        "catalogs": catalogs,
+        "federation": federation_status,
+    }
 
 
 async def _regenerate_catalogs() -> str:
