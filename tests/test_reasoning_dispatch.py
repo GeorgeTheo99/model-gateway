@@ -7,6 +7,7 @@ visible failure instead of a quiet behavior change.
 Run:  cd model-gateway && uv run pytest
 """
 
+import asyncio
 import base64
 import io
 from types import SimpleNamespace
@@ -478,11 +479,12 @@ def test_chat_completions_image_request_extracts_then_answers_with_original_mode
             return fallback_info
         return None
 
-    async def fake_extract(request, body, fallback_model, fallback, error_factory):
+    async def fake_extract(request, body, fallback_model, fallback, error_factory, **kwargs):
         assert fallback_model == server_module.DEFAULT_VISION_FALLBACK_MODEL
         assert fallback is fallback_info
         assert server_module._payload_has_image(body)
-        return "Visible: a concrete wall with a crack."
+        assert kwargs == {"max_images": 1, "require_inline_images": False}
+        return ["Visible: a concrete wall with a crack."]
 
     async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
         assert endpoint == "http://up/chat/completions"
@@ -512,6 +514,115 @@ def test_chat_completions_image_request_extracts_then_answers_with_original_mode
 
     assert resp.status_code == 200
     assert resp.json() == {"ok": True}
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_chat_completions_composite_defaults_to_scoped_local_extraction(client, monkeypatch):
+    text_info = _info("glm-chat-template", provider="omlx", provider_model_id="glm-upstream")
+    text_info.composite = providers.CompositeRoute(
+        text_model="glm-local",
+        vision_model="gemma-local",
+        image_handling="extract_then_answer",
+        max_images=4,
+    )
+    vision_info = _info("", thinking="", provider="omlx", provider_model_id="gemma-upstream", vision=True)
+    resolved = []
+
+    def fake_resolve(model):
+        resolved.append(model)
+        if model == "best-local":
+            return text_info
+        if model == "gemma-local":
+            return vision_info
+        if model == "cloud-trap":
+            raise AssertionError("composite must not use the global cloud fallback")
+        return None
+
+    async def fake_extract(request, body, fallback_model, fallback, error_factory, **kwargs):
+        assert fallback_model == "gemma-local"
+        assert fallback is vision_info
+        assert kwargs == {"max_images": 4, "require_inline_images": True}
+        return ["Dense Gemma sees a terminal window."]
+
+    async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
+        assert body["model"] == "glm-upstream"
+        assert not server_module._payload_has_image(body)
+        assert "Dense Gemma sees a terminal window." in str(body["messages"])
+        return server_module.JSONResponse(status_code=200, content={"ok": True})
+
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "cloud-trap")
+    monkeypatch.setattr(server_module, "resolve", fake_resolve)
+    monkeypatch.setattr(server_module, "_extract_image_observations", fake_extract)
+    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough_sync)
+
+    resp = client.post("/v1/chat/completions", json={
+        "model": "best-local",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "What is shown?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]}],
+    })
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+    assert resolved == ["best-local", "gemma-local"]
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/chat/completions", "/v1/responses", "/v1/messages"])
+def test_composite_staging_is_consistent_across_api_translations(monkeypatch, endpoint):
+    from src.responses import responses_to_chat
+    from src.translator import anthropic_to_openai
+
+    text_info = _info("glm-chat-template", provider="omlx", provider_model_id="glm-upstream")
+    text_info.composite = providers.CompositeRoute(
+        text_model="glm-local",
+        vision_model="gemma-local",
+        image_handling="extract_then_answer",
+        max_images=4,
+    )
+    vision_info = _info("", thinking="", provider="omlx", provider_model_id="gemma-upstream", vision=True)
+    image_url = "data:image/png;base64,AAAA"
+    if endpoint == "/v1/responses":
+        chat_body = responses_to_chat({"model": "best-local", "input": [{
+            "type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "inspect"},
+                {"type": "input_image", "image_url": image_url},
+            ],
+        }]})
+    elif endpoint == "/v1/messages":
+        chat_body = anthropic_to_openai({"model": "best-local", "messages": [{
+            "role": "user", "content": [
+                {"type": "text", "text": "inspect"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+            ],
+        }]})
+    else:
+        chat_body = {"model": "best-local", "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "inspect"},
+            {"type": "image_url", "image_url": {"url": image_url}},
+        ]}]}
+
+    async def fake_extract(request, body, fallback_model, fallback, error_factory, **kwargs):
+        assert fallback_model == "gemma-local"
+        assert fallback is vision_info
+        return ["visible terminal"]
+
+    monkeypatch.setattr(server_module, "resolve", lambda model: vision_info if model == "gemma-local" else None)
+    monkeypatch.setattr(server_module, "_extract_image_observations", fake_extract)
+    request = SimpleNamespace(headers={}, state=SimpleNamespace())
+
+    rewritten, served_model, served_info, error = asyncio.run(
+        server_module._apply_chat_vision_fallback(
+            request, chat_body, "best-local", text_info, endpoint,
+            server_module._error if endpoint == "/v1/messages" else server_module._error_openai,
+        )
+    )
+
+    assert error is None
+    assert served_model == "best-local"
+    assert served_info is text_info
+    assert not server_module._payload_has_image(rewritten)
+    assert "visible terminal" in str(rewritten["messages"])
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
@@ -582,14 +693,27 @@ def test_replace_image_preserves_order_and_all_content():
     assert body["messages"][0]["content"][1]["type"] == "image_url"
 
 
-def test_replace_images_rejects_multiple_images():
-    with pytest.raises(ValueError, match="exactly one"):
+def test_replace_multiple_images_uses_matching_observations():
+    result = server_module._replace_images_with_extracted_text(
+        {"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "one"}},
+            {"type": "image_url", "image_url": {"url": "two"}},
+        ]}]},
+        ["first detail", "second detail"], "vision",
+    )
+    parts = result["messages"][0]["content"]
+    assert "image 1" in parts[0]["text"] and "first detail" in parts[0]["text"]
+    assert "image 2" in parts[1]["text"] and "second detail" in parts[1]["text"]
+
+
+def test_replace_images_rejects_observation_count_mismatch():
+    with pytest.raises(ValueError, match="count does not match"):
         server_module._replace_images_with_extracted_text(
             {"messages": [{"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": "one"}},
                 {"type": "image_url", "image_url": {"url": "two"}},
             ]}]},
-            "visible detail", "vision",
+            ["only one detail"], "vision",
         )
 
 
@@ -599,6 +723,226 @@ def test_replace_images_rejects_empty_observations():
             {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]},
             "  ", "vision",
         )
+
+
+def test_multi_image_extraction_is_bounded_and_ordered(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, observation):
+            self.observation = observation
+
+        def json(self):
+            return {
+                "choices": [{"finish_reason": "stop", "message": {"content": self.observation}}],
+                "usage": {},
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, endpoint, json, headers):
+            calls.append((endpoint, json, headers))
+            return FakeResponse(f"observation {len(calls)}")
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", lambda **kwargs: FakeClient())
+    monkeypatch.setattr(server_module, "_ledger_record", lambda *args, **kwargs: None)
+    request = SimpleNamespace(state=SimpleNamespace())
+    info = _info("", thinking="", provider="omlx", provider_model_id="gemma-upstream", vision=True)
+    body = {"messages": [{"role": "tool", "content": [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQID"}},
+    ]}]}
+
+    result = asyncio.run(server_module._extract_image_observations(
+        request, body, "gemma-local", info,
+        max_images=4, require_inline_images=True,
+    ))
+
+    assert result == ["observation 1", "observation 2"]
+    assert len(calls) == 2
+    assert all(server_module._image_count(call[1]) == 1 for call in calls)
+    assert all(len(call[1]["messages"]) == 2 for call in calls)
+
+
+def test_local_composite_rejects_remote_images_before_upstream(monkeypatch):
+    class ForbiddenClient:
+        def __init__(self, **kwargs):
+            raise AssertionError("image validation must happen before creating a client")
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", ForbiddenClient)
+    request = SimpleNamespace(state=SimpleNamespace())
+    info = _info("", thinking="", provider="omlx", provider_model_id="gemma-upstream", vision=True)
+    result = asyncio.run(server_module._extract_image_observations(
+        request,
+        {"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "https://example.test/image.png"}},
+        ]}]},
+        "gemma-local",
+        info,
+        max_images=4,
+        require_inline_images=True,
+    ))
+
+    assert result.status_code == 400
+    assert "inline data:image" in result.body.decode()
+
+
+@pytest.mark.parametrize(
+    ("urls", "max_images", "expected_status", "message"),
+    [
+        (["data:image/png;base64,AAAA"] * 5, 4, 400, "1 through 4"),
+        (["data:image/png;base64,%%%"], 4, 400, "malformed base64"),
+    ],
+)
+def test_local_composite_rejects_invalid_image_batches_before_upstream(
+    monkeypatch, urls, max_images, expected_status, message,
+):
+    class ForbiddenClient:
+        def __init__(self, **kwargs):
+            raise AssertionError("image validation must happen before creating a client")
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", ForbiddenClient)
+    request = SimpleNamespace(state=SimpleNamespace())
+    info = _info("", thinking="", provider="omlx", provider_model_id="gemma-upstream", vision=True)
+    body = {"messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": url}} for url in urls
+    ]}]}
+
+    result = asyncio.run(server_module._extract_image_observations(
+        request, body, "gemma-local", info,
+        max_images=max_images, require_inline_images=True,
+    ))
+
+    assert result.status_code == expected_status
+    assert message in result.body.decode()
+
+
+def test_local_composite_enforces_per_image_and_total_byte_limits(monkeypatch):
+    class ForbiddenClient:
+        def __init__(self, **kwargs):
+            raise AssertionError("size validation must happen before creating a client")
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", ForbiddenClient)
+    monkeypatch.setattr(server_module, "DEFAULT_COMPOSITE_IMAGE_MAX_BYTES", 2)
+    monkeypatch.setattr(server_module, "DEFAULT_COMPOSITE_IMAGE_TOTAL_MAX_BYTES", 3)
+    request = SimpleNamespace(state=SimpleNamespace())
+    info = _info("", thinking="", provider="omlx", provider_model_id="gemma-upstream", vision=True)
+
+    per_image = asyncio.run(server_module._extract_image_observations(
+        request,
+        {"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQID"}},
+        ]}]},
+        "gemma-local", info, max_images=4, require_inline_images=True,
+    ))
+    total = asyncio.run(server_module._extract_image_observations(
+        request,
+        {"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQI="}},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AwQ="}},
+        ]}]},
+        "gemma-local", info, max_images=4, require_inline_images=True,
+    ))
+
+    assert per_image.status_code == 413 and "per-image byte limit" in per_image.body.decode()
+    assert total.status_code == 413 and "total byte limit" in total.body.decode()
+
+
+@pytest.mark.parametrize("finish_reason", ["length", None, ""])
+def test_local_composite_rejects_nonterminal_observations(monkeypatch, finish_reason):
+    calls = 0
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "choices": [{
+                    "finish_reason": finish_reason,
+                    "message": {"content": "partial observation"},
+                }],
+                "usage": {},
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, endpoint, json, headers):
+            nonlocal calls
+            calls += 1
+            return FakeResponse()
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", lambda **kwargs: FakeClient())
+    monkeypatch.setattr(server_module, "_ledger_record", lambda *args, **kwargs: None)
+    request = SimpleNamespace(state=SimpleNamespace())
+    info = _info("", thinking="", provider="omlx", provider_model_id="gemma-upstream", vision=True)
+
+    result = asyncio.run(server_module._extract_image_observations(
+        request,
+        {"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]}]},
+        "gemma-local", info, max_images=4, require_inline_images=True,
+    ))
+
+    assert calls == 1
+    assert result.status_code == 502
+    assert f"finish_reason={finish_reason}" in result.body.decode()
+
+
+@pytest.mark.parametrize("content", [
+    None,
+    {},
+    7,
+    [{"type": "image_url", "image_url": {"url": "x"}}],
+    [{"type": "text", "text": "partial"}, {"type": "image_url", "image_url": {"url": "x"}}],
+])
+def test_local_composite_rejects_nontext_observations(monkeypatch, content):
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "choices": [{"finish_reason": "stop", "message": {"content": content}}],
+                "usage": {},
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, endpoint, json, headers):
+            return FakeResponse()
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", lambda **kwargs: FakeClient())
+    monkeypatch.setattr(server_module, "_ledger_record", lambda *args, **kwargs: None)
+    request = SimpleNamespace(state=SimpleNamespace())
+    info = _info("", thinking="", provider="omlx", provider_model_id="gemma-upstream", vision=True)
+
+    result = asyncio.run(server_module._extract_image_observations(
+        request,
+        {"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]}]},
+        "gemma-local", info, max_images=4, require_inline_images=True,
+    ))
+
+    assert result.status_code == 502
+    assert "empty observations" in result.body.decode()
 
 
 def test_responses_input_image_translates_to_real_image_block():
@@ -647,6 +991,44 @@ def test_anthropic_tool_results_preserve_block_sequence():
     assert [(message["role"], message["content"]) for message in result["messages"]] == [
         ("user", "before"), ("tool", "result"), ("user", "after"),
     ]
+
+
+def test_anthropic_tool_result_preserves_images_for_gateway_staging():
+    from src.translator import anthropic_to_openai
+    result = anthropic_to_openai({"model": "m", "messages": [{"role": "user", "content": [{
+        "type": "tool_result",
+        "tool_use_id": "call_1",
+        "content": [
+            {"type": "text", "text": "screenshot"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+        ],
+    }]}]})
+    tool = result["messages"][0]
+    assert tool["role"] == "tool"
+    assert tool["content"][0] == {"type": "text", "text": "screenshot"}
+    assert tool["content"][1]["image_url"]["url"] == "data:image/png;base64,AAAA"
+    assert server_module._image_count(result) == 1
+
+
+def test_responses_tool_output_preserves_images_for_gateway_staging():
+    from src.responses import responses_to_chat
+    result = responses_to_chat({"input": [{
+        "type": "function_call_output",
+        "call_id": "call_1",
+        "output": [
+            {"type": "input_text", "text": "screenshot"},
+            {"type": "input_text", "text": {"page": 2}},
+            {"type": "input_file", "filename": "report.pdf"},
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+        ],
+    }]})
+    tool = result["messages"][0]
+    assert tool["role"] == "tool"
+    assert tool["content"][0] == {"type": "text", "text": "screenshot"}
+    assert tool["content"][1] == {"type": "text", "text": '{"page": 2}'}
+    assert tool["content"][2] == {"type": "text", "text": "[file: report.pdf]"}
+    assert tool["content"][3]["image_url"]["url"] == "data:image/png;base64,AAAA"
+    assert server_module._image_count(result) == 1
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")

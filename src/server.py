@@ -86,6 +86,8 @@ app = FastAPI(title="Model Gateway", lifespan=_lifespan)
 app.include_router(admin_router)
 
 DEFAULT_VISION_FALLBACK_MODEL = "qwen3.7-plus-fw"
+DEFAULT_COMPOSITE_IMAGE_MAX_BYTES = 20_000_000
+DEFAULT_COMPOSITE_IMAGE_TOTAL_MAX_BYTES = 32_000_000
 DEFAULT_FIREWORKS_IMAGE_MAX_BYTES = 1_000_000
 DEFAULT_FIREWORKS_IMAGE_MAX_DIMENSION = 1600
 DEFAULT_FIREWORKS_IMAGE_TOTAL_MAX_BYTES = 8_000_000
@@ -743,8 +745,14 @@ def _strip_gateway_controls(body: dict) -> None:
             body.pop("model_gateway", None)
 
 
-def _resolve_vision_fallback(original_model: str, error_factory=_error_openai):
-    fallback_model = os.environ.get("GATEWAY_VISION_FALLBACK", DEFAULT_VISION_FALLBACK_MODEL).strip()
+def _resolve_vision_fallback(original_model: str, info, error_factory=_error_openai):
+    composite = getattr(info, "composite", None)
+    if composite is not None:
+        # Logical composites are deliberately scoped and local-only. Never let
+        # their image turns escape through the process-wide/cloud fallback.
+        fallback_model = composite.vision_model
+    else:
+        fallback_model = os.environ.get("GATEWAY_VISION_FALLBACK", DEFAULT_VISION_FALLBACK_MODEL).strip()
     if not fallback_model:
         return None, None, error_factory(
             400,
@@ -762,8 +770,7 @@ def _resolve_vision_fallback(original_model: str, error_factory=_error_openai):
             502,
             "api_error",
             f"Vision fallback model '{fallback_model}' is not available; "
-            f"cannot route image input for text-only model '{original_model}'. "
-            f"Set GATEWAY_VISION_FALLBACK to a resolvable vision-capable model.",
+            f"cannot route image input for text-only model '{original_model}'.",
         )
     if not fallback_info.vision:
         log.error(
@@ -775,16 +782,23 @@ def _resolve_vision_fallback(original_model: str, error_factory=_error_openai):
             502,
             "api_error",
             f"Vision fallback model '{fallback_model}' is not vision-capable; "
-            f"cannot route image input for text-only model '{original_model}'. "
-            f"Set GATEWAY_VISION_FALLBACK to a vision-capable model.",
+            f"cannot route image input for text-only model '{original_model}'.",
+        )
+    if composite is not None and fallback_info.provider != "omlx":
+        return None, None, error_factory(
+            502,
+            "api_error",
+            f"Composite vision model '{fallback_model}' must use local oMLX.",
         )
     return fallback_model, fallback_info, None
 
 
-def _replace_images_with_extracted_text(body: dict, observations: str, vision_model: str) -> dict:
+def _replace_images_with_extracted_text(
+    body: dict, observations: str | list[str], vision_model: str,
+) -> dict:
     rewritten = copy.deepcopy(body)
-    observation_text = observations.strip()
-    if not observation_text:
+    observation_list = [observations] if isinstance(observations, str) else list(observations)
+    if not observation_list or any(not str(observation).strip() for observation in observation_list):
         raise ValueError("Vision extraction returned empty observations")
     image_index = 0
     messages = []
@@ -799,6 +813,9 @@ def _replace_images_with_extracted_text(body: dict, observations: str, vision_mo
         updated_parts = []
         for part in content:
             if isinstance(part, dict) and (part.get("type") in {"image", "image_url"} or "image_url" in part):
+                if image_index >= len(observation_list):
+                    raise ValueError("Vision observation count does not match image count")
+                observation_text = str(observation_list[image_index]).strip()
                 image_index += 1
                 note = (
                     f"[Image observations from vision model {vision_model}; image {image_index}. "
@@ -811,10 +828,22 @@ def _replace_images_with_extracted_text(body: dict, observations: str, vision_mo
         updated = dict(message)
         updated["content"] = updated_parts
         messages.append(updated)
-    if image_index != 1:
-        raise ValueError("extract_then_answer requires exactly one replaceable image")
+    if image_index != len(observation_list):
+        raise ValueError("Vision observation count does not match image count")
     rewritten["messages"] = messages
     return rewritten
+
+
+def _inline_image_size(part: dict) -> int:
+    image_url = part.get("image_url")
+    url = image_url.get("url") if isinstance(image_url, dict) else image_url
+    if not isinstance(url, str) or not url.startswith("data:image/") or ";base64," not in url:
+        raise ValueError("Local composite vision accepts only inline data:image/...;base64 images")
+    encoded = url.split(";base64,", 1)[1]
+    try:
+        return len(base64.b64decode(encoded, validate=True))
+    except (ValueError, TypeError) as exc:
+        raise ValueError("Local composite vision received malformed base64 image data") from exc
 
 
 async def _extract_image_observations(
@@ -823,9 +852,13 @@ async def _extract_image_observations(
     fallback_model: str,
     fallback_info,
     error_factory=_error_openai,
-) -> str | JSONResponse:
+    *,
+    max_images: int = 1,
+    require_inline_images: bool = False,
+) -> list[str] | JSONResponse:
     # Extraction is an explicit cross-model boundary. Send only image blocks,
-    # never the surrounding conversation, tools, or user text.
+    # never the surrounding conversation, tools, or user text. Extract each
+    # image separately so observations remain aligned with its original place.
     image_parts = []
     for message in body.get("messages", []) or []:
         content = message.get("content", []) if isinstance(message, dict) else []
@@ -834,25 +867,21 @@ async def _extract_image_observations(
         for part in content:
             if isinstance(part, dict) and (part.get("type") in {"image", "image_url"} or "image_url" in part):
                 image_parts.append(copy.deepcopy(part))
-    if len(image_parts) != 1:
+    if not 1 <= len(image_parts) <= max_images:
         return error_factory(
             400,
             "invalid_request_error",
-            "extract_then_answer currently requires exactly one image; use reroute for multi-image requests.",
+            f"extract_then_answer accepts 1 through {max_images} images per request.",
         )
-    extraction_body = {
-        "model": fallback_info.provider_model_id,
-        "messages": [
-            {"role": "system", "content": VISION_OBSERVATION_PROMPT},
-            {"role": "user", "content": image_parts},
-        ],
-        "stream": False,
-        "max_tokens": 1800,
-    }
-    _inject_openai_system_instruction(extraction_body, fallback_info.system_instruction)
-    _strip_fireworks_unsupported_message_fields(extraction_body, fallback_info)
-    _compress_fireworks_inline_images(extraction_body, fallback_info)
-    _remap_max_tokens_for_provider(extraction_body, fallback_info.provider)
+    if require_inline_images:
+        try:
+            sizes = [_inline_image_size(part) for part in image_parts]
+        except ValueError as exc:
+            return error_factory(400, "invalid_request_error", str(exc))
+        if any(size > DEFAULT_COMPOSITE_IMAGE_MAX_BYTES for size in sizes):
+            return error_factory(413, "invalid_request_error", "A local composite image exceeds the per-image byte limit.")
+        if sum(sizes) > DEFAULT_COMPOSITE_IMAGE_TOTAL_MAX_BYTES:
+            return error_factory(413, "invalid_request_error", "Local composite images exceed the total byte limit.")
     if fallback_info.protocol == "anthropic":
         return error_factory(502, "api_error", f"Vision fallback model '{fallback_model}' does not support Chat Completions")
 
@@ -867,35 +896,70 @@ async def _extract_image_observations(
         else:
             del request.state.api_key
     endpoint = _upstream_endpoint(fallback_info, "/chat/completions")
-    start = time.time()
+    results: list[str] = []
     async with httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS) as client:
-        try:
-            resp = await client.post(endpoint, json=extraction_body, headers=headers)
-        except httpx.ConnectError:
-            return error_factory(502, "api_error", "Cannot connect to cloud provider")
-        except Exception as exc:  # noqa: BLE001
-            return error_factory(502, "api_error", f"Vision fallback request failed: {type(exc).__name__}")
-    latency_ms = int((time.time() - start) * 1000)
-    try:
-        data = resp.json()
-    except Exception:  # noqa: BLE001
-        data = {}
-    usage = data.get("usage") if isinstance(data, dict) and isinstance(data.get("usage"), dict) else None
-    _ledger_record(
-        "/internal/image-extract", "POST", fallback_model, fallback_info.provider,
-        fallback_info.provider_model_id, resp.status_code, latency_ms, False, usage, pricing_for(fallback_model),
-    )
-    if resp.status_code >= 400:
-        return error_factory(502, "api_error", f"Vision fallback provider returned HTTP {resp.status_code}")
-    message = ((data.get("choices") or [{}])[0].get("message") or {}) if isinstance(data, dict) else {}
-    content = message.get("content", "")
-    if isinstance(content, list):
-        result = "\n".join(str(part.get("text", "")) for part in content if isinstance(part, dict)).strip()
-    else:
-        result = str(content).strip()
-    if not result:
-        return error_factory(502, "api_error", "Vision fallback returned empty observations")
-    return result
+        for image_index, image_part in enumerate(image_parts, start=1):
+            extraction_body = {
+                "model": fallback_info.provider_model_id,
+                "messages": [
+                    {"role": "system", "content": VISION_OBSERVATION_PROMPT},
+                    {"role": "user", "content": [image_part]},
+                ],
+                "stream": False,
+                "max_tokens": 1800,
+            }
+            _inject_openai_system_instruction(extraction_body, fallback_info.system_instruction)
+            _strip_fireworks_unsupported_message_fields(extraction_body, fallback_info)
+            _compress_fireworks_inline_images(extraction_body, fallback_info)
+            _remap_max_tokens_for_provider(extraction_body, fallback_info.provider)
+            start = time.time()
+            try:
+                resp = await client.post(endpoint, json=extraction_body, headers=headers)
+            except httpx.ConnectError:
+                return error_factory(502, "api_error", "Cannot connect to vision model provider")
+            except Exception as exc:  # noqa: BLE001
+                return error_factory(502, "api_error", f"Vision fallback request failed: {type(exc).__name__}")
+            latency_ms = int((time.time() - start) * 1000)
+            try:
+                data = resp.json()
+            except Exception:  # noqa: BLE001
+                data = {}
+            usage = data.get("usage") if isinstance(data, dict) and isinstance(data.get("usage"), dict) else None
+            _ledger_record(
+                "/internal/image-extract", "POST", fallback_model, fallback_info.provider,
+                fallback_info.provider_model_id, resp.status_code, latency_ms, False, usage, pricing_for(fallback_model),
+            )
+            if resp.status_code >= 400:
+                return error_factory(
+                    502, "api_error",
+                    f"Vision fallback provider returned HTTP {resp.status_code} for image {image_index}.",
+                )
+            choice = (data.get("choices") or [{}])[0] if isinstance(data, dict) else {}
+            finish_reason = choice.get("finish_reason") if isinstance(choice, dict) else None
+            if finish_reason not in {"stop", "end_turn"}:
+                return error_factory(
+                    502,
+                    "api_error",
+                    f"Vision fallback did not complete image {image_index} (finish_reason={finish_reason}).",
+                )
+            message = (choice.get("message") or {}) if isinstance(choice, dict) else {}
+            content = message.get("content", "")
+            if isinstance(content, list):
+                valid_text_parts = bool(content) and all(
+                    isinstance(part, dict)
+                    and part.get("type") in {"text", "output_text"}
+                    and isinstance(part.get("text"), str)
+                    for part in content
+                )
+                result = "\n".join(part["text"] for part in content).strip() if valid_text_parts else ""
+            elif isinstance(content, str):
+                result = content.strip()
+            else:
+                result = ""
+            if not result:
+                return error_factory(502, "api_error", f"Vision fallback returned empty observations for image {image_index}.")
+            results.append(result)
+    return results
 
 
 async def _apply_chat_vision_fallback(
@@ -907,7 +971,9 @@ async def _apply_chat_vision_fallback(
     error_factory=_error_openai,
 ):
     """Apply staged vision handling to a Chat-shaped request."""
-    mode = _gateway_image_handling_mode(request, body) or "reroute"
+    composite = getattr(info, "composite", None)
+    default_mode = composite.image_handling if composite is not None else "reroute"
+    mode = _gateway_image_handling_mode(request, body) or default_mode
     _strip_gateway_controls(body)
     if mode not in {"reroute", IMAGE_HANDLING_EXTRACT_THEN_ANSWER}:
         return body, requested_model, info, error_factory(
@@ -935,13 +1001,19 @@ async def _apply_chat_vision_fallback(
             log.info("vision_fallback endpoint=%s requested=%s served=%s mode=native outcome=bypass image_count=%d", endpoint_name, requested_model, requested_model, image_count)
         return body, requested_model, info, None
 
-    fallback_model, fallback_info, error = _resolve_vision_fallback(requested_model, error_factory)
+    fallback_model, fallback_info, error = _resolve_vision_fallback(requested_model, info, error_factory)
     if error:
         log.info("vision_fallback endpoint=%s requested=%s served=none mode=%s outcome=rejected image_count=%d", endpoint_name, requested_model, mode, image_count)
         return body, requested_model, info, error
     if mode == IMAGE_HANDLING_EXTRACT_THEN_ANSWER:
         observations = await _extract_image_observations(
-            request, body, fallback_model, fallback_info, error_factory,
+            request,
+            body,
+            fallback_model,
+            fallback_info,
+            error_factory,
+            max_images=composite.max_images if composite is not None else 1,
+            require_inline_images=composite is not None,
         )
         if isinstance(observations, JSONResponse):
             return body, requested_model, info, observations

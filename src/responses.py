@@ -138,11 +138,48 @@ def responses_to_chat(body: dict) -> dict:
                     log.warning("signature_cache: NO cached thought_signature for function_call %s (%s) — Gemini may reject", item.get("call_id", ""), item.get("name", ""))
 
             elif item_type == "function_call_output":
-                # Tool result back to the model
+                # Tool result back to the model. Preserve image parts so the
+                # gateway can stage them through a logical vision companion.
+                output = item.get("output", "")
+                if isinstance(output, list):
+                    chat_parts = []
+                    has_image = False
+                    for part in output:
+                        if not isinstance(part, dict):
+                            chat_parts.append({"type": "text", "text": json.dumps(part)})
+                            continue
+                        part_type = part.get("type", "")
+                        if part_type in {"input_text", "output_text", "text"}:
+                            text = part.get("text", "")
+                            if not isinstance(text, str):
+                                text = json.dumps(text, sort_keys=True)
+                            chat_parts.append({"type": "text", "text": text})
+                        elif part_type in {"input_image", "image_url"}:
+                            image_url = part.get("image_url")
+                            if isinstance(image_url, str) and image_url:
+                                chat_parts.append({"type": "image_url", "image_url": {"url": image_url}})
+                                has_image = True
+                            elif part.get("file_id"):
+                                chat_parts.append({"type": "unsupported_input_image_file", "file_id": part["file_id"]})
+                                has_image = True
+                            else:
+                                chat_parts.append({"type": "text", "text": json.dumps(part, sort_keys=True)})
+                        elif part_type == "input_file":
+                            file_label = part.get("filename") or part.get("file_id") or "unknown"
+                            chat_parts.append({"type": "text", "text": f"[file: {file_label}]"})
+                        else:
+                            chat_parts.append({"type": "text", "text": json.dumps(part, sort_keys=True)})
+                    output = (
+                        chat_parts
+                        if has_image
+                        else "\n".join(part["text"] for part in chat_parts)
+                    )
+                elif not isinstance(output, str):
+                    output = json.dumps(output)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": item.get("call_id", ""),
-                    "content": item.get("output", "") if isinstance(item.get("output"), str) else json.dumps(item.get("output", "")),
+                    "content": output,
                 })
 
     # Build Chat Completions request

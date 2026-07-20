@@ -92,13 +92,31 @@ def anthropic_to_openai(body: dict) -> dict:
                     flush_pending()
                     tr_content = block.get("content", "")
                     if isinstance(tr_content, list):
-                        tr_content = " ".join(
-                            item.get("text", "") for item in tr_content if item.get("type") == "text"
+                        tool_parts = []
+                        has_image = False
+                        for item in tr_content:
+                            if not isinstance(item, dict):
+                                continue
+                            if item.get("type") == "text":
+                                tool_parts.append({"type": "text", "text": item.get("text", "")})
+                            elif item.get("type") == "image":
+                                source = item.get("source", {})
+                                if source.get("type") == "url" and source.get("url"):
+                                    image_url = source["url"]
+                                else:
+                                    media_type = source.get("media_type", "image/png")
+                                    image_url = f"data:{media_type};base64,{source.get('data', '')}"
+                                tool_parts.append({"type": "image_url", "image_url": {"url": image_url}})
+                                has_image = True
+                        tr_content = (
+                            tool_parts
+                            if has_image
+                            else "\n".join(part["text"] for part in tool_parts)
                         )
                     messages.append({
                         "role": "tool",
                         "tool_call_id": block["tool_use_id"],
-                        "content": str(tr_content),
+                        "content": tr_content if isinstance(tr_content, list) else str(tr_content),
                     })
             flush_pending()
 

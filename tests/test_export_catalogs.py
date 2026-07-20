@@ -79,6 +79,39 @@ def test_renders_alias_file(tmp_path):
     assert cloud_entry["provider_model_id"] == "glm-5.2-zai"
 
 
+def test_composite_exports_as_ordinary_local_vision_alias(tmp_path):
+    mi = tmp_path / "model-info.json"
+    _write_model_info(mi, [{
+        "name": "best-local",
+        "alias": "best-local",
+        "provider": "omlx",
+        "omlx_id": "best-local",
+        "vision": True,
+        "context": 202752,
+        "max_output_tokens": 32768,
+        "thinking": "always",
+        "thinking_format": "glm-chat-template",
+        "composite": {
+            "text_model": "glm-5.2-4.5bit",
+            "vision_model": "gemma4-31b",
+            "image_handling": "extract_then_answer",
+            "max_images": 4,
+        },
+    }])
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(f"exports:\n  model_aliases: {tmp_path}/aliases.json\n")
+
+    result = _run(cfg, mi)
+
+    assert result.returncode == 0, result.stderr
+    entry = json.loads((tmp_path / "aliases.json").read_text())["best-local"]
+    assert entry["alias"] == "best-local"
+    assert entry["vision"] is True
+    assert entry["thinking_format"] == "glm-chat-template"
+    assert entry["context"] == 202752
+    assert "composite" not in entry
+
+
 def test_relative_api_key_file_uses_selected_config_target(tmp_path):
     real_dir = tmp_path / "shared"
     real_dir.mkdir()
