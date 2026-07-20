@@ -10,6 +10,7 @@ Run:  cd model-gateway && uv run pytest
 import asyncio
 import base64
 import io
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -468,19 +469,19 @@ def test_fireworks_inline_image_compression(monkeypatch):
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
-def test_chat_completions_image_request_extracts_then_answers_with_original_model(client, monkeypatch):
+def test_chat_completions_image_request_extracts_then_answers_with_opt_in_fallback(client, monkeypatch):
     text_info = _info("none", thinking="", provider="test", provider_model_id="text-upstream")
     fallback_info = _info("", thinking="optional", provider="test", provider_model_id="vision-upstream", vision=True)
 
     def fake_resolve(model):
         if model == "text-model":
             return text_info
-        if model == server_module.DEFAULT_VISION_FALLBACK_MODEL:
+        if model == "vision-fallback":
             return fallback_info
         return None
 
     async def fake_extract(request, body, fallback_model, fallback, error_factory, **kwargs):
-        assert fallback_model == server_module.DEFAULT_VISION_FALLBACK_MODEL
+        assert fallback_model == "vision-fallback"
         assert fallback is fallback_info
         assert server_module._payload_has_image(body)
         assert kwargs == {"max_images": 1, "require_inline_images": False}
@@ -497,7 +498,7 @@ def test_chat_completions_image_request_extracts_then_answers_with_original_mode
         assert "model_gateway" not in body
         return server_module.JSONResponse(status_code=200, content={"ok": True})
 
-    monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
     monkeypatch.setattr(server_module, "resolve", fake_resolve)
     monkeypatch.setattr(server_module, "_extract_image_observations", fake_extract)
     monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough_sync)
@@ -625,8 +626,183 @@ def test_composite_staging_is_consistent_across_api_translations(monkeypatch, en
     assert "visible terminal" in str(rewritten["messages"])
 
 
+@pytest.mark.parametrize(
+    ("headers", "controls"),
+    [
+        ({"x-gateway-image-handling": "reroute"}, {}),
+        ({}, {"gateway_image_handling": "reroute"}),
+        ({}, {"model_gateway": {"image_handling": "reroute"}}),
+    ],
+)
+def test_composite_rejects_client_image_handling_override(headers, controls):
+    text_info = _info("glm-chat-template", provider="omlx", provider_model_id="glm-upstream")
+    text_info.composite = providers.CompositeRoute(
+        text_model="glm-local",
+        vision_model="gemma-local",
+        image_handling="extract_then_answer",
+        max_images=4,
+    )
+    body = {
+        "model": "best-local",
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]}],
+        **controls,
+    }
+    request = SimpleNamespace(headers=headers, state=SimpleNamespace())
+
+    rewritten, served_model, served_info, error = asyncio.run(
+        server_module._apply_chat_vision_fallback(
+            request, body, "best-local", text_info, "/v1/chat/completions",
+        )
+    )
+
+    assert error.status_code == 400
+    assert b"client overrides are not allowed" in error.body
+    assert served_model == "best-local"
+    assert served_info is text_info
+    assert "gateway_image_handling" not in rewritten
+    assert "model_gateway" not in rewritten
+
+
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
-def test_chat_completions_image_request_uses_fireworks_default_vision_fallback(client, monkeypatch):
+@pytest.mark.parametrize("endpoint", ["/v1/chat/completions", "/v1/responses", "/v1/messages"])
+@pytest.mark.parametrize("control", ["header", "body", "nested"])
+def test_composite_override_is_rejected_across_api_routes(
+    client, monkeypatch, endpoint, control,
+):
+    text_info = _info("glm-chat-template", provider="omlx", provider_model_id="glm-upstream")
+    text_info.composite = providers.CompositeRoute(
+        text_model="glm-local",
+        vision_model="gemma-local",
+        image_handling="extract_then_answer",
+        max_images=4,
+    )
+    monkeypatch.setattr(server_module, "resolve", lambda model: text_info)
+
+    headers = {}
+    if endpoint == "/v1/responses":
+        payload = {"model": "best-local", "input": [{
+            "type": "message", "role": "user", "content": [
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+            ],
+        }]}
+    elif endpoint == "/v1/messages":
+        payload = {"model": "best-local", "max_tokens": 32, "messages": [{
+            "role": "user", "content": [{
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"},
+            }],
+        }]}
+    else:
+        payload = {"model": "best-local", "messages": [{
+            "role": "user", "content": [{
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,AAAA"},
+            }],
+        }]}
+
+    if control == "header":
+        headers["x-gateway-image-handling"] = "reroute"
+    elif control == "body":
+        payload["gateway_image_handling"] = "reroute"
+    else:
+        payload["model_gateway"] = {"image_handling": "reroute"}
+
+    response = client.post(endpoint, headers=headers, json=payload)
+
+    assert response.status_code == 400
+    assert "client overrides are not allowed" in response.json()["error"]["message"]
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+@pytest.mark.parametrize("control", ["body", "nested", "nested-extra", "nondict"])
+@pytest.mark.parametrize("with_image", [False, True], ids=["text", "native-vision"])
+def test_native_anthropic_body_controls_do_not_trigger_staging_or_forward(
+    client, monkeypatch, control, with_image,
+):
+    native = _info(
+        "anthropic", provider="anthropic", provider_model_id="claude-native",
+        vision=with_image,
+    )
+    native.protocol = "anthropic"
+    monkeypatch.setattr(server_module, "resolve", lambda model: native)
+
+    async def fake_passthrough(endpoint, body, headers, **kwargs):
+        assert "gateway_image_handling" not in body
+        assert "model_gateway" not in body
+        return server_module.JSONResponse(status_code=200, content={"ok": True})
+
+    monkeypatch.setattr(server_module, "_passthrough_anthropic_sync", fake_passthrough)
+    content = [{"type": "text", "text": "hello"}]
+    if with_image:
+        content.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"},
+        })
+    payload = {
+        "model": "claude-native",
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": content}],
+    }
+    if control == "body":
+        payload["gateway_image_handling"] = "reroute"
+    elif control == "nested":
+        payload["model_gateway"] = {"image_handling": "reroute"}
+    elif control == "nested-extra":
+        payload["model_gateway"] = {"image_handling": "reroute", "trace": "private"}
+    else:
+        payload["model_gateway"] = "invalid"
+
+    response = client.post("/v1/messages", json=payload)
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+@pytest.mark.parametrize("control", ["body", "nested", "nested-extra", "nondict"])
+def test_native_openai_responses_body_controls_are_not_forwarded(
+    client, monkeypatch, control,
+):
+    native = _info(
+        "openai-responses", provider="openai", provider_model_id="gpt-native",
+        vision=True,
+    )
+    monkeypatch.setattr(server_module, "resolve", lambda model: native)
+
+    async def fake_passthrough(endpoint, body, headers, is_stream, **kwargs):
+        assert "gateway_image_handling" not in body
+        assert "model_gateway" not in body
+        return server_module.JSONResponse(status_code=200, content={"ok": True})
+
+    monkeypatch.setattr(
+        server_module, "_handle_openai_responses_passthrough", fake_passthrough,
+    )
+    payload = {
+        "model": "gpt-native",
+        "input": [{
+            "type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}],
+        }],
+    }
+    if control == "body":
+        payload["gateway_image_handling"] = "reroute"
+    elif control == "nested":
+        payload["model_gateway"] = {"image_handling": "reroute"}
+    elif control == "nested-extra":
+        payload["model_gateway"] = {"image_handling": "reroute", "trace": "private"}
+    else:
+        payload["model_gateway"] = "invalid"
+
+    response = client.post("/v1/responses", json=payload)
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_chat_completions_image_request_uses_explicit_cloud_vision_fallback(client, monkeypatch):
     text_info = _info("none", thinking="", provider="test", provider_model_id="text-upstream")
     fallback_info = _info(
         "",
@@ -639,7 +815,7 @@ def test_chat_completions_image_request_uses_fireworks_default_vision_fallback(c
     def fake_resolve(model):
         if model == "text-model":
             return text_info
-        if model == server_module.DEFAULT_VISION_FALLBACK_MODEL:
+        if model == "cloud-vision":
             return fallback_info
         return None
 
@@ -652,7 +828,7 @@ def test_chat_completions_image_request_uses_fireworks_default_vision_fallback(c
         assert "reasoning_content" not in body["messages"][0]
         return server_module.JSONResponse(status_code=200, content={"ok": True})
 
-    monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "cloud-vision")
     monkeypatch.setattr(server_module, "resolve", fake_resolve)
     monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough_sync)
 
@@ -676,6 +852,132 @@ def test_chat_completions_image_request_uses_fireworks_default_vision_fallback(c
 
     assert resp.status_code == 200
     assert resp.json() == {"ok": True}
+
+
+def test_lifespan_validates_vision_policy_before_initialization(monkeypatch):
+    def reject_policy():
+        raise RuntimeError("invalid vision policy")
+
+    monkeypatch.setattr(server_module, "_validate_vision_fallback_policy", reject_policy)
+
+    async def enter_lifespan():
+        async with server_module._lifespan(server_module.app):
+            pytest.fail("invalid policy must prevent startup")
+
+    with pytest.raises(RuntimeError, match="invalid vision policy"):
+        asyncio.run(enter_lifespan())
+
+
+def test_startup_vision_fallback_disabled_by_default(monkeypatch, caplog):
+    monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
+    monkeypatch.setattr(
+        server_module,
+        "resolve",
+        lambda model: pytest.fail(f"disabled policy must not resolve {model}"),
+    )
+
+    with caplog.at_level(logging.INFO, logger="model-gateway"):
+        server_module._validate_vision_fallback_policy()
+
+    assert "vision fallback policy: disabled" in caplog.text
+    assert "fails closed" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("fallback_info", "message"),
+    [
+        (None, "is not resolvable"),
+        (_info("none", provider="omlx", vision=False), "is not vision-capable"),
+    ],
+)
+def test_startup_rejects_invalid_opt_in_vision_fallback(
+    monkeypatch, fallback_info, message,
+):
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "bad-fallback")
+    monkeypatch.setattr(server_module, "resolve", lambda model: fallback_info)
+
+    with pytest.raises(RuntimeError, match=message):
+        server_module._validate_vision_fallback_policy()
+
+
+def test_startup_rejects_protocol_incompatible_vision_fallback(monkeypatch):
+    fallback_info = _info("none", provider="anthropic", vision=True)
+    fallback_info.protocol = "anthropic"
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "anthropic-vision")
+    monkeypatch.setattr(server_module, "resolve", lambda model: fallback_info)
+
+    with pytest.raises(RuntimeError, match="OpenAI-compatible protocol"):
+        server_module._validate_vision_fallback_policy()
+
+
+def test_startup_rejects_mixed_local_cloud_fallback_pool(monkeypatch):
+    infos = {
+        "omlx": _info("none", provider="omlx", vision=True),
+        "fireworks": _info("none", provider="fireworks", vision=True),
+    }
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "mixed-vision")
+    monkeypatch.setattr(server_module, "pool_candidates", lambda model: list(infos))
+    monkeypatch.setattr(
+        server_module,
+        "resolve",
+        lambda model, provider_override=None: infos[provider_override],
+    )
+
+    with pytest.raises(RuntimeError, match="mixes local and cloud providers"):
+        server_module._validate_vision_fallback_policy()
+
+
+def test_request_revalidates_opt_in_fallback_policy(monkeypatch):
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
+
+    def reject_policy(**kwargs):
+        assert kwargs == {"log_policy": False}
+        raise RuntimeError("mixed locality")
+
+    monkeypatch.setattr(server_module, "_validate_vision_fallback_policy", reject_policy)
+
+    _, _, error = server_module._resolve_vision_fallback(
+        "text-model", _info("none", provider="omlx", vision=False),
+    )
+
+    assert error.status_code == 502
+    assert b"Vision fallback policy is invalid: mixed locality" in error.body
+
+
+def test_startup_rejects_composite_as_global_vision_fallback(monkeypatch):
+    composite_info = _info("none", provider="omlx", vision=True)
+    composite_info.composite = providers.CompositeRoute(
+        text_model="text-local",
+        vision_model="vision-local",
+        image_handling="extract_then_answer",
+        max_images=4,
+    )
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "best-local")
+    monkeypatch.setattr(
+        server_module, "resolve", lambda model, provider_override=None: composite_info,
+    )
+
+    with pytest.raises(RuntimeError, match="not a composite"):
+        server_module._validate_vision_fallback_policy()
+
+
+@pytest.mark.parametrize(
+    ("provider", "cloud_egress", "level"),
+    [("omlx", "false", logging.INFO), ("fireworks", "true", logging.WARNING)],
+)
+def test_startup_logs_effective_opt_in_vision_policy(
+    monkeypatch, caplog, provider, cloud_egress, level,
+):
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
+    fallback_info = _info("none", provider=provider, vision=True)
+    monkeypatch.setattr(server_module, "resolve", lambda model: fallback_info)
+
+    with caplog.at_level(level, logger="model-gateway"):
+        server_module._validate_vision_fallback_policy()
+
+    assert "vision fallback policy: enabled model=vision-fallback" in caplog.text
+    assert f"providers={provider}" in caplog.text
+    assert f"cloud_egress={cloud_egress}" in caplog.text
 
 
 def test_replace_image_preserves_order_and_all_content():
@@ -1090,8 +1392,12 @@ def test_invalid_image_handling_mode_is_rejected(client, monkeypatch):
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
-def test_chat_text_only_image_fails_closed_when_fallback_empty(client, monkeypatch):
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "")
+@pytest.mark.parametrize("fallback_env", [None, ""], ids=["unset", "empty"])
+def test_chat_text_only_image_fails_closed_by_default(client, monkeypatch, fallback_env):
+    if fallback_env is None:
+        monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
+    else:
+        monkeypatch.setenv("GATEWAY_VISION_FALLBACK", fallback_env)
     monkeypatch.setattr(server_module, "resolve", lambda model: _info("none", provider="test", vision=False))
     response = client.post("/v1/chat/completions", json={
         "model": "text-model", "messages": [{"role": "user", "content": [
@@ -1100,6 +1406,9 @@ def test_chat_text_only_image_fails_closed_when_fallback_empty(client, monkeypat
     })
     assert response.status_code == 400
     assert set(response.json()) == {"error"}
+    message = response.json()["error"]["message"]
+    assert "text-only" in message
+    assert "GATEWAY_VISION_FALLBACK=<model>" in message
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")

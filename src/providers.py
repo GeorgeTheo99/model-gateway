@@ -2,21 +2,44 @@
 
 import asyncio
 import base64
+import copy
 import json
 import logging
 import os
 import re
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from functools import wraps
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 import yaml
 
 from src import catalog
+from src.config_lock import config_write_lock
 from src.secret_files import read_api_key_file
 
 log = logging.getLogger("model-gateway")
+
+_registry_lock = threading.RLock()
+
+
+def _registry_locked(function):
+    """Keep readers from observing a candidate registry before validation."""
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        with _registry_lock:
+            return function(*args, **kwargs)
+    return wrapped
+
+
+@contextmanager
+def registry_transaction():
+    """Serialize registry replacement with all registry-backed readers."""
+    with _registry_lock:
+        yield
 
 
 # model-info.json is the gateway-owned source of truth. Allow the path to be
@@ -107,24 +130,25 @@ def _canonical_provider(provider: str | None) -> str:
     return catalog.canonical_provider(provider)
 
 
-def _find_provider_entry(config: dict, provider: str) -> tuple[str, dict] | None:
-    """Return (config_key, entry) for a provider, matching canonical synonyms.
-
-    Searches both the ``providers:`` section and the ``workspaces:`` alias
-    section (same schema; "workspace" is the operator-facing name for a
-    Databricks upstream in the pools design).
-    """
+def _find_provider_location(config: dict, provider: str) -> tuple[str, str, dict] | None:
+    """Return (section, config_key, entry), matching canonical synonyms."""
     for section in ("providers", "workspaces"):
-        providers = config.get(section, {}) or {}
-        if not isinstance(providers, dict):
+        entries = config.get(section, {}) or {}
+        if not isinstance(entries, dict):
             continue
-        direct = providers.get(provider)
+        direct = entries.get(provider)
         if direct:
-            return provider, direct
-        for key, value in providers.items():
+            return section, provider, direct
+        for key, value in entries.items():
             if _canonical_provider(key) == provider:
-                return key, value or {}
+                return section, key, value or {}
     return None
+
+
+def _find_provider_entry(config: dict, provider: str) -> tuple[str, dict] | None:
+    """Return (config_key, entry) for a provider, matching canonical synonyms."""
+    found = _find_provider_location(config, provider)
+    return (found[1], found[2]) if found else None
 
 
 def _pools(config: dict) -> dict[str, list[str]]:
@@ -251,6 +275,7 @@ def _effective_provider_config(config: dict, provider: str) -> dict:
     return effective
 
 
+@_registry_locked
 def _load_config() -> dict:
     global _config
     if _config is not None:
@@ -268,6 +293,7 @@ def _entry_routable_ids(entry: dict) -> list[str]:
     return catalog.entry_routable_ids(entry)
 
 
+@_registry_locked
 def _load_models() -> dict[str, dict]:
     """Load routable models from model-info.json (keyed by name/alias/id).
 
@@ -292,6 +318,7 @@ def _load_models() -> dict[str, dict]:
     return _models
 
 
+@_registry_locked
 def routable_ids(name: str) -> list[str]:
     """Return every identifier that routes to the named model.
 
@@ -305,6 +332,7 @@ def routable_ids(name: str) -> list[str]:
     return sorted(_entry_routable_ids(entry))
 
 
+@_registry_locked
 def provider_quirks(provider: str) -> frozenset:
     """Return the quirk set for a provider from live runtime config.
 
@@ -319,6 +347,7 @@ def provider_quirks(provider: str) -> frozenset:
     return frozenset(quirks_raw)
 
 
+@_registry_locked
 def auth_config() -> dict:
     """Return the live ``auth`` section from config.yaml.
 
@@ -329,6 +358,7 @@ def auth_config() -> dict:
     return _load_config().get("auth") or {}
 
 
+@_registry_locked
 def model_overrides() -> dict:
     """Return the live ``model_overrides`` section from config.yaml.
 
@@ -357,6 +387,20 @@ def _is_model_enabled(name: str | None) -> bool:
     return True
 
 
+@_registry_locked
+def snapshot_registry() -> tuple[dict, dict[str, dict]]:
+    """Capture the loaded registry so a rejected admin reload can roll back."""
+    return _load_config(), _load_models()
+
+
+@_registry_locked
+def restore_registry(snapshot: tuple[dict, dict[str, dict]]) -> None:
+    """Restore a snapshot returned by :func:`snapshot_registry`."""
+    global _config, _models
+    _config, _models = snapshot
+
+
+@_registry_locked
 def reload():
     """Force reload of config and models (e.g. after config change)."""
     global _config, _models
@@ -387,47 +431,119 @@ def _jwt_expiry_epoch(token: str) -> float | None:
     return None
 
 
-def _persist_api_key(config_key: str, token: str) -> None:
-    """Write a rotated api_key back to config.yaml, preserving comments.
+def _replace_provider_api_key_line(
+    lines: list[str], section: str, config_key: str, token: str,
+) -> bool:
+    """Replace only a direct ``api_key`` child of the selected provider block."""
+    section_re = re.compile(rf"^([ \t]*){re.escape(section)}:[ \t]*(?:#.*)?$")
+    key_re = re.compile(rf"^([ \t]*){re.escape(config_key)}:[ \t]*(?:#.*)?$")
+    section_matches = []
+    for index, line in enumerate(lines):
+        match = section_re.match(line.rstrip("\n"))
+        if match and not match.group(1):
+            section_matches.append(index)
+    if len(section_matches) != 1:
+        return False
+    section_start = section_matches[0]
+    section_indent = 0
 
-    Keeps the on-disk config consistent with the in-memory one so gateway
-    restarts and any external token-refresh job agree on the token.
-    """
-    if not CONFIG_PATH.exists():
-        return
+    provider_start = None
+    provider_indent = None
+    direct_indent = None
+    for index in range(section_start + 1, len(lines)):
+        stripped = lines[index].strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(lines[index]) - len(lines[index].lstrip(" \t"))
+        if indent <= section_indent:
+            break
+        if direct_indent is None:
+            direct_indent = indent
+        if indent == direct_indent and key_re.match(lines[index].rstrip("\n")):
+            provider_start = index
+            provider_indent = indent
+            break
+    if provider_start is None or provider_indent is None:
+        return False
+
+    api_key_re = re.compile(r"^([ \t]*api_key:[ \t]*)(\S+)(.*)$")
+    field_indent = None
+    for index in range(provider_start + 1, len(lines)):
+        stripped = lines[index].strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(lines[index]) - len(lines[index].lstrip(" \t"))
+        if indent <= provider_indent:
+            break
+        if field_indent is None:
+            field_indent = indent
+        if indent != field_indent:
+            continue
+        match = api_key_re.match(lines[index].rstrip("\n"))
+        if match:
+            lines[index] = f"{match.group(1)}{token}{match.group(3)}\n"
+            return True
+    return False
+
+
+def _atomic_replace_config_text(text: str) -> None:
+    """Replace the config target without widening its secret-bearing mode."""
+    target = Path(os.path.realpath(CONFIG_PATH))
+    mode = target.stat().st_mode & 0o777 if target.exists() else 0o600
+    tmp = target.with_suffix(target.suffix + f".tmp.{os.getpid()}")
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        lines = CONFIG_PATH.read_text().splitlines(keepends=True)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, target)
+    finally:
+        tmp.unlink(missing_ok=True)
 
-        # Locate the provider's own key line and its indent.
-        key_re = re.compile(rf"^([ \t]*){re.escape(config_key)}:[ \t]*(#.*)?$")
-        start = None
-        provider_indent = ""
-        for i, line in enumerate(lines):
-            m = key_re.match(line.rstrip("\n"))
-            if m:
-                start = i
-                provider_indent = m.group(1)
-                break
-        if start is None:
-            log.warning("Could not persist refreshed api_key for %r to %s", config_key, CONFIG_PATH)
-            return
 
-        # Replace api_key only within this provider's block: lines strictly
-        # more indented than the provider key. Stop at the next sibling/parent
-        # so a missing api_key line can never clobber the NEXT provider's.
-        api_key_re = re.compile(r"^([ \t]*api_key:[ \t]*)(\S+)(.*)$")
-        for i in range(start + 1, len(lines)):
-            stripped = lines[i].strip()
-            if stripped and not lines[i].startswith(provider_indent + " ") and not lines[i].startswith(provider_indent + "\t"):
-                break  # left the provider block (sibling or parent)
-            m = api_key_re.match(lines[i].rstrip("\n"))
-            if m:
-                lines[i] = f"{m.group(1)}{token}{m.group(3)}\n"
-                CONFIG_PATH.write_text("".join(lines))
-                return
-        log.warning("Could not persist refreshed api_key for %r to %s", config_key, CONFIG_PATH)
-    except OSError as exc:
-        log.warning("Failed to persist refreshed api_key for %r: %s", config_key, exc)
+def _persist_api_key(
+    config_key: str,
+    token: str,
+    *,
+    expected_entry: dict | None = None,
+) -> bool:
+    """Compare-and-swap a rotated key under the shared config transaction."""
+    with config_write_lock(CONFIG_PATH):
+        with registry_transaction():
+            try:
+                if not CONFIG_PATH.exists():
+                    return False
+                text = CONFIG_PATH.read_text()
+                disk_config = yaml.safe_load(text) or {}
+                disk_location = _find_provider_location(disk_config, config_key)
+                cached_location = _find_provider_location(_load_config(), config_key)
+                if not disk_location or not cached_location:
+                    return False
+                section, actual_key, disk_entry = disk_location
+                if expected_entry is not None and (
+                    disk_entry != expected_entry or cached_location[2] != expected_entry
+                ):
+                    log.warning(
+                        "Discarding stale OAuth refresh for provider %r after config changed",
+                        config_key,
+                    )
+                    return False
+
+                lines = text.splitlines(keepends=True)
+                if not _replace_provider_api_key_line(lines, section, actual_key, token):
+                    log.warning(
+                        "Could not persist refreshed api_key for %r to %s",
+                        config_key,
+                        CONFIG_PATH,
+                    )
+                    return False
+                _atomic_replace_config_text("".join(lines))
+                cached_location[2]["api_key"] = token
+                return True
+            except (OSError, yaml.YAMLError) as exc:
+                log.warning("Failed to persist refreshed api_key for %r: %s", config_key, exc)
+                return False
 
 
 async def refresh_oauth_token(provider: str, *, force: bool = False) -> str | None:
@@ -450,10 +566,9 @@ async def refresh_oauth_token(provider: str, *, force: bool = False) -> str | No
     found = _find_provider_entry(config, provider)
     if not found:
         return None
-    config_key, entry = found
+    _config_key, entry = found
     if (entry.get("auth_refresh") or "") != "databricks-cli":
         return None
-    base_url = (entry.get("base_url") or "").rstrip("/")
     current = entry.get("api_key", "")
     # Only short-lived OAuth JWTs ("eyJ...") benefit; PATs never expire this way.
     if not current.startswith("eyJ"):
@@ -461,10 +576,19 @@ async def refresh_oauth_token(provider: str, *, force: bool = False) -> str | No
 
     lock = _token_refresh_locks.setdefault(provider, asyncio.Lock())
     async with lock:
-        # A concurrent request may have refreshed while we waited on the lock.
+        # Re-read after acquiring the async refresh lease. Admin reloads replace
+        # the registry while an earlier caller may be waiting here.
+        latest_found = _find_provider_entry(_load_config(), provider)
+        if not latest_found:
+            return None
+        config_key, entry = latest_found
         latest = entry.get("api_key", "")
         if latest != current:
             return latest
+        if (entry.get("auth_refresh") or "") != "databricks-cli":
+            return None
+        expected_entry = copy.deepcopy(entry)
+        base_url = (entry.get("base_url") or "").rstrip("/")
 
         now = time.monotonic()
         if not force and now - _last_token_refresh_attempt.get(provider, 0.0) < _AUTH_REFRESH_MIN_INTERVAL:
@@ -551,8 +675,10 @@ async def refresh_oauth_token(provider: str, *, force: bool = False) -> str | No
         if not token or token == current:
             return None
 
-        entry["api_key"] = token
-        _persist_api_key(config_key, token)
+        if not _persist_api_key(config_key, token, expected_entry=expected_entry):
+            latest_found = _find_provider_entry(_load_config(), provider)
+            latest = latest_found[1].get("api_key", "") if latest_found else ""
+            return latest if latest and latest != current else None
         log.warning("Refreshed expired OAuth token for provider %r via CLI token cache", provider)
         return token
 
@@ -741,15 +867,18 @@ def _availability_for_entry(model_id: str, entry: dict | None) -> dict:
     }
 
 
+@_registry_locked
 def model_availability(model_id: str) -> dict:
     """Return availability details for a model identifier without exposing secrets."""
     return _availability_for_entry(model_id, _load_models().get(model_id))
 
 
+@_registry_locked
 def is_model_available(model_id: str) -> bool:
     return bool(model_availability(model_id).get("available"))
 
 
+@_registry_locked
 def pool_candidates(model_id: str) -> list[str]:
     """Ordered, locally-configured pool member providers for a model id.
 
@@ -762,6 +891,7 @@ def pool_candidates(model_id: str) -> list[str]:
     return _configured_pool_members(entry, _load_config())
 
 
+@_registry_locked
 def resolve(model_id: str, provider_override: str | None = None) -> ProviderInfo | None:
     """Resolve a model name/alias/id to provider info.
 
@@ -876,6 +1006,7 @@ def resolve(model_id: str, provider_override: str | None = None) -> ProviderInfo
     )
 
 
+@_registry_locked
 def pricing_for(model_id: str) -> dict | None:
     """Return the $/Mtok pricing dict for a routable model, or None if unset.
 
@@ -892,6 +1023,7 @@ def pricing_for(model_id: str) -> dict | None:
     return pricing
 
 
+@_registry_locked
 def effective_model_inventory() -> list[dict]:
     """Return one effective runtime row per logical model.
 
@@ -921,6 +1053,7 @@ def effective_model_inventory() -> list[dict]:
     return result
 
 
+@_registry_locked
 def list_models() -> list[dict]:
     """Return all routable identifiers, preserving discovery compatibility."""
     result = []
@@ -932,6 +1065,7 @@ def list_models() -> list[dict]:
     return result
 
 
+@_registry_locked
 def list_available_models() -> list[dict]:
     """Return routable identifiers for enabled, locally usable models."""
     return [m for m in list_models() if m["available"]]
@@ -966,6 +1100,7 @@ def _safe_url(value: str) -> str:
     return urlunsplit((parts.scheme, host, parts.path, "", ""))
 
 
+@_registry_locked
 def provider_status() -> list[dict]:
     """Return masked provider configuration status for admin/observability APIs."""
     config = _load_config()
@@ -1006,6 +1141,7 @@ def provider_status() -> list[dict]:
     return result
 
 
+@_registry_locked
 def model_status() -> list[dict]:
     """Return the shared effective inventory in the admin API shape."""
     ready = {p["id"]: p["ready"] for p in provider_status()}
@@ -1038,6 +1174,7 @@ def model_status() -> list[dict]:
     return result
 
 
+@_registry_locked
 def config_validation() -> dict:
     """Validate current provider/model config without exposing secrets."""
     providers = provider_status()

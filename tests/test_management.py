@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from src import config_io
+from src import admin, config_io
 import src.providers as providers
 from src.server import app
 
@@ -422,6 +422,158 @@ def test_admin_status_reports_writes_enabled_true(client):
 def test_admin_status_reports_writes_enabled_false(client_readonly):
     h = {"Authorization": "Bearer admin"}
     assert client_readonly.get("/admin/api/status", headers=h).json()["writes_enabled"] is False
+
+
+def test_admin_reload_rejects_invalid_vision_fallback_and_restores_registry(
+    client, tmp_config, monkeypatch,
+):
+    model_info_path = tmp_config / "model-info.json"
+    valid_catalog = {"llm": [{
+        "name": "vision-fallback",
+        "provider": "omlx",
+        "omlx_id": "vision-upstream",
+        "vision": True,
+        "context": 4096,
+        "max_output_tokens": 512,
+    }]}
+    model_info_path.write_text(json.dumps(valid_catalog))
+    providers.reload()
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
+    assert providers.resolve("vision-fallback").vision is True
+
+    invalid_catalog = json.loads(json.dumps(valid_catalog))
+    invalid_catalog["llm"][0]["vision"] = False
+    model_info_path.write_text(json.dumps(invalid_catalog))
+
+    response = client.post(
+        "/admin/api/reload",
+        headers={"Authorization": "Bearer admin"},
+    )
+
+    assert response.status_code == 400
+    assert "not vision-capable" in response.text
+    restored = providers.resolve("vision-fallback")
+    assert restored is not None
+    assert restored.vision is True
+
+
+def test_admin_reload_malformed_catalog_restores_live_registry(
+    client, tmp_config,
+):
+    assert providers.resolve("claude-test") is not None
+    (tmp_config / "model-info.json").write_text("{ malformed")
+
+    response = client.post(
+        "/admin/api/reload",
+        headers={"Authorization": "Bearer admin"},
+    )
+
+    assert response.status_code == 400
+    assert "reload rejected" in response.text
+    assert providers.resolve("claude-test") is not None
+
+
+def test_admin_mutations_rollback_when_they_invalidate_vision_fallback(
+    client, tmp_config, monkeypatch,
+):
+    import yaml
+
+    model_info_path = tmp_config / "model-info.json"
+    valid_catalog = {"llm": [{
+        "name": "vision-fallback",
+        "provider": "omlx",
+        "omlx_id": "vision-upstream",
+        "vision": True,
+        "context": 4096,
+        "max_output_tokens": 512,
+    }]}
+    model_info_path.write_text(json.dumps(valid_catalog))
+    config_path = tmp_config / "config.yaml"
+    model_info_path.chmod(0o600)
+    config_path.chmod(0o600)
+    providers.reload()
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
+    assert providers.resolve("vision-fallback").vision is True
+    headers = {"Authorization": "Bearer admin"}
+
+    update_response = client.post(
+        "/admin/api/models/vision-fallback",
+        headers=headers,
+        json={
+            "provider": "omlx",
+            "omlx_id": "vision-upstream",
+            "vision": False,
+        },
+    )
+
+    assert update_response.status_code == 400
+    assert "changes rolled back" in update_response.text
+    restored_catalog = json.loads(model_info_path.read_text())
+    assert restored_catalog["llm"][0]["vision"] is True
+    assert model_info_path.stat().st_mode & 0o777 == 0o600
+    assert providers.resolve("vision-fallback").vision is True
+
+    disable_response = client.post(
+        "/admin/api/models/vision-fallback/disable",
+        headers=headers,
+    )
+
+    assert disable_response.status_code == 400
+    assert "changes rolled back" in disable_response.text
+    config = yaml.safe_load(config_path.read_text())
+    assert "vision-fallback" not in (config.get("model_overrides") or {})
+    assert config_path.stat().st_mode & 0o777 == 0o600
+    assert providers.resolve("vision-fallback").vision is True
+
+
+def test_registry_mutations_are_serialized_across_validation(tmp_config, monkeypatch):
+    monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
+    a_written = threading.Event()
+    release_a = threading.Event()
+    b_started = threading.Event()
+    b_entered = threading.Event()
+    errors = []
+
+    def mutate_a():
+        result = config_io.upsert_provider(
+            "provider-a", base_url="https://a.example.test/v1", api_key="a",
+        )
+        a_written.set()
+        assert release_a.wait(timeout=2)
+        return result
+
+    def mutate_b():
+        b_entered.set()
+        return config_io.upsert_provider(
+            "provider-b", base_url="https://b.example.test/v1", api_key="b",
+        )
+
+    def run(mutate, started=None):
+        if started is not None:
+            started.set()
+        try:
+            result, reload_error = admin._apply_registry_mutation(mutate)
+            assert reload_error is None
+            assert result is not None
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    thread_a = threading.Thread(target=run, args=(mutate_a,))
+    thread_b = threading.Thread(target=run, args=(mutate_b, b_started))
+    thread_a.start()
+    assert a_written.wait(timeout=2)
+    thread_b.start()
+    assert b_started.wait(timeout=2)
+    assert not b_entered.wait(timeout=0.05)
+    release_a.set()
+    thread_a.join(timeout=2)
+    thread_b.join(timeout=2)
+
+    assert not thread_a.is_alive()
+    assert not thread_b.is_alive()
+    assert errors == []
+    config = config_io.load_config_full()
+    assert {"provider-a", "provider-b"}.issubset(config["providers"])
 
 
 def test_admin_writes_require_admin_auth(client_readonly):

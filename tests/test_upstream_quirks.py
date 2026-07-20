@@ -11,6 +11,7 @@ hosts and ids, exactly as real deployments configure them via config.yaml.
 
 import asyncio
 import json
+import threading
 from types import SimpleNamespace
 
 import httpx
@@ -19,7 +20,8 @@ import pytest
 import src.circuit as circuit
 import src.model_fallback as model_fallback
 import src.providers as providers
-from src import errors
+from src import admin, config_io, errors
+from src.config_lock import config_write_lock
 from src.server import _apply_openai_request_quirks, _maybe_stream_options, _upstream_endpoint
 
 
@@ -540,6 +542,76 @@ def test_persist_api_key_rewrites_own_block_only(tmp_config):
     assert "keep-me" in text
 
 
+def test_persist_api_key_is_scoped_to_provider_section(tmp_config):
+    _write_config(tmp_config, """metadata:
+  providers:
+    first:
+      api_key: nested-secret
+federation:
+  peers:
+    first:
+      api_key: peer-secret
+providers:
+  first:
+    base_url: https://a.example.com
+    api_key: eyJold
+""")
+
+    assert providers._persist_api_key("first", "eyJnew") is True
+
+    config = (tmp_config / "config.yaml").read_text()
+    assert "api_key: nested-secret" in config
+    assert "api_key: peer-secret" in config
+    assert "api_key: eyJnew" in config
+    assert "api_key: eyJold" not in config
+
+
+def test_persist_api_key_preserves_secure_config_mode(tmp_config):
+    _write_config(tmp_config, """providers:
+  first:
+    base_url: https://a.example.com
+    api_key: eyJold
+""")
+    path = tmp_config / "config.yaml"
+    path.chmod(0o600)
+
+    assert providers._persist_api_key("first", "eyJnew") is True
+
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_persist_api_key_waits_for_shared_config_transaction(tmp_config):
+    _write_config(tmp_config, """providers:
+  first:
+    base_url: https://a.example.com
+    api_key: eyJold
+""")
+    started = threading.Event()
+    finished = threading.Event()
+    errors = []
+
+    def persist():
+        started.set()
+        try:
+            providers._persist_api_key("first", "eyJnew")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    with config_write_lock(providers.CONFIG_PATH):
+        thread = threading.Thread(target=persist)
+        thread.start()
+        assert started.wait(timeout=2)
+        assert not finished.wait(timeout=0.05)
+
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert errors == []
+    assert "api_key: eyJnew" in (tmp_config / "config.yaml").read_text()
+    assert providers._load_config()["providers"]["first"]["api_key"] == "eyJnew"
+
+
 def test_refresh_oauth_token_runs_browser_sso_when_cli_cache_is_broken(tmp_config, monkeypatch):
     _write_config(tmp_config, """providers:
   ws:
@@ -584,6 +656,64 @@ def test_refresh_oauth_token_runs_browser_sso_when_cli_cache_is_broken(tmp_confi
     ]
     text = (tmp_config / "config.yaml").read_text()
     assert "api_key: eyJnew" in text
+
+
+def test_stale_oauth_refresh_cannot_overwrite_admin_provider_update(
+    tmp_config, monkeypatch,
+):
+    _write_config(tmp_config, """providers:
+  ws:
+    base_url: https://old.example.com/serving-endpoints
+    api_key: eyJold
+    auth_refresh: databricks-cli
+""")
+    monkeypatch.setattr(config_io, "CONFIG_PATH", tmp_config / "config.yaml")
+    monkeypatch.setattr(config_io, "MODEL_INFO_PATH", tmp_config / "model-info.json")
+    monkeypatch.setattr(config_io, "MODEL_INFO_SOURCE_PATH", None)
+    monkeypatch.setattr(config_io, "log_dir", tmp_config / "logs")
+    monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
+    providers._last_token_refresh_attempt.clear()
+    providers._last_auth_login_attempt.clear()
+    monkeypatch.setattr(providers, "_databricks_cli", lambda: "databricks")
+    cli_started = asyncio.Event()
+    release_cli = asyncio.Event()
+
+    class Proc:
+        returncode = 0
+
+        async def communicate(self):
+            cli_started.set()
+            await release_cli.wait()
+            return b'{"access_token":"eyJstale"}', b""
+
+    async def fake_exec(*args, **kwargs):
+        return Proc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    async def run():
+        refresh = asyncio.create_task(providers.refresh_oauth_token("ws", force=True))
+        await asyncio.wait_for(cli_started.wait(), timeout=2)
+        result, reload_error = await asyncio.to_thread(
+            admin._apply_registry_mutation,
+            lambda: config_io.upsert_provider(
+                "ws",
+                base_url="https://new.example.com/serving-endpoints",
+                api_key="eyJadmin",
+            ),
+        )
+        assert result is not None
+        assert reload_error is None
+        release_cli.set()
+        return await asyncio.wait_for(refresh, timeout=2)
+
+    token = asyncio.run(run())
+
+    assert token == "eyJadmin"
+    config = config_io.load_config_full()["providers"]["ws"]
+    assert config["api_key"] == "eyJadmin"
+    assert config["base_url"] == "https://new.example.com/serving-endpoints"
+    assert "eyJstale" not in (tmp_config / "config.yaml").read_text()
 
 
 def test_refresh_oauth_token_respects_auth_login_false(tmp_config, monkeypatch):

@@ -74,9 +74,17 @@ def _atomic_write(path: Path, text: str) -> None:
     """
     target = _resolve_target(path)
     target.parent.mkdir(parents=True, exist_ok=True)
+    mode = target.stat().st_mode & 0o777 if target.exists() else 0o600
     tmp = target.with_suffix(target.suffix + f".tmp.{os.getpid()}")
-    tmp.write_text(text)
-    os.replace(tmp, target)
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, target)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _backup(path: Path) -> Path | None:
@@ -88,6 +96,28 @@ def _backup(path: Path) -> Path | None:
     bak = backup_dir / f"{path.name}.bak.{int(time.time())}"
     shutil.copy2(path, bak)
     return bak
+
+
+def snapshot_writable_files() -> dict[Path, str | None]:
+    """Capture every admin-managed file for validation rollback."""
+    paths = {CONFIG_PATH, MODEL_INFO_PATH}
+    if MODEL_INFO_SOURCE_PATH:
+        paths.add(MODEL_INFO_SOURCE_PATH)
+    snapshot = {}
+    for path in paths:
+        target = _resolve_target(path)
+        snapshot[path] = target.read_text() if target.exists() else None
+    return snapshot
+
+
+def restore_writable_files(snapshot: dict[Path, str | None]) -> None:
+    """Atomically restore files captured by :func:`snapshot_writable_files`."""
+    with config_write_lock(CONFIG_PATH):
+        for path, text in snapshot.items():
+            if text is None:
+                _resolve_target(path).unlink(missing_ok=True)
+            else:
+                _atomic_write(path, text)
 
 
 @_write_transaction

@@ -1228,7 +1228,7 @@ def test_failed_admin_reload_preserves_provider_and_federation_state(tmp_path, m
     previous = federation.FederationManager(_config(tmp_path))
     _seed(previous)
     monkeypatch.setattr(federation, "_manager", previous)
-    monkeypatch.setattr(admin, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(admin.config_io, "CONFIG_PATH", config_path)
     provider_reload_calls = []
     monkeypatch.setattr(admin, "reload_provider_registry", lambda: provider_reload_calls.append(True))
     monkeypatch.setenv("MODEL_GATEWAY_ADMIN_KEY", "admin-secret")
@@ -1256,7 +1256,7 @@ def test_admin_reload_passes_prevalidated_federation_config(tmp_path, monkeypatc
     async def regenerate():
         return "regenerated"
 
-    monkeypatch.setattr(admin, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(admin.config_io, "CONFIG_PATH", config_path)
     monkeypatch.setattr(admin.federation, "load_config", lambda path: validated)
     monkeypatch.setattr(admin.federation, "reconfigure", reconfigure)
     monkeypatch.setattr(admin, "reload_provider_registry", lambda: captured.setdefault("provider_reloaded", True))

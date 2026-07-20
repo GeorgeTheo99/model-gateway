@@ -26,7 +26,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from src.admin import router as admin_router
 from src.auth import require_client_auth
 from src.errors import upstream_error, upstream_error_openai
-from src.providers import list_available_models, list_models as list_routable_models, model_availability, pricing_for, provider_quirks, resolve
+from src.providers import list_available_models, list_models as list_routable_models, model_availability, pool_candidates, pricing_for, provider_quirks, resolve, snapshot_registry as snapshot_provider_registry
 from src.upstream import (
     PoolContext,
     _retry_post,
@@ -64,7 +64,11 @@ def _stream_error_event(message: str) -> str:
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    """Initialize the request ledger and regenerate downstream catalogs on startup."""
+    """Validate routing policy, initialize state, and start background services."""
+    _validate_vision_fallback_policy()
+    # Keep a last-known-good registry loaded so a rejected admin reload can
+    # restore live routing even when no model request has arrived yet.
+    snapshot_provider_registry()
     try:
         ledger.init()
         log.info("ledger ready at %s", ledger.ledger_path())
@@ -85,7 +89,7 @@ async def _lifespan(_app: FastAPI):
 app = FastAPI(title="Model Gateway", lifespan=_lifespan)
 app.include_router(admin_router)
 
-DEFAULT_VISION_FALLBACK_MODEL = "qwen3.7-plus-fw"
+DEFAULT_VISION_FALLBACK_MODEL = ""
 DEFAULT_COMPOSITE_IMAGE_MAX_BYTES = 20_000_000
 DEFAULT_COMPOSITE_IMAGE_TOTAL_MAX_BYTES = 32_000_000
 DEFAULT_FIREWORKS_IMAGE_MAX_BYTES = 1_000_000
@@ -103,6 +107,64 @@ Return concise, structured observations only. Do not answer the user's question,
 5. Visible defects/risks/constraints
 6. Uncertainties / things not visible
 """.strip()
+
+
+def _configured_vision_fallback_model() -> str:
+    """Return the explicit process-wide fallback, disabled when unset or empty."""
+    return os.environ.get("GATEWAY_VISION_FALLBACK", DEFAULT_VISION_FALLBACK_MODEL).strip()
+
+
+def _validate_vision_fallback_policy(*, log_policy: bool = True) -> None:
+    """Fail startup/reload on an invalid opt-in and make cloud egress visible."""
+    fallback_model = _configured_vision_fallback_model()
+    if not fallback_model:
+        if log_policy:
+            log.info("vision fallback policy: disabled; image input to text-only models fails closed")
+        return
+
+    candidates = pool_candidates(fallback_model)
+    candidate_infos = (
+        [(provider, resolve(fallback_model, provider_override=provider)) for provider in candidates]
+        if candidates
+        else [("", resolve(fallback_model))]
+    )
+    if not candidate_infos or any(info is None for _, info in candidate_infos):
+        raise RuntimeError(
+            f"GATEWAY_VISION_FALLBACK model '{fallback_model}' is not resolvable"
+        )
+    for provider, fallback_info in candidate_infos:
+        provider_label = provider or fallback_info.provider
+        if getattr(fallback_info, "composite", None) is not None:
+            raise RuntimeError(
+                "GATEWAY_VISION_FALLBACK must name a native vision model, not a composite"
+            )
+        if not fallback_info.vision:
+            raise RuntimeError(
+                f"GATEWAY_VISION_FALLBACK model '{fallback_model}' is not vision-capable "
+                f"on provider '{provider_label}'"
+            )
+        if fallback_info.protocol != "openai":
+            raise RuntimeError(
+                f"GATEWAY_VISION_FALLBACK model '{fallback_model}' must use an "
+                f"OpenAI-compatible protocol on provider '{provider_label}'"
+            )
+
+    effective_providers = sorted({info.provider for _, info in candidate_infos})
+    localities = {provider == "omlx" for provider in effective_providers}
+    if len(localities) > 1:
+        raise RuntimeError(
+            f"GATEWAY_VISION_FALLBACK model '{fallback_model}' mixes local and cloud "
+            "providers; choose a locality-stable fallback"
+        )
+    cloud_egress = False in localities
+    message = (
+        "vision fallback policy: enabled model=%s providers=%s cloud_egress=%s"
+    )
+    provider_list = ",".join(effective_providers)
+    if log_policy and cloud_egress:
+        log.warning(message, fallback_model, provider_list, "true")
+    elif log_policy:
+        log.info(message, fallback_model, provider_list, "false")
 
 
 def _session_affinity_id(request: Request) -> str:
@@ -734,15 +796,9 @@ def _gateway_image_handling_mode(request: Request, body: dict) -> str:
 
 
 def _strip_gateway_controls(body: dict) -> None:
+    """Remove all gateway-owned transport controls before upstream dispatch."""
     body.pop("gateway_image_handling", None)
-    mg = body.get("model_gateway")
-    if isinstance(mg, dict):
-        mg = dict(mg)
-        mg.pop("image_handling", None)
-        if mg:
-            body["model_gateway"] = mg
-        else:
-            body.pop("model_gateway", None)
+    body.pop("model_gateway", None)
 
 
 def _resolve_vision_fallback(original_model: str, info, error_factory=_error_openai):
@@ -752,13 +808,25 @@ def _resolve_vision_fallback(original_model: str, info, error_factory=_error_ope
         # their image turns escape through the process-wide/cloud fallback.
         fallback_model = composite.vision_model
     else:
-        fallback_model = os.environ.get("GATEWAY_VISION_FALLBACK", DEFAULT_VISION_FALLBACK_MODEL).strip()
+        fallback_model = _configured_vision_fallback_model()
     if not fallback_model:
         return None, None, error_factory(
             400,
             "invalid_request_error",
-            f"Vision fallback is disabled; cannot route image input for text-only model '{original_model}'.",
+            f"Model '{original_model}' is text-only and global vision fallback is disabled. "
+            "Use a native vision model or explicit composite, or configure "
+            "GATEWAY_VISION_FALLBACK=<model>.",
         )
+    if composite is None:
+        try:
+            _validate_vision_fallback_policy(log_policy=False)
+        except RuntimeError as exc:
+            log.error("Vision fallback policy rejected at request time: %s", exc)
+            return None, None, error_factory(
+                502,
+                "api_error",
+                f"Vision fallback policy is invalid: {exc}",
+            )
     fallback_info = resolve(fallback_model)
     if not fallback_info:
         log.error(
@@ -783,6 +851,12 @@ def _resolve_vision_fallback(original_model: str, info, error_factory=_error_ope
             "api_error",
             f"Vision fallback model '{fallback_model}' is not vision-capable; "
             f"cannot route image input for text-only model '{original_model}'.",
+        )
+    if composite is None and fallback_info.protocol != "openai":
+        return None, None, error_factory(
+            502,
+            "api_error",
+            f"Vision fallback model '{fallback_model}' must use an OpenAI-compatible protocol.",
         )
     if composite is not None and fallback_info.provider != "omlx":
         return None, None, error_factory(
@@ -973,8 +1047,16 @@ async def _apply_chat_vision_fallback(
     """Apply staged vision handling to a Chat-shaped request."""
     composite = getattr(info, "composite", None)
     default_mode = composite.image_handling if composite is not None else "reroute"
-    mode = _gateway_image_handling_mode(request, body) or default_mode
+    requested_mode = _gateway_image_handling_mode(request, body)
     _strip_gateway_controls(body)
+    if composite is not None and requested_mode and requested_mode != default_mode:
+        return body, requested_model, info, error_factory(
+            400,
+            "invalid_request_error",
+            f"Composite model '{requested_model}' requires gateway image handling mode "
+            f"'{default_mode}'; client overrides are not allowed.",
+        )
+    mode = requested_mode or default_mode
     if mode not in {"reroute", IMAGE_HANDLING_EXTRACT_THEN_ANSWER}:
         return body, requested_model, info, error_factory(
             400, "invalid_request_error", f"Unsupported gateway image handling mode '{mode}'.",
@@ -1566,12 +1648,15 @@ async def create_response(request: Request):
         original_vision_chat["gateway_image_handling"] = body["gateway_image_handling"]
     if "model_gateway" in body:
         original_vision_chat["model_gateway"] = copy.deepcopy(body["model_gateway"])
+    vision_baseline = copy.deepcopy(original_vision_chat)
+    _strip_gateway_controls(vision_baseline)
+    _strip_gateway_controls(body)
     vision_chat, served_model, served_info, vision_error = await _apply_chat_vision_fallback(
         request, copy.deepcopy(original_vision_chat), model, info, "/v1/responses", _error_openai,
     )
     if vision_error:
         return vision_error
-    vision_changed = served_info is not info or vision_chat != original_vision_chat
+    vision_changed = served_info is not info or vision_chat != vision_baseline
     if vision_changed:
         info, model = served_info, served_model
         # A staged fallback must use the translated Chat payload below.
@@ -2352,12 +2437,21 @@ async def messages(request: Request):
     # Inspect through the existing lossless Anthropic→Chat translation. Native
     # vision models keep the Messages path unchanged; text-only models are staged.
     original_vision_chat = anthropic_to_openai(body)
+    # Gateway controls are transport-level policy, not Anthropic message fields;
+    # preserve them explicitly for the same validation applied on other APIs.
+    if "gateway_image_handling" in body:
+        original_vision_chat["gateway_image_handling"] = body["gateway_image_handling"]
+    if "model_gateway" in body:
+        original_vision_chat["model_gateway"] = copy.deepcopy(body["model_gateway"])
+    vision_baseline = copy.deepcopy(original_vision_chat)
+    _strip_gateway_controls(vision_baseline)
+    _strip_gateway_controls(body)
     vision_chat, served_model, served_info, vision_error = await _apply_chat_vision_fallback(
         request, copy.deepcopy(original_vision_chat), model, info, "/v1/messages", _error,
     )
     if vision_error:
         return vision_error
-    vision_changed = served_info is not info or vision_chat != original_vision_chat
+    vision_changed = served_info is not info or vision_chat != vision_baseline
     if vision_changed:
         info, model = served_info, served_model
         if info.protocol == "anthropic":

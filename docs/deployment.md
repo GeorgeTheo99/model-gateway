@@ -67,6 +67,28 @@ The dev-server pipeline updates the runtime checkout, keeps `config/config.yaml`
 
 Databricks is optional and disabled/unconfigured on this machine. A work machine can enable Databricks model serving with gitignored config or env (`DATABRICKS_HOST`, `DATABRICKS_TOKEN`, optional `DATABRICKS_SERVING_BASE_URL`) without changing the committed catalog.
 
+## Vision routing policy
+
+Image input to a raw text-only model fails closed by default. Use a native vision
+model or an explicit gateway composite such as `best-local` when images are
+expected. Composite models always use their declared image-handling mode and
+cannot be redirected by client headers or request fields.
+
+For compatibility clients only, an operator may explicitly enable a process-wide
+fallback with `GATEWAY_VISION_FALLBACK=<native-vision-model>`. The fallback must
+use an OpenAI-compatible protocol. The gateway validates every configured pool
+candidate at startup and on admin reload, and refuses the policy when the model
+is missing, text-only, a composite, protocol-incompatible, or mixes local oMLX
+and cloud providers. A cloud-only fallback is explicit cloud egress and is
+logged as such at startup. Its default `reroute` mode sends the complete
+translated conversation, including images and surrounding text, to that model;
+compatibility clients may explicitly request `extract_then_answer` with the
+`x-gateway-image-handling` header or matching request control to send only image
+blocks for observation extraction. The same policy checks run before each
+fallback request so runtime registry changes cannot bypass them. Leaving the
+variable unset or empty never routes image content to another model or provider
+implicitly.
+
 ## Optional federation
 
 Nodes may import direct routes from explicitly configured peer gateways. Add a

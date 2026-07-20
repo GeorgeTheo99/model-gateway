@@ -13,14 +13,17 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 
 from src.auth import admin_writes_enabled, auth_mode, require_admin_auth, require_admin_writes
+from src.config_lock import config_write_lock
 from src.providers import (
-    CONFIG_PATH,
     MODEL_INFO_PATH,
     config_validation,
     model_status,
     provider_status,
+    registry_transaction as provider_registry_transaction,
     reload as reload_provider_registry,
+    restore_registry as restore_provider_registry,
     routable_ids,
+    snapshot_registry as snapshot_provider_registry,
 )
 from src import config_io, federation, ledger
 
@@ -43,7 +46,7 @@ async def admin_status(request: Request):
         "pid": os.getpid(),
         "uptime_seconds": round(time.time() - _STARTED_AT, 3),
         "model_info_path": str(MODEL_INFO_PATH),
-        "config_path": str(CONFIG_PATH),
+        "config_path": str(config_io.CONFIG_PATH),
         "writes_enabled": mode.writes_enabled,
         "auth": {
             "client_auth_enabled": mode.client_auth_enabled,
@@ -89,17 +92,57 @@ async def admin_config_validation(request: Request):
     return config_validation()
 
 
+def _reload_registry_transactionally(provider_snapshot) -> str | None:
+    """Eagerly load and validate a new registry, restoring live state on error."""
+    with provider_registry_transaction():
+        reload_provider_registry()
+        try:
+            snapshot_provider_registry()
+            # Local import avoids the admin ↔ server module cycle at import time.
+            from src.server import _validate_vision_fallback_policy
+            _validate_vision_fallback_policy()
+        except Exception as exc:  # noqa: BLE001 — malformed registries must roll back
+            restore_provider_registry(provider_snapshot)
+            return str(exc)
+        return None
+
+
+def _apply_registry_mutation(mutate):
+    """Run one locked admin file mutation and publish it only after validation."""
+    with config_write_lock(config_io.CONFIG_PATH):
+        provider_snapshot = snapshot_provider_registry()
+        file_snapshot = config_io.snapshot_writable_files()
+        try:
+            result = mutate()
+        except Exception:
+            config_io.restore_writable_files(file_snapshot)
+            restore_provider_registry(provider_snapshot)
+            raise
+        reload_error = _reload_registry_transactionally(provider_snapshot)
+        if reload_error is None:
+            return result, None
+        try:
+            config_io.restore_writable_files(file_snapshot)
+        except Exception as exc:  # noqa: BLE001
+            return None, f"{reload_error}; file rollback failed: {exc}"
+        return None, f"{reload_error}; changes rolled back"
+
+
 @router.post("/admin/api/reload")
 async def admin_reload(request: Request):
     require_admin_auth(request)
     require_admin_writes()
     # Validate federation before invalidating the live provider registry. A
     # malformed shared YAML/federation block must leave both registries intact.
-    try:
-        federation_config = federation.load_config(CONFIG_PATH)
-    except federation.FederationConfigError as exc:
-        return _bad_request(str(exc))
-    reload_provider_registry()
+    with config_write_lock(config_io.CONFIG_PATH):
+        try:
+            federation_config = federation.load_config(config_io.CONFIG_PATH)
+        except federation.FederationConfigError as exc:
+            return _bad_request(str(exc))
+        provider_snapshot = snapshot_provider_registry()
+        reload_error = _reload_registry_transactionally(provider_snapshot)
+        if reload_error is not None:
+            return _bad_request(f"Provider registry reload rejected: {reload_error}")
     federation_status = await federation.reconfigure(config=federation_config)
     catalogs = await _regenerate_catalogs()
     return {
@@ -118,7 +161,7 @@ async def _regenerate_catalogs() -> str:
         return "skipped (script missing)"
     try:
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, str(script), "--config", str(CONFIG_PATH),
+            sys.executable, str(script), "--config", str(config_io.CONFIG_PATH),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         )
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
@@ -257,16 +300,17 @@ async def admin_upsert_provider(provider_id: str, request: Request):
     except Exception:
         return _bad_request("Invalid JSON body")
     try:
-        result = config_io.upsert_provider(
+        result, reload_error = _apply_registry_mutation(lambda: config_io.upsert_provider(
             provider_id,
             base_url=body.get("base_url", ""),
             api_key=body.get("api_key"),
             protocol=body.get("protocol"),
             default_headers=body.get("default_headers"),
-        )
+        ))
     except ValueError as exc:
         return _bad_request(str(exc))
-    reload_provider_registry()
+    if reload_error is not None:
+        return _bad_request(f"Provider registry update rejected: {reload_error}")
     result["reloaded"] = True
     return result
 
@@ -277,12 +321,15 @@ async def admin_delete_provider(provider_id: str, request: Request):
     require_admin_auth(request)
     require_admin_writes()
     try:
-        result = config_io.delete_provider(provider_id)
+        result, reload_error = _apply_registry_mutation(
+            lambda: config_io.delete_provider(provider_id)
+        )
     except KeyError as exc:
         return _bad_request(str(exc), status=404)
     except ValueError as exc:
         return _bad_request(str(exc), status=409)
-    reload_provider_registry()
+    if reload_error is not None:
+        return _bad_request(f"Provider registry update rejected: {reload_error}")
     return result
 
 
@@ -348,10 +395,13 @@ async def admin_upsert_model(model_name: str, request: Request):
     except Exception:
         return _bad_request("Invalid JSON body")
     try:
-        result = config_io.upsert_model(model_name, **body)
+        result, reload_error = _apply_registry_mutation(
+            lambda: config_io.upsert_model(model_name, **body)
+        )
     except ValueError as exc:
         return _bad_request(str(exc))
-    reload_provider_registry()
+    if reload_error is not None:
+        return _bad_request(f"Provider registry update rejected: {reload_error}")
     result["reloaded"] = True
     return result
 
@@ -362,10 +412,13 @@ async def admin_delete_model(model_name: str, request: Request):
     require_admin_auth(request)
     require_admin_writes()
     try:
-        result = config_io.delete_model(model_name)
+        result, reload_error = _apply_registry_mutation(
+            lambda: config_io.delete_model(model_name)
+        )
     except KeyError as exc:
         return _bad_request(str(exc), status=404)
-    reload_provider_registry()
+    if reload_error is not None:
+        return _bad_request(f"Provider registry update rejected: {reload_error}")
     return result
 
 
@@ -374,10 +427,13 @@ async def admin_enable_model(model_name: str, request: Request):
     require_admin_auth(request)
     require_admin_writes()
     try:
-        result = config_io.set_model_enabled(model_name, True)
+        result, reload_error = _apply_registry_mutation(
+            lambda: config_io.set_model_enabled(model_name, True)
+        )
     except KeyError as exc:
         return _bad_request(str(exc), status=404)
-    reload_provider_registry()
+    if reload_error is not None:
+        return _bad_request(f"Provider registry update rejected: {reload_error}")
     return result
 
 
@@ -386,10 +442,13 @@ async def admin_disable_model(model_name: str, request: Request):
     require_admin_auth(request)
     require_admin_writes()
     try:
-        result = config_io.set_model_enabled(model_name, False)
+        result, reload_error = _apply_registry_mutation(
+            lambda: config_io.set_model_enabled(model_name, False)
+        )
     except KeyError as exc:
         return _bad_request(str(exc), status=404)
-    reload_provider_registry()
+    if reload_error is not None:
+        return _bad_request(f"Provider registry update rejected: {reload_error}")
     return result
 
 
