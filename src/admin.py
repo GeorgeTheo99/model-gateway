@@ -385,8 +385,8 @@ async def admin_upsert_model(model_name: str, request: Request):
 
     Body fields: provider, provider_model_id (or omlx_id for local/oMLX),
     alias, context, max_output_tokens, thinking, thinking_format, vision,
-    system_instruction, pricing, desc, enabled.
-    Writes deploy to the live catalog + source-repo mirror; reloads registry.
+    system_instruction, pricing, pricing_status, desc, enabled.
+    Writes the live catalog and optional machine-local mirror; reloads registry.
     """
     require_admin_auth(request)
     require_admin_writes()
@@ -394,10 +394,19 @@ async def admin_upsert_model(model_name: str, request: Request):
         body = await request.json()
     except Exception:
         return _bad_request("Invalid JSON body")
+    def mutate_model():
+        result = config_io.upsert_model(model_name, **body)
+        if "enabled" in body:
+            enabled_result = config_io.set_model_enabled(model_name, bool(body["enabled"]))
+            result["enabled"] = enabled_result["enabled"]
+            result["written_to"] = list(dict.fromkeys([
+                *result.get("written_to", []),
+                *enabled_result.get("written_to", []),
+            ]))
+        return result
+
     try:
-        result, reload_error = _apply_registry_mutation(
-            lambda: config_io.upsert_model(model_name, **body)
-        )
+        result, reload_error = _apply_registry_mutation(mutate_model)
     except ValueError as exc:
         return _bad_request(str(exc))
     if reload_error is not None:
@@ -641,11 +650,11 @@ _ADMIN_HTML = r"""
     .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
     .control { display: flex; flex-direction: column; gap: 3px; }
     .control > label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
-    .control input[type=text], .control input[type=password], .control input[type=number], input[type=text].ctl, input[type=password].ctl, input[type=number].ctl {
+    .control input[type=text], .control input[type=password], .control input[type=number], .control select, input[type=text].ctl, input[type=password].ctl, input[type=number].ctl {
       font: inherit; font-size: 13px; color: var(--text); background: var(--surface-2);
       border: 1px solid var(--rule); border-radius: var(--radius-sm); padding: 7px 9px; width: 100%;
     }
-    .control input:focus, input.ctl:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+    .control input:focus, .control select:focus, input.ctl:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
     .checkrow { display: flex; gap: 18px; flex-wrap: wrap; align-items: center; }
     .check { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-2); }
     .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
@@ -809,7 +818,7 @@ _ADMIN_HTML = r"""
       <section class="tab-panel" data-tab-panel="models" role="tabpanel">
         <div class="sec-head"><h2>Models</h2><span class="meta" id="modelsMeta">grouped local / cloud</span></div>
         <div class="scroll">
-          <table id="models"><thead><tr><th>Name</th><th>Upstream id</th><th>Provider</th><th class="num">Context</th><th class="num">Max out</th><th>Thinking</th><th>Vision</th><th>State</th><th></th></tr></thead><tbody></tbody></table>
+          <table id="models"><thead><tr><th>Name</th><th>Upstream id</th><th>Provider</th><th>Pricing</th><th class="num">Context</th><th class="num">Max out</th><th>Thinking</th><th>Vision</th><th>State</th><th></th></tr></thead><tbody></tbody></table>
         </div>
         <div id="modelDetail" class="detail hidden" aria-live="polite"></div>
         <details class="formset"><summary>Add or edit a model</summary>
@@ -823,7 +832,8 @@ _ADMIN_HTML = r"""
               <div class="control"><label>Max output tokens</label><input id="mMaxOut" type="number" placeholder="tokens" /></div>
               <div class="control"><label>Thinking</label><input id="mThinking" type="text" placeholder="| optional | always" /></div>
               <div class="control"><label>Thinking format</label><input id="mThinkingFmt" type="text" placeholder="glm-chat-template" /></div>
-              <div class="control" style="grid-column: 1 / -1;"><label>Pricing JSON ($/Mtok)</label><input id="mPricing" class="ctl" type="text" placeholder='{"input":3,"output":15}' /></div>
+              <div class="control"><label>Pricing status</label><select id="mPricingStatus"><option value="metered">metered</option><option value="unmetered">unmetered local</option><option value="unknown">unknown</option></select></div>
+              <div class="control"><label>Pricing JSON ($/Mtok)</label><input id="mPricing" class="ctl" type="text" placeholder='{"input":3,"output":15}' /></div>
               <div class="control" style="grid-column: 1 / -1;"><label>Description (no $ prices)</label><input id="mDesc" class="ctl" type="text" placeholder="short note" /></div>
             </div>
             <div class="checkrow">
@@ -835,7 +845,7 @@ _ADMIN_HTML = r"""
               <button class="btn danger" id="deleteModelBtn" type="button">Delete</button>
               <span id="mMsg" class="msg"></span>
             </div>
-            <p class="hint">Writes are hot (immediate) and mirrored to the source repo, pending a commit. Fetch pricing from the official provider via the add-model workflow. Disabled models are hidden from /v1/models.</p>
+            <p class="hint">Writes are hot (immediate) and mirrored to the configured machine-local catalog copy. Back up reviewed catalog changes through the operator's private configuration workflow. Disabled models are hidden from /v1/models.</p>
           </div>
         </details>
         <p class="mgmt-hint">Model management is read-only. Set <code>MODEL_GATEWAY_ADMIN_WRITES=true</code> to add or edit models.</p>
@@ -866,12 +876,12 @@ _ADMIN_HTML = r"""
         <div class="strip" id="usageStrip">
           <div class="stat"><span class="label">Requests</span><span class="value" id="uRequests">—</span><span class="detail" id="uRequestsDetail">ok / errors</span></div>
           <div class="stat"><span class="label">Tokens</span><span class="value" id="uTokens">—</span><span class="detail" id="uTokensDetail">in / out (cached)</span></div>
-          <div class="stat"><span class="label">Est. cost</span><span class="value" id="uCost">—</span><span class="detail">priced rows only</span></div>
+          <div class="stat"><span class="label">Est. cost</span><span class="value" id="uCost">—</span><span class="detail" id="uCostDetail">cost coverage —</span></div>
           <div class="stat"><span class="label">Avg latency</span><span class="value" id="uLatency">—</span><span class="detail" id="uLatencyDetail">over window</span></div>
         </div>
-        <div class="scroll"><table id="usageByModel"><thead><tr><th>Model</th><th class="num">Requests</th><th class="num">Errors</th><th class="num">In tok</th><th class="num">Out tok</th><th class="num">Cached</th><th class="num">Cost</th><th class="num">Avg ms</th></tr></thead><tbody></tbody></table></div>
+        <div class="scroll"><table id="usageByModel"><thead><tr><th>Model</th><th class="num">Requests</th><th class="num">Usage</th><th class="num">Costed</th><th class="num">Errors</th><th class="num">In tok</th><th class="num">Out tok</th><th class="num">Cached</th><th class="num">Cost</th><th class="num">Avg ms</th></tr></thead><tbody></tbody></table></div>
         <div class="sec-head" style="margin-top:4px;"><h2>Recent requests</h2><span class="meta">last 50</span></div>
-        <div class="scroll"><table id="recentReq"><thead><tr><th>Time</th><th>Endpoint</th><th>Model</th><th class="num">Status</th><th>Stream</th><th class="num">In</th><th class="num">Out</th><th class="num">Cached</th><th class="num">Cost</th><th class="num">Latency</th></tr></thead><tbody></tbody></table></div>
+        <div class="scroll"><table id="recentReq"><thead><tr><th>Time</th><th>Endpoint</th><th>Model</th><th class="num">Status</th><th>Stream</th><th>Coverage</th><th class="num">In</th><th class="num">Out</th><th class="num">Cached</th><th class="num">Cost</th><th class="num">Latency</th></tr></thead><tbody></tbody></table></div>
         <div id="usageErr" class="inline-err hidden"></div>
       </section>
 
@@ -917,6 +927,13 @@ _ADMIN_HTML = r"""
   function fmtMs(v){ return (v===null||v===undefined) ? '—' : Math.round(v)+'ms'; }
   function fmtUptime(s){ if (s===undefined||s===null) return '—'; s = Math.round(s); const d=Math.floor(s/86400), h=Math.floor((s%86400)/3600), m=Math.floor((s%3600)/60); if (d) return d+'d '+h+'h'; if (h) return h+'h '+m+'m'; return m+'m'; }
   function statePill(kind, label){ return '<span class="pill '+kind+'"><span class="dot"></span>'+escapeHtml(label)+'</span>'; }
+  function requestCoverage(r){
+    if (r.error) return statePill('bad','stream error');
+    const usage = r.usage_reported ? statePill('ok','usage') : statePill('warn','no usage');
+    let cost = statePill('warn','cost unknown');
+    if (r.cost_usd !== null && r.cost_usd !== undefined) cost = r.pricing_complete ? statePill('ok','costed') : statePill('warn','partial');
+    return usage+' '+cost;
+  }
   function idPill(v){ return '<span class="pill id">'+escapeHtml(v)+'</span>'; }
 
   async function get(path){
@@ -1006,20 +1023,22 @@ _ADMIN_HTML = r"""
     const parts = [];
     function group(label, items){
       if (!items.length) return;
-      parts.push('<tr class="group-row"><td colspan="9">'+escapeHtml(label)+' · '+items.length+'</td></tr>');
+      parts.push('<tr class="group-row"><td colspan="10">'+escapeHtml(label)+' · '+items.length+'</td></tr>');
       for (const m of items) {
         const en = m.enabled !== false;
         const nm = escapeHtml(m.name || m.id);
         const up = escapeHtml(m.provider_model_id || m.omlx_id || m.name || '');
         const th = escapeHtml(m.thinking || m.thinking_format || '');
         const state = en ? statePill('ok','on') : statePill('bad','off');
+        const priceState = m.pricing_status || (m.pricing ? 'metered' : 'unknown');
+        const price = statePill(priceState === 'unknown' ? 'warn' : 'ok', priceState);
         const toggle = '<button class="btn secondary" data-mgmt data-toggle-model="'+nm+'" data-enable="'+(!en)+'">'+(en?'disable':'enable')+'</button> <button class="btn secondary" data-mgmt data-edit-model="'+nm+'">edit</button>';
-        parts.push('<tr class="clickable-row" data-open-model="'+nm+'"><td>'+idPill(m.name || m.id)+'</td><td class="id">'+up+'</td><td>'+escapeHtml(m.provider)+'</td><td class="num">'+escapeHtml(m.context)+'</td><td class="num">'+escapeHtml(m.max_output_tokens)+'</td><td>'+th+'</td><td>'+(m.vision?'yes':'no')+'</td><td>'+state+'</td><td>'+toggle+'</td></tr>');
+        parts.push('<tr class="clickable-row" data-open-model="'+nm+'"><td>'+idPill(m.name || m.id)+'</td><td class="id">'+up+'</td><td>'+escapeHtml(m.provider)+'</td><td>'+price+'</td><td class="num">'+escapeHtml(m.context)+'</td><td class="num">'+escapeHtml(m.max_output_tokens)+'</td><td>'+th+'</td><td>'+(m.vision?'yes':'no')+'</td><td>'+state+'</td><td>'+toggle+'</td></tr>');
       }
     }
     group('Local (oMLX)', local);
     group('Cloud', cloud);
-    body.innerHTML = parts.join('') || '<tr class="empty"><td colspan="9">No models configured.</td></tr>';
+    body.innerHTML = parts.join('') || '<tr class="empty"><td colspan="10">No models configured.</td></tr>';
     document.getElementById('modelsMeta').textContent = local.length + ' local · ' + cloud.length + ' cloud';
   }
 
@@ -1111,9 +1130,10 @@ _ADMIN_HTML = r"""
       document.getElementById('uRequestsDetail').textContent = ok + ' ok / ' + errs + ' errors';
       const uTok = document.getElementById('uTokens');
       uTok.textContent = fmtNum((s.input_tokens||0) + (s.output_tokens||0)); uTok.className = 'value ok-c';
-      document.getElementById('uTokensDetail').textContent = fmtNum(s.input_tokens)+' in / '+fmtNum(s.output_tokens)+' out ('+fmtNum(s.cached_read_tokens)+' cached)';
+      document.getElementById('uTokensDetail').textContent = fmtNum(s.input_tokens)+' in / '+fmtNum(s.output_tokens)+' out · '+fmtNum(s.usage_reported_requests)+'/'+fmtNum(s.requests)+' reported';
       const uCost = document.getElementById('uCost');
-      uCost.textContent = fmtCost(s.cost_usd); uCost.className = 'value ok-c';
+      uCost.textContent = fmtCost(s.cost_usd); uCost.className = 'value ' + ((s.unknown_cost_requests||0) ? 'warn-c' : 'ok-c');
+      document.getElementById('uCostDetail').textContent = fmtNum(s.known_cost_requests)+'/'+fmtNum(s.requests)+' known · '+fmtNum(s.missing_pricing_requests)+' missing price';
       const uLat = document.getElementById('uLatency');
       uLat.textContent = fmtMs(s.avg_latency_ms); uLat.className = 'value ok-c';
       document.getElementById('uLatencyDetail').textContent = s.requests ? 'over '+s.requests+' requests' : 'no requests';
@@ -1122,10 +1142,10 @@ _ADMIN_HTML = r"""
         const name = resolveModelName(r.dim);
         const cls = name ? 'bymodel-clickable' : '';
         const attr = name ? ' data-open-model="'+escapeHtml(name)+'"' : '';
-        return '<tr class="'+cls+'"'+attr+'><td>'+idPill(r.dim||'—')+'</td><td class="num">'+fmtNum(r.requests)+'</td><td class="num '+(r.errors?'bad-c':'ok-c')+'">'+fmtNum(r.errors)+'</td><td class="num">'+fmtNum(r.input_tokens)+'</td><td class="num">'+fmtNum(r.output_tokens)+'</td><td class="num">'+fmtNum(r.cached_read_tokens)+'</td><td class="num">'+fmtCost(r.cost_usd)+'</td><td class="num">'+fmtMs(r.avg_latency_ms)+'</td></tr>';
-      }).join('') || '<tr class="empty"><td colspan="8">No requests in this window.</td></tr>';
+        return '<tr class="'+cls+'"'+attr+'><td>'+idPill(r.dim||'—')+'</td><td class="num">'+fmtNum(r.requests)+'</td><td class="num">'+fmtNum(r.usage_reported_requests)+'</td><td class="num">'+fmtNum(r.known_cost_requests)+'</td><td class="num '+(r.errors?'bad-c':'ok-c')+'">'+fmtNum(r.errors)+'</td><td class="num">'+fmtNum(r.input_tokens)+'</td><td class="num">'+fmtNum(r.output_tokens)+'</td><td class="num">'+fmtNum(r.cached_read_tokens)+'</td><td class="num">'+fmtCost(r.cost_usd)+'</td><td class="num">'+fmtMs(r.avg_latency_ms)+'</td></tr>';
+      }).join('') || '<tr class="empty"><td colspan="10">No requests in this window.</td></tr>';
       const reqs = recent.requests || [];
-      document.querySelector('#recentReq tbody').innerHTML = reqs.map(r => '<tr><td>'+escapeHtml(r.ts_iso||'—')+'</td><td>'+escapeHtml(r.endpoint||'—')+'</td><td>'+idPill(r.model||'—')+'</td><td class="num '+(r.status && r.status < 400 ? 'ok-c' : 'bad-c')+'">'+(r.status||'—')+'</td><td>'+(r.is_stream?'stream':'sync')+'</td><td class="num">'+fmtNum(r.input_tokens)+'</td><td class="num">'+fmtNum(r.output_tokens)+'</td><td class="num">'+fmtNum(r.cached_read_tokens)+'</td><td class="num">'+fmtCost(r.cost_usd)+'</td><td class="num">'+fmtMs(r.latency_ms)+'</td></tr>').join('') || '<tr class="empty"><td colspan="10">No requests yet.</td></tr>';
+      document.querySelector('#recentReq tbody').innerHTML = reqs.map(r => '<tr><td>'+escapeHtml(r.ts_iso||'—')+'</td><td>'+escapeHtml(r.endpoint||'—')+'</td><td>'+idPill(r.model||'—')+'</td><td class="num '+(!r.error && r.status && r.status < 400 ? 'ok-c' : 'bad-c')+'">'+(r.status||'—')+'</td><td>'+(r.is_stream?'stream':'sync')+'</td><td>'+requestCoverage(r)+'</td><td class="num">'+fmtNum(r.input_tokens)+'</td><td class="num">'+fmtNum(r.output_tokens)+'</td><td class="num">'+fmtNum(r.cached_read_tokens)+'</td><td class="num">'+fmtCost(r.cost_usd)+'</td><td class="num">'+fmtMs(r.latency_ms)+'</td></tr>').join('') || '<tr class="empty"><td colspan="11">No requests yet.</td></tr>';
     } catch (e) {
       if (e instanceof AuthError) { return; } // loadHealth drives the locked state on auth failure
       usageErr.textContent = e.message; usageErr.classList.remove('hidden');
@@ -1173,16 +1193,20 @@ _ADMIN_HTML = r"""
     setMsg('pMsg', 'editing '+id+' — fill base_url (blank=keep) + key (blank=keep)', true);
   }
   function editModel(name){
-    const rows = document.querySelectorAll('#models tbody tr');
-    let m = null;
-    for (const r of rows) { if (r.dataset.modelName === name) { m = r.dataset; break; } }
+    const m = _modelsCache.find(row => (row.name || row.id) === name);
     if (!m) return setMsg('mMsg', 'could not find '+name, false);
     document.getElementById('mName').value = name;
-    document.getElementById('mProvider').value = m.provider || '';
-    document.getElementById('mPmid').value = m.upstream || '';
-    document.getElementById('mContext').value = m.context && m.context !== '—' ? m.context : '';
-    document.getElementById('mThinking').value = m.thinking && m.thinking !== '—' ? m.thinking : '';
-    document.getElementById('mEnabled').checked = m.enabled === 'true';
+    document.getElementById('mProvider').value = m.configured_provider || m.provider || '';
+    document.getElementById('mPmid').value = m.provider_model_id || m.omlx_id || '';
+    document.getElementById('mAlias').value = m.alias || '';
+    document.getElementById('mContext').value = m.context || '';
+    document.getElementById('mMaxOut').value = m.max_output_tokens || '';
+    document.getElementById('mThinking').value = m.thinking || '';
+    document.getElementById('mThinkingFmt').value = m.thinking_format || '';
+    document.getElementById('mPricingStatus').value = m.pricing_status || (m.pricing ? 'metered' : 'unknown');
+    document.getElementById('mPricing').value = m.pricing ? JSON.stringify(m.pricing) : '';
+    document.getElementById('mVision').checked = m.vision === true;
+    document.getElementById('mEnabled').checked = m.enabled !== false;
     setMsg('mMsg', 'editing '+name, true);
   }
   async function saveModel(){
@@ -1195,11 +1219,19 @@ _ADMIN_HTML = r"""
     const mo = parseInt(document.getElementById('mMaxOut').value); if (!isNaN(mo)) body.max_output_tokens = mo;
     const th = document.getElementById('mThinking').value.trim(); if (th) body.thinking = th;
     const tf = document.getElementById('mThinkingFmt').value.trim(); if (tf) body.thinking_format = tf;
-    const pr = document.getElementById('mPricing').value.trim(); if (pr) { try { body.pricing = JSON.parse(pr); } catch(e){ return setMsg('mMsg', 'pricing JSON invalid', false); } }
+    const pricingStatus = document.getElementById('mPricingStatus').value;
+    body.pricing_status = pricingStatus;
+    const pr = document.getElementById('mPricing').value.trim();
+    if (pricingStatus === 'metered') {
+      if (!pr) return setMsg('mMsg', 'metered pricing JSON required', false);
+      try { body.pricing = JSON.parse(pr); } catch(e){ return setMsg('mMsg', 'pricing JSON invalid', false); }
+    } else {
+      body.pricing = null;
+    }
     const desc = document.getElementById('mDesc').value.trim(); if (desc) body.desc = desc;
     body.vision = document.getElementById('mVision').checked;
     body.enabled = document.getElementById('mEnabled').checked;
-    try { await send('POST', '/admin/api/models/'+encodeURIComponent(name), body); setMsg('mMsg', 'saved + reloaded (hot; commit source repo to persist)', true); loadHealth(); }
+    try { await send('POST', '/admin/api/models/'+encodeURIComponent(name), body); setMsg('mMsg', 'saved + reloaded (machine-local catalog updated)', true); loadHealth(); }
     catch(e){ if (e instanceof AuthError) return showLocked(); setMsg('mMsg', e.message, false); }
   }
   async function deleteModel(){
@@ -1223,7 +1255,8 @@ _ADMIN_HTML = r"""
     const parts = [];
     if (p.input != null) parts.push('in $'+Number(p.input).toFixed(2));
     if (p.output != null) parts.push('out $'+Number(p.output).toFixed(2));
-    if (p.cache_read != null) parts.push('cache $'+Number(p.cache_read).toFixed(3));
+    if (p.cache_read != null) parts.push('cache read $'+Number(p.cache_read).toFixed(3));
+    if (p.cache_write != null) parts.push('cache write $'+Number(p.cache_write).toFixed(3));
     if (p.reasoning != null) parts.push('reason $'+Number(p.reasoning).toFixed(3));
     return parts.length ? parts.join(' · ') : JSON.stringify(p);
   }
@@ -1256,10 +1289,10 @@ _ADMIN_HTML = r"""
     html += '<button class="btn secondary" data-mgmt data-edit-model="'+escapeHtml(name)+'">Edit</button>';
     html += '<button class="close" type="button" data-close-detail aria-label="Close">×</button></div></div>';
     // Cost callout
-    html += '<div class="cost-callout"><span class="cost-value">'+cost+'</span><span class="cost-label">estimated cost · '+escapeHtml(winLabel)+' · priced rows only</span></div>';
+    html += '<div class="cost-callout"><span class="cost-value">'+cost+'</span><span class="cost-label">estimated cost · '+escapeHtml(winLabel)+' · '+fmtNum(u.known_cost_requests)+'/'+fmtNum(u.requests)+' requests costed</span></div>';
     // Usage strip
     html += '<div class="strip"><div class="stat"><span class="label">Requests</span><span class="value '+(errs?'warn-c':'ok-c')+'">'+reqs+'</span><span class="detail">'+fmtNum(u.ok)+' ok / '+fmtNum(errs)+' errors</span></div>';
-    html += '<div class="stat"><span class="label">Tokens</span><span class="value ok-c">'+fmtNum((u.input_tokens||0)+(u.output_tokens||0))+'</span><span class="detail">'+fmtNum(u.input_tokens)+' in / '+fmtNum(u.output_tokens)+' out ('+fmtNum(u.cached_read_tokens)+' cached)</span></div>';
+    html += '<div class="stat"><span class="label">Tokens</span><span class="value ok-c">'+fmtNum((u.input_tokens||0)+(u.output_tokens||0))+'</span><span class="detail">'+fmtNum(u.input_tokens)+' in / '+fmtNum(u.output_tokens)+' out · '+fmtNum(u.usage_reported_requests)+'/'+fmtNum(u.requests)+' reported</span></div>';
     html += '<div class="stat"><span class="label">Avg latency</span><span class="value ok-c">'+fmtMs(u.avg_latency_ms)+'</span><span class="detail">over '+fmtNum(u.requests)+' requests</span></div>';
     html += '<div class="stat"><span class="label">Reasoning tok</span><span class="value ok-c">'+fmtNum(u.reasoning_tokens)+'</span><span class="detail">thinking output</span></div></div>';
     // Config grid
@@ -1270,13 +1303,14 @@ _ADMIN_HTML = r"""
     html += kv('Max output', escapeHtml(m.max_output_tokens));
     html += kv('Thinking', escapeHtml(m.thinking || m.thinking_format || '—'));
     html += kv('Vision', m.vision ? 'yes' : 'no');
+    html += kv('Pricing status', statePill(m.pricing_status === 'unknown' ? 'warn' : 'ok', m.pricing_status || 'unknown'));
     html += kv('Pricing ($/Mtok)', '<span class="id">'+escapeHtml(pricingText(m.pricing))+'</span>');
     html += kv('Routable ids', '<span class="id">'+escapeHtml(ids.join(', ')||'—')+'</span>');
     html += '</div></div>';
     // Recent requests for this model
     const reqs2 = data.recent || [];
-    html += '<div><div class="subhead">Recent requests · this model · '+winLabel+'</div><div class="scroll"><table><thead><tr><th>Time</th><th class="num">Status</th><th>Stream</th><th class="num">In</th><th class="num">Out</th><th class="num">Cached</th><th class="num">Cost</th><th class="num">Latency</th></tr></thead><tbody>';
-    html += reqs2.map(r => '<tr><td>'+escapeHtml(r.ts_iso||'—')+'</td><td class="num '+(r.status && r.status < 400 ? 'ok-c' : 'bad-c')+'">'+(r.status||'—')+'</td><td>'+(r.is_stream?'stream':'sync')+'</td><td class="num">'+fmtNum(r.input_tokens)+'</td><td class="num">'+fmtNum(r.output_tokens)+'</td><td class="num">'+fmtNum(r.cached_read_tokens)+'</td><td class="num">'+fmtCost(r.cost_usd)+'</td><td class="num">'+fmtMs(r.latency_ms)+'</td></tr>').join('') || '<tr class="empty"><td colspan="8">No requests for this model in '+escapeHtml(winLabel)+'.</td></tr>';
+    html += '<div><div class="subhead">Recent requests · this model · '+winLabel+'</div><div class="scroll"><table><thead><tr><th>Time</th><th class="num">Status</th><th>Stream</th><th>Coverage</th><th class="num">In</th><th class="num">Out</th><th class="num">Cached</th><th class="num">Cost</th><th class="num">Latency</th></tr></thead><tbody>';
+    html += reqs2.map(r => '<tr><td>'+escapeHtml(r.ts_iso||'—')+'</td><td class="num '+(!r.error && r.status && r.status < 400 ? 'ok-c' : 'bad-c')+'">'+(r.status||'—')+'</td><td>'+(r.is_stream?'stream':'sync')+'</td><td>'+requestCoverage(r)+'</td><td class="num">'+fmtNum(r.input_tokens)+'</td><td class="num">'+fmtNum(r.output_tokens)+'</td><td class="num">'+fmtNum(r.cached_read_tokens)+'</td><td class="num">'+fmtCost(r.cost_usd)+'</td><td class="num">'+fmtMs(r.latency_ms)+'</td></tr>').join('') || '<tr class="empty"><td colspan="9">No requests for this model in '+escapeHtml(winLabel)+'.</td></tr>';
     html += '</tbody></table></div></div>';
     modelDetail.innerHTML = html;
   }

@@ -20,6 +20,7 @@ import time
 import uuid
 
 from src.signature_cache import inject_into_tool_call, store_from_extra_content
+from src.usage import openai_chat_usage_to_responses, usage_was_reported
 
 log = logging.getLogger("model-gateway")
 
@@ -314,10 +315,9 @@ def chat_to_responses(resp: dict, model: str, stream: bool = False) -> dict:
             "content": [{"type": "output_text", "text": "", "annotations": []}],
         })
 
-    # Usage
-    usage = resp.get("usage", {})
-    prompt_details = usage.get("prompt_tokens_details") or {}
-    completion_details = usage.get("completion_tokens_details") or {}
+    # Usage remains absent when the upstream did not report it. Explicit zero
+    # fields are preserved as a reported usage object.
+    response_usage = openai_chat_usage_to_responses(resp.get("usage"))
 
     # Finish reason mapping
     finish_reason = choice.get("finish_reason", "stop")
@@ -344,13 +344,7 @@ def chat_to_responses(resp: dict, model: str, stream: bool = False) -> dict:
         "tools": [],
         "top_p": None,
         "truncation": "disabled",
-        "usage": {
-            "input_tokens": usage.get("prompt_tokens", 0),
-            "input_tokens_details": {"cached_tokens": prompt_details.get("cached_tokens", 0)},
-            "output_tokens": usage.get("completion_tokens", 0),
-            "output_tokens_details": {"reasoning_tokens": completion_details.get("reasoning_tokens", 0)},
-            "total_tokens": usage.get("total_tokens", 0),
-        },
+        "usage": response_usage,
         "user": None,
         "metadata": {},
     }
@@ -422,6 +416,8 @@ async def translate_responses_stream(chat_stream, model: str):
     # Track what output items we've announced
     current_msg_started = False
     current_tool_call_started: set[int] = set()
+    saw_finish = False
+    stream_done = False
 
     buffer = ""
     async for chunk in chat_stream:
@@ -429,17 +425,30 @@ async def translate_responses_stream(chat_stream, model: str):
         while "\n" in buffer:
             line, buffer = buffer.split("\n", 1)
             line = line.strip()
-            if not line.startswith("data: "):
+            if not line.startswith("data:"):
                 continue
-            payload = line[6:]
+            payload = line[5:].lstrip()
             if payload == "[DONE]":
+                stream_done = True
                 break
             try:
                 data = json.loads(payload)
             except json.JSONDecodeError:
                 continue
 
-            if data.get("usage"):
+            if isinstance(data, dict) and (data.get("error") is not None or data.get("type") == "error"):
+                raw_error = data.get("error")
+                if isinstance(raw_error, dict):
+                    error = raw_error
+                else:
+                    error = {
+                        "type": "api_error",
+                        "message": data.get("message") or str(raw_error or "upstream stream error"),
+                    }
+                yield _sse("error", {"type": "error", "error": error})
+                return
+
+            if usage_was_reported(data.get("usage")):
                 usage_data = data["usage"]
 
             choices = data.get("choices", [])
@@ -537,9 +546,18 @@ async def translate_responses_stream(chat_stream, model: str):
                         "delta": fn["arguments"],
                     })
 
-            # Finish
             if finish_reason:
-                break
+                saw_finish = True
+
+        if stream_done:
+            break
+
+    if not saw_finish:
+        yield _sse("error", {
+            "type": "error",
+            "error": {"type": "api_error", "message": "Upstream stream ended before a finish marker"},
+        })
+        return
 
     # Close any open content parts
     if current_msg_started:
@@ -602,16 +620,8 @@ async def translate_responses_stream(chat_stream, model: str):
             "item": item,
         })
 
-    # Build usage
-    prompt_details = usage_data.get("prompt_tokens_details") or {}
-    completion_details = usage_data.get("completion_tokens_details") or {}
-    resp_usage = {
-        "input_tokens": usage_data.get("prompt_tokens", 0),
-        "input_tokens_details": {"cached_tokens": prompt_details.get("cached_tokens", 0)},
-        "output_tokens": usage_data.get("completion_tokens", 0),
-        "output_tokens_details": {"reasoning_tokens": completion_details.get("reasoning_tokens", 0)},
-        "total_tokens": usage_data.get("total_tokens", 0),
-    }
+    # Build usage only from an authoritative upstream usage block.
+    resp_usage = openai_chat_usage_to_responses(usage_data)
 
     # Final completed response
     completed = _build_response_skeleton(model)

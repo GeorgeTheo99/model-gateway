@@ -31,6 +31,9 @@ useful only as a cross-check, never as the source of record.
 - If a rate is genuinely unknown, **omit the whole `pricing` field** — the
   ledger records `cost_usd = NULL` (unknown). Never guess or copy a rate from a
   different model/provider.
+- Local/oMLX models have no provider token charge. Mark them explicitly with
+  `"pricing_status": "unmetered"` and omit `pricing`; the ledger records known
+  `$0` cost while tracking token-reporting coverage separately.
 
 ## Provider → official pricing source
 
@@ -40,6 +43,7 @@ useful only as a cross-check, never as the source of record.
 | `openai` | https://platform.openai.com/docs/pricing | HTML table | cached input (read only) |
 | `fireworks` | https://docs.fireworks.ai/serverless/pricing | HTML table (per-model: input / cached input / output) | cached input (read only) |
 | `openrouter` | https://openrouter.ai/api/v1/models | **JSON API** (machine-readable) | `prompt_cache_read` / `prompt_cache_write` (often null) |
+| `moonshot` | https://platform.kimi.ai/docs/pricing/chat-k3 | HTML table | cached input (read only) |
 | `zai_coding` | https://docs.z.ai/guides/overview/pricing | HTML | none reported |
 | `zhipuai` | https://open.bigmodel.cn/pricing | HTML (Chinese site) | none reported |
 
@@ -92,6 +96,11 @@ omit the cache field (Google via OpenRouter does not report cache tokens
 reliably). Same OpenAI-shape cost-model caveat as Fireworks applies (see
 above) when `prompt_cache_read` is non-null.
 
+**Moonshot** (verified 2026-07-20): Kimi K3 is priced per 1M tokens at
+`$3.00` cache-miss input, `$0.30` cache-hit input, and `$15.00` output. Map
+these to `input`, `cache_read`, and `output` respectively. Automatic context
+caching is included; no separate cache-write token class is reported.
+
 **Z.ai (`zai_coding`)**: the Z.ai docs pricing page lists GLM models with
 input/output per 1M tokens. No cache fields. Match by `provider_model_id`
 (e.g. `glm-5.2`). Note: the `zai_coding` provider points at
@@ -118,7 +127,7 @@ Use this to know which source to read for each model. Regenerate with:
 | gpt-5.4-mini | openai | gpt-5.4-mini | openai |
 | deepseek-v4-pro-fw | fireworks | accounts/fireworks/models/deepseek-v4-pro | fireworks |
 | glm-5.1-fw | fireworks | accounts/fireworks/models/glm-5p1 | fireworks |
-| kimi-k2.7-code-fw | fireworks | accounts/fireworks/models/kimi-k2p7-code | fireworks |
+| kimi-k3 | moonshot | kimi-k3 | Moonshot K3 pricing |
 | minimax-m3-fw | fireworks | accounts/fireworks/models/minimax-m3 | fireworks |
 | qwen3.7-plus-fw | fireworks | accounts/fireworks/models/qwen3p7-plus | fireworks |
 | deepseek-v4-flash-or | openrouter | deepseek/deepseek-v4-flash | openrouter API |

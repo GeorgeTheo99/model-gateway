@@ -10,6 +10,10 @@ import secrets
 import time
 
 from src.signature_cache import inject_into_tool_call
+from src.usage import (
+    anthropic_usage_to_openai_chat as convert_anthropic_usage_to_openai_chat,
+    openai_chat_usage_to_anthropic,
+)
 
 log = logging.getLogger("model-gateway")
 
@@ -377,19 +381,17 @@ def anthropic_to_openai_chat(resp: dict, model: str) -> dict:
 
     stop_reason = resp.get("stop_reason")
     finish_reason = "tool_calls" if stop_reason == "tool_use" else "length" if stop_reason == "max_tokens" else "stop"
-    usage = resp.get("usage") or {}
-    return {
+    result = {
         "id": "chatcmpl_" + secrets.token_hex(12),
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
         "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
-        "usage": {
-            "prompt_tokens": usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0) + usage.get("cache_creation_input_tokens", 0),
-            "completion_tokens": usage.get("output_tokens", 0),
-            "total_tokens": usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0) + usage.get("cache_creation_input_tokens", 0) + usage.get("output_tokens", 0),
-        },
     }
+    usage = convert_anthropic_usage_to_openai_chat(resp.get("usage"))
+    if usage is not None:
+        result["usage"] = usage
+    return result
 
 
 def openai_to_anthropic(resp: dict, model: str, has_tools: bool = False, thinking_enabled: bool = False) -> dict:
@@ -464,21 +466,7 @@ def openai_to_anthropic(resp: dict, model: str, has_tools: bool = False, thinkin
     else:
         stop_reason = "end_turn"
 
-    usage = resp.get("usage", {})
-
-    # Build Anthropic usage — pass through cache stats from Fireworks
-    anthropic_usage = {
-        "input_tokens": usage.get("prompt_tokens", 0),
-        "output_tokens": usage.get("completion_tokens", 0),
-    }
-
-    # Fireworks returns cached_tokens in prompt_tokens_details
-    prompt_details = usage.get("prompt_tokens_details") or {}
-    cached_tokens = prompt_details.get("cached_tokens", 0)
-    if cached_tokens:
-        anthropic_usage["cache_read_input_tokens"] = cached_tokens
-
-    return {
+    result = {
         "id": _gen_msg_id(),
         "type": "message",
         "role": "assistant",
@@ -486,5 +474,8 @@ def openai_to_anthropic(resp: dict, model: str, has_tools: bool = False, thinkin
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": None,
-        "usage": anthropic_usage,
     }
+    anthropic_usage = openai_chat_usage_to_anthropic(resp.get("usage"))
+    if anthropic_usage is not None:
+        result["usage"] = anthropic_usage
+    return result

@@ -82,10 +82,10 @@ def test_aggregate_by_model(tmp_ledger):
                       usage=_usage(input_tokens=100, output_tokens=50),
                       cost=CostEstimate(0.01, True, []))
     ledger.record(endpoint="/v1/chat/completions", method="POST", model="b",
-                  provider="openai", provider_model_id="b", status=500,
-                  latency_ms=200, is_stream=False,
+                  provider="openai", provider_model_id="b", status=200,
+                  latency_ms=200, is_stream=True,
                   usage=_usage(reported=False),
-                  cost=CostEstimate(None, False, []))
+                  cost=CostEstimate(None, False, []), error="stream failed")
     by_model = ledger.aggregate(group_by="model")
     dims = {row["dim"]: row for row in by_model}
     assert dims["a"]["requests"] == 3
@@ -93,9 +93,14 @@ def test_aggregate_by_model(tmp_ledger):
     assert dims["a"]["errors"] == 0
     assert dims["a"]["input_tokens"] == 300
     assert dims["a"]["cost_usd"] == 0.03
+    assert dims["a"]["usage_reported_requests"] == 3
+    assert dims["a"]["known_cost_requests"] == 3
+    assert dims["a"]["complete_pricing_requests"] == 3
     assert dims["b"]["requests"] == 1
     assert dims["b"]["errors"] == 1
     assert dims["b"]["cost_usd"] is None
+    assert dims["b"]["missing_usage_requests"] == 1
+    assert dims["b"]["unknown_cost_requests"] == 1
 
 
 def test_aggregate_window_filters_by_time(tmp_ledger):
@@ -119,6 +124,10 @@ def test_summary_totals(tmp_ledger):
     assert s["ok"] == 1
     assert s["input_tokens"] == 1000
     assert s["cost_usd"] == 0.05
+    assert s["usage_reported_requests"] == 1
+    assert s["known_cost_requests"] == 1
+    assert s["unknown_cost_requests"] == 0
+    assert s["complete_pricing_requests"] == 1
     assert s["first_ts"] is not None
 
 

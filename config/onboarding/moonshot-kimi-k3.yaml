@@ -17,6 +17,10 @@ models:
     thinking: always
     thinking_format: openai
     vision: true
+    pricing:
+      input: 3.0
+      output: 15.0
+      cache_read: 0.3
     quirks:
       - force_reasoning_effort_max
       - use_max_completion_tokens

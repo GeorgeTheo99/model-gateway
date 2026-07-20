@@ -26,7 +26,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from src.admin import router as admin_router
 from src.auth import require_client_auth
 from src.errors import upstream_error, upstream_error_openai
-from src.providers import list_available_models, list_models as list_routable_models, model_availability, pool_candidates, pricing_for, provider_quirks, resolve, snapshot_registry as snapshot_provider_registry
+from src.providers import list_available_models, list_models as list_routable_models, model_availability, pool_candidates, pricing_for, pricing_status_for, provider_quirks, resolve, snapshot_registry as snapshot_provider_registry
 from src.upstream import (
     PoolContext,
     _retry_post,
@@ -39,7 +39,13 @@ from src.signature_cache import store_from_extra_content
 from src.streaming import _flatten_list_content, translate_stream
 from src.translator import anthropic_to_openai, anthropic_to_openai_chat, openai_chat_to_anthropic, openai_to_anthropic
 from src import federation, ledger
-from src.usage import extract_usage, estimate_cost
+from src.usage import (
+    anthropic_usage_to_openai_chat as convert_anthropic_usage_to_openai_chat,
+    anthropic_usage_to_responses,
+    extract_usage,
+    estimate_cost,
+    usage_was_reported,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("model-gateway")
@@ -1001,7 +1007,8 @@ async def _extract_image_observations(
             usage = data.get("usage") if isinstance(data, dict) and isinstance(data.get("usage"), dict) else None
             _ledger_record(
                 "/internal/image-extract", "POST", fallback_model, fallback_info.provider,
-                fallback_info.provider_model_id, resp.status_code, latency_ms, False, usage, pricing_for(fallback_model),
+                fallback_info.provider_model_id, resp.status_code, latency_ms, False, usage,
+                pricing_for(fallback_model), pricing_status_for(fallback_model),
             )
             if resp.status_code >= 400:
                 return error_factory(
@@ -1390,12 +1397,13 @@ def _set_ledger_ctx(request: Request, model: str, info, is_stream: bool = False)
     )
 
 
-def _usage_from_sse_line(line: str) -> dict | None:
-    """Extract a usage dict from an SSE ``data:`` line, if present.
+def _usage_fragment_from_sse_line(line: str) -> tuple[str, dict] | None:
+    """Extract an authoritative usage fragment from one SSE data line.
 
-    Handles OpenAI Chat (top-level ``usage``), Anthropic Messages
-    (``message_delta`` -> ``usage``), and OpenAI Responses
-    (``response.completed`` -> ``response.usage``).
+    Anthropic splits usage across ``message_start`` (input/cache) and
+    ``message_delta`` (output). The caller must merge those fragments and only
+    consider them complete after the final delta. Chat and Responses usage
+    blocks are complete in one event.
     """
     s = line.strip()
     if not s.startswith("data:"):
@@ -1407,12 +1415,51 @@ def _usage_from_sse_line(line: str) -> dict | None:
         data = json.loads(payload)
     except json.JSONDecodeError:
         return None
-    if isinstance(data, dict):
-        if isinstance(data.get("usage"), dict):
-            return data["usage"]
-        resp = data.get("response")
-        if isinstance(resp, dict) and isinstance(resp.get("usage"), dict):
-            return resp["usage"]
+    if not isinstance(data, dict):
+        return None
+
+    event_type = data.get("type")
+    if event_type == "message_start":
+        usage = (data.get("message") or {}).get("usage")
+        if usage_was_reported(usage):
+            return "initial", usage
+    if event_type == "message_delta":
+        usage = data.get("usage")
+        if usage_was_reported(usage):
+            return "final", usage
+    usage = data.get("usage")
+    if usage_was_reported(usage):
+        return "complete", usage
+    resp = data.get("response")
+    if isinstance(resp, dict) and usage_was_reported(resp.get("usage")):
+        return "complete", resp["usage"]
+    return None
+
+
+def _sse_error_from_line(line: str) -> str | None:
+    """Return a redacted stream error message from one SSE data line."""
+    s = line.strip()
+    if not s.startswith("data:"):
+        return None
+    payload = s[5:].strip()
+    if not payload or payload == "[DONE]":
+        return None
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    error = data.get("error")
+    if isinstance(error, dict):
+        return str(error.get("message") or error.get("type") or "upstream stream error")[:500]
+    if data.get("type") == "error":
+        return str(data.get("message") or error or data.get("code") or "upstream stream error")[:500]
+    response = data.get("response")
+    if data.get("type") == "response.failed" and isinstance(response, dict):
+        response_error = response.get("error")
+        if isinstance(response_error, dict):
+            return str(response_error.get("message") or response_error.get("code") or "response failed")[:500]
     return None
 
 
@@ -1420,15 +1467,16 @@ def _ledger_record(
     endpoint: str, method: str, model: str | None, provider: str | None,
     provider_model_id: str | None, status: int | None, latency_ms: int | None,
     is_stream: bool, usage_dict: dict | None, pricing: dict | None,
+    pricing_status: str = "unknown", error: str | None = None,
 ) -> None:
     """Best-effort: normalize usage, estimate cost, insert a ledger row."""
     try:
         usage = extract_usage({"usage": usage_dict}) if usage_dict else extract_usage(None)
-        cost = estimate_cost(usage, pricing)
+        cost = estimate_cost(usage, pricing, pricing_status=pricing_status)
         ledger.record(
             endpoint=endpoint, method=method, model=model, provider=provider,
             provider_model_id=provider_model_id, status=status, latency_ms=latency_ms,
-            is_stream=is_stream, usage=usage, cost=cost, error=None,
+            is_stream=is_stream, usage=usage, cost=cost, error=error,
         )
     except Exception as exc:  # noqa: BLE001 - ledger must never break requests
         log.warning("ledger record failed: %s", exc)
@@ -1457,29 +1505,55 @@ async def ledger_middleware(request: Request, call_next):
     provider = ctx.get("provider")
     provider_model_id = ctx.get("provider_model_id")
     is_stream = bool(ctx.get("is_stream"))
-    pricing = pricing_for(model) if model else None
+    try:
+        pricing = pricing_for(model) if model else None
+        pricing_status = pricing_status_for(model) if model else "unknown"
+    except Exception as exc:  # noqa: BLE001 - ledger lookup must not break responses
+        log.warning("ledger pricing lookup failed for %r: %s", model, exc)
+        pricing = None
+        pricing_status = "unknown"
     status = response.status_code
 
     if is_stream:
         original_iter = response.body_iterator
-        usage_capture = {"usage": None}
+        usage_capture = {"usage": None, "initial": None, "error": None}
+        sse_buffer = ""
+
+        def capture_line(line: str) -> None:
+            stream_error = _sse_error_from_line(line)
+            if stream_error is not None:
+                usage_capture["error"] = stream_error
+            fragment = _usage_fragment_from_sse_line(line)
+            if fragment is None:
+                return
+            kind, usage = fragment
+            if kind == "initial":
+                usage_capture["initial"] = dict(usage)
+            elif kind == "final":
+                usage_capture["usage"] = {
+                    **(usage_capture["initial"] or {}),
+                    **usage,
+                }
+            else:
+                usage_capture["usage"] = dict(usage)
 
         async def wrapped_iter():
+            nonlocal sse_buffer
             try:
                 async for chunk in original_iter:
-                    if isinstance(chunk, (bytes, bytearray)):
-                        for line in chunk.decode("utf-8", errors="replace").splitlines():
-                            u = _usage_from_sse_line(line)
-                            if u is not None:
-                                # Last usage block wins (Anthropic sends an
-                                # initial message_start usage then a final
-                                # message_delta usage).
-                                usage_capture["usage"] = u
+                    text = chunk if isinstance(chunk, str) else bytes(chunk).decode("utf-8", errors="replace")
+                    sse_buffer += text
+                    while "\n" in sse_buffer:
+                        line, sse_buffer = sse_buffer.split("\n", 1)
+                        capture_line(line)
                     yield chunk
             finally:
+                if sse_buffer:
+                    capture_line(sse_buffer)
                 _ledger_record(
                     request.url.path, "POST", model, provider, provider_model_id,
                     status, latency_ms, True, usage_capture["usage"], pricing,
+                    pricing_status, usage_capture["error"],
                 )
 
         response.body_iterator = wrapped_iter()
@@ -1503,7 +1577,7 @@ async def ledger_middleware(request: Request, call_next):
             pass
     _ledger_record(
         request.url.path, "POST", model, provider, provider_model_id,
-        status, latency_ms, False, usage_dict, pricing,
+        status, latency_ms, False, usage_dict, pricing, pricing_status,
     )
 
     return Response(
@@ -2171,6 +2245,7 @@ async def _anthropic_sse_to_openai_chat(byte_iter, model: str):
     created = int(time.time())
     tool_block_indices: dict[int, int] = {}
     usage: dict = {}
+    usage_complete = False
 
     def chunk(delta: dict, finish_reason=None, include_usage: bool = False) -> bytes:
         payload = {
@@ -2180,10 +2255,10 @@ async def _anthropic_sse_to_openai_chat(byte_iter, model: str):
             "model": model,
             "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
         }
-        if include_usage:
-            prompt = usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0) + usage.get("cache_creation_input_tokens", 0)
-            completion = usage.get("output_tokens", 0)
-            payload["usage"] = {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
+        if include_usage and usage_complete:
+            converted = convert_anthropic_usage_to_openai_chat(usage)
+            if converted is not None:
+                payload["usage"] = converted
         return f"data: {json.dumps(payload)}\n\n".encode()
 
     yield chunk({"role": "assistant"})
@@ -2194,16 +2269,26 @@ async def _anthropic_sse_to_openai_chat(byte_iter, model: str):
         while "\n" in buffer:
             line, buffer = buffer.split("\n", 1)
             line = line.strip()
-            if not line.startswith("data: "):
+            if not line.startswith("data:"):
                 continue
-            payload = line[6:]
+            payload = line[5:].lstrip()
             try:
                 data = json.loads(payload)
             except json.JSONDecodeError:
                 continue
             event_type = data.get("type")
+            if event_type == "error":
+                raw_error = data.get("error")
+                error = raw_error if isinstance(raw_error, dict) else {
+                    "type": "api_error",
+                    "message": data.get("message") or str(raw_error or "Anthropic stream error"),
+                }
+                yield f"data: {json.dumps({'error': error})}\n\n".encode()
+                return
             if event_type == "message_start":
-                usage.update((data.get("message") or {}).get("usage") or {})
+                initial_usage = (data.get("message") or {}).get("usage")
+                if usage_was_reported(initial_usage):
+                    usage.update(initial_usage)
             elif event_type == "content_block_start":
                 idx = data.get("index", 0)
                 block = data.get("content_block") or {}
@@ -2229,14 +2314,16 @@ async def _anthropic_sse_to_openai_chat(byte_iter, model: str):
                     yield chunk({"tool_calls": [{"index": tool_index, "function": {"arguments": delta["partial_json"]}}]})
             elif event_type == "message_delta":
                 stop_reason = (data.get("delta") or {}).get("stop_reason") or stop_reason
-                usage.update(data.get("usage") or {})
+                final_usage = data.get("usage")
+                if usage_was_reported(final_usage):
+                    usage.update(final_usage)
+                    usage_complete = True
             elif event_type == "message_stop":
                 finish = "tool_calls" if stop_reason == "tool_use" else "length" if stop_reason == "max_tokens" else "stop"
-                yield chunk({}, finish_reason=finish, include_usage=True)
+                yield chunk({}, finish_reason=finish, include_usage=usage_complete)
                 yield b"data: [DONE]\n\n"
                 return
-    yield chunk({}, finish_reason="stop", include_usage=True)
-    yield b"data: [DONE]\n\n"
+    yield _stream_error_event("Anthropic stream ended before message_stop").encode()
 
 
 async def _passthrough_sync(endpoint: str, body: dict, headers: dict, provider: str = "", request: Request | None = None) -> JSONResponse:
@@ -2322,6 +2409,7 @@ async def _collect_stream(resp: httpx.Response) -> dict:
     reasoning_content = ""
     tool_calls: dict[int, dict] = {}  # index -> {id, function: {name, arguments}}
     finish_reason = None
+    saw_finish = False
     usage = {}
 
     buffer = ""
@@ -2330,9 +2418,9 @@ async def _collect_stream(resp: httpx.Response) -> dict:
         while "\n" in buffer:
             line, buffer = buffer.split("\n", 1)
             line = line.strip()
-            if not line.startswith("data: "):
+            if not line.startswith("data:"):
                 continue
-            payload = line[6:]
+            payload = line[5:].lstrip()
             if payload == "[DONE]":
                 break
             try:
@@ -2340,7 +2428,15 @@ async def _collect_stream(resp: httpx.Response) -> dict:
             except json.JSONDecodeError:
                 continue
 
-            if data.get("usage"):
+            if isinstance(data, dict) and (data.get("error") is not None or data.get("type") == "error"):
+                raw_error = data.get("error")
+                if isinstance(raw_error, dict):
+                    message = raw_error.get("message") or raw_error.get("type")
+                else:
+                    message = data.get("message") or raw_error
+                raise ValueError(str(message or "upstream stream error"))
+
+            if usage_was_reported(data.get("usage")):
                 usage = data["usage"]
 
             choice = (data.get("choices") or [{}])[0]
@@ -2348,6 +2444,7 @@ async def _collect_stream(resp: httpx.Response) -> dict:
             fr = choice.get("finish_reason")
             if fr:
                 finish_reason = fr
+                saw_finish = True
 
             delta_content = delta.get("content")
             if isinstance(delta_content, list):
@@ -2383,6 +2480,9 @@ async def _collect_stream(resp: httpx.Response) -> dict:
                     tool_calls[idx]["extra_content"] = tc["extra_content"]
                     store_from_extra_content(tc.get("id") or tool_calls[idx].get("id", ""), tc["extra_content"])
                 tool_calls[idx]["function"]["arguments"] += fn.get("arguments", "")
+
+    if not saw_finish:
+        raise ValueError("upstream stream ended before a finish marker")
 
     # Assemble response in OpenAI non-streaming shape
     message: dict = {"role": "assistant"}
@@ -2810,7 +2910,7 @@ def _anthropic_messages_to_responses(resp: dict, model: str) -> dict:
             "content": [{"type": "output_text", "text": "", "annotations": []}],
         })
 
-    usage = resp.get("usage", {})
+    response_usage = anthropic_usage_to_responses(resp.get("usage"))
 
     return {
         "id": resp_id,
@@ -2834,13 +2934,7 @@ def _anthropic_messages_to_responses(resp: dict, model: str) -> dict:
         "tools": [],
         "top_p": None,
         "truncation": "disabled",
-        "usage": {
-            "input_tokens": usage.get("input_tokens", 0),
-            "input_tokens_details": {"cached_tokens": usage.get("cache_read_input_tokens", 0)},
-            "output_tokens": usage.get("output_tokens", 0),
-            "output_tokens_details": {"reasoning_tokens": 0},
-            "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
-        },
+        "usage": response_usage,
         "user": None,
         "metadata": {},
     }
@@ -2898,6 +2992,8 @@ async def _collect_anthropic_stream(resp: httpx.Response) -> dict:
     msg_data: dict = {}
     content_blocks: dict[int, dict] = {}  # index -> block
     usage: dict = {}
+    saw_final_usage = False
+    saw_message_stop = False
 
     buffer = ""
     async for chunk in resp.aiter_bytes():
@@ -2905,18 +3001,28 @@ async def _collect_anthropic_stream(resp: httpx.Response) -> dict:
         while "\n" in buffer:
             line, buffer = buffer.split("\n", 1)
             line = line.strip()
-            if not line.startswith("data: "):
+            if not line.startswith("data:"):
                 continue
-            payload = line[6:]
+            payload = line[5:].lstrip()
             try:
                 data = json.loads(payload)
             except json.JSONDecodeError:
                 continue
 
             event_type = data.get("type", "")
+            if event_type == "error":
+                raw_error = data.get("error")
+                if isinstance(raw_error, dict):
+                    message = raw_error.get("message") or raw_error.get("type")
+                else:
+                    message = data.get("message") or raw_error
+                raise ValueError(str(message or "Anthropic stream error"))
 
             if event_type == "message_start":
                 msg_data = data.get("message", {})
+                initial_usage = msg_data.get("usage")
+                if usage_was_reported(initial_usage):
+                    usage.update(initial_usage)
             elif event_type == "content_block_start":
                 block = data.get("content_block", {})
                 idx = data.get("index", len(content_blocks))
@@ -2936,9 +3042,15 @@ async def _collect_anthropic_stream(resp: httpx.Response) -> dict:
                 delta = data.get("delta", {})
                 if "stop_reason" in delta:
                     msg_data["stop_reason"] = delta["stop_reason"]
-                usage_update = data.get("usage", {})
-                if usage_update:
+                usage_update = data.get("usage")
+                if usage_was_reported(usage_update):
                     usage.update(usage_update)
+                    saw_final_usage = True
+            elif event_type == "message_stop":
+                saw_message_stop = True
+
+    if not saw_message_stop or not saw_final_usage:
+        raise ValueError("Anthropic stream ended before final usage/message_stop")
 
     # Assemble content blocks, parsing any accumulated JSON input
     content = []

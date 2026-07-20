@@ -1,5 +1,8 @@
+import json
+
 from fastapi.testclient import TestClient
 
+import src.admin as admin_module
 import src.providers as providers
 from src.server import app
 
@@ -46,8 +49,23 @@ def test_admin_auth_requires_configured_admin_key(monkeypatch):
     assert resp.json()["auth"]["admin_auth_enabled"] is True
 
 
-def test_admin_presets_endpoint_is_read_only_and_auth_protected(monkeypatch):
+def test_admin_presets_endpoint_is_read_only_and_auth_protected(monkeypatch, tmp_path):
     monkeypatch.setenv("MODEL_GATEWAY_ADMIN_KEY", "admin-key")
+    model_info = tmp_path / "model-info.json"
+    model_info.write_text(json.dumps({
+        "llm": [],
+        "auto_models": {
+            "default_scope": "cloud",
+            "cloud": {"model": "cloud-model", "vision_model": "cloud-model"},
+        },
+        "model_presets": {
+            "default_tier": "best",
+            "presets": {
+                "best": {"cloud": {"text_model": "cloud-model", "vision_model": "cloud-model"}},
+            },
+        },
+    }))
+    monkeypatch.setattr(admin_module, "MODEL_INFO_PATH", model_info)
 
     assert client.get("/admin/api/presets").status_code == 401
     resp = client.get("/admin/api/presets", headers={"Authorization": "Bearer admin-key"})

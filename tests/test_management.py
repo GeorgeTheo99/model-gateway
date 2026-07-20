@@ -161,6 +161,47 @@ def test_upsert_model_updates_existing(tmp_config, monkeypatch):
     assert entry["pricing"] == {"input": 3.0, "output": 15.0}
 
 
+def test_upsert_local_model_can_be_explicitly_unmetered(tmp_config, monkeypatch):
+    config_io.log_dir = tmp_config / "logs"
+    result = config_io.upsert_model(
+        "local-unmetered", provider="omlx", provider_model_id="local-upstream",
+        pricing_status="unmetered", pricing=None,
+    )
+    assert result["entry"]["pricing_status"] == "unmetered"
+    assert "pricing" not in result["entry"]
+    providers.reload()
+    status = next(row for row in providers.model_status() if row["name"] == "local-unmetered")
+    assert status["pricing_status"] == "unmetered"
+    assert status["pricing"] is None
+
+
+def test_upsert_model_rejects_invalid_pricing_policy(tmp_config, monkeypatch):
+    config_io.log_dir = tmp_config / "logs"
+    with pytest.raises(ValueError, match="only valid for local"):
+        config_io.upsert_model(
+            "cloud-free", provider="openai", provider_model_id="cloud-free",
+            pricing_status="unmetered", pricing=None,
+        )
+    with pytest.raises(ValueError, match="requires: output"):
+        config_io.upsert_model(
+            "bad-price", provider="openai", provider_model_id="bad-price",
+            pricing_status="metered", pricing={"input": 1.0},
+        )
+    with pytest.raises(ValueError, match="finite non-negative"):
+        config_io.upsert_model(
+            "infinite-price", provider="openai", provider_model_id="infinite-price",
+            pricing_status="metered", pricing={"input": float("inf"), "output": 1.0},
+        )
+    config_io.upsert_model(
+        "local-to-cloud", provider="omlx", provider_model_id="local-upstream",
+        pricing_status="unmetered", pricing=None,
+    )
+    with pytest.raises(ValueError, match="only valid for local"):
+        config_io.upsert_model(
+            "local-to-cloud", provider="openai", provider_model_id="cloud-upstream",
+        )
+
+
 def test_set_model_enabled_writes_config_yaml(tmp_config, monkeypatch):
     """enabled state lives in config.yaml model_overrides, not model-info.json."""
     config_io.log_dir = tmp_config / "logs"
@@ -315,9 +356,11 @@ def test_unconfigured_provider_models_are_hidden_from_v1_models(tmp_config, monk
     assert providers.model_availability("gpt-unconfigured")["reason"] == "provider_not_configured"
 
     with TestClient(app) as c:
-        ids = {m["id"] for m in c.get("/v1/models").json()["data"]}
+        public_rows = c.get("/v1/models").json()["data"]
+        ids = {m["id"] for m in public_rows}
         assert "claude-test" in ids
         assert "gpt-unconfigured" not in ids
+        assert all("pricing" not in m and "pricing_status" not in m for m in public_rows)
 
         admin = {"Authorization": "Bearer admin"}
         row = next(
@@ -609,6 +652,25 @@ def test_admin_upsert_model_endpoint(client):
     assert "new-model" in providers._load_models()
 
 
+def test_admin_upsert_model_applies_enabled_checkbox(client):
+    h = {"Authorization": "Bearer admin"}
+    payload = {
+        "provider": "anthropic",
+        "provider_model_id": "claude-test-1",
+        "enabled": False,
+    }
+    response = client.post("/admin/api/models/claude-test", headers=h, json=payload)
+    assert response.status_code == 200
+    assert response.json()["enabled"] is False
+    assert providers.resolve("claude-test") is None
+
+    payload["enabled"] = True
+    response = client.post("/admin/api/models/claude-test", headers=h, json=payload)
+    assert response.status_code == 200
+    assert response.json()["enabled"] is True
+    assert providers.resolve("claude-test") is not None
+
+
 def test_admin_disable_enable_model_endpoint(client):
     h = {"Authorization": "Bearer admin"}
     assert client.post("/admin/api/models/claude-test/disable", headers=h).status_code == 200
@@ -619,8 +681,15 @@ def test_admin_disable_enable_model_endpoint(client):
 
 def test_admin_delete_model_endpoint(client):
     h = {"Authorization": "Bearer admin"}
+    created = client.post(
+        "/admin/api/models/replacement",
+        headers=h,
+        json={"provider": "anthropic", "provider_model_id": "replacement-1"},
+    )
+    assert created.status_code == 200
     assert client.delete("/admin/api/models/claude-test", headers=h).status_code == 200
     assert providers.resolve("claude-test") is None
+    assert providers.resolve("replacement") is not None
 
 
 def test_admin_delete_provider_refuses_with_dependents(client):

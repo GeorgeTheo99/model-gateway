@@ -9,6 +9,7 @@ any write fails.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import secrets
@@ -20,6 +21,7 @@ from urllib.parse import urlsplit
 import httpx
 import yaml
 
+from src.catalog import entry_routable_ids, validate_pricing_policy
 from src.config_lock import config_write_lock
 from src.secret_files import read_api_key_file, resolve_api_key_file
 
@@ -29,7 +31,11 @@ class OnboardingError(ValueError):
 
 
 def load_profile(path: Path) -> dict:
-    data = yaml.safe_load(path.read_text()) or {}
+    return validate_profile(yaml.safe_load(path.read_text()) or {})
+
+
+def validate_profile(data: object) -> dict:
+    """Validate a parsed profile for both CLI and direct API callers."""
     if not isinstance(data, dict):
         raise OnboardingError("profile root must be an object")
     if data.get("schema_version") != 1:
@@ -61,19 +67,21 @@ def load_profile(path: Path) -> dict:
         if not isinstance(model, dict):
             raise OnboardingError("every profile model must be an object")
         for field in ("name", "provider", "provider_model_id"):
-            if not model.get(field):
-                raise OnboardingError(f"profile model requires {field}")
-        name = str(model["name"])
+            value = model.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise OnboardingError(f"profile model requires non-empty string {field}")
+        name = model["name"]
         if name in names:
             raise OnboardingError(f"duplicate profile model name: {name}")
         names.add(name)
-        for value in (model.get("name"), model.get("alias"), model.get("provider_model_id")):
-            if not value:
-                continue
-            identifier = str(value)
+        try:
+            routable_ids = entry_routable_ids(model)
+        except ValueError as exc:
+            raise OnboardingError(str(exc)) from exc
+        for identifier in routable_ids:
             owner = identifiers.get(identifier)
             if owner and owner != name:
-                raise OnboardingError(f"duplicate profile model identifier: {value}")
+                raise OnboardingError(f"duplicate profile model identifier: {identifier}")
             identifiers[identifier] = name
         if model["provider"] != provider["id"]:
             raise OnboardingError(
@@ -82,6 +90,34 @@ def load_profile(path: Path) -> dict:
         for field in ("context", "max_output_tokens"):
             if field in model and (not isinstance(model[field], int) or model[field] <= 0):
                 raise OnboardingError(f"model {model['name']!r} {field} must be a positive integer")
+        pricing = model.get("pricing")
+        if pricing is not None:
+            if not isinstance(pricing, dict) or not pricing:
+                raise OnboardingError(f"model {model['name']!r} pricing must be a non-empty object")
+            unknown_pricing = set(pricing) - {"input", "output", "cache_read", "cache_write", "reasoning"}
+            if unknown_pricing:
+                raise OnboardingError(
+                    f"model {model['name']!r} has unknown pricing field(s): "
+                    + ", ".join(sorted(unknown_pricing))
+                )
+            missing_pricing = {"input", "output"} - set(pricing)
+            if missing_pricing:
+                raise OnboardingError(
+                    f"model {model['name']!r} pricing requires: "
+                    + ", ".join(sorted(missing_pricing))
+                )
+            if any(
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(value)
+                or value < 0
+                for value in pricing.values()
+            ):
+                raise OnboardingError(f"model {model['name']!r} pricing values must be finite non-negative numbers")
+        try:
+            validate_pricing_policy(model)
+        except ValueError as exc:
+            raise OnboardingError(str(exc)) from exc
     provenance = data.get("provenance")
     if provenance is not None and not isinstance(provenance, dict):
         raise OnboardingError("profile provenance must be an object")
@@ -184,6 +220,11 @@ def _build_candidates(profile: dict, config: dict, model_doc: dict, *, secret_fi
     provider = profile["provider"]
     provider_id = str(provider["id"]).strip().lower()
     models = [dict(model) for model in profile["models"]]
+    for model in models:
+        try:
+            validate_pricing_policy(model)
+        except ValueError as exc:
+            raise OnboardingError(str(exc)) from exc
     retired = set((profile.get("retire") or {}).get("models") or [])
     new_names = {str(model["name"]) for model in models}
 
@@ -197,8 +238,18 @@ def _build_candidates(profile: dict, config: dict, model_doc: dict, *, secret_fi
     }
     current_names = set(current_by_name)
     missing_retired = retired - current_names
-    already_applied = all(current_by_name.get(str(model["name"])) == model for model in models)
-    if missing_retired and not already_applied:
+    # A previously applied profile may legitimately add reviewed metadata
+    # (for example pricing) after its retired predecessor is already gone.
+    # Permit that update only when every replacement still has the same
+    # structural owner/upstream identity; a coincidental name from another
+    # provider must not bypass first-run retirement checks.
+    replacement_already_present = all(
+        current_by_name.get(str(model["name"])) is not None
+        and current_by_name[str(model["name"])].get("provider") == model.get("provider")
+        and current_by_name[str(model["name"])].get("provider_model_id") == model.get("provider_model_id")
+        for model in models
+    )
+    if missing_retired and not replacement_already_present:
         raise OnboardingError(
             "expected retired model(s) not found: " + ", ".join(sorted(missing_retired))
         )
@@ -321,6 +372,7 @@ def _apply_profile_unlocked(
     post_rollback: Callable[[], None] | None = None,
 ) -> dict:
     """Apply an onboarding profile and rollback every touched file on failure."""
+    profile = validate_profile(profile)
     config_path = _real_target(config_path)
     model_info_path = _real_target(model_info_path)
     source_path = _real_target(model_info_source_path) if model_info_source_path else None

@@ -125,9 +125,9 @@ providers:
   #   auth_profile: my-cli-profile   # optional; falls back to --host <base_url>
   #   auth_login: false              # optional kill switch for browser SSO
 
-# Runtime-local model overlay. Same schema as model-info.json `llm` entries;
-# merged on top of the committed catalog (overlay wins on id clash). Keeps
-# machine/workspace-specific model routes out of the repo entirely.
+# Runtime-local model overlay. Same schema as machine-local model-info.json
+# `llm` entries; merged on top of that catalog (overlay wins on id clash).
+# Useful for temporary/provider-specific overrides without rewriting the catalog.
 # Per-model `protocol` overrides the provider default (useful when one
 # gateway host serves both Anthropic- and OpenAI-protocol models).
 # models:

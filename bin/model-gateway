@@ -112,6 +112,32 @@ EOF
   warn "Created empty config at $CONFIG_PATH; add provider secrets/auth before expecting models to route"
 }
 
+ensure_model_catalog() {
+  [ -f "$MODEL_INFO_PATH" ] || die "machine-local model catalog missing: $MODEL_INFO_PATH (provision a reviewed model-info.json; see docs/deployment.md)"
+  (
+    cd "$ROOT_DIR"
+    "$UV_BIN" run python - "$MODEL_INFO_PATH" "$CONFIG_PATH" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from src.catalog import load_catalog_entries
+
+path = Path(sys.argv[1])
+config_path = Path(sys.argv[2])
+data = json.loads(path.read_text())
+if not isinstance(data, dict) or not isinstance(data.get("llm"), list) or not data["llm"]:
+    raise SystemExit("model-info.json must contain a non-empty llm list")
+if any(not isinstance(row, dict) for row in data["llm"]):
+    raise SystemExit("model-info.json llm entries must be objects")
+effective = load_catalog_entries(path, config_path, require_nonempty=True)
+if not effective:
+    raise SystemExit("effective model catalog is empty")
+PY
+  ) || die "invalid machine-local model catalog: $MODEL_INFO_PATH"
+  ok "Model catalog ready: $MODEL_INFO_PATH"
+}
+
 sync_venv() {
   log "Syncing Python environment"
   uv sync --project "$ROOT_DIR" >/dev/null
@@ -387,6 +413,7 @@ cmd_install() {
   log "Installing model-gateway from $ROOT_DIR"
   ensure_config
   sync_venv
+  ensure_model_catalog
   install_cli_symlink
   write_plist
   if [ $start -eq 1 ]; then

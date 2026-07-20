@@ -671,6 +671,10 @@ def test_stale_oauth_refresh_cannot_overwrite_admin_provider_update(
     monkeypatch.setattr(config_io, "MODEL_INFO_PATH", tmp_config / "model-info.json")
     monkeypatch.setattr(config_io, "MODEL_INFO_SOURCE_PATH", None)
     monkeypatch.setattr(config_io, "log_dir", tmp_config / "logs")
+    (tmp_config / "model-info.json").write_text(json.dumps({
+        "llm": [{"name": "ws-model", "provider": "ws", "provider_model_id": "ws-model"}],
+    }))
+    providers.reload()
     monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
     providers._last_token_refresh_attempt.clear()
     providers._last_auth_login_attempt.clear()

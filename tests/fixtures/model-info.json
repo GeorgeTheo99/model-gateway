@@ -1,0 +1,18 @@
+{
+  "updated": "2026-07-20T00:00:00+00:00",
+  "llm": [
+    {
+      "name": "test-local",
+      "alias": "testlocal",
+      "provider": "omlx",
+      "omlx_id": "test-local-upstream",
+      "context": 32768,
+      "max_output_tokens": 4096,
+      "thinking": "",
+      "thinking_format": "none",
+      "vision": false,
+      "pricing_status": "unmetered",
+      "desc": "Deterministic test-only local route"
+    }
+  ]
+}

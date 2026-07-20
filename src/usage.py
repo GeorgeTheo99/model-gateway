@@ -45,6 +45,99 @@ def _as_int(value) -> int:
         return 0
 
 
+_OPENAI_CHAT_USAGE_KEYS = {
+    "prompt_tokens", "completion_tokens", "total_tokens",
+    "prompt_tokens_details", "completion_tokens_details",
+}
+_ANTHROPIC_USAGE_KEYS = {
+    "input_tokens", "output_tokens", "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+}
+_RESPONSES_USAGE_KEYS = {
+    "input_tokens", "output_tokens", "total_tokens",
+    "input_tokens_details", "output_tokens_details",
+}
+
+
+def usage_was_reported(usage: object) -> bool:
+    """Return whether a usage object contains recognized provider fields.
+
+    Field presence, not token magnitude, distinguishes a valid explicit-zero
+    report from a fabricated or absent empty object.
+    """
+    return isinstance(usage, dict) and bool(
+        set(usage) & (_OPENAI_CHAT_USAGE_KEYS | _ANTHROPIC_USAGE_KEYS | _RESPONSES_USAGE_KEYS)
+    )
+
+
+def openai_chat_usage_to_anthropic(usage: object) -> dict | None:
+    """Convert authoritative Chat usage to Anthropic's exclusive-input shape."""
+    if not isinstance(usage, dict) or not (set(usage) & _OPENAI_CHAT_USAGE_KEYS):
+        return None
+    details = usage.get("prompt_tokens_details") or {}
+    cached_read = _as_int(details.get("cached_tokens"))
+    cache_write = _as_int(details.get("cache_write_tokens"))
+    result = {
+        "input_tokens": max(0, _as_int(usage.get("prompt_tokens")) - cached_read - cache_write),
+        "output_tokens": _as_int(usage.get("completion_tokens")),
+    }
+    if "cached_tokens" in details:
+        result["cache_read_input_tokens"] = cached_read
+    if "cache_write_tokens" in details:
+        result["cache_creation_input_tokens"] = cache_write
+    return result
+
+
+def openai_chat_usage_to_responses(usage: object) -> dict | None:
+    """Convert authoritative Chat usage to the Responses inclusive-input shape."""
+    if not isinstance(usage, dict) or not (set(usage) & _OPENAI_CHAT_USAGE_KEYS):
+        return None
+    prompt = _as_int(usage.get("prompt_tokens"))
+    completion = _as_int(usage.get("completion_tokens"))
+    prompt_details = usage.get("prompt_tokens_details") or {}
+    completion_details = usage.get("completion_tokens_details") or {}
+    input_details = {"cached_tokens": _as_int(prompt_details.get("cached_tokens"))}
+    if "cache_write_tokens" in prompt_details:
+        input_details["cache_write_tokens"] = _as_int(prompt_details.get("cache_write_tokens"))
+    return {
+        "input_tokens": prompt,
+        "input_tokens_details": input_details,
+        "output_tokens": completion,
+        "output_tokens_details": {
+            "reasoning_tokens": _as_int(completion_details.get("reasoning_tokens")),
+        },
+        "total_tokens": _as_int(usage.get("total_tokens")) or prompt + completion,
+    }
+
+
+def anthropic_usage_to_openai_chat(usage: object) -> dict | None:
+    """Convert authoritative Anthropic usage to Chat's inclusive-input shape."""
+    if not isinstance(usage, dict) or not (set(usage) & _ANTHROPIC_USAGE_KEYS):
+        return None
+    input_tokens = _as_int(usage.get("input_tokens"))
+    output_tokens = _as_int(usage.get("output_tokens"))
+    cached_read = _as_int(usage.get("cache_read_input_tokens"))
+    cache_write = _as_int(usage.get("cache_creation_input_tokens"))
+    prompt_tokens = input_tokens + cached_read + cache_write
+    details = {"cached_tokens": cached_read}
+    if "cache_creation_input_tokens" in usage:
+        # Additive gateway extension used to preserve exact Anthropic billing
+        # when the client-facing API has no standard cache-write field.
+        details["cache_write_tokens"] = cache_write
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": output_tokens,
+        "total_tokens": prompt_tokens + output_tokens,
+        "prompt_tokens_details": details,
+    }
+
+
+def anthropic_usage_to_responses(usage: object) -> dict | None:
+    """Convert authoritative Anthropic usage to Responses usage."""
+    chat_usage = anthropic_usage_to_openai_chat(usage)
+    return openai_chat_usage_to_responses(chat_usage) if chat_usage is not None else None
+
+
 def extract_usage(resp: dict | None) -> Usage:
     """Normalize a response body's ``usage`` block into a :class:`Usage`.
 
@@ -63,19 +156,33 @@ def extract_usage(resp: dict | None) -> Usage:
     if not isinstance(resp, dict):
         return Usage()
     usage = resp.get("usage")
-    if not isinstance(usage, dict) or not usage:
+    if not usage_was_reported(usage):
         # Some OpenAI stream chunks put usage at the top level after reassembly.
-        if isinstance(resp, dict) and any(
-            k in resp for k in ("prompt_tokens", "completion_tokens")
-        ):
+        if set(resp) & _OPENAI_CHAT_USAGE_KEYS:
             usage = resp
         else:
             return Usage()
 
-    # Anthropic Messages shape: top-level cache_read/cache_creation keys.
-    # Anthropic's input_tokens EXCLUDES cached tokens (cache reads and writes
-    # are reported separately), so no subtraction needed.
-    if "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage:
+    # OpenAI Responses shape: nested *_tokens_details. Check before Anthropic
+    # because both protocols use input_tokens/output_tokens.
+    if "input_tokens_details" in usage or "output_tokens_details" in usage:
+        in_details = usage.get("input_tokens_details") or {}
+        out_details = usage.get("output_tokens_details") or {}
+        cached = _as_int(in_details.get("cached_tokens"))
+        cache_write = _as_int(in_details.get("cache_write_tokens"))
+        return Usage(
+            input_tokens=max(0, _as_int(usage.get("input_tokens")) - cached - cache_write),
+            output_tokens=_as_int(usage.get("output_tokens")),
+            cached_read_tokens=cached,
+            cache_write_tokens=cache_write,
+            reasoning_tokens=_as_int(out_details.get("reasoning_tokens")),
+            reported=True,
+        )
+
+    # Anthropic Messages shape. A block containing only input_tokens and/or
+    # output_tokens is still Anthropic-shaped and must not fall through to the
+    # Chat parser. Anthropic input excludes cache reads and writes.
+    if set(usage) & _ANTHROPIC_USAGE_KEYS and not (set(usage) & {"prompt_tokens", "completion_tokens"}):
         return Usage(
             input_tokens=_as_int(usage.get("input_tokens")),
             output_tokens=_as_int(usage.get("output_tokens")),
@@ -85,35 +192,18 @@ def extract_usage(resp: dict | None) -> Usage:
             reported=True,
         )
 
-    # OpenAI Responses shape: nested *_tokens_details.
-    # OpenAI's input_tokens INCLUDES cached tokens, so subtract cached to get
-    # cache-miss input (consistent with Anthropic semantics). This prevents
-    # estimate_cost from billing cached tokens at both the input and cache_read
-    # rates.
-    if "input_tokens_details" in usage or "output_tokens_details" in usage:
-        in_details = usage.get("input_tokens_details") or {}
-        out_details = usage.get("output_tokens_details") or {}
-        cached = _as_int(in_details.get("cached_tokens"))
-        return Usage(
-            input_tokens=max(0, _as_int(usage.get("input_tokens")) - cached),
-            output_tokens=_as_int(usage.get("output_tokens")),
-            cached_read_tokens=cached,
-            cache_write_tokens=0,
-            reasoning_tokens=_as_int(out_details.get("reasoning_tokens")),
-            reported=True,
-        )
-
     # OpenAI Chat Completions shape: prompt_tokens / completion_tokens +
     # prompt_tokens_details.cached_tokens + completion_tokens_details.reasoning_tokens.
     # prompt_tokens INCLUDES cached tokens; subtract to get cache-miss input.
     in_details = usage.get("prompt_tokens_details") or {}
     out_details = usage.get("completion_tokens_details") or {}
     cached = _as_int(in_details.get("cached_tokens"))
+    cache_write = _as_int(in_details.get("cache_write_tokens"))
     return Usage(
-        input_tokens=max(0, _as_int(usage.get("prompt_tokens")) - cached),
+        input_tokens=max(0, _as_int(usage.get("prompt_tokens")) - cached - cache_write),
         output_tokens=_as_int(usage.get("completion_tokens")),
         cached_read_tokens=cached,
-        cache_write_tokens=0,
+        cache_write_tokens=cache_write,
         reasoning_tokens=_as_int(out_details.get("reasoning_tokens")),
         reported=True,
     )
@@ -160,16 +250,29 @@ _CLASS_FIELDS = [
 ]
 
 
-def estimate_cost(usage: Usage, pricing: dict | None) -> CostEstimate:
-    """Estimate USD cost from a Usage record and a model pricing dict.
+def estimate_cost(
+    usage: Usage,
+    pricing: dict | None,
+    *,
+    pricing_status: str = "unknown",
+) -> CostEstimate:
+    """Estimate USD cost from normalized usage and a model pricing policy.
 
     ``pricing`` keys are $/Mtok: ``input``, ``output``, ``cache_read``,
-    ``cache_write``, ``reasoning`` (any may be absent). Returns
-    ``cost_usd=None`` when pricing is missing entirely or usage was not
-    reported. When a non-zero token class has no matching price, the cost is
-    still computed from the priced classes but ``pricing_complete`` is False
-    and the unpriced classes are listed in ``missing_classes``.
+    ``cache_write``, ``reasoning`` (any may be absent). ``pricing_status`` may
+    be ``unmetered`` for local models whose marginal provider charge is known
+    to be zero. Unmetered cost is complete even when token usage was not
+    reported; token coverage remains represented separately by
+    :attr:`Usage.reported`.
+
+    Otherwise, returns ``cost_usd=None`` when pricing is missing entirely or
+    usage was not reported. When a non-zero token class has no matching price,
+    the cost is still computed from the priced classes but
+    ``pricing_complete`` is False and the unpriced classes are listed in
+    ``missing_classes``.
     """
+    if pricing_status == "unmetered":
+        return CostEstimate(cost_usd=0.0, pricing_complete=True, missing_classes=[])
     if not usage.reported:
         return CostEstimate(cost_usd=None, pricing_complete=False, missing_classes=[])
     if not pricing:

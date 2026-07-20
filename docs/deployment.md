@@ -9,9 +9,12 @@ A second Mac can run the gateway directly from a clone — no `server-ci`, bare 
 ```bash
 git clone <repo-url> ~/local_code/model-gateway
 cd ~/local_code/model-gateway
+cp <reviewed-private-catalog> model-info.json
 ./install.sh              # uv sync + launchd plist + start + /health verify
 # or: ./install.sh --no-start
 ```
+
+Before installing, provision that machine's Git-ignored `model-info.json` catalog (for example, copy a reviewed catalog from the machine's private configuration backup). The repository intentionally does not ship model routes, local model paths, or per-machine pricing metadata. The installer does not create this file.
 
 The installer creates a repo-local `config/config.yaml` if missing, installs the `com.local.model-gateway` LaunchAgent, symlinks `model-gateway` into `~/.local/bin`, and runs from the clone with:
 
@@ -63,9 +66,11 @@ The dev-server pipeline updates the runtime checkout, keeps `config/config.yaml`
 
 ## Provider config
 
-`model-info.json` is the committed portable catalog. Upstream providers are local runtime config: a model is exposed from `/v1/models` only when its provider is enabled and has the required local config/secrets in `config/config.yaml` or provider env vars. Missing providers do not block startup; requests for catalog models whose provider is unavailable return a clear `provider_not_configured` / `provider_disabled` error.
+`model-info.json` is a machine-local, Git-ignored catalog. `MODEL_GATEWAY_MODEL_INFO` selects the live copy. `MODEL_GATEWAY_MODEL_INFO_SOURCE` may select a second machine-local mirror used by admin/onboarding writes; it is not a Git ownership boundary and may point to the same file on portable installs. Operators are responsible for backing up and propagating reviewed catalog changes between machines.
 
-Databricks is optional and disabled/unconfigured on this machine. A work machine can enable Databricks model serving with gitignored config or env (`DATABRICKS_HOST`, `DATABRICKS_TOKEN`, optional `DATABRICKS_SERVING_BASE_URL`) without changing the committed catalog.
+A model is exposed from `/v1/models` only when its provider is enabled and has the required local config/secrets in `config/config.yaml` or provider environment variables. Missing providers do not block startup; requests for catalog models whose provider is unavailable return a clear `provider_not_configured` / `provider_disabled` error.
+
+Databricks is optional and disabled/unconfigured on this machine. A work machine can enable Databricks model serving with Git-ignored catalog/config or environment variables (`DATABRICKS_HOST`, `DATABRICKS_TOKEN`, optional `DATABRICKS_SERVING_BASE_URL`) without changing repository-owned files.
 
 ## Vision routing policy
 
@@ -135,8 +140,9 @@ Generation runs on gateway start (`src/server.py` lifespan) and on
 aliases itself — it delegates to `export_catalogs.py --aliases-out`, so a manual
 `fan_out` run stays consistent with the gateway-generated catalog.
 
-`runtime/model-info.json` is a symlink to the repo-root `model-info.json`; the
-committed root catalog is the single source of truth.
+The catalog path is resolved directly from `MODEL_GATEWAY_MODEL_INFO` (or the
+checkout-local `model-info.json` default); there is no tracked runtime catalog
+or compatibility symlink.
 
 ## Pi launcher integration
 

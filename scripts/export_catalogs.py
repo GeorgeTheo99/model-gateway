@@ -8,8 +8,8 @@ Renders:
      Pi-specific artifacts (models.json, pi-launchers.zsh) are rendered by
      pi-shared from this file, not here.
 
-Rendered from the SAME merge the gateway router uses: ``model-info.json``
-(committed catalog) with the ``config.yaml`` ``models:`` overlay applied on
+Rendered from the SAME merge the gateway router uses: the machine-local,
+Git-ignored ``model-info.json`` with the ``config.yaml`` ``models:`` overlay applied on
 top (overlay wins on id clash). The merge lives in
 ``src.catalog.load_catalog_entries`` and is shared with ``src.providers``, so
 the generator and the router can never drift.
@@ -72,7 +72,7 @@ DEFAULT_CONFIG = Path(
     or Path(__file__).resolve().parents[1] / "config" / "config.yaml"
 )
 # Same model-info resolution as src.providers: env override, else the
-# checkout-local catalog. This is the committed source of truth.
+# checkout-local machine catalog.
 DEFAULT_MODEL_INFO = Path(
     os.environ.get("MODEL_GATEWAY_MODEL_INFO")
     or Path(__file__).resolve().parents[1] / "model-info.json"
@@ -107,12 +107,12 @@ def _merged_entries(model_info_path: Path, config: dict) -> list[dict]:
     reading the overlay alone if ``src.catalog`` is not importable (rare: bare
     python3 outside the venv).
     """
-    overlay = config.get("models") or []
+    overlay = config.get("models", [])
     if not isinstance(overlay, list):
-        overlay = []
+        raise ValueError("config models overlay must be a list")
     if catalog_mod is not None:
         return catalog_mod.load_catalog_entries(model_info_path, overlay=overlay)
-    # Fallback: overlay only (no merge with the committed catalog).
+    # Fallback: overlay only (no merge with the machine catalog).
     return [
         {**e, "provider": e.get("provider", "local")} for e in overlay if isinstance(e, dict)
     ]
@@ -337,7 +337,10 @@ def main() -> int:
 
     if not args.model_info.exists():
         sys.exit(f"export_catalogs: model-info.json not found: {args.model_info}")
-    entries = _merged_entries(args.model_info, config)
+    try:
+        entries = _merged_entries(args.model_info, config)
+    except ValueError as exc:
+        parser.error(str(exc))
     exported = _exported_models(entries)
     if not exported:
         sys.exit("export_catalogs: refusing to render an empty catalog (no exportable models in model-info.json + config overlay)")

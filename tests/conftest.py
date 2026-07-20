@@ -5,7 +5,15 @@ ever writes to the production ledger at ~/srv/model-gateway/shared/ledger.db.
 Tests that need to inspect the ledger can still override the path.
 """
 
+import os
+from pathlib import Path
+
 import pytest
+
+# Provider paths are resolved at import time. Point them at a committed,
+# machine-neutral fixture before importing the registry so the suite never
+# depends on the operator's Git-ignored model-info.json.
+os.environ["MODEL_GATEWAY_MODEL_INFO"] = str(Path(__file__).parent / "fixtures" / "model-info.json")
 
 import src.providers as providers
 

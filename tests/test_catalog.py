@@ -20,11 +20,59 @@ def _write_model_info(path, llm, **extra):
     path.write_text(json.dumps(doc))
 
 
+def test_catalog_rejects_malformed_model_entries_and_overlays(tmp_path):
+    mi = tmp_path / "model-info.json"
+    _write_model_info(mi, ["not-a-model"])
+    with pytest.raises(ValueError, match="entries must be objects"):
+        catalog.load_catalog_entries(mi)
+
+    mi.write_text(json.dumps({"llm": {}}))
+    with pytest.raises(ValueError, match="llm must be a list"):
+        catalog.load_catalog_entries(mi)
+
+    _write_model_info(mi, [{}])
+    with pytest.raises(ValueError, match="routable identifier"):
+        catalog.load_catalog_entries(mi)
+
+    _write_model_info(mi, [{"name": {"bad": "id"}, "provider": "openai"}])
+    with pytest.raises(ValueError, match="name must be a string"):
+        catalog.load_catalog_entries(mi)
+
+    _write_model_info(mi, [{"name": "bad-alternates", "provider": "openai", "alternate_ids": ["ok", 7]}])
+    with pytest.raises(ValueError, match="alternate_ids must contain only strings"):
+        catalog.load_catalog_entries(mi)
+
+    _write_model_info(mi, [])
+    with pytest.raises(ValueError, match="effective model catalog is empty"):
+        catalog.load_catalog_entries(mi, require_nonempty=True)
+
+    _write_model_info(mi, [{"name": "valid", "provider": "openai"}])
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("models: not-a-list\n")
+    with pytest.raises(ValueError, match="overlay must be a list"):
+        catalog.load_catalog_entries(mi, cfg)
+    cfg.write_text("models: {}\n")
+    with pytest.raises(ValueError, match="overlay must be a list"):
+        catalog.load_catalog_entries(mi, cfg)
+    with pytest.raises(ValueError, match="overlay entries must be objects"):
+        catalog.load_catalog_entries(mi, overlay=["not-a-model"])
+
+
 def test_overlay_empty_when_no_config(tmp_path):
     mi = tmp_path / "model-info.json"
     _write_model_info(mi, [{"name": "a", "alias": "a", "provider": "openrouter"}])
     entries = catalog.load_catalog_entries(mi, tmp_path / "missing.yaml")
     assert [e["name"] for e in entries] == ["a"]
+
+
+def test_base_catalog_rejects_duplicate_routable_ids(tmp_path):
+    mi = tmp_path / "model-info.json"
+    _write_model_info(mi, [
+        {"name": "first", "alias": "shared", "provider": "openai"},
+        {"name": "second", "provider_model_id": "shared", "provider": "openai"},
+    ])
+    with pytest.raises(ValueError, match="collides between 'first' and 'second'"):
+        catalog.load_catalog_entries(mi)
 
 
 def test_merge_overlay_wins_on_name_clash(tmp_path):
@@ -151,11 +199,75 @@ def test_provider_canonicalization(tmp_path):
     assert entries["claude-one"]["provider"] == "anthropic"
 
 
+def test_pricing_policy_accepts_local_unmetered_and_metered_cloud(tmp_path):
+    mi = tmp_path / "model-info.json"
+    _write_model_info(mi, [
+        {"name": "local", "provider": "omlx", "pricing_status": "unmetered"},
+        {"name": "cloud", "provider": "openai", "pricing": {"input": 1.0, "output": 2.0}},
+    ])
+    entries = catalog.load_catalog_entries(mi)
+    assert [catalog.validate_pricing_policy(entry) for entry in entries] == ["unmetered", "metered"]
+
+
+def test_pricing_policy_rejects_nonfinite_rates(tmp_path):
+    mi = tmp_path / "model-info.json"
+    for value in (float("nan"), float("inf"), float("-inf")):
+        _write_model_info(mi, [{
+            "name": "bad-price", "provider": "openai",
+            "pricing": {"input": value, "output": 2.0},
+        }])
+        with pytest.raises(ValueError, match="finite non-negative"):
+            catalog.load_catalog_entries(mi)
+
+
+def test_pricing_policy_rejects_cloud_unmetered_and_conflicts(tmp_path):
+    mi = tmp_path / "model-info.json"
+    _write_model_info(mi, [{"name": "cloud", "provider": "openai", "pricing_status": "unmetered"}])
+    with pytest.raises(ValueError, match="only valid for local"):
+        catalog.load_catalog_entries(mi)
+
+    _write_model_info(mi, [{
+        "name": "local", "provider": "omlx", "pricing_status": "unmetered",
+        "pricing": {"input": 0, "output": 0},
+    }])
+    with pytest.raises(ValueError, match="cannot combine"):
+        catalog.load_catalog_entries(mi)
+
+    _write_model_info(mi, [{
+        "name": "pooled-local", "provider": "omlx", "pool": "cloud-pool",
+        "pricing_status": "unmetered",
+    }])
+    with pytest.raises(ValueError, match="cannot use a provider pool"):
+        catalog.load_catalog_entries(mi)
+
+
+def test_cloud_overlay_must_clear_inherited_unmetered_marker(tmp_path):
+    mi = tmp_path / "model-info.json"
+    _write_model_info(mi, [{"name": "local", "provider": "omlx", "pricing_status": "unmetered"}])
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("models:\n  - name: local\n    provider: openai\n")
+    with pytest.raises(ValueError, match="only valid for local"):
+        catalog.load_catalog_entries(mi, cfg)
+
+    cfg.write_text("models:\n  - name: local\n    provider: openai\n    pricing_status: null\n")
+    assert catalog.load_catalog_entries(mi, cfg)[0]["provider"] == "openai"
+
+
 def test_routable_ids_includes_alternate_ids():
     ids = catalog.entry_routable_ids(
         {"name": "n", "alias": "a", "provider_model_id": "pm", "omlx_id": "omlx", "alternate_ids": ["x", "y"]}
     )
     assert ids == ["n", "a", "pm", "omlx", "x", "y"]
+
+
+def test_provider_registry_rejects_empty_catalog_without_publishing(tmp_path, monkeypatch):
+    import src.providers as providers
+
+    monkeypatch.setattr(providers, "MODEL_INFO_PATH", tmp_path / "missing.json")
+    monkeypatch.setattr(providers, "_models", None)
+    with pytest.raises(ValueError, match="effective model catalog is empty"):
+        providers._load_models()
+    assert providers._models is None
 
 
 def test_routable_ids_match_providers_module():

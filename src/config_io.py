@@ -6,10 +6,9 @@ productionization plan):
 - ``config.yaml`` (providers + auth): deployed copy is a symlink to the shared
   gitignored file. Edits are hot (after reload) and durable across deploys.
   Holds secrets — never echo ``api_key`` back; writes are additive/preserving.
-- ``model-info.json`` (models): deployed copy is a git-checked-out real file,
-  overwritten on each deploy. Writes edit the deployed copy (hot) AND mirror to
-  the source-repo copy (``MODEL_INFO_SOURCE_PATH``) so the change is durable
-  once the operator commits it. The API never commits/pushes.
+- ``model-info.json`` (models): machine-local and Git-ignored. Writes edit the
+  live copy (hot) and, when configured, a second machine-local mirror
+  (``MODEL_INFO_SOURCE_PATH``) used by deploy tooling or private backup flows.
 
 All writes: validate -> backup -> atomic temp+rename. Best-effort; a write
 failure raises a clear error to the admin API caller.
@@ -18,6 +17,7 @@ failure raises a clear error to the admin API caller.
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import time
@@ -27,6 +27,7 @@ from typing import Any
 
 import yaml
 
+from src.catalog import validate_pricing_policy
 from src.config_lock import config_write_lock
 from src.providers import CONFIG_PATH, MODEL_INFO_PATH, MODEL_INFO_SOURCE_PATH
 
@@ -226,7 +227,7 @@ def load_model_info() -> dict:
 
 
 def _write_model_info(doc: dict) -> list[str]:
-    """Write model-info.json to deployed copy + source-repo mirror if set.
+    """Write model-info.json to the live copy and optional local mirror.
 
     Returns the list of paths actually written.
     """
@@ -239,18 +240,70 @@ def _write_model_info(doc: dict) -> list[str]:
             _atomic_write(MODEL_INFO_SOURCE_PATH, text)
             paths.append(MODEL_INFO_SOURCE_PATH)
         except Exception as exc:  # noqa: BLE001
-            log.warning("could not mirror model-info.json to source %s: %s", MODEL_INFO_SOURCE_PATH, exc)
+            log.warning("could not mirror model-info.json to %s: %s", MODEL_INFO_SOURCE_PATH, exc)
     return [str(p) for p in paths]
 
 
 # Fields a cloud model entry may carry. Used to validate + order writes.
 # NOTE: "enabled" is intentionally absent — runtime state lives in
-# config.yaml model_overrides, not the committed catalog.
+# config.yaml model_overrides, not the machine-local catalog.
 _MODEL_FIELDS = [
     "name", "provider", "provider_model_id", "omlx_id", "alias", "context",
     "max_output_tokens", "thinking", "thinking_format", "vision", "quirks",
-    "system_instruction", "pricing", "desc",
+    "system_instruction", "pricing", "pricing_status", "desc",
 ]
+_PRICING_RATE_FIELDS = {"input", "output", "cache_read", "cache_write", "reasoning"}
+_LOCAL_PROVIDERS = {"local", "omlx", "mlx"}
+
+
+def _validated_pricing(pricing: object) -> dict:
+    if not isinstance(pricing, dict) or not pricing:
+        raise ValueError("metered pricing must be a non-empty object")
+    unknown = set(pricing) - _PRICING_RATE_FIELDS
+    if unknown:
+        raise ValueError("unknown pricing field(s): " + ", ".join(sorted(unknown)))
+    missing = {"input", "output"} - set(pricing)
+    if missing:
+        raise ValueError("metered pricing requires: " + ", ".join(sorted(missing)))
+    if any(
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value < 0
+        for value in pricing.values()
+    ):
+        raise ValueError("pricing values must be finite non-negative numbers")
+    return dict(pricing)
+
+
+def _apply_pricing_update(entry: dict, fields: dict, provider: str) -> None:
+    """Apply the explicit metered/unmetered/unknown pricing policy."""
+    if "pricing" not in fields and "pricing_status" not in fields:
+        return
+
+    status = fields.get("pricing_status")
+    if status is not None:
+        status = str(status).strip().lower()
+    if status not in {None, "metered", "unmetered", "unknown"}:
+        raise ValueError("pricing_status must be metered, unmetered, or unknown")
+
+    supplied_pricing = fields.get("pricing") if "pricing" in fields else entry.get("pricing")
+    if status == "unmetered":
+        if provider not in _LOCAL_PROVIDERS:
+            raise ValueError("unmetered pricing is only valid for local/oMLX models")
+        if supplied_pricing:
+            raise ValueError("unmetered models cannot also define token prices")
+        entry.pop("pricing", None)
+        entry["pricing_status"] = "unmetered"
+        return
+    if status == "unknown" or (status is None and "pricing" in fields and supplied_pricing is None):
+        entry.pop("pricing", None)
+        entry.pop("pricing_status", None)
+        return
+
+    if status == "metered" or "pricing" in fields:
+        entry["pricing"] = _validated_pricing(supplied_pricing)
+        entry.pop("pricing_status", None)
 
 
 @_write_transaction
@@ -258,8 +311,8 @@ def upsert_model(name: str, **fields) -> dict:
     """Create or update a model entry in model-info.json.
 
     ``name`` is the gateway-facing model id and the dict key. Returns the
-    written entry (masked: no secrets; models carry none). Writes deploy to
-    both the live catalog and the source-repo mirror.
+    written entry (masked: no secrets; models carry none). Writes the live
+    catalog and optional machine-local mirror.
     """
     name = (name or "").strip()
     if not name:
@@ -292,13 +345,15 @@ def upsert_model(name: str, **fields) -> dict:
     if omlx_id:
         entry["omlx_id"] = omlx_id
     for f in ("alias", "context", "max_output_tokens", "thinking",
-              "thinking_format", "quirks", "system_instruction", "pricing", "desc"):
+              "thinking_format", "quirks", "system_instruction", "desc"):
         if f in fields and fields[f] is not None:
             entry[f] = fields[f]
+    _apply_pricing_update(entry, fields, provider)
+    validate_pricing_policy(entry)
     if "vision" in fields and fields["vision"] is not None:
         entry["vision"] = bool(fields["vision"])
     # "enabled" is handled by set_model_enabled() writing config.yaml
-    # model_overrides; it is never written to the committed catalog.
+    # model_overrides; it is never written to the model catalog.
 
     paths = _write_model_info(doc)
     return {"name": name, "entry": _model_summary(entry), "written_to": paths}
@@ -332,8 +387,8 @@ def delete_model(name: str) -> dict:
 def set_model_enabled(name: str, enabled: bool) -> dict:
     """Toggle a model's runtime enabled state in config.yaml model_overrides.
 
-    Writes to the gitignored config.yaml (symlinked shared file), NOT the
-    committed model-info.json — so the toggle is hot, durable across deploys,
+    Writes to the Git-ignored config.yaml (symlinked shared file), not
+    model-info.json — so the toggle is hot, durable across deploys,
     and doesn't dirty the repo. The catalog stays the source of truth for
     *what models exist*; this is purely runtime on/off state.
     """

@@ -1,6 +1,15 @@
 """Tests for usage normalization and cost estimation."""
 
-from src.usage import Usage, extract_usage, estimate_cost
+from src.usage import (
+    Usage,
+    anthropic_usage_to_openai_chat,
+    anthropic_usage_to_responses,
+    extract_usage,
+    estimate_cost,
+    openai_chat_usage_to_anthropic,
+    openai_chat_usage_to_responses,
+    usage_was_reported,
+)
 
 
 def test_extract_openai_chat_shape():
@@ -37,6 +46,13 @@ def test_extract_anthropic_shape():
     assert u.reasoning_tokens == 0
 
 
+def test_extract_anthropic_shape_without_cache_fields():
+    u = extract_usage({"usage": {"input_tokens": 11, "output_tokens": 7}})
+    assert u.reported is True
+    assert u.input_tokens == 11
+    assert u.output_tokens == 7
+
+
 def test_extract_responses_shape():
     # OpenAI Responses input_tokens INCLUDES cached; subtracted to cache-miss
     # (1200 - 300 = 900).
@@ -61,6 +77,39 @@ def test_extract_no_usage_returns_unreported():
     assert u.reported is False
     assert u.input_tokens == 0
     assert extract_usage(None).reported is False
+    assert usage_was_reported({}) is False
+    assert usage_was_reported({"input_tokens": 0, "output_tokens": 0}) is True
+
+
+def test_usage_shape_conversions_preserve_cache_semantics():
+    chat = {
+        "prompt_tokens": 1000,
+        "completion_tokens": 300,
+        "prompt_tokens_details": {"cached_tokens": 150, "cache_write_tokens": 50},
+    }
+    anthropic = openai_chat_usage_to_anthropic(chat)
+    assert anthropic == {
+        "input_tokens": 800,
+        "output_tokens": 300,
+        "cache_read_input_tokens": 150,
+        "cache_creation_input_tokens": 50,
+    }
+    responses = openai_chat_usage_to_responses(chat)
+    assert extract_usage({"usage": responses}) == Usage(
+        input_tokens=800, output_tokens=300, cached_read_tokens=150,
+        cache_write_tokens=50, reported=True,
+    )
+
+    round_trip_chat = anthropic_usage_to_openai_chat(anthropic)
+    assert extract_usage({"usage": round_trip_chat}) == Usage(
+        input_tokens=800, output_tokens=300, cached_read_tokens=150,
+        cache_write_tokens=50, reported=True,
+    )
+    round_trip_responses = anthropic_usage_to_responses(anthropic)
+    assert extract_usage({"usage": round_trip_responses}) == Usage(
+        input_tokens=800, output_tokens=300, cached_read_tokens=150,
+        cache_write_tokens=50, reported=True,
+    )
 
 
 def test_estimate_cost_full_pricing():
@@ -113,6 +162,13 @@ def test_estimate_cost_unreported_usage_is_unknown():
     usage = Usage(reported=False)
     cost = estimate_cost(usage, {"input": 3.0, "output": 15.0})
     assert cost.cost_usd is None
+
+
+def test_estimate_cost_unmetered_is_known_zero_without_usage():
+    cost = estimate_cost(Usage(reported=False), None, pricing_status="unmetered")
+    assert cost.cost_usd == 0.0
+    assert cost.pricing_complete is True
+    assert cost.missing_classes == []
 
 
 def test_estimate_cost_zero_tokens_complete():

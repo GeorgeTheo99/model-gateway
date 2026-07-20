@@ -1554,7 +1554,15 @@ def test_models_endpoint_exposes_thinking_fields(client, monkeypatch):
             }
         }
     })
-    providers._models = None
+    monkeypatch.setattr(providers, "_models", {
+        "test-thinking": {
+            "name": "test-thinking",
+            "provider": "openrouter",
+            "provider_model_id": "test/thinking",
+            "thinking": "optional",
+            "thinking_format": "openrouter",
+        },
+    })
     resp = client.get("/v1/models")
     assert resp.status_code == 200
     data = resp.json()["data"]
@@ -1579,10 +1587,19 @@ def test_debug_thinking_endpoint_matrix(client):
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
-def test_debug_thinking_zai_max_reachable(client):
+def test_debug_thinking_zai_max_reachable(client, monkeypatch):
     """The zai branch now forwards reasoning_effort, so glm-5.2-zai is
     max-reachable in the debug matrix: forwarded_params includes
     reasoning_effort alongside enable_thinking."""
+    monkeypatch.setattr(providers, "_models", {
+        "glm-5.2-zai": {
+            "name": "glm-5.2-zai",
+            "provider": "zai_coding",
+            "provider_model_id": "glm-5.2",
+            "thinking": "always",
+            "thinking_format": "zai",
+        },
+    })
     resp = client.get("/v1/debug/thinking")
     assert resp.status_code == 200
     rows = {r["name"]: r for r in resp.json()["models"]}

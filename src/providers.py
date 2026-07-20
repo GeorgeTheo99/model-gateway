@@ -42,17 +42,16 @@ def registry_transaction():
         yield
 
 
-# model-info.json is the gateway-owned source of truth. Allow the path to be
-# supplied via env (set by the launcher/deploy); fall back to the checkout-local
-# catalog for tests and local dev.
+# model-info.json is the machine-local model catalog. Allow the live path to be
+# supplied by the launcher/deploy; fall back to the checkout-local Git-ignored
+# catalog for portable installs, tests, and local development.
 _DEFAULT_MODEL_INFO = Path(__file__).resolve().parents[1] / "model-info.json"
 MODEL_INFO_PATH = Path(
     os.environ.get("MODEL_GATEWAY_MODEL_INFO") or str(_DEFAULT_MODEL_INFO)
 ).resolve()
-# Optional source-repo path for durable model edits. When set, model write
-# operations mirror edits here (pending commit) in addition to the deployed
-# MODEL_INFO_PATH, so changes survive deploys once committed. The deployed
-# copy is overwritten by git checkout on each deploy; the source copy is not.
+# Optional machine-local mirror for durable model edits. When set, admin and
+# onboarding writes update it in addition to MODEL_INFO_PATH. Deploy tooling may
+# use separate live/mirror paths; portable installs normally use one file.
 _DEFAULT_MODEL_INFO_SOURCE = Path.home() / "local_code" / "model-gateway" / "model-info.json"
 MODEL_INFO_SOURCE_PATH = (
     Path(
@@ -305,15 +304,21 @@ def _load_models() -> dict[str, dict]:
     if _models is not None:
         return _models
 
-    _models = {}
-    if not MODEL_INFO_PATH.exists():
-        log.warning("model-info.json not found at %s", MODEL_INFO_PATH)
-    overlay = _load_config().get("models") or []
-    entries = catalog.load_catalog_entries(MODEL_INFO_PATH, overlay=overlay if isinstance(overlay, list) else [])
+    config = _load_config()
+    overlay = config.get("models", [])
+    if not isinstance(overlay, list):
+        raise ValueError("config models overlay must be a list")
+    entries = catalog.load_catalog_entries(
+        MODEL_INFO_PATH,
+        overlay=overlay,
+        require_nonempty=True,
+    )
+    loaded: dict[str, dict] = {}
     for entry in entries:
         for model_id in _entry_routable_ids(entry):
-            _models[model_id] = entry
+            loaded[model_id] = entry
 
+    _models = loaded
     log.info("Loaded %d routable model keys (catalog + config overlay)", len(_models))
     return _models
 
@@ -362,9 +367,9 @@ def auth_config() -> dict:
 def model_overrides() -> dict:
     """Return the live ``model_overrides`` section from config.yaml.
 
-    Runtime state for models (currently just ``enabled``) lives here — NOT in
-    model-info.json — so admin enable/disable toggles don't dirty the committed
-    catalog and aren't reverted by deploys. Keys are model names; values are
+    Runtime state for models (currently just ``enabled``) lives here, not in
+    model-info.json, so admin enable/disable toggles do not rewrite the catalog.
+    Keys are model names; values are
     dicts with ``enabled: bool``. Missing entry = enabled (default true).
 
     Example config.yaml::
@@ -1006,21 +1011,40 @@ def resolve(model_id: str, provider_override: str | None = None) -> ProviderInfo
     )
 
 
+def _pricing_status(entry: dict | None) -> str:
+    """Classify one catalog entry as metered, unmetered, or unknown.
+
+    Numeric rates take precedence over the marker so a malformed conflicting
+    entry can never be treated as free. Catalog/admin validation prevents that
+    conflict for newly written entries.
+    """
+    if not entry:
+        return "unknown"
+    pricing = entry.get("pricing")
+    if isinstance(pricing, dict) and pricing:
+        return "metered"
+    if (
+        entry.get("pricing_status") == "unmetered"
+        and not entry.get("pool")
+        and catalog.canonical_provider(entry.get("provider")) == "omlx"
+    ):
+        return "unmetered"
+    return "unknown"
+
+
 @_registry_locked
 def pricing_for(model_id: str) -> dict | None:
-    """Return the $/Mtok pricing dict for a routable model, or None if unset.
+    """Return the $/Mtok pricing dict for a routable model, or None if unset."""
+    entry = _load_models().get(model_id)
+    if not entry or _pricing_status(entry) != "metered":
+        return None
+    return entry["pricing"]
 
-    Keys may include: input, output, cache_read, cache_write, reasoning.
-    None means cost is "unknown" for this model (ledger must not guess).
-    """
-    models = _load_models()
-    entry = models.get(model_id)
-    if not entry:
-        return None
-    pricing = entry.get("pricing")
-    if not isinstance(pricing, dict):
-        return None
-    return pricing
+
+@_registry_locked
+def pricing_status_for(model_id: str) -> str:
+    """Return ``metered``, ``unmetered``, or ``unknown`` for a routable id."""
+    return _pricing_status(_load_models().get(model_id))
 
 
 @_registry_locked
@@ -1169,6 +1193,7 @@ def model_status() -> list[dict]:
             "thinking_format": model.get("thinking_format", ""),
             "vision": bool(model.get("vision", False)),
             "pricing": model.get("pricing"),
+            "pricing_status": _pricing_status(model),
             "enabled": model.get("enabled", True),
         })
     return result

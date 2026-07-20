@@ -227,7 +227,7 @@ def test_duplicate_alias_hard_fails(tmp_path):
     cfg.write_text(f"exports:\n  model_aliases: {tmp_path}/aliases.json\n")
     r = _run(cfg, mi)
     assert r.returncode == 2
-    assert "duplicate aliases" in r.stderr
+    assert "routable id 'dup' collides" in r.stderr
 
 
 def test_export_false_skips_model(tmp_path):

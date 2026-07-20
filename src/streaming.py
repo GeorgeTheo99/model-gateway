@@ -10,6 +10,7 @@ import secrets
 from collections.abc import AsyncIterator
 
 from src.signature_cache import store_from_extra_content
+from src.usage import openai_chat_usage_to_anthropic, usage_was_reported
 
 log = logging.getLogger("model-gateway")
 
@@ -66,13 +67,17 @@ async def translate_stream(
     output_tokens = 0
     input_tokens = 0
     cached_tokens = 0
+    cache_write_tokens = 0
+    cache_write_reported = False
+    usage_reported = False
     finish_reason = None
+    saw_finish = False
 
     async for raw_line in _iter_sse_lines(openai_stream):
         line = raw_line.strip()
-        if not line.startswith("data: "):
+        if not line.startswith("data:"):
             continue
-        payload = line[6:]
+        payload = line[5:].lstrip()
         if payload == "[DONE]":
             break
 
@@ -81,21 +86,37 @@ async def translate_stream(
         except json.JSONDecodeError:
             continue
 
-        # Extract usage if present (including cached_tokens for Fireworks)
+        if isinstance(chunk, dict) and (chunk.get("error") is not None or chunk.get("type") == "error"):
+            raw_error = chunk.get("error")
+            if isinstance(raw_error, dict):
+                error = raw_error
+            else:
+                error = {
+                    "type": "api_error",
+                    "message": chunk.get("message") or str(raw_error or "upstream stream error"),
+                }
+            yield _sse("error", {"type": "error", "error": error})
+            return
+
+        # Extract only authoritative upstream usage. Field presence preserves a
+        # valid explicit-zero report; an absent/empty block stays unknown.
         u = chunk.get("usage")
-        if u:
-            input_tokens = u.get("prompt_tokens", input_tokens)
-            output_tokens = u.get("completion_tokens", output_tokens)
-            prompt_details = u.get("prompt_tokens_details") or {}
-            ct = prompt_details.get("cached_tokens", 0)
-            if ct:
-                cached_tokens = ct
+        if usage_was_reported(u):
+            converted = openai_chat_usage_to_anthropic(u) or {}
+            input_tokens = converted.get("input_tokens", input_tokens)
+            output_tokens = converted.get("output_tokens", output_tokens)
+            cached_tokens = converted.get("cache_read_input_tokens", cached_tokens)
+            if "cache_creation_input_tokens" in converted:
+                cache_write_tokens = converted["cache_creation_input_tokens"]
+                cache_write_reported = True
+            usage_reported = True
 
         choice = (chunk.get("choices") or [{}])[0]
         delta = choice.get("delta", {})
         fr = choice.get("finish_reason")
         if fr:
             finish_reason = fr
+            saw_finish = True
 
         # Emit message_start on first chunk
         if not started:
@@ -229,6 +250,13 @@ async def translate_stream(
                         },
                     })
 
+    if not saw_finish:
+        yield _sse("error", {
+            "type": "error",
+            "error": {"type": "api_error", "message": "Upstream stream ended before a finish marker"},
+        })
+        return
+
     # Close any open blocks
     if thinking_block_open:
         yield _sse("content_block_stop", {
@@ -271,18 +299,22 @@ async def translate_stream(
         })
 
     # Log cache hit rate
-    if cached_tokens and input_tokens:
-        log.info("Cache hit: %d/%d prompt tokens cached (%.0f%%)", cached_tokens, input_tokens, cached_tokens / input_tokens * 100)
+    prompt_tokens = input_tokens + cached_tokens + cache_write_tokens
+    if cached_tokens and prompt_tokens:
+        log.info("Cache hit: %d/%d prompt tokens cached (%.0f%%)", cached_tokens, prompt_tokens, cached_tokens / prompt_tokens * 100)
 
-    yield _sse("message_delta", {
+    final_delta = {
         "type": "message_delta",
         "delta": {"stop_reason": stop_reason},
-        "usage": {
+    }
+    if usage_reported:
+        final_delta["usage"] = {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             **({"cache_read_input_tokens": cached_tokens} if cached_tokens else {}),
-        },
-    })
+            **({"cache_creation_input_tokens": cache_write_tokens} if cache_write_reported else {}),
+        }
+    yield _sse("message_delta", final_delta)
 
     yield _sse("message_stop", {"type": "message_stop"})
 

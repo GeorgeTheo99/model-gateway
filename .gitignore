@@ -8,6 +8,7 @@ config/federation-cache.json
 # Machine-local model catalog (per-machine; committed in error previously)
 model-info.json
 model-info.json.bak-*
+!tests/fixtures/model-info.json
 
 # Python
 __pycache__/

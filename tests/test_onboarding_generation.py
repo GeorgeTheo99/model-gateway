@@ -417,7 +417,23 @@ def test_invalid_generated_metadata_is_rejected(tmp_path):
             base_url="https://api.example.com/v1",
             model_ids=["model-a"],
             model_info_path=catalog,
-            pricing={"input": -1},
+            pricing={"input": -1, "output": 2},
+        )
+    with pytest.raises(OnboardingError, match="finite non-negative"):
+        generation.build_draft(
+            provider_id="example",
+            base_url="https://api.example.com/v1",
+            model_ids=["model-a"],
+            model_info_path=catalog,
+            pricing={"input": float("nan"), "output": 2},
+        )
+    with pytest.raises(OnboardingError, match="pricing requires: output"):
+        generation.build_draft(
+            provider_id="example",
+            base_url="https://api.example.com/v1",
+            model_ids=["model-a"],
+            model_info_path=catalog,
+            pricing={"input": 1},
         )
 
 

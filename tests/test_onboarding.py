@@ -82,6 +82,63 @@ def test_same_live_and_source_model_catalog_is_valid(tmp_path):
     assert result["added_models"] == ["new-model"]
 
 
+def test_profile_rejects_cloud_unmetered_pricing(tmp_path):
+    profile = _profile()
+    profile["models"][0]["pricing_status"] = "unmetered"
+    path = tmp_path / "profile.yaml"
+    path.write_text(yaml.safe_dump(profile, sort_keys=False))
+    with pytest.raises(onboarding.OnboardingError, match="only valid for local"):
+        onboarding.load_profile(path)
+
+    config, model_info, source = _files(tmp_path)
+    with pytest.raises(onboarding.OnboardingError, match="only valid for local"):
+        onboarding.apply_profile(
+            profile,
+            config_path=config,
+            model_info_path=model_info,
+            model_info_source_path=source,
+            dry_run=True,
+        )
+
+
+def test_direct_apply_validates_profile_before_using_credentials(tmp_path):
+    config, model_info, source = _files(tmp_path)
+    profile = _profile()
+    profile["schema_version"] = 999
+    profile["provider"]["base_url"] = "http://user:password@example.com/v1"
+    profile["models"].append(dict(profile["models"][0]))
+    with pytest.raises(onboarding.OnboardingError, match="schema_version"):
+        onboarding.apply_profile(
+            profile,
+            config_path=config,
+            model_info_path=model_info,
+            model_info_source_path=source,
+            api_key="must-not-be-sent",
+            dry_run=True,
+        )
+
+
+def test_direct_apply_rejects_malformed_identifiers_without_writes(tmp_path):
+    config, model_info, source = _files(tmp_path)
+    before = (config.read_bytes(), model_info.read_bytes(), source.read_bytes())
+    profile = _profile()
+    profile["models"][0]["alias"] = {"bad": "id"}
+    profile["models"][0]["alternate_ids"] = ["valid", 7]
+
+    with pytest.raises(onboarding.OnboardingError, match="alias must be a string"):
+        onboarding.apply_profile(
+            profile,
+            config_path=config,
+            model_info_path=model_info,
+            model_info_source_path=source,
+            api_key="must-not-be-written",
+            confirmed_retirements={"old-model"},
+        )
+
+    assert (config.read_bytes(), model_info.read_bytes(), source.read_bytes()) == before
+    assert not list((tmp_path / "secrets").glob("*"))
+
+
 def test_apply_profile_retires_old_model_and_uses_secret_file(tmp_path):
     config, model_info, source = _files(tmp_path)
     validated = []
@@ -123,6 +180,22 @@ def test_apply_profile_is_idempotent(tmp_path):
     result = onboarding.apply_profile(_profile(), **kwargs)
     assert result["already_retired"] == ["old-model"]
     assert [row["name"] for row in json.loads(model_info.read_text())["llm"]] == ["new-model"]
+
+
+def test_apply_profile_can_update_metadata_after_retirement(tmp_path):
+    config, model_info, source = _files(tmp_path)
+    kwargs = dict(
+        config_path=config, model_info_path=model_info,
+        model_info_source_path=source, api_key="secret", check_upstream=False,
+        confirmed_retirements={"old-model"},
+    )
+    onboarding.apply_profile(_profile(), **kwargs)
+    updated = _profile()
+    updated["models"][0]["pricing"] = {"input": 3.0, "output": 15.0}
+    result = onboarding.apply_profile(updated, confirmed_replacements={"new-model"}, **kwargs)
+    assert result["already_retired"] == ["old-model"]
+    row = json.loads(model_info.read_text())["llm"][0]
+    assert row["pricing"] == {"input": 3.0, "output": 15.0}
 
 
 def test_apply_profile_requires_expected_retirement_on_first_run(tmp_path):

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fan out model metadata from model-info.json into oMLX settings and restart oMLX.
 
-Reads the authoritative repo-root model-info.json and:
+Reads the checkout-local machine model-info.json and:
   1. Syncs oMLX model_settings.json — context windows, max output tokens,
      optional thinking budgets, sampling defaults, and chat-template controls
      (preserves oMLX-managed fields like is_default, is_pinned, etc.)
@@ -31,8 +31,8 @@ import sys
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-# Repo root (parent of runtime/). The authoritative model-info.json lives at
-# the repo root; ``runtime/model-info.json`` is a legacy symlink to it.
+# Repo root (parent of runtime/). The Git-ignored machine catalog lives at the
+# checkout root and may be overridden with --model-info.
 REPO_ROOT = SCRIPT_DIR.parent.parent
 MODEL_INFO_DEFAULT = REPO_ROOT / "model-info.json"
 OMLX_SETTINGS_DEFAULT = Path.home() / ".omlx" / "model_settings.json"

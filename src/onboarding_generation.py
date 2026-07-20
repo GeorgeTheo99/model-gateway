@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -378,8 +379,17 @@ def build_draft(
         unknown_pricing = set(pricing) - ALLOWED_PRICING_FIELDS
         if unknown_pricing:
             raise OnboardingError("unknown pricing field(s): " + ", ".join(sorted(unknown_pricing)))
-        if any(not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0 for value in pricing.values()):
-            raise OnboardingError("pricing values must be non-negative numbers")
+        missing_pricing = {"input", "output"} - set(pricing)
+        if missing_pricing:
+            raise OnboardingError("pricing requires: " + ", ".join(sorted(missing_pricing)))
+        if any(
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            or value < 0
+            for value in pricing.values()
+        ):
+            raise OnboardingError("pricing values must be finite non-negative numbers")
     for index, model_id in enumerate(models):
         row: dict = {
             "name": model_id,
