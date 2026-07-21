@@ -85,6 +85,7 @@ def sync_omlx_settings(llm_entries: list, omlx_path: Path, dry_run: bool) -> Non
             "enable_thinking": entry.get("enable_thinking"),
             "chat_template_kwargs": entry.get("chat_template_kwargs"),
             "forced_ct_kwargs": entry.get("forced_ct_kwargs"),
+            "model_type_override": entry.get("model_type_override"),
         }
         if (
             ctx is None
