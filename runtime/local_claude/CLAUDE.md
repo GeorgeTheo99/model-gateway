@@ -56,7 +56,7 @@ Hook script: `local_claude/block-cloud-tools.sh` — exits 0 if `ANTHROPIC_BASE_
 
 ### Current MCP servers
 
-- **websearch** — SearXNG wrapper (`~/local_code/local-search/mcp-websearch/server.py`), provides `web_search` and `web_fetch` tools. Runs in a uv-managed Python 3.12 venv at `~/local_code/local-search/mcp-websearch/.venv/`.
+- **websearch** — SearXNG wrapper (`~/local_code/local_web_search/mcp-websearch/server.py`), provides `web_search` and `web_fetch` tools. Runs in a uv-managed Python 3.12 venv at `~/local_code/local_web_search/mcp-websearch/.venv/`.
 
 ### Server-specific Claude instructions
 

@@ -10,9 +10,9 @@
       "command": "/Users/localserver99/local_code/server/scripts/macos-use-global.sh"
     },
     "websearch": {
-      "command": "/Users/localserver99/local_code/local-search/mcp-websearch/.venv/bin/python",
+      "command": "/Users/localserver99/local_code/local_web_search/mcp-websearch/.venv/bin/python",
       "args": [
-        "/Users/localserver99/local_code/local-search/mcp-websearch/server.py"
+        "/Users/localserver99/local_code/local_web_search/mcp-websearch/server.py"
       ]
     }
   },
