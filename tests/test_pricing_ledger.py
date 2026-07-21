@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.providers import ProviderInfo, pricing_for, pricing_status_for
+from src.providers import CompositeRoute, ProviderInfo, pricing_for, pricing_status_for
 import src.server as server_module
 from src.server import app
 from src import ledger
@@ -152,6 +152,91 @@ def test_non_streaming_request_records_ledger_with_cost(tmp_ledger, monkeypatch)
     # (cached tokens priced once at cache_read, not double-counted at input rate)
     assert r["cost_usd"] == pytest.approx(0.996, abs=1e-6)
     assert r["pricing_complete"] == 1
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_semantic_composite_request_records_requested_and_resolved_model_ids(tmp_ledger, monkeypatch):
+    info = _info(provider="omlx", provider_model_id="GLM-5.2-MLX-4.5bit")
+    info.composite = CompositeRoute(
+        text_model="glm-5.2-4.5bit",
+        vision_model="gemma4-26b",
+        image_handling="extract_then_answer",
+        max_images=4,
+    )
+    import src.providers as providers
+    monkeypatch.setattr(providers, "_models", {
+        "auto-local": {
+            "name": "auto-local",
+            "provider": "omlx",
+            "omlx_id": "auto-local",
+            "pricing_status": "unmetered",
+        },
+    })
+    monkeypatch.setattr(server_module, "resolve", lambda model: info if model == "auto-local" else None)
+
+    async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
+        assert body["model"] == "GLM-5.2-MLX-4.5bit"
+        return server_module.JSONResponse(status_code=200, content={"choices": []})
+
+    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough_sync)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "auto-local", "messages": [{"role": "user", "content": "hello"}]},
+        )
+        assert response.status_code == 200
+
+    row = ledger.recent()[0]
+    assert row["model"] == "auto-local"
+    assert row["provider_model_id"] == "GLM-5.2-MLX-4.5bit"
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_composite_validation_error_keeps_resolution_receipt(tmp_ledger, monkeypatch):
+    info = _info(provider="omlx", provider_model_id="GLM-5.2-MLX-4.5bit")
+    info.composite = CompositeRoute(
+        text_model="glm-5.2-4.5bit",
+        vision_model="gemma4-26b",
+        image_handling="extract_then_answer",
+        max_images=4,
+    )
+    vision = _info(provider="omlx", provider_model_id="gemma4-26b-upstream", vision=True)
+    import src.providers as providers
+    monkeypatch.setattr(providers, "_models", {
+        "auto-local": {
+            "name": "auto-local",
+            "provider": "omlx",
+            "omlx_id": "auto-local",
+            "pricing_status": "unmetered",
+        },
+    })
+    monkeypatch.setattr(
+        server_module,
+        "resolve",
+        lambda model: info if model == "auto-local" else vision if model == "gemma4-26b" else None,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "auto-local",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.test/not-inline.png"},
+                    }],
+                }],
+            },
+        )
+        assert response.status_code == 400
+
+    row = ledger.recent()[0]
+    assert row["model"] == "auto-local"
+    assert row["provider"] == "omlx"
+    assert row["provider_model_id"] == "GLM-5.2-MLX-4.5bit"
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")

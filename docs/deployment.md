@@ -75,9 +75,13 @@ Databricks is optional and disabled/unconfigured on this machine. A work machine
 ## Vision routing policy
 
 Image input to a raw text-only model fails closed by default. Use a native vision
-model or an explicit gateway composite such as `best-local` when images are
-expected. Composite models always use their declared image-handling mode and
-cannot be redirected by client headers or request fields.
+model or an explicit gateway composite when images are expected. On machines
+that install the standard local preset contract, callers send `auto-local` for
+the canonical Local Best route; the gateway expands it to GLM-5.2 text plus
+Gemma 4 26B vision using `extract_then_answer`. The legacy `best-local` ID stays
+distinct during migration and shares the explicit `detail-local` route backed by
+Gemma 4 31B vision. Composite models always use their declared image-handling
+mode and cannot be redirected by client headers or request fields.
 
 For compatibility clients only, an operator may explicitly enable a process-wide
 fallback with `GATEWAY_VISION_FALLBACK=<native-vision-model>`. The fallback must

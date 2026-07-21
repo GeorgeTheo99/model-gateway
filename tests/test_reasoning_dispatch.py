@@ -1608,3 +1608,90 @@ def test_debug_thinking_zai_max_reachable(client, monkeypatch):
     assert zai["thinking_format"] == "zai"
     assert zai["forwarded_params"] == ["enable_thinking", "reasoning_effort"]
     assert zai["max_reachable"] is True
+
+
+def test_composite_inline_image_bytes_never_appear_in_gateway_logs(monkeypatch, caplog):
+    encoded = base64.b64encode(b"private image sentinel" * 100).decode("ascii")
+    text_info = _info("glm-chat-template", provider="omlx", provider_model_id="glm-upstream")
+    text_info.composite = providers.CompositeRoute(
+        text_model="glm-local",
+        vision_model="gemma-local",
+        image_handling="extract_then_answer",
+        max_images=4,
+    )
+    vision_info = _info("", thinking="", provider="omlx", provider_model_id="gemma-upstream", vision=True)
+
+    async def fake_extract(*args, **kwargs):
+        return ["visible wall"]
+
+    monkeypatch.setattr(server_module, "resolve", lambda model: vision_info if model == "gemma-local" else None)
+    monkeypatch.setattr(server_module, "_extract_image_observations", fake_extract)
+    request = SimpleNamespace(headers={}, state=SimpleNamespace())
+    body = {"model": "auto-local", "messages": [{"role": "user", "content": [{
+        "type": "image_url",
+        "image_url": {"url": f"data:image/png;base64,{encoded}"},
+    }]}]}
+
+    caplog.set_level(logging.INFO, logger="model-gateway")
+    rewritten, _model, _info_result, error = asyncio.run(
+        server_module._apply_chat_vision_fallback(
+            request,
+            body,
+            "auto-local",
+            text_info,
+            "/v1/chat/completions",
+        )
+    )
+
+    assert error is None
+    assert not server_module._payload_has_image(rewritten)
+    assert encoded not in caplog.text
+    assert "data:image" not in caplog.text
+
+
+def test_client_bound_operation_skips_work_when_already_disconnected():
+    called = False
+
+    class Request:
+        async def is_disconnected(self):
+            return True
+
+    async def operation():
+        nonlocal called
+        called = True
+        return "unexpected"
+
+    async def exercise():
+        with pytest.raises(asyncio.CancelledError):
+            await server_module._await_client_bound_operation(Request(), operation)
+
+    asyncio.run(exercise())
+    assert called is False
+
+
+def test_client_bound_operation_cancels_inflight_work_on_disconnect(monkeypatch):
+    checks = 0
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    class Request:
+        async def is_disconnected(self):
+            nonlocal checks
+            checks += 1
+            return checks >= 2
+
+    async def operation():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    async def exercise():
+        monkeypatch.setattr(server_module, "CLIENT_DISCONNECT_POLL_SECONDS", 0.001)
+        with pytest.raises(asyncio.CancelledError):
+            await server_module._await_client_bound_operation(Request(), operation)
+        assert started.is_set()
+        assert cancelled.is_set()
+
+    asyncio.run(exercise())

@@ -112,6 +112,56 @@ def test_composite_exports_as_ordinary_local_vision_alias(tmp_path):
     assert "composite" not in entry
 
 
+def test_balanced_and_legacy_detail_composites_export_as_distinct_routes(tmp_path):
+    mi = tmp_path / "model-info.json"
+    _write_model_info(mi, [
+        {
+            "name": "auto-local",
+            "alias": "auto-local",
+            "provider": "omlx",
+            "omlx_id": "auto-local",
+            "vision": True,
+            "composite": {
+                "text_model": "glm-local",
+                "vision_model": "vision-balanced",
+            },
+        },
+        {
+            "name": "detail-local",
+            "alias": "detail-local",
+            "provider": "omlx",
+            "omlx_id": "detail-local",
+            "vision": True,
+            "composite": {
+                "text_model": "glm-local",
+                "vision_model": "vision-detail",
+            },
+        },
+        {
+            "name": "best-local",
+            "alias": "best-local",
+            "provider": "omlx",
+            "omlx_id": "best-local",
+            "vision": True,
+            "composite": {
+                "text_model": "glm-local",
+                "vision_model": "vision-detail",
+            },
+        },
+    ])
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(f"exports:\n  model_aliases: {tmp_path}/aliases.json\n")
+
+    result = _run(cfg, mi)
+
+    assert result.returncode == 0, result.stderr
+    aliases = json.loads((tmp_path / "aliases.json").read_text())
+    assert aliases["auto-local"]["alias"] == "auto-local"
+    assert aliases["detail-local"]["alias"] == "detail-local"
+    assert aliases["best-local"]["alias"] == "best-local"
+    assert aliases["auto-local"]["name"] != aliases["detail-local"]["name"]
+
+
 def test_relative_api_key_file_uses_selected_config_target(tmp_path):
     real_dir = tmp_path / "shared"
     real_dir.mkdir()

@@ -19,13 +19,56 @@ BASE_MODELS = [
         "thinking_format": "glm-chat-template",
     },
     {
-        "name": "vision-local",
-        "alias": "visionlocal",
+        "name": "vision-balanced",
+        "alias": "visionbalanced",
         "provider": "omlx",
-        "omlx_id": "vision-upstream",
+        "omlx_id": "vision-balanced-upstream",
         "vision": True,
         "context": 4096,
         "max_output_tokens": 512,
+    },
+    {
+        "name": "vision-detail",
+        "alias": "visiondetail",
+        "provider": "omlx",
+        "omlx_id": "vision-detail-upstream",
+        "vision": True,
+        "context": 4096,
+        "max_output_tokens": 512,
+    },
+    {
+        "name": "auto-local",
+        "alias": "auto-local",
+        "provider": "omlx",
+        "omlx_id": "auto-local",
+        "vision": True,
+        "context": 2048,
+        "max_output_tokens": 256,
+        "thinking": "always",
+        "thinking_format": "glm-chat-template",
+        "composite": {
+            "text_model": "text-local",
+            "vision_model": "vision-balanced",
+            "image_handling": "extract_then_answer",
+            "max_images": 4,
+        },
+    },
+    {
+        "name": "detail-local",
+        "alias": "detail-local",
+        "provider": "omlx",
+        "omlx_id": "detail-local",
+        "vision": True,
+        "context": 2048,
+        "max_output_tokens": 256,
+        "thinking": "always",
+        "thinking_format": "glm-chat-template",
+        "composite": {
+            "text_model": "text-local",
+            "vision_model": "vision-detail",
+            "image_handling": "extract_then_answer",
+            "max_images": 4,
+        },
     },
     {
         "name": "best-local",
@@ -39,12 +82,16 @@ BASE_MODELS = [
         "thinking_format": "glm-chat-template",
         "composite": {
             "text_model": "text-local",
-            "vision_model": "vision-local",
+            "vision_model": "vision-detail",
             "image_handling": "extract_then_answer",
             "max_images": 4,
         },
     },
 ]
+
+
+def _model(models, name):
+    return next(model for model in models if model["name"] == name)
 
 
 def _install_registry(monkeypatch, models):
@@ -63,7 +110,7 @@ def reset_registry():
 def test_composite_resolves_to_text_upstream_with_scoped_policy(monkeypatch):
     _install_registry(monkeypatch, deepcopy(BASE_MODELS))
 
-    info = providers.resolve("best-local")
+    info = providers.resolve("auto-local")
 
     assert info is not None
     assert info.provider == "omlx"
@@ -72,21 +119,36 @@ def test_composite_resolves_to_text_upstream_with_scoped_policy(monkeypatch):
     assert info.thinking_format == "glm-chat-template"
     assert info.composite == providers.CompositeRoute(
         text_model="text-local",
-        vision_model="vision-local",
+        vision_model="vision-balanced",
         image_handling="extract_then_answer",
         max_images=4,
     )
     assert providers.resolve("textlocal").composite is None
 
 
+def test_local_best_and_detail_routes_are_distinct_with_legacy_compatibility(monkeypatch):
+    _install_registry(monkeypatch, deepcopy(BASE_MODELS))
+
+    balanced = providers.resolve("auto-local")
+    legacy_detail = providers.resolve("best-local")
+    explicit_detail = providers.resolve("detail-local")
+
+    assert balanced.composite.vision_model == "vision-balanced"
+    assert legacy_detail.composite.vision_model == "vision-detail"
+    assert explicit_detail.composite == legacy_detail.composite
+    assert providers.routable_ids("best-local") == ["best-local"]
+    assert providers.routable_ids("detail-local") == ["detail-local"]
+
+
 def test_composite_inventory_is_publicly_vision_capable(monkeypatch):
     _install_registry(monkeypatch, deepcopy(BASE_MODELS))
 
-    row = next(model for model in providers.list_available_models() if model["id"] == "best-local")
+    rows = {model["id"]: model for model in providers.list_available_models()}
 
-    assert row["vision"] is True
-    assert row["effective_provider"] == "omlx"
-    assert row["available"] is True
+    assert rows["auto-local"]["vision"] is True
+    assert rows["auto-local"]["effective_provider"] == "omlx"
+    assert rows["auto-local"]["available"] is True
+    assert rows["detail-local"]["vision"] is True
 
 
 def test_composite_forces_staging_even_if_text_dependency_is_multimodal(monkeypatch):
@@ -95,17 +157,17 @@ def test_composite_forces_staging_even_if_text_dependency_is_multimodal(monkeypa
     _install_registry(monkeypatch, models)
 
     assert providers.resolve("text-local").vision is True
-    assert providers.resolve("best-local").vision is False
+    assert providers.resolve("auto-local").vision is False
 
 
 @pytest.mark.parametrize(
     ("mutate", "reason"),
     [
-        (lambda models: models[2]["composite"].update(vision_model="missing"), "invalid_composite"),
-        (lambda models: models[1].update(vision=False), "invalid_composite"),
-        (lambda models: models[1].update(provider="fireworks"), "invalid_composite"),
-        (lambda models: models[1].update(composite={"text_model": "text-local", "vision_model": "vision-local"}), "invalid_composite"),
-        (lambda models: models[2]["composite"].update(max_images=0), "invalid_composite"),
+        (lambda models: _model(models, "best-local")["composite"].update(vision_model="missing"), "invalid_composite"),
+        (lambda models: _model(models, "vision-detail").update(vision=False), "invalid_composite"),
+        (lambda models: _model(models, "vision-detail").update(provider="fireworks"), "invalid_composite"),
+        (lambda models: _model(models, "vision-detail").update(composite={"text_model": "text-local", "vision_model": "vision-balanced"}), "invalid_composite"),
+        (lambda models: _model(models, "best-local")["composite"].update(max_images=0), "invalid_composite"),
     ],
 )
 def test_invalid_or_unavailable_composite_fails_closed(monkeypatch, mutate, reason):
@@ -123,7 +185,7 @@ def test_invalid_or_unavailable_composite_fails_closed(monkeypatch, mutate, reas
 def test_disabled_companion_disables_composite(monkeypatch):
     models = deepcopy(BASE_MODELS)
     _install_registry(monkeypatch, models)
-    providers._config["model_overrides"] = {"vision-local": {"enabled": False}}
+    providers._config["model_overrides"] = {"vision-detail": {"enabled": False}}
     providers._models = None
 
     availability = providers.model_availability("best-local")

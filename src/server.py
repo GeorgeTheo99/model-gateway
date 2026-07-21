@@ -7,6 +7,7 @@ Presents the same dual API contract on port 9111:
   /health               (health check)
 """
 
+import asyncio
 import base64
 import copy
 import hashlib
@@ -103,6 +104,7 @@ DEFAULT_FIREWORKS_IMAGE_MAX_DIMENSION = 1600
 DEFAULT_FIREWORKS_IMAGE_TOTAL_MAX_BYTES = 8_000_000
 IMAGE_HANDLING_EXTRACT_THEN_ANSWER = "extract_then_answer"
 STREAM_READ_TIMEOUT_SECONDS = int(os.environ.get("MODEL_GATEWAY_STREAM_READ_TIMEOUT_SECONDS", "900"))
+CLIENT_DISCONNECT_POLL_SECONDS = 0.05
 VISION_OBSERVATION_PROMPT = """You extract visual observations for a separate reasoning model.
 
 Return concise, structured observations only. Do not answer the user's question, do not make recommendations, and do not infer beyond what is visible. Include these sections when applicable:
@@ -926,6 +928,32 @@ def _inline_image_size(part: dict) -> int:
         raise ValueError("Local composite vision received malformed base64 image data") from exc
 
 
+async def _await_client_bound_operation(request: Request, operation):
+    """Cancel an in-flight internal request promptly when its client disconnects."""
+    is_disconnected = getattr(request, "is_disconnected", None)
+    if not callable(is_disconnected):
+        return await operation()
+    if await is_disconnected():
+        raise asyncio.CancelledError("client disconnected")
+
+    task = asyncio.create_task(operation())
+    try:
+        while True:
+            done, _pending = await asyncio.wait(
+                {task},
+                timeout=CLIENT_DISCONNECT_POLL_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if task in done:
+                return task.result()
+            if await is_disconnected():
+                raise asyncio.CancelledError("client disconnected")
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
 async def _extract_image_observations(
     request: Request,
     body: dict,
@@ -994,7 +1022,10 @@ async def _extract_image_observations(
             _remap_max_tokens_for_provider(extraction_body, fallback_info.provider)
             start = time.time()
             try:
-                resp = await client.post(endpoint, json=extraction_body, headers=headers)
+                resp = await _await_client_bound_operation(
+                    request,
+                    lambda: client.post(endpoint, json=extraction_body, headers=headers),
+                )
             except httpx.ConnectError:
                 return error_factory(502, "api_error", "Cannot connect to vision model provider")
             except Exception as exc:  # noqa: BLE001
@@ -1710,6 +1741,9 @@ async def create_response(request: Request):
     if not info:
         return _error_openai(404, "invalid_request_error", _model_error_message(model))
 
+    # Seed a resolution receipt before composite validation/extraction so
+    # rejected image requests still retain the semantic and concrete model IDs.
+    _set_ledger_ctx(request, model, info, is_stream=is_stream)
     _inject_responses_instruction(body, info.system_instruction)
 
     # Convert once for vision inspection. Native-capable models retain their original
@@ -2127,6 +2161,7 @@ async def chat_completions(request: Request):
             content={"error": {"message": _model_error_message(model), "type": "invalid_request_error"}},
         )
 
+    _set_ledger_ctx(request, model, info, is_stream=bool(body.get("stream", False)))
     body, model, info, vision_error = await _apply_chat_vision_fallback(
         request, body, model, info, "/v1/chat/completions", _error_openai,
     )
@@ -2534,6 +2569,7 @@ async def messages(request: Request):
     if not info:
         return _error(404, "invalid_request_error", _model_error_message(model))
 
+    _set_ledger_ctx(request, model, info, is_stream=is_stream)
     # Inspect through the existing lossless Anthropic→Chat translation. Native
     # vision models keep the Messages path unchanged; text-only models are staged.
     original_vision_chat = anthropic_to_openai(body)
