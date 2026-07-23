@@ -43,6 +43,7 @@ ALLOWED_QUIRKS = {
     "force_reasoning_effort_max",
     "use_max_completion_tokens",
     "drop_fixed_sampling_fields",
+    "named_tool_choice_as_required",
     "inline_image_urls_only",
 }
 ALLOWED_PRICING_FIELDS = {"input", "output", "cache_read", "cache_write", "reasoning"}

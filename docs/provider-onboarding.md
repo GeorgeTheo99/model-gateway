@@ -315,6 +315,7 @@ Supported reusable request quirks are:
 - `force_reasoning_effort_max`
 - `use_max_completion_tokens`
 - `drop_fixed_sampling_fields`
+- `named_tool_choice_as_required`
 - `inline_image_urls_only`
 
 Provider-specific request code should only be added when the upstream cannot

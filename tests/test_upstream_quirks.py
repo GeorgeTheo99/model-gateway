@@ -220,6 +220,48 @@ def test_openai_request_quirks_normalize_new_provider_shape():
     assert req["tools"][0]["function"]["name"] == "lookup"
 
 
+def test_named_tool_choice_as_required_preserves_selected_function():
+    info = SimpleNamespace(quirks=frozenset({"named_tool_choice_as_required"}))
+    req = {
+        "tools": [
+            {"type": "function", "function": {"name": "lookup"}},
+            {"type": "function", "function": {"name": "run_python"}},
+        ],
+        "tool_choice": {"type": "function", "function": {"name": "run_python"}},
+    }
+
+    assert _apply_openai_request_quirks(req, info) is None
+    assert req["tool_choice"] == "required"
+    assert [tool["function"]["name"] for tool in req["tools"]] == ["run_python"]
+
+
+@pytest.mark.parametrize(
+    ("tools", "function_name"),
+    [
+        ([{"type": "function", "function": {"name": "lookup"}}], "run_python"),
+        (42, "run_python"),
+        ([], ""),
+        (
+            [
+                {"type": "function", "function": {"name": "run_python"}},
+                {"type": "function", "function": {"name": "run_python"}},
+            ],
+            "run_python",
+        ),
+    ],
+)
+def test_named_tool_choice_as_required_rejects_invalid_selection(tools, function_name):
+    info = SimpleNamespace(quirks=frozenset({"named_tool_choice_as_required"}))
+    req = {
+        "tools": tools,
+        "tool_choice": {"type": "function", "function": {"name": function_name}},
+    }
+
+    error = _apply_openai_request_quirks(req, info)
+
+    assert error == "The requested named function must appear exactly once in tools."
+
+
 def test_inline_image_only_quirk_rejects_public_url_and_accepts_data_url():
     info = SimpleNamespace(quirks=frozenset({"inline_image_urls_only"}))
     public = {"messages": [{"role": "user", "content": [

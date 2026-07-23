@@ -110,6 +110,7 @@ providers:
   #   #   force_reasoning_effort_max   -> always send literal max
   #   #   use_max_completion_tokens    -> normalize completion-token field
   #   #   drop_fixed_sampling_fields   -> omit fixed sampling parameters
+  #   #   named_tool_choice_as_required -> keep only the named tool, then require a tool call
   #   #   inline_image_urls_only       -> reject public HTTP(S) image URLs
   #   quirks:
   #     - no_stream_options
