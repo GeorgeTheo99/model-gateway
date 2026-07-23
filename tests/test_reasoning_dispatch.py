@@ -283,6 +283,7 @@ def test_chat_completions_applies_declarative_provider_onboarding_quirks(client,
         "force_reasoning_effort_max",
         "use_max_completion_tokens",
         "drop_fixed_sampling_fields",
+        "named_tool_choice_as_required",
         "inline_image_urls_only",
     })
 
@@ -293,7 +294,8 @@ def test_chat_completions_applies_declarative_provider_onboarding_quirks(client,
         assert body["model"] == "new-upstream"
         assert body["reasoning_effort"] == "max"
         assert body["max_completion_tokens"] == 123
-        assert body["tools"][0]["function"]["name"] == "lookup"
+        assert body["tool_choice"] == "required"
+        assert [tool["function"]["name"] for tool in body["tools"]] == ["run_python"]
         for field in ("max_tokens", "temperature", "top_p", "n", "presence_penalty", "frequency_penalty"):
             assert field not in body
         return server_module.JSONResponse(status_code=200, content={"ok": True})
@@ -308,7 +310,11 @@ def test_chat_completions_applies_declarative_provider_onboarding_quirks(client,
         "n": 1,
         "presence_penalty": 0,
         "frequency_penalty": 0,
-        "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
+        "tools": [
+            {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "run_python", "parameters": {"type": "object"}}},
+        ],
+        "tool_choice": {"type": "function", "function": {"name": "run_python"}},
     })
     assert response.status_code == 200
     assert response.json() == {"ok": True}

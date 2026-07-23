@@ -484,6 +484,27 @@ def _apply_openai_request_quirks(req: dict, info) -> str | None:
         for key in ("temperature", "top_p", "n", "presence_penalty", "frequency_penalty"):
             req.pop(key, None)
 
+    if "named_tool_choice_as_required" in quirks:
+        tool_choice = req.get("tool_choice")
+        if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+            function_choice = tool_choice.get("function")
+            function_name = function_choice.get("name") if isinstance(function_choice, dict) else None
+            tools = req.get("tools")
+            if not isinstance(function_name, str) or not function_name or not isinstance(tools, list):
+                return "The requested named function must appear exactly once in tools."
+            matching_tools = [
+                tool
+                for tool in tools
+                if isinstance(tool, dict)
+                and tool.get("type") == "function"
+                and isinstance(tool.get("function"), dict)
+                and tool["function"].get("name") == function_name
+            ]
+            if len(matching_tools) != 1:
+                return "The requested named function must appear exactly once in tools."
+            req["tools"] = matching_tools
+            req["tool_choice"] = "required"
+
     if "inline_image_urls_only" in quirks:
         messages = req.get("messages")
         if isinstance(messages, list):
