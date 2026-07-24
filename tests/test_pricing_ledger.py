@@ -1,5 +1,6 @@
 """Tests for pricing lookup and the ledger middleware end-to-end."""
 
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -134,6 +135,7 @@ def test_non_streaming_request_records_ledger_with_cost(tmp_ledger, monkeypatch)
         resp = c.post("/v1/chat/completions", json={
             "model": "priced-model",
             "messages": [{"role": "user", "content": "hi"}],
+            "prompt_cache_key": "raw-openai-session",
         })
         assert resp.status_code == 200
 
@@ -152,6 +154,10 @@ def test_non_streaming_request_records_ledger_with_cost(tmp_ledger, monkeypatch)
     # (cached tokens priced once at cache_read, not double-counted at input rate)
     assert r["cost_usd"] == pytest.approx(0.996, abs=1e-6)
     assert r["pricing_complete"] == 1
+    assert r["session_observed"] is True
+    assert r["session_source"] == "prompt_cache_key"
+    assert r["cache_retention_requested"] == "short"
+    assert "session_fingerprint" not in r
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
@@ -178,7 +184,7 @@ def test_native_anthropic_cache_usage_and_markers_are_preserved(tmp_ledger, monk
 
     async def fake_passthrough_anthropic_sync(endpoint, body, headers, **kwargs):
         assert body["model"] == "claude-opus-5"
-        assert body["system"][0]["cache_control"] == {"type": "ephemeral"}
+        assert body["system"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
         return server_module.JSONResponse(status_code=200, content={
             "type": "message",
             "model": "claude-opus-5",
@@ -202,17 +208,22 @@ def test_native_anthropic_cache_usage_and_markers_are_preserved(tmp_ledger, monk
         fake_passthrough_anthropic_sync,
     )
 
+    raw_session_id = "raw-anthropic-session"
     with TestClient(app) as client:
-        response = client.post("/v1/messages", json={
-            "model": "opus5",
-            "max_tokens": 16,
-            "system": [{
-                "type": "text",
-                "text": "stable prefix",
-                "cache_control": {"type": "ephemeral"},
-            }],
-            "messages": [{"role": "user", "content": "Reply OK"}],
-        })
+        response = client.post(
+            "/v1/messages",
+            headers={"x-session-affinity": raw_session_id},
+            json={
+                "model": "opus5",
+                "max_tokens": 16,
+                "system": [{
+                    "type": "text",
+                    "text": "stable prefix",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                }],
+                "messages": [{"role": "user", "content": "Reply OK"}],
+            },
+        )
         assert response.status_code == 200
 
     row = ledger.recent()[0]
@@ -224,6 +235,29 @@ def test_native_anthropic_cache_usage_and_markers_are_preserved(tmp_ledger, monk
     assert row["reasoning_tokens"] == 3
     assert row["cost_usd"] == pytest.approx(0.1442, abs=1e-9)
     assert row["pricing_complete"] == 1
+    assert row["session_observed"] is True
+    assert row["session_source"] == "x-session-affinity"
+    assert row["cache_retention_requested"] == "long"
+    assert "session_fingerprint" not in row
+    with sqlite3.connect(tmp_ledger) as conn:
+        fingerprint, request_started_at = conn.execute(
+            "SELECT session_fingerprint, request_started_at FROM requests"
+        ).fetchone()
+    assert fingerprint == ledger.session_fingerprint(raw_session_id)
+    assert request_started_at is not None
+    assert raw_session_id not in tmp_ledger.read_bytes().decode("latin-1")
+
+    monkeypatch.setenv("MODEL_GATEWAY_ADMIN_KEY", "admin-key")
+    with TestClient(app) as client:
+        admin_response = client.get(
+            "/admin/api/requests",
+            headers={"Authorization": "Bearer admin-key"},
+        )
+    assert admin_response.status_code == 200
+    admin_text = admin_response.text
+    assert raw_session_id not in admin_text
+    assert fingerprint not in admin_text
+    assert admin_response.json()["requests"][0]["session_observed"] is True
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
@@ -600,3 +634,11 @@ def test_admin_usage_endpoint_requires_admin_key(monkeypatch, tmp_ledger):
     with TestClient(app) as c:
         assert c.get("/admin/api/usage").status_code == 401
         assert c.get("/admin/api/requests").status_code == 401
+
+        monkeypatch.setenv("MODEL_GATEWAY_ADMIN_KEY", "admin-key")
+        response = c.get(
+            "/admin/api/usage",
+            headers={"Authorization": "Bearer admin-key"},
+        )
+        assert response.status_code == 200
+        assert response.json()["cache_retention"]["min_gap_seconds"] == 300

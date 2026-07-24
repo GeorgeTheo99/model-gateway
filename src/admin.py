@@ -212,6 +212,7 @@ async def admin_usage(request: Request):
         "by_model": ledger.aggregate(since=since, until=until, group_by="model"),
         "by_endpoint": ledger.aggregate(since=since, until=until, group_by="endpoint"),
         "by_status": ledger.aggregate(since=since, until=until, group_by="status"),
+        "cache_retention": ledger.cache_retention_analysis(since=since, until=until),
     }
 
 

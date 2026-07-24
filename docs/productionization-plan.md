@@ -222,6 +222,10 @@ Clients that will break until updated:
 3. **Request/usage ledger** ✅
    - SQLite schema, request ids, latency/status/error logging.
    - Token/cost extraction for non-streaming AND streaming (SSE tee).
+   - Prompt-cache retention observability uses stable HMAC session fingerprints;
+     raw session ids, prompts, and completions are never stored or exposed.
+   - Authenticated usage aggregates report conservative 5–60 minute
+     same-session short-cache rewrite candidates without returning fingerprints.
 4. **Provider/key management** ✅
    - Add/edit provider configs and API keys via admin API/UI.
    - Validate provider connection.
