@@ -7,6 +7,7 @@ import json
 
 import pytest
 
+import src.server as server_module
 from src.responses import chat_to_responses, responses_result_events, translate_responses_stream
 from src.server import (
     _anthropic_messages_to_responses,
@@ -66,20 +67,107 @@ def test_messages_stream_preserves_explicit_zero_and_cached_input():
     }
 
 
-def test_messages_stream_preserves_cache_write_usage():
+def test_messages_stream_preserves_cache_write_ttls_and_reasoning_usage():
     upstream = _byte_stream(
         b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
         b'data: {"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":3,',
-        b'"prompt_tokens_details":{"cached_tokens":200,"cache_write_tokens":50}}}\n\n',
+        b'"prompt_tokens_details":{"cached_tokens":200,"cache_write_tokens":50,',
+        b'"cache_write_1h_tokens":100},"completion_tokens_details":',
+        b'{"reasoning_tokens":2}}}\n\n',
     )
     output = asyncio.run(_collect(translate_stream(upstream, "test")))
     final = next(p for p in _sse_payloads(output) if p.get("type") == "message_delta")
     assert final["usage"] == {
-        "input_tokens": 750,
+        "input_tokens": 650,
         "output_tokens": 3,
         "cache_read_input_tokens": 200,
-        "cache_creation_input_tokens": 50,
+        "cache_creation_input_tokens": 150,
+        "cache_creation": {
+            "ephemeral_5m_input_tokens": 50,
+            "ephemeral_1h_input_tokens": 100,
+        },
+        "output_tokens_details": {"thinking_tokens": 2},
     }
+
+
+def test_google_tool_stream_preserves_rich_usage_and_does_not_fabricate_it(monkeypatch):
+    upstream_responses = [
+        {
+            "choices": [{
+                "message": {"role": "assistant", "content": "OK"},
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 3,
+                "prompt_tokens_details": {
+                    "cached_tokens": 200,
+                    "cache_write_tokens": 50,
+                    "cache_write_1h_tokens": 100,
+                },
+                "completion_tokens_details": {"reasoning_tokens": 2},
+            },
+        },
+        {
+            "choices": [{
+                "message": {"role": "assistant", "content": "OK"},
+                "finish_reason": "stop",
+            }],
+        },
+    ]
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+    async def fake_retry(*args, **kwargs):
+        return FakeResponse(upstream_responses.pop(0))
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", lambda **kwargs: FakeClient())
+    monkeypatch.setattr(server_module, "_retry_post_with_model_fallback", fake_retry)
+
+    async def run_once():
+        response = await server_module._handle_streaming_google(
+            "http://up",
+            {"messages": []},
+            "test",
+            {},
+            has_tools=True,
+            thinking_enabled=True,
+            info=type("Info", (), {"provider": "google"})(),
+        )
+        return _sse_payloads(await _collect(response.body_iterator))
+
+    rich = asyncio.run(run_once())
+    rich_final = next(p for p in rich if p.get("type") == "message_delta")
+    assert rich_final["usage"] == {
+        "input_tokens": 650,
+        "output_tokens": 3,
+        "cache_read_input_tokens": 200,
+        "cache_creation_input_tokens": 150,
+        "cache_creation": {
+            "ephemeral_5m_input_tokens": 50,
+            "ephemeral_1h_input_tokens": 100,
+        },
+        "output_tokens_details": {"thinking_tokens": 2},
+    }
+
+    missing = asyncio.run(run_once())
+    missing_final = next(p for p in missing if p.get("type") == "message_delta")
+    assert "usage" not in missing_final
 
 
 def test_responses_stream_absent_vs_explicit_zero_usage():

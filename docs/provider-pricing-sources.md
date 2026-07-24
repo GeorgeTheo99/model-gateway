@@ -13,15 +13,20 @@ useful only as a cross-check, never as the source of record.
   "input": 3.0,
   "output": 15.0,
   "cache_read": 0.3,
-  "cache_write": 3.75
+  "cache_write": 3.75,
+  "cache_write_1h": 6.0
 }
 ```
 
 - All values are **USD per 1,000,000 tokens** ($/Mtok).
 - `input` and `output` are required for a priced entry.
-- `cache_read` / `cache_write`: include only when the provider reports those
-  token classes **and** the gateway receives them. The gateway receives:
-  - Anthropic: `cache_read_input_tokens` + `cache_creation_input_tokens` ✓
+- `cache_read` / `cache_write` / `cache_write_1h`: include only when the
+  provider reports those token classes **and** the gateway receives them.
+  `cache_write` means the default 5-minute write; `cache_write_1h` means the
+  1-hour write. The gateway receives:
+  - Anthropic: `cache_read_input_tokens` + `cache_creation_input_tokens`, split
+    by `cache_creation.ephemeral_5m_input_tokens` and
+    `cache_creation.ephemeral_1h_input_tokens` ✓
   - OpenAI / Fireworks / OpenRouter / Z.ai: `prompt_tokens_details.cached_tokens`
     (cache reads only; cache writes are not reported by these providers) — set
     `cache_read` when the provider charges a distinct cache-read rate, omit
@@ -49,12 +54,12 @@ useful only as a cross-check, never as the source of record.
 
 ### Parsing notes per provider
 
-**Anthropic** (verified parseable 2026-06-28): the page has a block per model
-with four lines: `Input $X / MTok`, `Output $Y / MTok`, then a "Prompt
-caching" group with `Write $Z / MTok` and `Read $W / MTok`. Map directly:
-input→input, output→output, Write→cache_write, Read→cache_read. Rates are
-concrete (Anthropic documents cache_read = 0.1× input, cache_write = 1.25×
-input, but read the concrete numbers off the page).
+**Anthropic** (verified 2026-07-24): the page has a block per model
+with input/output and prompt-caching rates. Map directly: input→input,
+output→output, 5-minute write→cache_write, 1-hour write→cache_write_1h, and
+cache hit/refresh→cache_read. Anthropic documents cache_read = 0.1× input,
+cache_write = 1.25× input, and cache_write_1h = 2× input; prefer concrete
+numbers from the current official page.
 
 **OpenAI**: the pricing page lists models in a table with Input / Output /
 Cached input per 1M tokens. GPT-5.x models report a cached-input rate (0.5×

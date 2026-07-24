@@ -46,7 +46,9 @@ _PROVIDER_SYNONYMS = {
 # Retired local serving backends. Entries whose canonical provider is one of
 # these are skipped by default (matches ``src.providers._load_models``).
 _RETIRED_LOCAL_PROVIDERS = {"gguf", "llama", "llama_cpp", "llama.cpp"}
-_PRICING_RATE_FIELDS = {"input", "output", "cache_read", "cache_write", "reasoning"}
+_PRICING_RATE_FIELDS = {
+    "input", "output", "cache_read", "cache_write", "cache_write_1h", "reasoning",
+}
 
 # Canonical gateway thinking levels. ``off`` is a real explicit control while
 # Auto is represented by omitting a reasoning control from the request.

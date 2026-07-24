@@ -48,7 +48,9 @@ ALLOWED_QUIRKS = {
     "named_tool_choice_as_required",
     "inline_image_urls_only",
 }
-ALLOWED_PRICING_FIELDS = {"input", "output", "cache_read", "cache_write", "reasoning"}
+ALLOWED_PRICING_FIELDS = {
+    "input", "output", "cache_read", "cache_write", "cache_write_1h", "reasoning",
+}
 DISCOVERY_OVERRIDE_STATES = {
     "unavailable",
     "rate_limited",

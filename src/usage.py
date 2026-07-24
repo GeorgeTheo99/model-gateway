@@ -31,6 +31,7 @@ class Usage:
     output_tokens: int = 0
     cached_read_tokens: int = 0
     cache_write_tokens: int = 0
+    cache_write_1h_tokens: int = 0
     reasoning_tokens: int = 0
     reported: bool = False
 
@@ -43,6 +44,22 @@ def _as_int(value) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def _anthropic_cache_write_tokens(usage: dict) -> tuple[int, int]:
+    """Return Anthropic cache writes split into 5-minute and 1-hour classes."""
+    total = _as_int(usage.get("cache_creation_input_tokens"))
+    details = usage.get("cache_creation")
+    if not isinstance(details, dict) or not (
+        {"ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"} & set(details)
+    ):
+        return total, 0
+    write_5m = _as_int(details.get("ephemeral_5m_input_tokens"))
+    write_1h = _as_int(details.get("ephemeral_1h_input_tokens"))
+    # Older/compatible providers may report only part of the aggregate
+    # breakdown. Treat any remainder as the default 5-minute class.
+    write_5m += max(0, total - write_5m - write_1h)
+    return write_5m, write_1h
 
 
 _OPENAI_CHAT_USAGE_KEYS = {
@@ -77,14 +94,27 @@ def openai_chat_usage_to_anthropic(usage: object) -> dict | None:
     details = usage.get("prompt_tokens_details") or {}
     cached_read = _as_int(details.get("cached_tokens"))
     cache_write = _as_int(details.get("cache_write_tokens"))
+    cache_write_1h = _as_int(details.get("cache_write_1h_tokens"))
+    completion_details = usage.get("completion_tokens_details") or {}
     result = {
-        "input_tokens": max(0, _as_int(usage.get("prompt_tokens")) - cached_read - cache_write),
+        "input_tokens": max(
+            0,
+            _as_int(usage.get("prompt_tokens")) - cached_read - cache_write - cache_write_1h,
+        ),
         "output_tokens": _as_int(usage.get("completion_tokens")),
     }
     if "cached_tokens" in details:
         result["cache_read_input_tokens"] = cached_read
-    if "cache_write_tokens" in details:
-        result["cache_creation_input_tokens"] = cache_write
+    if "cache_write_tokens" in details or "cache_write_1h_tokens" in details:
+        result["cache_creation_input_tokens"] = cache_write + cache_write_1h
+        result["cache_creation"] = {
+            "ephemeral_5m_input_tokens": cache_write,
+            "ephemeral_1h_input_tokens": cache_write_1h,
+        }
+    if "reasoning_tokens" in completion_details:
+        result["output_tokens_details"] = {
+            "thinking_tokens": _as_int(completion_details.get("reasoning_tokens")),
+        }
     return result
 
 
@@ -99,6 +129,8 @@ def openai_chat_usage_to_responses(usage: object) -> dict | None:
     input_details = {"cached_tokens": _as_int(prompt_details.get("cached_tokens"))}
     if "cache_write_tokens" in prompt_details:
         input_details["cache_write_tokens"] = _as_int(prompt_details.get("cache_write_tokens"))
+    if "cache_write_1h_tokens" in prompt_details:
+        input_details["cache_write_1h_tokens"] = _as_int(prompt_details.get("cache_write_1h_tokens"))
     return {
         "input_tokens": prompt,
         "input_tokens_details": input_details,
@@ -117,19 +149,26 @@ def anthropic_usage_to_openai_chat(usage: object) -> dict | None:
     input_tokens = _as_int(usage.get("input_tokens"))
     output_tokens = _as_int(usage.get("output_tokens"))
     cached_read = _as_int(usage.get("cache_read_input_tokens"))
-    cache_write = _as_int(usage.get("cache_creation_input_tokens"))
-    prompt_tokens = input_tokens + cached_read + cache_write
+    cache_write, cache_write_1h = _anthropic_cache_write_tokens(usage)
+    prompt_tokens = input_tokens + cached_read + cache_write + cache_write_1h
     details = {"cached_tokens": cached_read}
     if "cache_creation_input_tokens" in usage:
-        # Additive gateway extension used to preserve exact Anthropic billing
-        # when the client-facing API has no standard cache-write field.
+        # Additive gateway extensions preserve exact Anthropic billing when the
+        # client-facing API has no standard cache-write fields.
         details["cache_write_tokens"] = cache_write
-    return {
+        details["cache_write_1h_tokens"] = cache_write_1h
+    result = {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": output_tokens,
         "total_tokens": prompt_tokens + output_tokens,
         "prompt_tokens_details": details,
     }
+    output_details = usage.get("output_tokens_details") or {}
+    if "thinking_tokens" in output_details:
+        result["completion_tokens_details"] = {
+            "reasoning_tokens": _as_int(output_details.get("thinking_tokens")),
+        }
+    return result
 
 
 def anthropic_usage_to_responses(usage: object) -> dict | None:
@@ -149,9 +188,10 @@ def extract_usage(resp: dict | None) -> Usage:
         ``input_tokens_details`` / ``output_tokens_details``)
 
     A Responses-shaped block is distinguished from an Anthropic-shaped one by
-    the presence of ``input_tokens_details`` / ``output_tokens_details``
-    (Anthropic uses ``cache_read_input_tokens`` / ``cache_creation_input_tokens``
-    at the top level of ``usage``).
+    ``input_tokens_details``. Newer Anthropic models also return
+    ``output_tokens_details`` (with ``thinking_tokens``), while keeping
+    ``cache_read_input_tokens`` / ``cache_creation_input_tokens`` at the top
+    level of ``usage``.
     """
     if not isinstance(resp, dict):
         return Usage()
@@ -163,18 +203,24 @@ def extract_usage(resp: dict | None) -> Usage:
         else:
             return Usage()
 
-    # OpenAI Responses shape: nested *_tokens_details. Check before Anthropic
-    # because both protocols use input_tokens/output_tokens.
-    if "input_tokens_details" in usage or "output_tokens_details" in usage:
+    # OpenAI Responses shape: input_tokens_details is protocol-specific. Do not
+    # use output_tokens_details as the discriminator because newer Anthropic
+    # models expose that key too.
+    if "input_tokens_details" in usage:
         in_details = usage.get("input_tokens_details") or {}
         out_details = usage.get("output_tokens_details") or {}
         cached = _as_int(in_details.get("cached_tokens"))
         cache_write = _as_int(in_details.get("cache_write_tokens"))
+        cache_write_1h = _as_int(in_details.get("cache_write_1h_tokens"))
         return Usage(
-            input_tokens=max(0, _as_int(usage.get("input_tokens")) - cached - cache_write),
+            input_tokens=max(
+                0,
+                _as_int(usage.get("input_tokens")) - cached - cache_write - cache_write_1h,
+            ),
             output_tokens=_as_int(usage.get("output_tokens")),
             cached_read_tokens=cached,
             cache_write_tokens=cache_write,
+            cache_write_1h_tokens=cache_write_1h,
             reasoning_tokens=_as_int(out_details.get("reasoning_tokens")),
             reported=True,
         )
@@ -183,12 +229,15 @@ def extract_usage(resp: dict | None) -> Usage:
     # output_tokens is still Anthropic-shaped and must not fall through to the
     # Chat parser. Anthropic input excludes cache reads and writes.
     if set(usage) & _ANTHROPIC_USAGE_KEYS and not (set(usage) & {"prompt_tokens", "completion_tokens"}):
+        out_details = usage.get("output_tokens_details") or {}
+        cache_write, cache_write_1h = _anthropic_cache_write_tokens(usage)
         return Usage(
             input_tokens=_as_int(usage.get("input_tokens")),
             output_tokens=_as_int(usage.get("output_tokens")),
             cached_read_tokens=_as_int(usage.get("cache_read_input_tokens")),
-            cache_write_tokens=_as_int(usage.get("cache_creation_input_tokens")),
-            reasoning_tokens=0,
+            cache_write_tokens=cache_write,
+            cache_write_1h_tokens=cache_write_1h,
+            reasoning_tokens=_as_int(out_details.get("thinking_tokens")),
             reported=True,
         )
 
@@ -199,11 +248,16 @@ def extract_usage(resp: dict | None) -> Usage:
     out_details = usage.get("completion_tokens_details") or {}
     cached = _as_int(in_details.get("cached_tokens"))
     cache_write = _as_int(in_details.get("cache_write_tokens"))
+    cache_write_1h = _as_int(in_details.get("cache_write_1h_tokens"))
     return Usage(
-        input_tokens=max(0, _as_int(usage.get("prompt_tokens")) - cached - cache_write),
+        input_tokens=max(
+            0,
+            _as_int(usage.get("prompt_tokens")) - cached - cache_write - cache_write_1h,
+        ),
         output_tokens=_as_int(usage.get("completion_tokens")),
         cached_read_tokens=cached,
         cache_write_tokens=cache_write,
+        cache_write_1h_tokens=cache_write_1h,
         reasoning_tokens=_as_int(out_details.get("reasoning_tokens")),
         reported=True,
     )
@@ -215,8 +269,8 @@ class CostEstimate:
 
     ``cost_usd`` is None when pricing or usage is missing (unknown cost).
     ``pricing_complete`` is False when the usage contained a token class the
-    pricing dict did not rate (e.g. cache_write tokens appeared but no
-    ``cache_write`` price is configured); the partial cost is still returned.
+    pricing dict did not rate (e.g. 1-hour cache-write tokens appeared but no
+    ``cache_write_1h`` price is configured); the partial cost is still returned.
     """
 
     cost_usd: float | None
@@ -235,10 +289,10 @@ class CostEstimate:
 #
 # ``reasoning_tokens`` is intentionally NOT in this list: for every provider
 # the gateway currently routes to, reasoning tokens are a SUBSET of
-# output_tokens (OpenAI-shape ``completion_tokens_details.reasoning_tokens``
-# is part of ``completion_tokens``; Anthropic reports no separate reasoning
-# field). Billing them separately would double-count, and flagging them as a
-# missing pricing class made ``pricing_complete`` misleadingly false for every
+# output_tokens (OpenAI ``completion_tokens_details.reasoning_tokens`` and
+# Anthropic ``output_tokens_details.thinking_tokens`` are both included in
+# output tokens). Billing them separately would double-count, and flagging them
+# as a missing pricing class made ``pricing_complete`` misleadingly false for every
 # thinking request. reasoning_tokens is still recorded in the ledger for
 # observability; if a provider that bills reasoning SEPARATELY from output is
 # ever added, revisit this.
@@ -247,6 +301,7 @@ _CLASS_FIELDS = [
     ("output", "output_tokens"),
     ("cache_read", "cached_read_tokens"),
     ("cache_write", "cache_write_tokens"),
+    ("cache_write_1h", "cache_write_1h_tokens"),
 ]
 
 
@@ -259,7 +314,8 @@ def estimate_cost(
     """Estimate USD cost from normalized usage and a model pricing policy.
 
     ``pricing`` keys are $/Mtok: ``input``, ``output``, ``cache_read``,
-    ``cache_write``, ``reasoning`` (any may be absent). ``pricing_status`` may
+    ``cache_write`` (5-minute), ``cache_write_1h``, ``reasoning`` (any may be
+    absent). ``pricing_status`` may
     be ``unmetered`` for local models whose marginal provider charge is known
     to be zero. Unmetered cost is complete even when token usage was not
     reported; token coverage remains represented separately by

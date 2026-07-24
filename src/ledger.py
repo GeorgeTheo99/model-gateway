@@ -33,9 +33,10 @@ _DEFAULT_LEDGER_PATH = _DEFAULT_LEDGER_DIR / "ledger.db"
 _lock = threading.Lock()
 
 # Columns added after the initial schema. Each is checked/applied on startup
-# so older ledger.db files upgrade in place. (None currently; structure kept
-# for future additive migrations.)
-_ADDITIVE_COLUMNS: dict[str, str] = {}
+# so older ledger.db files upgrade in place.
+_ADDITIVE_COLUMNS: dict[str, str] = {
+    "cache_write_1h_tokens": "INTEGER NOT NULL DEFAULT 0",
+}
 
 
 def ledger_path() -> Path:
@@ -75,6 +76,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             output_tokens INTEGER NOT NULL DEFAULT 0,
             cached_read_tokens INTEGER NOT NULL DEFAULT 0,
             cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0,
             reasoning_tokens INTEGER NOT NULL DEFAULT 0,
             usage_reported INTEGER NOT NULL DEFAULT 0,
             cost_usd REAL,
@@ -129,9 +131,10 @@ def record(
                     id, ts, endpoint, method, model, provider, provider_model_id,
                     status, latency_ms, is_stream,
                     input_tokens, output_tokens, cached_read_tokens,
-                    cache_write_tokens, reasoning_tokens, usage_reported,
-                    cost_usd, pricing_complete, missing_pricing_classes, error
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    cache_write_tokens, cache_write_1h_tokens, reasoning_tokens,
+                    usage_reported, cost_usd, pricing_complete,
+                    missing_pricing_classes, error
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     rid,
@@ -148,6 +151,7 @@ def record(
                     usage.output_tokens,
                     usage.cached_read_tokens,
                     usage.cache_write_tokens,
+                    usage.cache_write_1h_tokens,
                     usage.reasoning_tokens,
                     1 if usage.reported else 0,
                     cost.cost_usd,
@@ -220,6 +224,7 @@ def aggregate(
             SUM(output_tokens) AS output_tokens,
             SUM(cached_read_tokens) AS cached_read_tokens,
             SUM(cache_write_tokens) AS cache_write_tokens,
+            SUM(cache_write_1h_tokens) AS cache_write_1h_tokens,
             SUM(reasoning_tokens) AS reasoning_tokens,
             SUM(cost_usd) AS cost_usd,
             SUM(CASE WHEN usage_reported = 1 THEN 1 ELSE 0 END) AS usage_reported_requests,
@@ -270,6 +275,7 @@ def summary(*, since: float | None = None, until: float | None = None, models: l
             SUM(output_tokens) AS output_tokens,
             SUM(cached_read_tokens) AS cached_read_tokens,
             SUM(cache_write_tokens) AS cache_write_tokens,
+            SUM(cache_write_1h_tokens) AS cache_write_1h_tokens,
             SUM(reasoning_tokens) AS reasoning_tokens,
             SUM(cost_usd) AS cost_usd,
             SUM(CASE WHEN usage_reported = 1 THEN 1 ELSE 0 END) AS usage_reported_requests,

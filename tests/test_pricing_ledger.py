@@ -155,6 +155,143 @@ def test_non_streaming_request_records_ledger_with_cost(tmp_ledger, monkeypatch)
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_native_anthropic_cache_usage_and_markers_are_preserved(tmp_ledger, monkeypatch):
+    """New Anthropic usage details must not hide cache tokens from the ledger."""
+    info = _info(provider="anthropic", provider_model_id="claude-opus-5")
+    info.protocol = "anthropic"
+    import src.providers as providers
+    monkeypatch.setattr(providers, "_models", {
+        "opus5": {
+            "name": "opus5",
+            "provider": "anthropic",
+            "provider_model_id": "claude-opus-5",
+            "pricing": {
+                "input": 5.0,
+                "output": 25.0,
+                "cache_read": 0.5,
+                "cache_write": 6.25,
+                "cache_write_1h": 10.0,
+            },
+        },
+    })
+    monkeypatch.setattr(server_module, "resolve", lambda model: info if model == "opus5" else None)
+
+    async def fake_passthrough_anthropic_sync(endpoint, body, headers, **kwargs):
+        assert body["model"] == "claude-opus-5"
+        assert body["system"][0]["cache_control"] == {"type": "ephemeral"}
+        return server_module.JSONResponse(status_code=200, content={
+            "type": "message",
+            "model": "claude-opus-5",
+            "content": [{"type": "text", "text": "OK"}],
+            "usage": {
+                "input_tokens": 14,
+                "output_tokens": 4,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 14_403,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 14_403,
+                },
+                "output_tokens_details": {"thinking_tokens": 3},
+            },
+        })
+
+    monkeypatch.setattr(
+        server_module,
+        "_passthrough_anthropic_sync",
+        fake_passthrough_anthropic_sync,
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/v1/messages", json={
+            "model": "opus5",
+            "max_tokens": 16,
+            "system": [{
+                "type": "text",
+                "text": "stable prefix",
+                "cache_control": {"type": "ephemeral"},
+            }],
+            "messages": [{"role": "user", "content": "Reply OK"}],
+        })
+        assert response.status_code == 200
+
+    row = ledger.recent()[0]
+    assert row["input_tokens"] == 14
+    assert row["output_tokens"] == 4
+    assert row["cached_read_tokens"] == 0
+    assert row["cache_write_tokens"] == 0
+    assert row["cache_write_1h_tokens"] == 14_403
+    assert row["reasoning_tokens"] == 3
+    assert row["cost_usd"] == pytest.approx(0.1442, abs=1e-9)
+    assert row["pricing_complete"] == 1
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_native_anthropic_stream_records_split_cache_usage(tmp_ledger, monkeypatch):
+    info = _info(provider="anthropic", provider_model_id="claude-opus-5")
+    info.protocol = "anthropic"
+    import src.providers as providers
+    monkeypatch.setattr(providers, "_models", {
+        "opus5-stream": {
+            "name": "opus5-stream",
+            "provider": "anthropic",
+            "provider_model_id": "claude-opus-5",
+            "pricing": {
+                "input": 5.0,
+                "output": 25.0,
+                "cache_read": 0.5,
+                "cache_write": 6.25,
+                "cache_write_1h": 10.0,
+            },
+        },
+    })
+    monkeypatch.setattr(
+        server_module,
+        "resolve",
+        lambda model: info if model == "opus5-stream" else None,
+    )
+
+    async def fake_passthrough_anthropic_stream(endpoint, body, headers, **kwargs):
+        async def chunks():
+            yield (
+                'data: {"type":"message_start","message":{"usage":'
+                '{"input_tokens":14,"output_tokens":0,"cache_read_input_tokens":0,'
+                '"cache_creation_input_tokens":300,"cache_creation":'
+                '{"ephemeral_5m_input_tokens":100,"ephemeral_1h_input_tokens":200}}}}\n\n'
+            ).encode()
+            yield (
+                'data: {"type":"message_delta","usage":{"output_tokens":4,'
+                '"output_tokens_details":{"thinking_tokens":3}}}\n\n'
+            ).encode()
+        return server_module.StreamingResponse(chunks(), media_type="text/event-stream")
+
+    monkeypatch.setattr(
+        server_module,
+        "_passthrough_anthropic_stream",
+        fake_passthrough_anthropic_stream,
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/v1/messages", json={
+            "model": "opus5-stream",
+            "max_tokens": 16,
+            "stream": True,
+            "messages": [{"role": "user", "content": "Reply OK"}],
+        })
+        assert response.status_code == 200
+
+    row = ledger.recent()[0]
+    assert row["input_tokens"] == 14
+    assert row["output_tokens"] == 4
+    assert row["cached_read_tokens"] == 0
+    assert row["cache_write_tokens"] == 100
+    assert row["cache_write_1h_tokens"] == 200
+    assert row["reasoning_tokens"] == 3
+    assert row["cost_usd"] == pytest.approx(0.002795, abs=1e-9)
+    assert row["pricing_complete"] == 1
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
 def test_semantic_composite_request_records_requested_and_resolved_model_ids(tmp_ledger, monkeypatch):
     info = _info(provider="omlx", provider_model_id="GLM-5.2-MLX-4.5bit")
     info.composite = CompositeRoute(

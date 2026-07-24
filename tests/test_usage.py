@@ -36,6 +36,7 @@ def test_extract_anthropic_shape():
         "output_tokens": 300,
         "cache_read_input_tokens": 150,
         "cache_creation_input_tokens": 400,
+        "output_tokens_details": {"thinking_tokens": 75},
     }}
     u = extract_usage(resp)
     assert u.reported is True
@@ -43,7 +44,7 @@ def test_extract_anthropic_shape():
     assert u.output_tokens == 300
     assert u.cached_read_tokens == 150
     assert u.cache_write_tokens == 400
-    assert u.reasoning_tokens == 0
+    assert u.reasoning_tokens == 75
 
 
 def test_extract_anthropic_shape_without_cache_fields():
@@ -86,6 +87,7 @@ def test_usage_shape_conversions_preserve_cache_semantics():
         "prompt_tokens": 1000,
         "completion_tokens": 300,
         "prompt_tokens_details": {"cached_tokens": 150, "cache_write_tokens": 50},
+        "completion_tokens_details": {"reasoning_tokens": 25},
     }
     anthropic = openai_chat_usage_to_anthropic(chat)
     assert anthropic == {
@@ -93,23 +95,52 @@ def test_usage_shape_conversions_preserve_cache_semantics():
         "output_tokens": 300,
         "cache_read_input_tokens": 150,
         "cache_creation_input_tokens": 50,
+        "cache_creation": {
+            "ephemeral_5m_input_tokens": 50,
+            "ephemeral_1h_input_tokens": 0,
+        },
+        "output_tokens_details": {"thinking_tokens": 25},
     }
     responses = openai_chat_usage_to_responses(chat)
     assert extract_usage({"usage": responses}) == Usage(
         input_tokens=800, output_tokens=300, cached_read_tokens=150,
-        cache_write_tokens=50, reported=True,
+        cache_write_tokens=50, reasoning_tokens=25, reported=True,
     )
 
     round_trip_chat = anthropic_usage_to_openai_chat(anthropic)
     assert extract_usage({"usage": round_trip_chat}) == Usage(
         input_tokens=800, output_tokens=300, cached_read_tokens=150,
-        cache_write_tokens=50, reported=True,
+        cache_write_tokens=50, reasoning_tokens=25, reported=True,
     )
     round_trip_responses = anthropic_usage_to_responses(anthropic)
     assert extract_usage({"usage": round_trip_responses}) == Usage(
         input_tokens=800, output_tokens=300, cached_read_tokens=150,
-        cache_write_tokens=50, reported=True,
+        cache_write_tokens=50, reasoning_tokens=25, reported=True,
     )
+
+
+def test_extract_anthropic_cache_write_ttls_and_costs_separately():
+    usage = extract_usage({"usage": {
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "cache_read_input_tokens": 200,
+        "cache_creation_input_tokens": 500,
+        "cache_creation": {
+            "ephemeral_5m_input_tokens": 100,
+            "ephemeral_1h_input_tokens": 400,
+        },
+    }})
+    assert usage.cache_write_tokens == 100
+    assert usage.cache_write_1h_tokens == 400
+    cost = estimate_cost(usage, {
+        "input": 5.0,
+        "output": 25.0,
+        "cache_read": 0.5,
+        "cache_write": 6.25,
+        "cache_write_1h": 10.0,
+    })
+    assert cost.cost_usd == 0.006475
+    assert cost.pricing_complete is True
 
 
 def test_estimate_cost_full_pricing():

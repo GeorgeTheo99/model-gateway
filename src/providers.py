@@ -105,7 +105,7 @@ class ProviderInfo:
     thinking_format: str = ""  # optional explicit gateway normalization format
     system_instruction: str = ""
     vision: bool = False  # authoritative: True if the model can natively handle image inputs
-    pricing: dict = None  # $/Mtok rates: input, output, cache_read?, cache_write?, reasoning?
+    pricing: dict = None  # $/Mtok: input, output, cache_read?, cache_write?, cache_write_1h?, reasoning?
     # Logical composites deliberately keep ``vision=False`` here because the
     # resolved upstream is the text model. The public catalog entry remains
     # ``vision: true`` so clients preserve image blocks for gateway staging.

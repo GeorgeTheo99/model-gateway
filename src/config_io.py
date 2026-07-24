@@ -252,7 +252,9 @@ _MODEL_FIELDS = [
     "max_output_tokens", "thinking", "thinking_levels", "thinking_format", "vision", "quirks",
     "system_instruction", "pricing", "pricing_status", "desc",
 ]
-_PRICING_RATE_FIELDS = {"input", "output", "cache_read", "cache_write", "reasoning"}
+_PRICING_RATE_FIELDS = {
+    "input", "output", "cache_read", "cache_write", "cache_write_1h", "reasoning",
+}
 _LOCAL_PROVIDERS = {"local", "omlx", "mlx"}
 
 

@@ -94,7 +94,9 @@ def validate_profile(data: object) -> dict:
         if pricing is not None:
             if not isinstance(pricing, dict) or not pricing:
                 raise OnboardingError(f"model {model['name']!r} pricing must be a non-empty object")
-            unknown_pricing = set(pricing) - {"input", "output", "cache_read", "cache_write", "reasoning"}
+            unknown_pricing = set(pricing) - {
+                "input", "output", "cache_read", "cache_write", "cache_write_1h", "reasoning",
+            }
             if unknown_pricing:
                 raise OnboardingError(
                     f"model {model['name']!r} has unknown pricing field(s): "

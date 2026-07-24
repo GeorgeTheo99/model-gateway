@@ -3383,9 +3383,8 @@ async def _handle_streaming_google(
     msg_id = anthropic_msg["id"]
     content = anthropic_msg.get("content", [])
     stop_reason = anthropic_msg.get("stop_reason", "end_turn")
-    input_tokens = anthropic_msg.get("usage", {}).get("input_tokens", 0)
-    output_tokens = anthropic_msg.get("usage", {}).get("output_tokens", 0)
-    cached_tokens = anthropic_msg.get("usage", {}).get("cache_read_input_tokens", 0)
+    anthropic_usage = anthropic_msg.get("usage")
+    input_tokens = (anthropic_usage or {}).get("input_tokens", 0)
 
     def _sse(event: str, data: dict) -> str:
         return f"event: {event}\ndata: {json.dumps(data)}\n\n"
@@ -3454,14 +3453,13 @@ async def _handle_streaming_google(
             })
 
         # message_delta
-        usage_out = {"input_tokens": input_tokens, "output_tokens": output_tokens}
-        if cached_tokens:
-            usage_out["cache_read_input_tokens"] = cached_tokens
-        yield _sse("message_delta", {
+        message_delta = {
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason},
-            "usage": usage_out,
-        })
+        }
+        if anthropic_usage is not None:
+            message_delta["usage"] = anthropic_usage
+        yield _sse("message_delta", message_delta)
 
         # message_stop
         yield _sse("message_stop", {"type": "message_stop"})

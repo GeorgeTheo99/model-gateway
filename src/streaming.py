@@ -82,7 +82,10 @@ async def translate_stream(
     input_tokens = 0
     cached_tokens = 0
     cache_write_tokens = 0
+    cache_write_1h_tokens = 0
     cache_write_reported = False
+    reasoning_tokens = 0
+    reasoning_reported = False
     usage_reported = False
     finish_reason = None
     saw_finish = False
@@ -121,8 +124,17 @@ async def translate_stream(
             output_tokens = converted.get("output_tokens", output_tokens)
             cached_tokens = converted.get("cache_read_input_tokens", cached_tokens)
             if "cache_creation_input_tokens" in converted:
-                cache_write_tokens = converted["cache_creation_input_tokens"]
+                cache_creation = converted.get("cache_creation") or {}
+                cache_write_tokens = cache_creation.get(
+                    "ephemeral_5m_input_tokens",
+                    converted["cache_creation_input_tokens"],
+                )
+                cache_write_1h_tokens = cache_creation.get("ephemeral_1h_input_tokens", 0)
                 cache_write_reported = True
+            output_details = converted.get("output_tokens_details") or {}
+            if "thinking_tokens" in output_details:
+                reasoning_tokens = output_details["thinking_tokens"]
+                reasoning_reported = True
             usage_reported = True
 
         choice = (chunk.get("choices") or [{}])[0]
@@ -309,7 +321,7 @@ async def translate_stream(
         })
 
     # Log cache hit rate
-    prompt_tokens = input_tokens + cached_tokens + cache_write_tokens
+    prompt_tokens = input_tokens + cached_tokens + cache_write_tokens + cache_write_1h_tokens
     if cached_tokens and prompt_tokens:
         log.info("Cache hit: %d/%d prompt tokens cached (%.0f%%)", cached_tokens, prompt_tokens, cached_tokens / prompt_tokens * 100)
 
@@ -322,7 +334,20 @@ async def translate_stream(
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             **({"cache_read_input_tokens": cached_tokens} if cached_tokens else {}),
-            **({"cache_creation_input_tokens": cache_write_tokens} if cache_write_reported else {}),
+            **(
+                {
+                    "cache_creation_input_tokens": cache_write_tokens + cache_write_1h_tokens,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": cache_write_tokens,
+                        "ephemeral_1h_input_tokens": cache_write_1h_tokens,
+                    },
+                }
+                if cache_write_reported else {}
+            ),
+            **(
+                {"output_tokens_details": {"thinking_tokens": reasoning_tokens}}
+                if reasoning_reported else {}
+            ),
         }
     yield _sse("message_delta", final_delta)
 

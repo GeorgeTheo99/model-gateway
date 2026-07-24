@@ -1260,7 +1260,8 @@ _ADMIN_HTML = r"""
     if (p.input != null) parts.push('in $'+Number(p.input).toFixed(2));
     if (p.output != null) parts.push('out $'+Number(p.output).toFixed(2));
     if (p.cache_read != null) parts.push('cache read $'+Number(p.cache_read).toFixed(3));
-    if (p.cache_write != null) parts.push('cache write $'+Number(p.cache_write).toFixed(3));
+    if (p.cache_write != null) parts.push('cache write 5m $'+Number(p.cache_write).toFixed(3));
+    if (p.cache_write_1h != null) parts.push('cache write 1h $'+Number(p.cache_write_1h).toFixed(3));
     if (p.reasoning != null) parts.push('reason $'+Number(p.reasoning).toFixed(3));
     return parts.length ? parts.join(' · ') : JSON.stringify(p);
   }
