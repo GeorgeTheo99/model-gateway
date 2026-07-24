@@ -254,6 +254,42 @@ def test_upsert_model_validates_required(tmp_config, monkeypatch):
         config_io.upsert_model("x", provider="openai", provider_model_id="")
 
 
+def test_upsert_model_validates_and_persists_thinking_levels(tmp_config):
+    result = config_io.upsert_model(
+        "max-only", provider="anthropic", provider_model_id="max-upstream",
+        thinking="always", thinking_levels=["max"],
+    )
+    assert result["entry"]["thinking_levels"] == ["max"]
+    providers.reload()
+    assert providers.resolve("max-only").thinking_levels == ("max",)
+
+    with pytest.raises(ValueError, match="supports off only"):
+        config_io.upsert_model(
+            "invalid", provider="anthropic", provider_model_id="invalid-upstream",
+            thinking="always", thinking_levels=["off", "high"],
+        )
+
+
+def test_upsert_model_thinking_null_preserves_narrow_levels(tmp_config):
+    config_io.upsert_model(
+        "max-only", provider="anthropic", provider_model_id="max-upstream",
+        thinking="always", thinking_levels=["max"],
+    )
+
+    result = config_io.upsert_model(
+        "max-only", provider="anthropic", provider_model_id="max-upstream",
+        thinking=None,
+    )
+
+    assert result["entry"]["thinking"] == "always"
+    assert result["entry"]["thinking_levels"] == ["max"]
+    persisted = next(
+        row for row in json.loads((tmp_config / "model-info.json").read_text())["llm"]
+        if row["name"] == "max-only"
+    )
+    assert persisted["thinking_levels"] == ["max"]
+
+
 # ── enabled field routing ───────────────────────────────────────────────────
 
 

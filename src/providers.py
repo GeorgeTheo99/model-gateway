@@ -99,6 +99,9 @@ class ProviderInfo:
     context: int = 0
     max_output_tokens: int = 0
     thinking: str = ""  # "", "optional", or "always"
+    # None preserves compatibility for callers constructing ProviderInfo from
+    # old entries; catalog-loaded models always carry a validated explicit tuple.
+    thinking_levels: tuple[str, ...] | None = None
     thinking_format: str = ""  # optional explicit gateway normalization format
     system_instruction: str = ""
     vision: bool = False  # authoritative: True if the model can natively handle image inputs
@@ -1004,6 +1007,7 @@ def resolve(model_id: str, provider_override: str | None = None) -> ProviderInfo
         context=entry.get("context", 0),
         max_output_tokens=entry.get("max_output_tokens", 0),
         thinking=entry.get("thinking", ""),
+        thinking_levels=(tuple(entry["thinking_levels"]) if "thinking_levels" in entry else None),
         thinking_format=entry.get("thinking_format", ""),
         system_instruction=entry.get("system_instruction", ""),
         vision=bool(entry.get("vision", False)),
@@ -1190,6 +1194,7 @@ def model_status() -> list[dict]:
             "context": model.get("context", 0),
             "max_output_tokens": model.get("max_output_tokens", 0),
             "thinking": model.get("thinking", ""),
+            "thinking_levels": list(model.get("thinking_levels", [])),
             "thinking_format": model.get("thinking_format", ""),
             "vision": bool(model.get("vision", False)),
             "pricing": model.get("pricing"),

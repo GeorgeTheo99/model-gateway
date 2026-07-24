@@ -9,6 +9,7 @@ import logging
 import secrets
 import time
 
+from src.reasoning import reasoning_alias_text
 from src.signature_cache import inject_into_tool_call
 from src.usage import (
     anthropic_usage_to_openai_chat as convert_anthropic_usage_to_openai_chat,
@@ -290,9 +291,9 @@ def openai_chat_to_anthropic(body: dict) -> dict:
             blocks = []
             if content:
                 blocks.append({"type": "text", "text": content if isinstance(content, str) else json.dumps(content)})
-            reasoning = msg.get("reasoning_content") or msg.get("reasoning")
+            reasoning = reasoning_alias_text(msg)
             if reasoning:
-                blocks.insert(0, {"type": "thinking", "thinking": str(reasoning)})
+                blocks.insert(0, {"type": "thinking", "thinking": reasoning})
             for tc in msg.get("tool_calls") or []:
                 fn = tc.get("function") or {}
                 raw_args = fn.get("arguments") or "{}"
@@ -405,7 +406,7 @@ def openai_to_anthropic(resp: dict, model: str, has_tools: bool = False, thinkin
 
     content = []
     text = message.get("content")
-    reasoning_content = message.get("reasoning_content") or message.get("reasoning")
+    reasoning_content = reasoning_alias_text(message)
 
     # Some upstreams (e.g. native serving invocations for reasoning models)
     # return message.content as a list of OpenAI content-part blocks rather
@@ -418,12 +419,6 @@ def openai_to_anthropic(resp: dict, model: str, has_tools: bool = False, thinkin
         if flat_reasoning and not reasoning_content:
             reasoning_content = flat_reasoning
 
-    if not reasoning_content and message.get("reasoning_details"):
-        parts = []
-        for item in message.get("reasoning_details") or []:
-            if isinstance(item, dict):
-                parts.append(item.get("text") or item.get("summary") or "")
-        reasoning_content = "".join(parts)
     tool_calls_raw = message.get("tool_calls")
 
     # Thinking/reasoning content

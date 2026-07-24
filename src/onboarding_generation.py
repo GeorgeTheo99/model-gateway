@@ -21,6 +21,7 @@ from urllib.parse import urlsplit
 import httpx
 import yaml
 
+from src.catalog import normalize_thinking_capabilities
 from src.onboarding import OnboardingError
 
 STRUCTURAL_MODEL_FIELDS = {"name", "provider", "provider_model_id"}
@@ -29,6 +30,7 @@ OPTIONAL_MODEL_FIELDS = (
     "context",
     "max_output_tokens",
     "thinking",
+    "thinking_levels",
     "thinking_format",
     "vision",
     "quirks",
@@ -307,6 +309,7 @@ def build_draft(
     context: int | None = None,
     max_output_tokens: int | None = None,
     thinking: str | None = None,
+    thinking_levels: Iterable[str] | None = None,
     thinking_format: str | None = None,
     vision: bool | None = None,
     quirks: Iterable[str] = (),
@@ -367,6 +370,7 @@ def build_draft(
         "context": context,
         "max_output_tokens": max_output_tokens,
         "thinking": thinking,
+        "thinking_levels": list(thinking_levels) if thinking_levels is not None else None,
         "thinking_format": thinking_format,
         "vision": vision,
         "pricing": pricing,
@@ -427,6 +431,19 @@ def build_draft(
             source = "documentation" if "quirks" in documented_fields else "operator"
             evidence = {"url": documented_fields["quirks"]} if source == "documentation" else {}
             fields[f"{pointer}/quirks"] = _field_evidence(source, "confirmed", **evidence)
+        if thinking in {"", "never"} and thinking_levels is None:
+            # An explicit disabled mode must not inherit stale enabled levels
+            # through --preserve-existing-metadata.
+            row.pop("thinking_levels", None)
+            fields.pop(f"{pointer}/thinking_levels", None)
+        try:
+            row.update(normalize_thinking_capabilities(row))
+        except ValueError as exc:
+            raise OnboardingError(str(exc)) from exc
+        if f"{pointer}/thinking_levels" not in fields:
+            fields[f"{pointer}/thinking_levels"] = _field_evidence(
+                "deterministic_default", "default"
+            )
         removed = sorted(
             key for key in old
             if key not in STRUCTURAL_MODEL_FIELDS and key not in row

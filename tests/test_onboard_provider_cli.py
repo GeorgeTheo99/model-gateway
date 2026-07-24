@@ -101,6 +101,35 @@ def test_generate_cli_writes_secret_free_reviewable_draft(tmp_path, monkeypatch)
     assert "api_key" not in output.read_text()
 
 
+def test_generate_cli_thinking_never_is_explicit_and_clears_preserved_levels(tmp_path):
+    config, model_info = _generation_files(tmp_path)
+    model_info.write_text(json.dumps({"llm": [{
+        "name": "model-a",
+        "provider": "example",
+        "provider_model_id": "model-a",
+        "thinking": "always",
+        "thinking_levels": ["max"],
+    }]}))
+    output = tmp_path / "draft.yaml"
+
+    CLI._generate_main([
+        "--provider", "example",
+        "--base-url", "https://api.example.com/v1",
+        "--model", "model-a",
+        "--output", str(output),
+        "--config", str(config),
+        "--model-info", str(model_info),
+        "--no-discover",
+        "--thinking", "never",
+        "--preserve-existing-metadata",
+        "--non-interactive",
+    ])
+
+    model = yaml.safe_load(output.read_text())["models"][0]
+    assert model["thinking"] == ""
+    assert model["thinking_levels"] == []
+
+
 def test_generate_apply_passes_saved_profile_unchanged_to_transaction_engine(tmp_path, monkeypatch):
     config, model_info = _generation_files(tmp_path)
     output = tmp_path / "draft.yaml"

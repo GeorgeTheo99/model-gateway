@@ -384,7 +384,7 @@ async def admin_upsert_model(model_name: str, request: Request):
     """Create or update a model entry in model-info.json.
 
     Body fields: provider, provider_model_id (or omlx_id for local/oMLX),
-    alias, context, max_output_tokens, thinking, thinking_format, vision,
+    alias, context, max_output_tokens, thinking, thinking_levels, thinking_format, vision,
     system_instruction, pricing, pricing_status, desc, enabled.
     Writes the live catalog and optional machine-local mirror; reloads registry.
     """
@@ -831,6 +831,7 @@ _ADMIN_HTML = r"""
               <div class="control"><label>Context</label><input id="mContext" type="number" placeholder="tokens" /></div>
               <div class="control"><label>Max output tokens</label><input id="mMaxOut" type="number" placeholder="tokens" /></div>
               <div class="control"><label>Thinking</label><input id="mThinking" type="text" placeholder="| optional | always" /></div>
+              <div class="control"><label>Thinking levels</label><input id="mThinkingLevels" type="text" placeholder="off, low, medium, high" /></div>
               <div class="control"><label>Thinking format</label><input id="mThinkingFmt" type="text" placeholder="glm-chat-template" /></div>
               <div class="control"><label>Pricing status</label><select id="mPricingStatus"><option value="metered">metered</option><option value="unmetered">unmetered local</option><option value="unknown">unknown</option></select></div>
               <div class="control"><label>Pricing JSON ($/Mtok)</label><input id="mPricing" class="ctl" type="text" placeholder='{"input":3,"output":15}' /></div>
@@ -1202,6 +1203,7 @@ _ADMIN_HTML = r"""
     document.getElementById('mContext').value = m.context || '';
     document.getElementById('mMaxOut').value = m.max_output_tokens || '';
     document.getElementById('mThinking').value = m.thinking || '';
+    document.getElementById('mThinkingLevels').value = (m.thinking_levels || []).join(', ');
     document.getElementById('mThinkingFmt').value = m.thinking_format || '';
     document.getElementById('mPricingStatus').value = m.pricing_status || (m.pricing ? 'metered' : 'unknown');
     document.getElementById('mPricing').value = m.pricing ? JSON.stringify(m.pricing) : '';
@@ -1218,6 +1220,8 @@ _ADMIN_HTML = r"""
     const ctx = parseInt(document.getElementById('mContext').value); if (!isNaN(ctx)) body.context = ctx;
     const mo = parseInt(document.getElementById('mMaxOut').value); if (!isNaN(mo)) body.max_output_tokens = mo;
     const th = document.getElementById('mThinking').value.trim(); if (th) body.thinking = th;
+    const levels = document.getElementById('mThinkingLevels').value.trim();
+    if (levels) body.thinking_levels = levels.split(',').map(value => value.trim()).filter(Boolean);
     const tf = document.getElementById('mThinkingFmt').value.trim(); if (tf) body.thinking_format = tf;
     const pricingStatus = document.getElementById('mPricingStatus').value;
     body.pricing_status = pricingStatus;
@@ -1302,6 +1306,7 @@ _ADMIN_HTML = r"""
     html += kv('Context', escapeHtml(m.context));
     html += kv('Max output', escapeHtml(m.max_output_tokens));
     html += kv('Thinking', escapeHtml(m.thinking || m.thinking_format || '—'));
+    html += kv('Thinking levels', escapeHtml((m.thinking_levels || []).join(', ') || '—'));
     html += kv('Vision', m.vision ? 'yes' : 'no');
     html += kv('Pricing status', statePill(m.pricing_status === 'unknown' ? 'warn' : 'ok', m.pricing_status || 'unknown'));
     html += kv('Pricing ($/Mtok)', '<span class="id">'+escapeHtml(pricingText(m.pricing))+'</span>');

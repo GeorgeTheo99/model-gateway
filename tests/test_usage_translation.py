@@ -7,7 +7,7 @@ import json
 
 import pytest
 
-from src.responses import chat_to_responses, translate_responses_stream
+from src.responses import chat_to_responses, responses_result_events, translate_responses_stream
 from src.server import (
     _anthropic_messages_to_responses,
     _anthropic_sse_to_openai_chat,
@@ -104,6 +104,207 @@ def test_responses_stream_absent_vs_explicit_zero_usage():
     )
     assert zero_completed["usage"]["input_tokens"] == 0
     assert extract_usage(zero_completed).reported is True
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("reasoning_content", "why"),
+        ("reasoning", "why"),
+        ("reasoning", {"text": "why"}),
+        ("reasoning_details", [{"text": "wh"}, {"summary": "y"}]),
+        ("reasoning_details", [{"summary": {"text": "wh"}}, {"summary": [{"text": "y"}]}]),
+    ],
+)
+def test_chat_to_responses_preserves_reasoning_aliases(field, value):
+    result = chat_to_responses({
+        "choices": [{
+            "message": {"content": "answer", field: value},
+            "finish_reason": "stop",
+        }],
+    }, "test")
+
+    assert [item["type"] for item in result["output"]] == ["reasoning", "message"]
+    assert result["output"][0]["summary"] == [{"type": "summary_text", "text": "why"}]
+    assert result["output"][1]["content"][0]["text"] == "answer"
+
+
+def test_chat_to_responses_preserves_alternating_list_content_order():
+    result = chat_to_responses({
+        "choices": [{
+            "message": {"content": [
+                {"type": "text", "text": "A"},
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "R"}]},
+                {"type": "output_text", "text": "B"},
+            ]},
+            "finish_reason": "stop",
+        }],
+    }, "test")
+
+    assert [item["type"] for item in result["output"]] == [
+        "message", "reasoning", "message",
+    ]
+    assert result["output"][0]["content"][0]["text"] == "A"
+    assert result["output"][1]["summary"][0]["text"] == "R"
+    assert result["output"][2]["content"][0]["text"] == "B"
+
+
+def test_responses_stream_preserves_alternating_list_content_order():
+    upstream = _byte_stream((
+        "data: " + json.dumps({
+            "choices": [{
+                "delta": {"content": [
+                    {"type": "text", "text": "A"},
+                    {"type": "reasoning", "summary": [{"text": "R"}]},
+                    {"type": "output_text", "text": "B"},
+                ]},
+                "finish_reason": "stop",
+            }],
+        }) + "\n\n"
+    ).encode())
+
+    payloads = _sse_payloads(asyncio.run(_collect(
+        translate_responses_stream(upstream, "test"),
+    )))
+    completed = next(
+        payload["response"] for payload in payloads
+        if payload.get("type") == "response.completed"
+    )
+
+    assert [item["type"] for item in completed["output"]] == [
+        "message", "reasoning", "message",
+    ]
+    assert [
+        payload["output_index"] for payload in payloads
+        if payload.get("type") == "response.output_item.added"
+    ] == [0, 1, 2]
+    assert [
+        payload["output_index"] for payload in payloads
+        if payload.get("type") == "response.output_item.done"
+    ] == [0, 1, 2]
+
+
+def test_responses_stream_preserves_interleaved_text_and_reasoning_deltas():
+    chunks = []
+    for delta, finish_reason in [
+        ({"reasoning": {"text": "R1"}}, None),
+        ({"content": "A"}, None),
+        ({"reasoning_details": [{"summary": {"text": "R2"}}]}, None),
+        ({"content": [
+            {"type": "reasoning_content", "text": "R3"},
+            {"type": "text", "text": "B"},
+        ]}, None),
+        ({"content": "C"}, "stop"),
+    ]:
+        chunks.append((
+            "data: " + json.dumps({
+                "choices": [{"delta": delta, "finish_reason": finish_reason}],
+            }) + "\n\n"
+        ).encode())
+
+    output = asyncio.run(_collect(translate_responses_stream(_byte_stream(*chunks), "test")))
+    payloads = _sse_payloads(output)
+    deltas = [
+        ("reasoning" if payload["type"] == "response.reasoning_summary_text.delta" else "text", payload["delta"])
+        for payload in payloads
+        if payload.get("type") in {
+            "response.reasoning_summary_text.delta", "response.output_text.delta",
+        }
+    ]
+    assert deltas == [
+        ("reasoning", "R1"), ("text", "A"), ("reasoning", "R2"),
+        ("reasoning", "R3"), ("text", "B"), ("text", "C"),
+    ]
+    completed = next(
+        payload["response"] for payload in payloads
+        if payload.get("type") == "response.completed"
+    )
+    assert [item["type"] for item in completed["output"]] == [
+        "reasoning", "message", "reasoning", "message",
+    ]
+    assert completed["output"][0]["summary"][0]["text"] == "R1"
+    assert completed["output"][1]["content"][0]["text"] == "A"
+    assert completed["output"][2]["summary"][0]["text"] == "R2R3"
+    assert completed["output"][3]["content"][0]["text"] == "BC"
+    added = [
+        (payload["output_index"], payload["item"]["type"])
+        for payload in payloads
+        if payload.get("type") == "response.output_item.added"
+    ]
+    done = [
+        (payload["output_index"], payload["item"]["type"])
+        for payload in payloads
+        if payload.get("type") == "response.output_item.done"
+    ]
+    assert added == done == [
+        (0, "reasoning"), (1, "message"),
+        (2, "reasoning"), (3, "message"),
+    ]
+
+
+def test_anthropic_stream_reopens_blocks_on_every_reasoning_text_transition():
+    chunks = []
+    for delta, finish_reason in [
+        ({"reasoning": {"text": "R1"}}, None),
+        ({"content": "A"}, None),
+        ({"reasoning_details": [{"summary": {"text": "R2"}}]}, None),
+        ({"content": "B"}, "stop"),
+    ]:
+        chunks.append((
+            "data: " + json.dumps({
+                "choices": [{"delta": delta, "finish_reason": finish_reason}],
+            }) + "\n\n"
+        ).encode())
+
+    output = asyncio.run(_collect(translate_stream(
+        _byte_stream(*chunks), "test", thinking_enabled=True,
+    )))
+    payloads = _sse_payloads(output)
+    starts = [
+        (payload["index"], payload["content_block"]["type"])
+        for payload in payloads
+        if payload.get("type") == "content_block_start"
+    ]
+    deltas = [
+        (payload["index"], payload["delta"].get("thinking") or payload["delta"].get("text"))
+        for payload in payloads
+        if payload.get("type") == "content_block_delta"
+    ]
+    stops = [
+        payload["index"] for payload in payloads
+        if payload.get("type") == "content_block_stop"
+    ]
+    assert starts == [(0, "thinking"), (1, "text"), (2, "thinking"), (3, "text")]
+    assert deltas == [(0, "R1"), (1, "A"), (2, "R2"), (3, "B")]
+    assert stops == [0, 1, 2, 3]
+
+
+def test_anthropic_responses_stream_emits_interleaved_reasoning_and_text_items():
+    result = _anthropic_messages_to_responses({
+        "content": [
+            {"type": "thinking", "thinking": "R1"},
+            {"type": "text", "text": "A"},
+            {"type": "thinking", "thinking": "R2"},
+            {"type": "text", "text": "B"},
+        ],
+        "stop_reason": "end_turn",
+    }, "test")
+
+    payloads = _sse_payloads(list(responses_result_events(result)))
+    deltas = [
+        ("reasoning" if payload["type"] == "response.reasoning_summary_text.delta" else "text", payload["delta"])
+        for payload in payloads
+        if payload.get("type") in {
+            "response.reasoning_summary_text.delta", "response.output_text.delta",
+        }
+    ]
+    assert deltas == [
+        ("reasoning", "R1"), ("text", "A"),
+        ("reasoning", "R2"), ("text", "B"),
+    ]
+    assert [item["type"] for item in result["output"]] == [
+        "reasoning", "message", "reasoning", "message",
+    ]
 
 
 def test_translated_openai_stream_errors_do_not_become_success():
@@ -223,10 +424,13 @@ def test_collect_anthropic_stream_keeps_initial_input_and_final_output():
 
 def test_collect_openai_stream_requires_finish_and_accepts_optional_sse_space():
     response = _FakeResponse([
-        b'data:{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n',
+        b'data:{"choices":[{"delta":{"reasoning":{"text":"R1"}},"finish_reason":null}]}\n\n',
+        b'data:{"choices":[{"delta":{"reasoning_details":[{"summary":{"text":"R2"}}],"content":"ok"},"finish_reason":"stop"}]}\n\n',
     ])
     result = asyncio.run(_collect_stream(response))
-    assert result["choices"][0]["message"]["content"] == "ok"
+    message = result["choices"][0]["message"]
+    assert message["content"] == "ok"
+    assert message["reasoning_content"] == "R1R2"
 
     truncated = _FakeResponse([
         b'data:{"choices":[{"delta":{"content":"partial"},"finish_reason":null}]}\n\n',
@@ -241,6 +445,27 @@ def test_collect_anthropic_stream_rejects_truncated_usage():
     ])
     with pytest.raises(ValueError, match="ended before final usage"):
         asyncio.run(_collect_anthropic_stream(response))
+
+
+@pytest.mark.parametrize(
+    "reasoning",
+    [
+        {"reasoning": {"text": "why"}},
+        {"reasoning_details": [{"summary": {"text": "wh"}}, {"summary": "y"}]},
+    ],
+)
+def test_messages_sync_translation_flattens_structured_reasoning(reasoning):
+    result = openai_to_anthropic({
+        "choices": [{
+            "message": {"content": "answer", **reasoning},
+            "finish_reason": "stop",
+        }],
+    }, "test", thinking_enabled=True)
+
+    assert result["content"] == [
+        {"type": "thinking", "thinking": "why"},
+        {"type": "text", "text": "answer"},
+    ]
 
 
 def test_nonstream_translators_preserve_absence_and_cache_semantics():

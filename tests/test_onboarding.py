@@ -101,6 +101,24 @@ def test_profile_rejects_cloud_unmetered_pricing(tmp_path):
         )
 
 
+def test_profile_validates_thinking_capabilities_before_writes(tmp_path):
+    profile = _profile()
+    profile["models"][0].update({"thinking": "always", "thinking_levels": ["off", "high"]})
+    with pytest.raises(onboarding.OnboardingError, match="supports off only"):
+        onboarding.validate_profile(profile)
+
+
+@pytest.mark.parametrize("legacy_mode", ["never", None])
+def test_profile_canonicalizes_legacy_no_thinking_modes(legacy_mode):
+    profile = _profile()
+    profile["models"][0]["thinking"] = legacy_mode
+
+    validated = onboarding.validate_profile(profile)
+
+    assert validated["models"][0]["thinking"] == ""
+    assert validated["models"][0]["thinking_levels"] == []
+
+
 def test_direct_apply_validates_profile_before_using_credentials(tmp_path):
     config, model_info, source = _files(tmp_path)
     profile = _profile()

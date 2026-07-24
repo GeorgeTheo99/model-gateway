@@ -375,6 +375,11 @@ def _generate_parser() -> argparse.ArgumentParser:
     parser.add_argument("--context", type=int)
     parser.add_argument("--max-output-tokens", type=int)
     parser.add_argument("--thinking", choices=("always", "optional", "never"))
+    parser.add_argument(
+        "--thinking-level", action="append", dest="thinking_levels",
+        choices=("off", "minimal", "low", "medium", "high", "xhigh", "max"),
+        help="repeat to declare model-specific explicit thinking levels",
+    )
     parser.add_argument("--thinking-format")
     parser.add_argument("--vision", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--quirk", action="append", default=[])
@@ -508,7 +513,8 @@ def _generate_main(argv: list[str]) -> dict | None:
         aliases=aliases,
         context=args.context,
         max_output_tokens=args.max_output_tokens,
-        thinking=args.thinking,
+        thinking="" if args.thinking == "never" else args.thinking,
+        thinking_levels=args.thinking_levels,
         thinking_format=args.thinking_format,
         vision=args.vision,
         quirks=args.quirk,

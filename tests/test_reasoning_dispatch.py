@@ -29,9 +29,9 @@ except Exception:  # pragma: no cover - fastapi is a runtime dep
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def _info(fmt: str, *, thinking: str = "always", provider: str = "x",
-          provider_model_id: str = "m", max_output_tokens: int = 32768,
-          vision: bool = False) -> ProviderInfo:
+def _info(fmt: str, *, thinking: str = "always", thinking_levels=None,
+          provider: str = "x", provider_model_id: str = "m",
+          max_output_tokens: int = 32768, vision: bool = False) -> ProviderInfo:
     """Build a ProviderInfo with an explicit thinking_format."""
     return ProviderInfo(
         provider=provider,
@@ -42,6 +42,7 @@ def _info(fmt: str, *, thinking: str = "always", provider: str = "x",
         context=0,
         max_output_tokens=max_output_tokens,
         thinking=thinking,
+        thinking_levels=thinking_levels,
         thinking_format=fmt,
         vision=vision,
     )
@@ -70,8 +71,8 @@ def _run(fmt: str, req: dict, *, thinking: str = "always",
 # Each case: (format, target_api, input_req_fragment, expected_enabled, expected_view)
 # Covers three scenarios across the matrix:
 #   A. always-thinking model, no client control  -> auto-enable, effort defaults "high"
-#   B. always-thinking model, client asks max    -> effort normalizes to "xhigh"
-#   C. always-thinking model, client disables    -> enabled False, format-specific shape
+#   B. always-thinking model, client asks max    -> provider-native mapping after validation
+#   C. optional model, client requests Off       -> enabled False, format-specific shape
 
 ANTHROPIC_BUDGET_HIGH = int(32768 * 0.80)   # 26214
 ANTHROPIC_BUDGET_XHIGH = int(32768 * 0.95)  # 31129
@@ -134,7 +135,7 @@ CASES = [
                  id="deepseek-max"),
     pytest.param("none", "chat", {"reasoning_effort": "max"}, True, {}, id="none-max"),
 
-    # ── C: client disables thinking on an always model ────────────────────
+    # ── C: client disables thinking on an optional model ──────────────────
     pytest.param("zai", "chat", {"reasoning_effort": "none"}, False,
                  {"enable_thinking": False}, id="zai-disabled"),
     pytest.param("openai-responses", "responses", {"reasoning_effort": "none"}, False,
@@ -162,7 +163,8 @@ CASES = [
 @pytest.mark.parametrize("fmt,target_api,fragment,exp_enabled,exp_view", CASES)
 def test_dispatch_per_format(fmt, target_api, fragment, exp_enabled, exp_view):
     req = {"messages": [], **fragment}
-    enabled, view = _run(fmt, req, target_api=target_api)
+    mode = "optional" if fragment.get("reasoning_effort") == "none" else "always"
+    enabled, view = _run(fmt, req, target_api=target_api, thinking=mode)
     assert enabled is exp_enabled
     assert view == exp_view
 
@@ -184,14 +186,105 @@ def test_optional_model_client_enables_is_forwarded():
     assert view == {"enable_thinking": True, "reasoning_effort": "high"}
 
 
-def test_no_thinking_no_format_strips_and_returns_false():
-    """A model with neither thinking nor thinking_format strips controls and
-    returns False even if the client sent reasoning params."""
+def test_always_model_strictly_rejects_off():
+    with pytest.raises(server_module.ThinkingValidationError, match="not supported"):
+        _run("openai", {"messages": [], "reasoning_effort": "none"})
+
+
+def test_legacy_thinking_false_is_auto_and_true_selects_supported_level():
+    disabled_req = {"messages": [], "thinking": False}
+    enabled, view = _run("openai", disabled_req, thinking="optional")
+    assert enabled is False
+    assert view == {}
+
+    enabled, view = _run("openai", {"messages": [], "thinking": False})
+    assert enabled is True
+    assert view == {"reasoning_effort": "high"}
+
+    enabled, view = _run(
+        "openai", {"messages": [], "thinking": True}, thinking="optional",
+        thinking_levels=("off", "max"),
+    )
+    assert enabled is True
+    assert view == {"reasoning_effort": "xhigh"}
+
+
+def test_kimi_max_only_rejects_lower_levels_and_translates_max_after_validation():
+    with pytest.raises(server_module.ThinkingValidationError, match="supported levels: max"):
+        _run("openai", {"messages": [], "reasoning_effort": "high"},
+             thinking_levels=("max",))
+    enabled, view = _run("openai", {"messages": []}, thinking_levels=("max",))
+    assert enabled is True
+    assert view == {"reasoning_effort": "xhigh"}
+
+
+def test_kimi_max_only_legacy_enabled_budget_dispatches_canonical_max():
+    enabled, view = _run(
+        "openai",
+        {"messages": [], "thinking": {"type": "enabled", "budget_tokens": 4096}},
+        thinking_levels=("max",),
+    )
+    assert enabled is True
+    assert view == {"reasoning_effort": "xhigh"}
+
+
+def test_dispatch_reuses_the_single_validated_reasoning_control(monkeypatch):
+    original = server_module._extract_reasoning_control
+    calls = 0
+
+    def counted_extract(req, info):
+        nonlocal calls
+        calls += 1
+        return original(req, info)
+
+    monkeypatch.setattr(server_module, "_extract_reasoning_control", counted_extract)
+    enabled, view = _run(
+        "openai",
+        {"messages": [], "thinking": {"type": "enabled", "budget_tokens": 4096}},
+        thinking_levels=("max",),
+    )
+    assert enabled is True
+    assert view == {"reasoning_effort": "xhigh"}
+    assert calls == 1
+
+
+def test_adaptive_anthropic_legacy_budget_preserves_prior_effort_inference():
+    info = _info(
+        "anthropic", provider="anthropic", provider_model_id="claude-fable-5",
+    )
+    body = {
+        "messages": [],
+        "thinking": {"type": "enabled", "budget_tokens": 2000},
+    }
+    assert _apply_gateway_reasoning(body, info, target_api="chat") is True
+    assert body["thinking"] == {"type": "adaptive"}
+    assert body["output_config"] == {"effort": "medium"}
+
+
+def test_unknown_or_overridden_unsupported_level_is_never_silently_dropped():
+    with pytest.raises(server_module.ThinkingValidationError, match="Unknown thinking level"):
+        _run("openai", {"messages": [], "reasoning_effort": "turbo"}, thinking="optional")
+    with pytest.raises(server_module.ThinkingValidationError, match="Thinking level 'low'"):
+        _run(
+            "openai",
+            {"messages": [], "reasoning": {"effort": "low"}, "reasoning_effort": "max"},
+            thinking_levels=("max",),
+        )
+
+
+def test_no_thinking_model_rejects_explicit_enabled_control():
     info = ProviderInfo(provider="x", base_url="http://up", api_key="k",
                         provider_model_id="m", thinking="", thinking_format="")
-    req = {"messages": [], "reasoning_effort": "high", "thinking": {"type": "enabled"}}
-    enabled = _apply_gateway_reasoning(req, info, target_api="chat")
-    assert enabled is False
+    req = {"messages": [], "thinking": {"type": "enabled"}}
+    with pytest.raises(server_module.ThinkingValidationError, match="does not support"):
+        _apply_gateway_reasoning(req, info, target_api="chat")
+
+
+def test_no_thinking_model_accepts_legacy_none_as_noop():
+    info = ProviderInfo(provider="x", base_url="http://up", api_key="k",
+                        provider_model_id="m", thinking="", thinking_format="")
+    req = {"messages": [], "reasoning_effort": "none"}
+    assert _apply_gateway_reasoning(req, info, target_api="chat") is False
     assert _think_view(req) == {}
 
 
@@ -231,7 +324,7 @@ def test_disabled_glm_chat_template_strips_stale_nested_effort():
             "reasoning_effort": "max",
             "unrelated": "kept",
         },
-    })
+    }, thinking="optional")
     assert enabled is False
     assert view == {"chat_template_kwargs": {"unrelated": "kept", "enable_thinking": False}}
 
@@ -249,6 +342,97 @@ def test_qwen_forwards_budget_when_provided():
                          {"messages": [], "reasoning": {"effort": "high", "max_tokens": 4096}})
     assert enabled is True
     assert view == {"enable_thinking": True, "thinking_budget": 4096}
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+@pytest.mark.parametrize(
+    "endpoint,payload",
+    [
+        ("/v1/chat/completions", {
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "low",
+        }),
+        ("/v1/responses", {"input": "hi", "reasoning": {"effort": "low"}}),
+        ("/v1/messages", {
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 32,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "low"},
+        }),
+    ],
+)
+def test_endpoints_reject_unsupported_level_with_protocol_error_shape(
+    client, monkeypatch, endpoint, payload,
+):
+    info = _info("openai", thinking_levels=("max",), provider="moonshot")
+    monkeypatch.setattr(server_module, "resolve", lambda model: info if model == "max-only" else None)
+    response = client.post(endpoint, json={"model": "max-only", **payload})
+    assert response.status_code == 400
+    body = response.json()
+    error = body["error"]
+    assert error["type"] == "invalid_request_error"
+    assert "supported levels: max" in error["message"]
+    if endpoint == "/v1/messages":
+        assert body["type"] == "error"
+    else:
+        assert "type" not in body
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+@pytest.mark.parametrize("endpoint", ["/v1/chat/completions", "/v1/responses", "/v1/messages"])
+def test_vision_reroute_revalidates_thinking_against_served_model(client, monkeypatch, endpoint):
+    requested = _info(
+        "openai", thinking="optional", thinking_levels=("off", "low"),
+        provider="test", provider_model_id="text-upstream", vision=False,
+    )
+    served = _info(
+        "openai", thinking_levels=("max",), provider="test",
+        provider_model_id="vision-upstream", vision=True,
+    )
+
+    def fake_resolve(model, provider_override=None):
+        return {"text-model": requested, "vision-fallback": served}.get(model)
+
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
+    monkeypatch.setattr(server_module, "pool_candidates", lambda model: [])
+    monkeypatch.setattr(server_module, "resolve", fake_resolve)
+
+    if endpoint == "/v1/responses":
+        payload = {
+            "model": "text-model",
+            "reasoning": {"effort": "low"},
+            "input": [{
+                "type": "message", "role": "user", "content": [
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                ],
+            }],
+        }
+    elif endpoint == "/v1/messages":
+        payload = {
+            "model": "text-model", "max_tokens": 32,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "low"},
+            "messages": [{"role": "user", "content": [{
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"},
+            }]}],
+        }
+    else:
+        payload = {
+            "model": "text-model", "reasoning_effort": "low",
+            "messages": [{"role": "user", "content": [{
+                "type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"},
+            }]}],
+        }
+
+    response = client.post(endpoint, json=payload)
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["error"]["type"] == "invalid_request_error"
+    assert "supported levels: max" in body["error"]["message"]
+    if endpoint == "/v1/messages":
+        assert body["type"] == "error"
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
@@ -330,6 +514,35 @@ def test_chat_completions_applies_declarative_provider_onboarding_quirks(client,
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_kimi_max_only_preserves_named_tool_and_stream_passthrough(client, monkeypatch):
+    info = _info(
+        "openai", thinking_levels=("max",), provider="moonshot",
+        provider_model_id="kimi-k3", vision=True,
+    )
+    info.quirks = frozenset({"force_reasoning_effort_max", "named_tool_choice_as_required"})
+    monkeypatch.setattr(server_module, "resolve", lambda model: info if model == "kimi-k3" else None)
+
+    async def fake_stream(endpoint, body, headers, **kwargs):
+        assert endpoint == "http://up/chat/completions"
+        assert body["reasoning_effort"] == "max"
+        assert body["tool_choice"] == "required"
+        assert body["stream"] is True
+        return server_module.JSONResponse(status_code=200, content={"stream_path": True})
+
+    monkeypatch.setattr(server_module, "_passthrough_stream", fake_stream)
+    response = client.post("/v1/chat/completions", json={
+        "model": "kimi-k3",
+        "messages": [{"role": "user", "content": "use the tool"}],
+        "stream": True,
+        "thinking": {"type": "enabled", "budget_tokens": 4096},
+        "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
+        "tool_choice": {"type": "function", "function": {"name": "lookup"}},
+    })
+    assert response.status_code == 200
+    assert response.json() == {"stream_path": True}
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
 def test_chat_completions_local_omlx_proxies_to_upstream_model(client, monkeypatch):
     info = _info(
         "glm-chat-template",
@@ -391,7 +604,8 @@ def test_chat_completions_anthropic_model_uses_native_handler(client, monkeypatc
     assert resp.json() == {"ok": True}
 
 
-def test_adaptive_anthropic_chat_uses_new_thinking_shape():
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "max"])
+def test_adaptive_anthropic_chat_preserves_canonical_effort(effort):
     info = _info(
         "anthropic",
         provider="anthropic",
@@ -402,13 +616,14 @@ def test_adaptive_anthropic_chat_uses_new_thinking_shape():
         "model": "anthropic/claude-fable-5",
         "messages": [{"role": "user", "content": "ping"}],
         "max_tokens": 2048,
+        "reasoning_effort": effort,
     })
 
     assert _apply_gateway_reasoning(body, info, target_api="messages") is True
     server_module._normalize_anthropic_adaptive_thinking(body, info)
 
     assert body["thinking"] == {"type": "adaptive"}
-    assert body["output_config"] == {"effort": "medium"}
+    assert body["output_config"] == {"effort": effort}
 
 
 def test_openai_chat_anthropic_translation_roundtrip_shapes():
@@ -1526,14 +1741,18 @@ def test_every_routable_model_has_known_format():
             api_key="k",
             provider_model_id=entry.get("provider_model_id", entry["id"]),
             thinking=entry.get("thinking", ""),
+            thinking_levels=tuple(entry.get("thinking_levels", ())),
             thinking_format=entry.get("thinking_format", ""),
             max_output_tokens=entry.get("max_output_tokens", 32768) or 32768,
         )
         fmt = _infer_thinking_format(info, target_api="chat")
         seen_formats.add(fmt)
-        # A max-effort probe (the same one the debug endpoint runs) must not raise.
-        req = {"messages": [], "reasoning_effort": "max"}
-        _apply_gateway_reasoning(req, info, target_api="chat")
+        # The strongest model-specific effort probe used by debug must not raise.
+        levels = tuple(entry.get("thinking_levels", ()))
+        enabled_levels = [level for level in levels if level != "off"]
+        if enabled_levels:
+            req = {"messages": [], "reasoning_effort": enabled_levels[-1]}
+            _apply_gateway_reasoning(req, info, target_api="chat")
     # Every format we exercised in the unit matrix should appear, or be absent
     # only because no model currently uses it.
     assert seen_formats.issubset({
@@ -1579,6 +1798,8 @@ def test_models_endpoint_exposes_thinking_fields(client, monkeypatch):
         assert required.issubset(m), f"missing thinking fields on {m.get('id')}"
         assert isinstance(m["forwarded_params"], list)
         assert isinstance(m["max_reachable"], bool)
+    thinking_model = next(m for m in data if m["id"] == "test-thinking")
+    assert thinking_model["thinking_levels"] == ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
@@ -1590,6 +1811,8 @@ def test_debug_thinking_endpoint_matrix(client):
     assert body["summary"]["max_reachable"] + body["summary"]["max_unreachable"] \
         == body["summary"]["models"]
     assert "by_format" in body["summary"]
+    assert "gateway_levels" not in body
+    assert all("thinking_levels" in row for row in body["models"])
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")

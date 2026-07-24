@@ -43,7 +43,7 @@ def _catalog(node_id: str = "edge", direct_ids: tuple[str, ...] = ("model-a",), 
             "created": 0,
             "thinking": "optional",
             "thinking_format": "openai",
-            "thinking_levels": ["none", "high"],
+            "thinking_levels": ["off", "high"],
             "max_reachable": True,
             "forwarded_params": ["reasoning_effort"],
             "vision": False,
@@ -271,6 +271,45 @@ def test_catalog_validation_rejects_nonfinite_model_numbers(value):
         federation.validate_catalog(payload, "edge", max_models=10)
 
 
+def test_schema_v1_legacy_thinking_metadata_remains_compatible(tmp_path):
+    payload = _catalog()
+    payload["models"][0]["thinking_levels"] = ["none", "high"]
+    payload["digest"] = federation.catalog_digest(payload["models"])
+    manager = federation.FederationManager(_config(tmp_path))
+    _seed(manager, payload)
+    assert manager.imported_rows()[0]["thinking_levels"] == ["off", "high"]
+
+    omitted = _catalog(revision=2)
+    omitted["models"][0].pop("thinking_levels")
+    omitted["digest"] = federation.catalog_digest(omitted["models"])
+    _seed(manager, omitted)
+    assert manager.imported_rows()[0]["thinking_levels"] == [
+        "off", "minimal", "low", "medium", "high", "xhigh", "max",
+    ]
+
+    legacy_synthetic = _catalog(revision=3)
+    legacy_synthetic["models"][0]["thinking_levels"] = [
+        "minimal", "low", "medium", "high", "xhigh", "max",
+    ]
+    legacy_synthetic["digest"] = federation.catalog_digest(legacy_synthetic["models"])
+    _seed(manager, legacy_synthetic)
+    assert manager.imported_rows()[0]["thinking_levels"] == [
+        "off", "minimal", "low", "medium", "high", "xhigh", "max",
+    ]
+    assert federation.SCHEMA_VERSION == 1
+
+
+@pytest.mark.parametrize("off_level", ["off", "none"])
+def test_catalog_validation_rejects_optional_thinking_with_no_enabled_level(off_level):
+    payload = _catalog()
+    payload["models"][0]["thinking"] = "optional"
+    payload["models"][0]["thinking_levels"] = [off_level]
+    payload["digest"] = federation.catalog_digest(payload["models"])
+
+    with pytest.raises(federation.CatalogValidationError, match="thinking_levels"):
+        federation.validate_catalog(payload, "edge", max_models=10)
+
+
 def test_catalog_validation_rejects_digest_mismatch_limits_and_rollback():
     payload = _catalog()
     payload["digest"] = "0" * 64
@@ -284,6 +323,27 @@ def test_catalog_validation_rejects_digest_mismatch_limits_and_rollback():
     payload = _catalog(revision=2)
     with pytest.raises(federation.CatalogValidationError, match="backwards"):
         federation.validate_catalog(payload, "edge", max_models=10, previous_revision=3)
+
+
+def test_null_thinking_is_canonical_in_discovery_and_federation(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "list_available_models", lambda: [{
+        "id": "legacy",
+        "name": "legacy",
+        "provider": "openai",
+        "provider_model_id": "legacy",
+        "thinking": None,
+        "thinking_format": "none",
+        "vision": False,
+    }])
+
+    rows = server._direct_model_rows()
+    assert rows[0]["thinking"] == ""
+    assert rows[0]["thinking_levels"] == []
+
+    manager = federation.FederationManager(_config(tmp_path))
+    payload = manager.build_catalog(rows)
+    assert payload["models"][0]["thinking"] == ""
+    assert payload["models"][0]["thinking_levels"] == []
 
 
 def test_catalog_endpoint_fails_closed_and_checks_source_peer(tmp_path, monkeypatch):

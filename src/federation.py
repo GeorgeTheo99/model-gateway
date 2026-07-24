@@ -28,6 +28,7 @@ import yaml
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from src import catalog as catalog_metadata
 from src.secret_files import read_api_key_file, resolve_api_key_file
 
 log = logging.getLogger("model-gateway")
@@ -337,6 +338,13 @@ def _sanitize_model(raw: Any, owner: str) -> dict[str, Any]:
                 )
             ):
                 raise CatalogValidationError(f"catalog model {direct_id!r} has invalid {key}")
+            if key == "thinking_levels":
+                # Schema v1 peers historically used ``none`` for Off. Retain
+                # the received spelling for digest/cache compatibility and
+                # canonicalize only when rendering imported discovery rows.
+                accepted = set(catalog_metadata.THINKING_LEVELS) | {"none"}
+                if len(value) != len(set(value)) or set(value) - accepted:
+                    raise CatalogValidationError(f"catalog model {direct_id!r} has invalid {key}")
         elif key == "created":
             if not _is_finite_number(value) or value < 0:
                 raise CatalogValidationError(f"catalog model {direct_id!r} has invalid {key}")
@@ -353,7 +361,36 @@ def _sanitize_model(raw: Any, owner: str) -> dict[str, Any]:
         model[key] = value
     model.setdefault("object", "model")
     model.setdefault("created", 0)
+    thinking = model.get("thinking", "")
+    if thinking not in {"", "optional", "always"}:
+        raise CatalogValidationError(f"catalog model {direct_id!r} has invalid thinking")
+    if thinking and "thinking_levels" in model:
+        canonical = ["off" if level == "none" else level for level in model["thinking_levels"]]
+        if not any(level != "off" for level in canonical):
+            raise CatalogValidationError(f"catalog model {direct_id!r} has invalid thinking_levels")
     return model
+
+
+def _imported_thinking_levels(model: dict[str, Any]) -> list[str]:
+    """Render canonical model-specific levels from schema-v1 peer metadata."""
+    thinking = model.get("thinking", "")
+    if not thinking:
+        # Old peers published a global synthetic list even for no-thinking
+        # models. The mode remains authoritative and safely collapses it.
+        return []
+    raw = model.get("thinking_levels")
+    if raw is None:
+        return catalog_metadata.normalized_thinking_levels({"thinking": thinking})
+    canonical = ["off" if level == "none" else level for level in raw]
+    canonical = list(dict.fromkeys(canonical))
+    # Earlier schema-v1 gateways exported one global synthetic enabled-level
+    # list for every thinking model. For optional models that exact legacy
+    # shape implied Off even though the row omitted it.
+    if thinking == "optional" and canonical == list(catalog_metadata.ENABLED_THINKING_LEVELS):
+        canonical.insert(0, "off")
+    if thinking == "always":
+        canonical = [level for level in canonical if level != "off"]
+    return [level for level in catalog_metadata.THINKING_LEVELS if level in canonical]
 
 
 def validate_catalog(
@@ -743,12 +780,18 @@ class FederationManager:
                 "catalog_digest": state.digest,
             }
             for direct_id, model in state.models.items():
+                metadata = {
+                    key: model[key]
+                    for key in _MODEL_METADATA_FIELDS
+                    if key in model and key not in {"object", "created", "thinking_levels"}
+                }
+                metadata["thinking_levels"] = _imported_thinking_levels(model)
                 row = {
                     "id": f"{owner}/{direct_id}",
                     "object": model.get("object", "model"),
                     "created": model.get("created", 0),
                     "owned_by": owner,
-                    **{key: model[key] for key in _MODEL_METADATA_FIELDS if key in model and key not in {"object", "created"}},
+                    **metadata,
                     "federated": True,
                     "owner_node": owner,
                     "direct_model_id": direct_id,

@@ -35,11 +35,12 @@ from src.upstream import (
     _retry_send_stream,
     _retry_send_stream_with_model_fallback,
 )
-from src.responses import chat_to_responses, responses_to_chat, translate_responses_stream
+from src.reasoning import reasoning_alias_text
+from src.responses import chat_to_responses, responses_result_events, responses_to_chat, translate_responses_stream
 from src.signature_cache import store_from_extra_content
 from src.streaming import _flatten_list_content, translate_stream
 from src.translator import anthropic_to_openai, anthropic_to_openai_chat, openai_chat_to_anthropic, openai_to_anthropic
-from src import federation, ledger
+from src import catalog, federation, ledger
 from src.usage import (
     anthropic_usage_to_openai_chat as convert_anthropic_usage_to_openai_chat,
     anthropic_usage_to_responses,
@@ -309,6 +310,11 @@ def _uses_adaptive_anthropic_thinking(provider_model_id: str) -> bool:
     return provider_model_id in ADAPTIVE_THINKING_ANTHROPIC_MODELS
 
 
+def _legacy_anthropic_budget_effort(budget: int | None) -> str:
+    """Preserve the historical enabled-budget mapping for adaptive Claude."""
+    return "high" if budget and budget >= 10000 else "medium" if budget else "high"
+
+
 def _normalize_anthropic_adaptive_thinking(body: dict, info) -> None:
     """Use Anthropic's adaptive thinking shape for Fable/Mythos/new Opus models."""
     if not _uses_adaptive_anthropic_thinking(info.provider_model_id):
@@ -318,8 +324,10 @@ def _normalize_anthropic_adaptive_thinking(body: dict, info) -> None:
         return
     if thinking_param.get("type") == "enabled":
         body["thinking"] = {"type": "adaptive"}
+        explicit_effort = _normalize_effort((body.get("output_config") or {}).get("effort"))
         budget = thinking_param.get("budget_tokens")
-        body["output_config"] = {"effort": "high" if budget and budget >= 10000 else "medium" if budget else "high"}
+        effort = explicit_effort or _legacy_anthropic_budget_effort(budget)
+        body["output_config"] = {"effort": effort}
     elif thinking_param.get("type") == "disabled":
         body["thinking"] = {"type": "adaptive"}
         body["output_config"] = {"effort": "low"}
@@ -646,9 +654,15 @@ def _compress_fireworks_inline_images(req: dict, info) -> None:
         )
 
 
-_REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh", "max"}
-_EFFORT_ALIASES = {"off": "none", "disabled": "none", "max": "xhigh"}
+_REASONING_EFFORTS = set(catalog.THINKING_LEVELS)
+# Input-only compatibility aliases. Provider-native aliases are applied later,
+# after capability validation, so canonical ``max`` remains distinguishable.
+_EFFORT_ALIASES = {"none": "off", "disabled": "off"}
 _EFFORT_RATIOS = {"minimal": 0.10, "low": 0.20, "medium": 0.50, "high": 0.80, "xhigh": 0.95, "max": 0.95}
+
+
+class ThinkingValidationError(ValueError):
+    """A client requested an unknown or unsupported explicit thinking level."""
 
 
 def _normalize_effort(value) -> str | None:
@@ -656,8 +670,109 @@ def _normalize_effort(value) -> str | None:
         return None
     effort = str(value).strip().lower()
     effort = _EFFORT_ALIASES.get(effort, effort)
-    if effort in _REASONING_EFFORTS or effort == "none":
-        return effort
+    return effort if effort in _REASONING_EFFORTS else None
+
+
+def _thinking_levels_for_info(info) -> tuple[str, ...]:
+    raw = getattr(info, "thinking_levels", None)
+    entry = {
+        "name": getattr(info, "provider_model_id", "model"),
+        "thinking": getattr(info, "thinking", "") or "",
+    }
+    if raw is not None:
+        entry["thinking_levels"] = list(raw)
+    try:
+        return tuple(catalog.normalized_thinking_levels(entry))
+    except ValueError as exc:
+        raise ThinkingValidationError(str(exc)) from exc
+
+
+def _default_enabled_thinking_level(levels: tuple[str, ...]) -> str | None:
+    enabled = [level for level in levels if level != "off"]
+    if not enabled:
+        return None
+    # Preserve the historical enabled/default behavior where possible. Models
+    # with a narrower declaration (notably Kimi K3) pick their strongest level.
+    if "high" in enabled:
+        return "high"
+    return max(enabled, key=catalog.THINKING_LEVELS.index)
+
+
+def _explicit_effort_values(req: dict):
+    reasoning = req.get("reasoning")
+    if isinstance(reasoning, dict) and reasoning.get("effort") is not None:
+        yield "reasoning.effort", reasoning["effort"]
+    if req.get("reasoning_effort") is not None:
+        yield "reasoning_effort", req["reasoning_effort"]
+    thinking = req.get("thinking")
+    if isinstance(thinking, str):
+        yield "thinking", thinking
+    elif thinking is not None and not isinstance(thinking, (bool, dict)):
+        yield "thinking", thinking
+    output_config = req.get("output_config")
+    if isinstance(output_config, dict) and output_config.get("effort") is not None:
+        yield "output_config.effort", output_config["effort"]
+    chat_template_kwargs = req.get("chat_template_kwargs")
+    if isinstance(chat_template_kwargs, dict) and chat_template_kwargs.get("reasoning_effort") is not None:
+        yield "chat_template_kwargs.reasoning_effort", chat_template_kwargs["reasoning_effort"]
+
+
+def _validate_reasoning_control(req: dict, info) -> dict:
+    """Validate client controls and return their effective canonical form."""
+    explicit_levels: list[tuple[str, str]] = []
+    for field, raw in _explicit_effort_values(req):
+        level = _normalize_effort(raw)
+        if level is None:
+            raise ThinkingValidationError(
+                f"Unknown thinking level {raw!r} in {field}; expected one of: "
+                + ", ".join(catalog.THINKING_LEVELS)
+            )
+        explicit_levels.append((field, level))
+
+    levels = _thinking_levels_for_info(info)
+    thinking = getattr(info, "thinking", "") or ""
+    for field, level in explicit_levels:
+        if level == "off" and not thinking:
+            continue  # legacy no-thinking disable is a compatibility no-op
+        if level not in levels:
+            supported = ", ".join(levels) if levels else "none"
+            raise ThinkingValidationError(
+                f"Thinking level {level!r} in {field} is not supported by this model; "
+                f"supported levels: {supported}"
+            )
+
+    control = _extract_reasoning_control(req, info)
+    enabled = control["enabled"]
+    effort = control["effort"]
+    if enabled is True:
+        if not any(level != "off" for level in levels):
+            raise ThinkingValidationError("This model does not support explicit enabled thinking")
+        selected = effort
+        if selected is None:
+            raise ThinkingValidationError("This model does not support explicit enabled thinking")
+        if selected not in levels:
+            supported = ", ".join(levels) if levels else "none"
+            raise ThinkingValidationError(
+                f"Thinking level {selected!r} is not supported by this model; supported levels: {supported}"
+            )
+    elif enabled is False:
+        # Disabling a model with no thinking capability is a compatibility no-op
+        # (e.g. legacy reasoning_effort=none). Always-thinking is strict.
+        if thinking == "always":
+            raise ThinkingValidationError("Thinking level 'off' is not supported by an always-thinking model")
+        if thinking == "optional" and "off" not in levels:
+            supported = ", ".join(levels) if levels else "none"
+            raise ThinkingValidationError(
+                f"Thinking level 'off' is not supported by this model; supported levels: {supported}"
+            )
+    return control
+
+
+def _thinking_validation_response(req: dict, info, error_factory):
+    try:
+        _validate_reasoning_control(req, info)
+    except ThinkingValidationError as exc:
+        return error_factory(400, "invalid_request_error", str(exc))
     return None
 
 
@@ -699,7 +814,7 @@ def _extract_reasoning_control(req: dict, info) -> dict:
             exclude = bool(reasoning.get("exclude"))
         if reasoning.get("enabled") is not None:
             enabled = bool(reasoning.get("enabled"))
-        if effort == "none":
+        if effort == "off":
             enabled = False
         elif effort or budget:
             enabled = True
@@ -707,10 +822,17 @@ def _extract_reasoning_control(req: dict, info) -> dict:
     effort_param = _normalize_effort(req.get("reasoning_effort"))
     if effort_param:
         effort = effort_param
-        enabled = effort_param != "none"
+        enabled = effort_param != "off"
 
     thinking = req.get("thinking")
-    if isinstance(thinking, dict):
+    if isinstance(thinking, bool):
+        # Legacy false means Auto/no override, not explicit Off.
+        if thinking:
+            enabled = True
+    elif isinstance(thinking, str):
+        effort = _normalize_effort(thinking)
+        enabled = effort != "off"
+    elif isinstance(thinking, dict):
         thinking_type = thinking.get("type")
         if thinking_type in ("enabled", "adaptive"):
             enabled = True
@@ -723,21 +845,35 @@ def _extract_reasoning_control(req: dict, info) -> dict:
             effort = _normalize_effort(output_effort) or effort
         elif thinking_type == "disabled":
             enabled = False
-            effort = "none"
+            effort = "off"
+
+    output_config = req.get("output_config")
+    output_effort = _normalize_effort(output_config.get("effort")) if isinstance(output_config, dict) else None
+    if output_effort and not isinstance(thinking, dict):
+        effort = output_effort
+        enabled = output_effort != "off"
 
     chat_template_kwargs = req.get("chat_template_kwargs")
     if isinstance(chat_template_kwargs, dict):
         if "enable_thinking" in chat_template_kwargs and enabled is None:
             enabled = bool(chat_template_kwargs.get("enable_thinking"))
+            if enabled is False:
+                effort = "off"
         nested_effort = _normalize_effort(chat_template_kwargs.get("reasoning_effort"))
         if nested_effort and effort is None:
             effort = nested_effort
-            enabled = nested_effort != "none"
+            enabled = nested_effort != "off"
 
+    levels = _thinking_levels_for_info(info)
     if enabled is None and getattr(info, "thinking", "") == "always":
         enabled = True
-    if enabled and not effort and not budget:
-        effort = "high"
+    if enabled and not effort:
+        if budget and _uses_adaptive_anthropic_thinking(info.provider_model_id):
+            effort = _legacy_anthropic_budget_effort(budget)
+        else:
+            effort = _default_enabled_thinking_level(levels)
+    elif enabled is False and not effort:
+        effort = "off"
 
     return {"enabled": enabled, "effort": effort, "budget": budget, "exclude": exclude}
 
@@ -1180,7 +1316,7 @@ def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat") -> bool:
     optional-thinking models receive no new params unless the client requested
     them; always-thinking models keep the prior auto-enable behavior.
     """
-    control = _extract_reasoning_control(req, info)
+    control = _validate_reasoning_control(req, info)
     enabled = control["enabled"]
 
     # Config-driven quirk: some upstreams (e.g. native serving invocations for
@@ -1209,16 +1345,19 @@ def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat") -> bool:
         return bool(enabled)
 
     if enabled is None:
+        # Legacy top-level false means Auto/no explicit override and must not
+        # leak as a provider-native thinking control.
+        if req.get("thinking") is False:
+            req.pop("thinking", None)
         return False
 
-    if not getattr(info, "thinking", "") and not getattr(info, "thinking_format", ""):
+    if not getattr(info, "thinking", ""):
         _strip_reasoning_controls(req)
-        if target_api != "responses":
-            req.pop("reasoning", None)
+        req.pop("reasoning", None)
         return False
 
     fmt = _infer_thinking_format(info, target_api)
-    effort = control["effort"] or ("high" if enabled else "none")
+    effort = control["effort"]
     budget = control["budget"]
     exclude = control["exclude"]
 
@@ -1231,17 +1370,24 @@ def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat") -> bool:
 
     if target_api == "responses" or fmt == "openai-responses":
         if enabled:
-            req["reasoning"] = {"effort": effort if effort != "max" else "high"}
-        elif effort == "none":
+            req["reasoning"] = {"effort": "xhigh" if effort == "max" else effort}
+        elif effort == "off":
             req["reasoning"] = {"effort": "none"}
         return bool(enabled)
 
     if fmt == "anthropic":
         if enabled:
-            req["thinking"] = {
-                "type": "enabled",
-                "budget_tokens": _reasoning_budget(req, effort, budget, info),
-            }
+            if _uses_adaptive_anthropic_thinking(info.provider_model_id):
+                # Adaptive models accept the validated canonical level directly.
+                # Reconstructing it from a token budget loses information (for
+                # example, an explicit low level can round back up to medium).
+                req["thinking"] = {"type": "adaptive"}
+                req["output_config"] = {"effort": effort}
+            else:
+                req["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": _reasoning_budget(req, effort, budget, info),
+                }
         return bool(enabled)
 
     if fmt == "openrouter":
@@ -1249,7 +1395,7 @@ def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat") -> bool:
         if budget:
             reasoning["max_tokens"] = budget
         elif effort:
-            reasoning["effort"] = _EFFORT_ALIASES.get(effort, effort)
+            reasoning["effort"] = "none" if effort == "off" else "xhigh" if effort == "max" else effort
         else:
             reasoning["enabled"] = bool(enabled)
         if exclude is not None:
@@ -1272,8 +1418,8 @@ def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat") -> bool:
         ctk["enable_thinking"] = bool(enabled)
         if enabled:
             ctk.setdefault("preserve_thinking", True)
-            if effort and effort != "none":
-                ctk["reasoning_effort"] = "max" if effort == "xhigh" else "high"
+            if effort and effort != "off":
+                ctk["reasoning_effort"] = "max" if effort in {"xhigh", "max"} else "high"
         req["chat_template_kwargs"] = ctk
         if budget:
             req["thinking_budget"] = budget
@@ -1297,26 +1443,23 @@ def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat") -> bool:
 
     if fmt == "zai":
         req["enable_thinking"] = bool(enabled)
-        if enabled and effort and effort != "none":
-            # Z.ai GLM-5.x accepts two effort levels: "high" (default) and
-            # "max". Internally "max" is normalized to "xhigh" (see
-            # _EFFORT_ALIASES); map it back to the literal Z.ai expects, and
-            # clamp finer-grained gateway levels (minimal/low/medium) to "high"
-            # — matching Z.ai's own Claude Code effort map (low/med/high→high,
-            # xhigh→max).
-            req["reasoning_effort"] = "max" if effort == "xhigh" else "high"
+        if enabled and effort and effort != "off":
+            # Z.ai GLM-5.x accepts two effort levels. Preserve canonical max
+            # through validation, then map xhigh/max to native max and clamp
+            # finer-grained levels to native high.
+            req["reasoning_effort"] = "max" if effort in {"xhigh", "max"} else "high"
         return bool(enabled)
 
     if fmt == "deepseek":
         req["thinking"] = {"type": "enabled" if enabled else "disabled"}
         if enabled and effort:
-            req["reasoning_effort"] = effort
+            req["reasoning_effort"] = "xhigh" if effort == "max" else effort
         return bool(enabled)
 
     # Default OpenAI-compatible shape.
-    if enabled and effort and effort != "none":
-        req["reasoning_effort"] = effort if effort != "max" else "high"
-    elif effort == "none":
+    if enabled and effort and effort != "off":
+        req["reasoning_effort"] = "xhigh" if effort == "max" else effort
+    elif effort == "off":
         req["reasoning_effort"] = "none"
     return bool(enabled)
 
@@ -1332,10 +1475,6 @@ _THINK_UPSTREAM_KEYS = ("enable_thinking", "reasoning", "reasoning_effort",
 # Params that carry an effort/budget *level* (not just an on/off toggle).
 _THINK_LEVEL_KEYS = ("reasoning", "reasoning_effort", "thinking", "thinking_budget",
                      "chat_template_kwargs.reasoning_effort")
-# Effort levels the gateway recognizes and normalizes (see _REASONING_EFFORTS).
-_GATEWAY_EFFORT_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"]
-
-
 def _forwarded_thinking_keys(req: dict) -> set[str]:
     forwarded = {k for k in _THINK_UPSTREAM_KEYS if "." not in k and k in req}
     ctk = req.get("chat_template_kwargs")
@@ -1344,25 +1483,24 @@ def _forwarded_thinking_keys(req: dict) -> set[str]:
     return forwarded
 
 
-def _probe_forwarded_params(entry: dict) -> set[str]:
-    """Probe the dispatch with max-effort requests; return the set of
-    thinking-related upstream params that actually get forwarded.
-
-    Two probes (effort-only and effort+budget) are unioned so format-specific
-    budget forwarding (qwen thinking_budget, anthropic thinking.budget_tokens)
-    is detected even when effort alone is not forwarded (e.g. the zai branch).
-    """
+def _probe_forwarded_params(entry: dict, levels: tuple[str, ...]) -> set[str]:
+    """Probe dispatch at the model's strongest declared enabled level."""
+    enabled_levels = [level for level in levels if level != "off"]
+    level = max(enabled_levels, key=catalog.THINKING_LEVELS.index) if enabled_levels else None
+    if level is None:
+        return set()
     info = SimpleNamespace(
         provider=entry.get("provider", ""),
         provider_model_id=entry.get("provider_model_id", entry.get("name", "")),
         thinking=entry.get("thinking", ""),
+        thinking_levels=levels,
         thinking_format=entry.get("thinking_format", ""),
         max_output_tokens=entry.get("max_output_tokens", 0) or 32768,
     )
     forwarded: set[str] = set()
     for probe in (
-        {"messages": [], "reasoning_effort": "max"},
-        {"messages": [], "reasoning": {"effort": "max", "max_tokens": 8000}},
+        {"messages": [], "reasoning_effort": level},
+        {"messages": [], "reasoning": {"effort": level, "max_tokens": 8000}},
     ):
         req = dict(probe)
         _apply_gateway_reasoning(req, info, target_api="chat")
@@ -1371,20 +1509,24 @@ def _probe_forwarded_params(entry: dict) -> set[str]:
 
 
 def _thinking_capabilities(entry: dict) -> dict:
-    """Runtime introspection of what thinking control a model forwards upstream."""
-    forwarded = _probe_forwarded_params(entry)
+    """Return validated model-specific capabilities plus dispatch evidence."""
+    normalized = catalog.normalize_thinking_capabilities(entry)
+    levels = tuple(normalized["thinking_levels"])
+    forwarded = _probe_forwarded_params(normalized, levels)
     info = SimpleNamespace(
-        provider=entry.get("provider", ""),
-        provider_model_id=entry.get("provider_model_id", entry.get("name", "")),
-        thinking_format=entry.get("thinking_format", ""),
+        provider=normalized.get("provider", ""),
+        provider_model_id=normalized.get("provider_model_id", normalized.get("name", "")),
+        thinking_format=normalized.get("thinking_format", ""),
     )
-    fmt = entry.get("thinking_format", "") or _infer_thinking_format(info, target_api="chat")
+    fmt = normalized.get("thinking_format", "") or _infer_thinking_format(info, target_api="chat")
     return {
-        "thinking": entry.get("thinking", ""),
+        "thinking": normalized.get("thinking", ""),
         "thinking_format": fmt,
+        "thinking_levels": list(levels),
+        "default_enabled_level": _default_enabled_thinking_level(levels),
+        "off_supported": "off" in levels,
         "forwarded_params": sorted(forwarded),
         "max_reachable": bool(forwarded & set(_THINK_LEVEL_KEYS)),
-        "gateway_levels": _GATEWAY_EFFORT_LEVELS,
     }
 
 
@@ -1659,7 +1801,7 @@ def _direct_model_rows() -> list[dict]:
             "owned_by": m.get("provider", "cloud"),
             "thinking": caps["thinking"],
             "thinking_format": caps["thinking_format"],
-            "thinking_levels": caps["gateway_levels"],
+            "thinking_levels": caps["thinking_levels"],
             "max_reachable": caps["max_reachable"],
             "forwarded_params": caps["forwarded_params"],
             "vision": bool(m.get("vision")),
@@ -1706,6 +1848,9 @@ async def debug_thinking(request: Request):
             "provider_model_id": m.get("provider_model_id", ""),
             "thinking": caps["thinking"],
             "thinking_format": caps["thinking_format"],
+            "thinking_levels": caps["thinking_levels"],
+            "off_supported": caps["off_supported"],
+            "default_enabled_level": caps["default_enabled_level"],
             "forwarded_params": caps["forwarded_params"],
             "max_reachable": caps["max_reachable"],
         })
@@ -1714,10 +1859,10 @@ async def debug_thinking(request: Request):
         by_format[r["thinking_format"]] = by_format.get(r["thinking_format"], 0) + 1
     reachable = sum(1 for r in rows if r["max_reachable"])
     return {
-        "note": "Runtime introspection of _apply_gateway_reasoning. "
-                "forwarded_params = upstream keys actually sent for a max-effort probe. "
-                "max_reachable = a level-carrying param (effort/budget) reaches upstream.",
-        "gateway_levels": _GATEWAY_EFFORT_LEVELS,
+        "note": "Effective model-specific capabilities plus runtime introspection of "
+                "_apply_gateway_reasoning. forwarded_params are upstream keys sent for "
+                "the model's strongest supported enabled level; max_reachable means a "
+                "level-carrying param (effort/budget) reaches upstream.",
         "summary": {
             "models": len(rows),
             "max_reachable": reachable,
@@ -1761,6 +1906,9 @@ async def create_response(request: Request):
             return forwarded
     if not info:
         return _error_openai(404, "invalid_request_error", _model_error_message(model))
+    thinking_error = _thinking_validation_response(body, info, _error_openai)
+    if thinking_error is not None:
+        return thinking_error
 
     # Seed a resolution receipt before composite validation/extraction so
     # rejected image requests still retain the semantic and concrete model IDs.
@@ -1791,6 +1939,9 @@ async def create_response(request: Request):
         # A staged fallback must use the translated Chat payload below.
         if info.protocol == "anthropic":
             return _error_openai(502, "api_error", "Vision fallback dependency does not support Chat Completions")
+    thinking_error = _thinking_validation_response(body, info, _error_openai)
+    if thinking_error is not None:
+        return thinking_error
     _set_ledger_ctx(request, model, info, is_stream=is_stream)
 
     # Anthropic models don't support Responses API directly — translate via Messages
@@ -2074,75 +2225,8 @@ async def _handle_responses_stream_google(endpoint: str, chat_req: dict, model: 
     # Convert to Responses format
     result = chat_to_responses(openai_resp, model)
 
-    # Generate Responses API SSE events from the complete response
-    def generate_sse():
-        # response.created
-        yield _sse("response.created", {"type": "response.created", "response": result})
-
-        # Output items
-        for idx, item in enumerate(result.get("output", [])):
-            item_type = item.get("type", "message")
-            if item_type == "function_call":
-                yield _sse("response.output_item.added", {
-                    "type": "response.output_item.added",
-                    "output_index": idx,
-                    "item": {"type": "function_call", "id": item.get("id", ""), "call_id": item.get("call_id", ""), "name": item.get("name", ""), "arguments": ""},
-                })
-                yield _sse("response.function_call_arguments.delta", {
-                    "type": "response.function_call_arguments.delta",
-                    "output_index": idx,
-                    "item_id": item.get("id", ""),
-                    "call_id": item.get("call_id", ""),
-                    "delta": item.get("arguments", ""),
-                })
-                yield _sse("response.function_call_arguments.done", {
-                    "type": "response.function_call_arguments.done",
-                    "output_index": idx,
-                    "item_id": item.get("id", ""),
-                    "call_id": item.get("call_id", ""),
-                    "arguments": item.get("arguments", ""),
-                })
-                yield _sse("response.output_item.done", {
-                    "type": "response.output_item.done",
-                    "output_index": idx,
-                    "item": item,
-                })
-            elif item_type == "message":
-                for cidx, content_part in enumerate(item.get("content", [])):
-                    yield _sse("response.output_item.added", {
-                        "type": "response.output_item.added",
-                        "output_index": idx,
-                        "item": {"type": "message", "id": item.get("id", ""), "role": item.get("role", "assistant"), "content": []},
-                    })
-                    yield _sse("response.content_part.added", {
-                        "type": "response.content_part.added",
-                        "output_index": idx,
-                        "content_index": cidx,
-                        "part": {"type": content_part.get("type", "output_text"), "text": ""},
-                    })
-                    yield _sse("response.output_text.delta", {
-                        "type": "response.output_text.delta",
-                        "output_index": idx,
-                        "content_index": cidx,
-                        "delta": content_part.get("text", ""),
-                    })
-                    yield _sse("response.output_text.done", {
-                        "type": "response.output_text.done",
-                        "output_index": idx,
-                        "content_index": cidx,
-                        "text": content_part.get("text", ""),
-                    })
-                yield _sse("response.output_item.done", {
-                    "type": "response.output_item.done",
-                    "output_index": idx,
-                    "item": item,
-                })
-
-        # response.completed
-        yield _sse("response.completed", {"type": "response.completed", "response": result})
-
     return StreamingResponse(
-        generate_sse(),
+        responses_result_events(result),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
@@ -2181,6 +2265,9 @@ async def chat_completions(request: Request):
             status_code=404,
             content={"error": {"message": _model_error_message(model), "type": "invalid_request_error"}},
         )
+    thinking_error = _thinking_validation_response(body, info, _error_openai)
+    if thinking_error is not None:
+        return thinking_error
 
     _set_ledger_ctx(request, model, info, is_stream=bool(body.get("stream", False)))
     body, model, info, vision_error = await _apply_chat_vision_fallback(
@@ -2188,6 +2275,9 @@ async def chat_completions(request: Request):
     )
     if vision_error:
         return vision_error
+    thinking_error = _thinking_validation_response(body, info, _error_openai)
+    if thinking_error is not None:
+        return thinking_error
 
     # Swap model to the provider's model ID
     body["model"] = info.provider_model_id
@@ -2511,13 +2601,7 @@ async def _collect_stream(resp: httpx.Response) -> dict:
                 reasoning_content += flat_reasoning
             elif delta_content:
                 content += delta_content
-            reasoning_delta = delta.get("reasoning_content") or delta.get("reasoning")
-            if not reasoning_delta and delta.get("reasoning_details"):
-                parts = []
-                for item in delta.get("reasoning_details") or []:
-                    if isinstance(item, dict):
-                        parts.append(item.get("text") or item.get("summary") or "")
-                reasoning_delta = "".join(parts)
+            reasoning_delta = reasoning_alias_text(delta)
             if reasoning_delta:
                 reasoning_content += reasoning_delta
 
@@ -2589,6 +2673,9 @@ async def messages(request: Request):
             return forwarded
     if not info:
         return _error(404, "invalid_request_error", _model_error_message(model))
+    thinking_error = _thinking_validation_response(body, info, _error)
+    if thinking_error is not None:
+        return thinking_error
 
     _set_ledger_ctx(request, model, info, is_stream=is_stream)
     # Inspect through the existing lossless Anthropic→Chat translation. Native
@@ -2613,6 +2700,9 @@ async def messages(request: Request):
         info, model = served_info, served_model
         if info.protocol == "anthropic":
             return _error(502, "api_error", "Vision fallback dependency does not support Chat Completions")
+    thinking_error = _thinking_validation_response(body, info, _error)
+    if thinking_error is not None:
+        return thinking_error
 
     _set_ledger_ctx(request, model, info, is_stream=is_stream)
     _inject_anthropic_system_instruction(body, info.system_instruction)
@@ -2770,18 +2860,13 @@ async def _handle_responses_anthropic(body: dict, info, model: str, request: Req
     _inject_anthropic_system_instruction(messages_req, info.system_instruction)
     messages_req["model"] = info.provider_model_id
 
-    # Map reasoning_effort from Responses API to Anthropic thinking param
-    _uses_adaptive = _uses_adaptive_anthropic_thinking(info.provider_model_id)
-    reasoning_effort = body.get("reasoning", {}).get("effort") if isinstance(body.get("reasoning"), dict) else None
-
-    if reasoning_effort or info.thinking in ("optional", "always"):
-        effort = reasoning_effort or "high"
-        if _uses_adaptive:
-            messages_req["thinking"] = {"type": "adaptive"}
-            messages_req["output_config"] = {"effort": effort}
-        else:
-            budget_map = {"high": 10000, "medium": 5000, "low": 2000}
-            messages_req["thinking"] = {"type": "enabled", "budget_tokens": budget_map.get(effort, 10000)}
+    # Keep the same centralized capability validation/provider translation used
+    # by Chat and Messages, including legacy booleans and max-only models.
+    for key in ("reasoning", "reasoning_effort", "thinking", "output_config", "chat_template_kwargs"):
+        if key in body:
+            messages_req[key] = copy.deepcopy(body[key])
+    _apply_gateway_reasoning(messages_req, info, target_api="messages")
+    _normalize_anthropic_adaptive_thinking(messages_req, info)
 
     is_stream = body.get("stream", False)
     request.state.api_key = info.api_key
@@ -2943,10 +3028,17 @@ def _anthropic_messages_to_responses(resp: dict, model: str) -> dict:
         if block_type == "text":
             output_items.append({
                 "type": "message",
-                "id": resp.get("id", "msg_" + secrets.token_hex(16)),
+                "id": "msg_" + secrets.token_hex(16),
                 "status": "completed",
                 "role": "assistant",
                 "content": [{"type": "output_text", "text": block.get("text", ""), "annotations": []}],
+            })
+        elif block_type == "thinking":
+            output_items.append({
+                "type": "reasoning",
+                "id": "rs_" + secrets.token_hex(16),
+                "status": "completed",
+                "summary": [{"type": "summary_text", "text": block.get("thinking", "")}],
             })
         elif block_type == "tool_use":
             output_items.append({
@@ -3032,13 +3124,9 @@ async def _handle_responses_anthropic_stream(endpoint: str, messages_req: dict, 
 
     result = _anthropic_messages_to_responses(anthropic_resp, model)
 
-    # Emit as Responses API SSE events
-    async def event_generator():
-        yield f"event: response.created\ndata: {json.dumps({'type': 'response.created', 'response': result})}\n\n".encode()
-        yield f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': result})}\n\n".encode()
-
+    # Emit the same output-level text/reasoning events as other translated paths.
     return StreamingResponse(
-        event_generator(),
+        responses_result_events(result),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )

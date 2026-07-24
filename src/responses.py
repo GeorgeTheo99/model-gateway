@@ -19,7 +19,9 @@ import secrets
 import time
 import uuid
 
+from src.reasoning import reasoning_alias_text
 from src.signature_cache import inject_into_tool_call, store_from_extra_content
+from src.streaming import _list_content_channels
 from src.usage import openai_chat_usage_to_responses, usage_was_reported
 
 log = logging.getLogger("model-gateway")
@@ -35,6 +37,38 @@ def _gen_msg_id() -> str:
 
 def _gen_call_id() -> str:
     return f"call_{secrets.token_hex(12)}"
+
+
+def _ordered_content_channels(container: dict) -> list[tuple[str, str]]:
+    """Return provider reasoning and content in their exact channel order."""
+    primary_reasoning = reasoning_alias_text(container)
+    raw_content = container.get("content")
+    if isinstance(raw_content, list):
+        channels = _list_content_channels(raw_content)
+        listed_reasoning = "".join(
+            text for channel, text in channels if channel == "reasoning"
+        )
+        # Some providers mirror list reasoning into a top-level alias. Prefer
+        # the ordered list in that case rather than emitting it twice.
+        if primary_reasoning and primary_reasoning != listed_reasoning:
+            return [("reasoning", primary_reasoning), *channels]
+        return channels
+
+    channels = []
+    if primary_reasoning:
+        channels.append(("reasoning", primary_reasoning))
+    if isinstance(raw_content, str) and raw_content:
+        channels.append(("text", raw_content))
+    return channels
+
+
+def _reasoning_item(text: str, *, item_id: str | None = None, status: str = "completed") -> dict:
+    return {
+        "type": "reasoning",
+        "id": item_id or _gen_id("rs"),
+        "status": status,
+        "summary": [{"type": "summary_text", "text": text}],
+    }
 
 
 def responses_to_chat(body: dict) -> dict:
@@ -265,13 +299,18 @@ def chat_to_responses(resp: dict, model: str, stream: bool = False) -> dict:
 
     output_items = []
 
-    # Build output items
-    text = message.get("content")
-    tool_calls = message.get("tool_calls", [])
-
-    if tool_calls:
-        # If there's text alongside tool calls, add it as a message item
-        if text:
+    # Build output items. List-valued content can alternate text and reasoning;
+    # every channel transition becomes a distinct Responses output item.
+    for channel, text in _ordered_content_channels(message):
+        if not text:
+            continue
+        if output_items and channel == "reasoning" and output_items[-1]["type"] == "reasoning":
+            output_items[-1]["summary"][0]["text"] += text
+        elif output_items and channel == "text" and output_items[-1]["type"] == "message":
+            output_items[-1]["content"][0]["text"] += text
+        elif channel == "reasoning":
+            output_items.append(_reasoning_item(text))
+        else:
             output_items.append({
                 "type": "message",
                 "id": _gen_msg_id(),
@@ -280,32 +319,25 @@ def chat_to_responses(resp: dict, model: str, stream: bool = False) -> dict:
                 "content": [{"type": "output_text", "text": text, "annotations": []}],
             })
 
-        # Add function call items
-        for tc in tool_calls:
-            fn = tc.get("function", {})
-            fc_item: dict = {
-                "type": "function_call",
-                "id": tc.get("id", _gen_id("fc")),
-                "call_id": tc.get("id", _gen_call_id()),
-                "name": fn.get("name", ""),
-                "arguments": fn.get("arguments", "{}"),
-                "status": "completed",
-            }
-            # Preserve Google thought_signature for Gemini models
-            if tc.get("extra_content"):
-                fc_item["extra_content"] = tc["extra_content"]
-                # Cache signature for later injection on outbound requests
-                store_from_extra_content(tc.get("id", ""), tc["extra_content"])
-            output_items.append(fc_item)
-    elif text:
-        output_items.append({
-            "type": "message",
-            "id": _gen_msg_id(),
+    tool_calls = message.get("tool_calls", [])
+    for tc in tool_calls:
+        fn = tc.get("function", {})
+        fc_item: dict = {
+            "type": "function_call",
+            "id": tc.get("id", _gen_id("fc")),
+            "call_id": tc.get("id", _gen_call_id()),
+            "name": fn.get("name", ""),
+            "arguments": fn.get("arguments", "{}"),
             "status": "completed",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": text, "annotations": []}],
-        })
-    else:
+        }
+        # Preserve Google thought_signature for Gemini models
+        if tc.get("extra_content"):
+            fc_item["extra_content"] = tc["extra_content"]
+            # Cache signature for later injection on outbound requests
+            store_from_extra_content(tc.get("id", ""), tc["extra_content"])
+        output_items.append(fc_item)
+
+    if not output_items:
         # Empty response
         output_items.append({
             "type": "message",
@@ -385,39 +417,138 @@ def _build_response_skeleton(model: str) -> dict:
 
 
 async def translate_responses_stream(chat_stream, model: str):
-    """Translate Chat Completions SSE stream into Responses API SSE events.
-
-    Emits the standard Responses API event sequence:
-    1. response.created
-    2. response.in_progress
-    3. response.output_item.added  (for message or function_call)
-    4. response.content_part.added  (for output_text)
-    5. response.output_text.delta / response.function_call_arguments.delta
-    6. response.output_text.done / response.function_call_arguments.done
-    7. response.content_part.done
-    8. response.output_item.done
-    9. response.completed
-    """
+    """Translate Chat Completions SSE into text, reasoning, and tool events."""
     skeleton = _build_response_skeleton(model)
-    msg_id = _gen_msg_id()
-    now = skeleton["created_at"]
 
-    # 1. response.created
     yield _sse("response.created", {"type": "response.created", "response": skeleton})
-    # 2. response.in_progress
     yield _sse("response.in_progress", {"type": "response.in_progress", "response": skeleton})
 
-    # State for accumulating content
-    full_text = ""
-    full_tool_calls: dict[int, dict] = {}  # index -> {id, call_id, name, arguments}
+    full_tool_calls: dict[int, dict] = {}
+    indexed_output: dict[int, dict] = {}
     usage_data = {}
-    output_items = []
-
-    # Track what output items we've announced
-    current_msg_started = False
-    current_tool_call_started: set[int] = set()
+    current_content: dict | None = None
+    next_output_index = 0
     saw_finish = False
     stream_done = False
+
+    def start_content_events(channel: str) -> list[bytes]:
+        nonlocal current_content, next_output_index
+        output_index = next_output_index
+        next_output_index += 1
+        if channel == "reasoning":
+            item_id = _gen_id("rs")
+            current_content = {
+                "channel": channel,
+                "id": item_id,
+                "output_index": output_index,
+                "text": "",
+            }
+            return [
+                _sse("response.output_item.added", {
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": {
+                        "id": item_id,
+                        "type": "reasoning",
+                        "status": "in_progress",
+                        "summary": [],
+                    },
+                }),
+                _sse("response.reasoning_summary_part.added", {
+                    "type": "response.reasoning_summary_part.added",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "summary_index": 0,
+                    "part": {"type": "summary_text", "text": ""},
+                }),
+            ]
+
+        item_id = _gen_msg_id()
+        current_content = {
+            "channel": channel,
+            "id": item_id,
+            "output_index": output_index,
+            "text": "",
+        }
+        return [
+            _sse("response.output_item.added", {
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {
+                    "id": item_id,
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": [],
+                },
+            }),
+            _sse("response.content_part.added", {
+                "type": "response.content_part.added",
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": "", "annotations": []},
+            }),
+        ]
+
+    def finish_content_events() -> list[bytes]:
+        nonlocal current_content
+        if current_content is None:
+            return []
+        state = current_content
+        current_content = None
+        item_id = state["id"]
+        output_index = state["output_index"]
+        text = state["text"]
+        if state["channel"] == "reasoning":
+            item = _reasoning_item(text, item_id=item_id)
+            events = [
+                _sse("response.reasoning_summary_text.done", {
+                    "type": "response.reasoning_summary_text.done",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "summary_index": 0,
+                    "text": text,
+                }),
+                _sse("response.reasoning_summary_part.done", {
+                    "type": "response.reasoning_summary_part.done",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "summary_index": 0,
+                    "part": {"type": "summary_text", "text": text},
+                }),
+            ]
+        else:
+            item = {
+                "type": "message",
+                "id": item_id,
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text, "annotations": []}],
+            }
+            events = [
+                _sse("response.output_text.done", {
+                    "type": "response.output_text.done",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "text": text,
+                }),
+                _sse("response.content_part.done", {
+                    "type": "response.content_part.done",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "part": item["content"][0],
+                }),
+            ]
+        indexed_output[output_index] = item
+        events.append(_sse("response.output_item.done", {
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": item,
+        }))
+        return events
 
     buffer = ""
     async for chunk in chat_stream:
@@ -438,13 +569,10 @@ async def translate_responses_stream(chat_stream, model: str):
 
             if isinstance(data, dict) and (data.get("error") is not None or data.get("type") == "error"):
                 raw_error = data.get("error")
-                if isinstance(raw_error, dict):
-                    error = raw_error
-                else:
-                    error = {
-                        "type": "api_error",
-                        "message": data.get("message") or str(raw_error or "upstream stream error"),
-                    }
+                error = raw_error if isinstance(raw_error, dict) else {
+                    "type": "api_error",
+                    "message": data.get("message") or str(raw_error or "upstream stream error"),
+                }
                 yield _sse("error", {"type": "error", "error": error})
                 return
 
@@ -458,72 +586,54 @@ async def translate_responses_stream(chat_stream, model: str):
             delta = choice.get("delta", {})
             finish_reason = choice.get("finish_reason")
 
-            # Handle text content
-            if delta.get("content"):
-                if not current_msg_started:
-                    # Emit output_item.added and content_part.added
-                    yield _sse("response.output_item.added", {
-                        "type": "response.output_item.added",
-                        "output_index": 0,
-                        "item": {
-                            "id": msg_id,
-                            "type": "message",
-                            "status": "in_progress",
-                            "role": "assistant",
-                            "content": [],
-                        },
+            for channel, content_delta in _ordered_content_channels(delta):
+                if current_content is not None and current_content["channel"] != channel:
+                    for event in finish_content_events():
+                        yield event
+                if current_content is None:
+                    for event in start_content_events(channel):
+                        yield event
+                assert current_content is not None
+                current_content["text"] += content_delta
+                if channel == "reasoning":
+                    yield _sse("response.reasoning_summary_text.delta", {
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": current_content["id"],
+                        "output_index": current_content["output_index"],
+                        "summary_index": 0,
+                        "delta": content_delta,
                     })
-                    yield _sse("response.content_part.added", {
-                        "type": "response.content_part.added",
-                        "item_id": msg_id,
-                        "output_index": 0,
+                else:
+                    yield _sse("response.output_text.delta", {
+                        "type": "response.output_text.delta",
+                        "item_id": current_content["id"],
+                        "output_index": current_content["output_index"],
                         "content_index": 0,
-                        "part": {"type": "output_text", "text": "", "annotations": []},
+                        "delta": content_delta,
                     })
-                    current_msg_started = True
 
-                text_delta = delta["content"]
-                full_text += text_delta
-                yield _sse("response.output_text.delta", {
-                    "type": "response.output_text.delta",
-                    "item_id": msg_id,
-                    "output_index": 0,
-                    "content_index": 0,
-                    "delta": text_delta,
-                })
-
-            # Handle tool calls
-            for tc in delta.get("tool_calls", []):
+            tool_call_deltas = delta.get("tool_calls", [])
+            if tool_call_deltas and current_content is not None:
+                for event in finish_content_events():
+                    yield event
+            for tc in tool_call_deltas:
                 idx = tc.get("index", 0)
                 fn = tc.get("function", {})
-
-                # Capture Google thought_signature from any tool_call delta
-                # (may arrive on first or subsequent deltas)
                 ec = tc.get("extra_content")
-                if ec and idx in full_tool_calls:
-                    existing_ts = (ec.get("google") or {}).get("thought_signature")
-                    if existing_ts:
-                        full_tool_calls[idx]["extra_content"] = ec
-                        store_from_extra_content(full_tool_calls[idx]["id"], ec)
-
                 if idx not in full_tool_calls:
-                    tc_id = tc.get("id", _gen_id("fc"))
+                    tc_id = tc.get("id") or _gen_id("fc")
+                    tc_output_index = next_output_index
+                    next_output_index += 1
                     full_tool_calls[idx] = {
                         "id": tc_id,
                         "call_id": tc_id,
                         "name": fn.get("name", ""),
                         "arguments": "",
+                        "output_index": tc_output_index,
                     }
-                    # Capture Google thought_signature for Gemini models
-                    if ec:
-                        full_tool_calls[idx]["extra_content"] = ec
-                        store_from_extra_content(tc_id, ec)
-
-                    # Emit output_item.added for the function call
-                    tc_output_idx = len(output_items) + (1 if current_msg_started else 0)
                     yield _sse("response.output_item.added", {
                         "type": "response.output_item.added",
-                        "output_index": tc_output_idx,
+                        "output_index": tc_output_index,
                         "item": {
                             "type": "function_call",
                             "id": tc_id,
@@ -533,16 +643,19 @@ async def translate_responses_stream(chat_stream, model: str):
                             "status": "in_progress",
                         },
                     })
-                    current_tool_call_started.add(idx)
-
+                tc_item = full_tool_calls[idx]
+                if fn.get("name"):
+                    tc_item["name"] = fn["name"]
+                if ec and (ec.get("google") or {}).get("thought_signature"):
+                    tc_item["extra_content"] = ec
+                    store_from_extra_content(tc_item["id"], ec)
                 if fn.get("arguments"):
-                    full_tool_calls[idx]["arguments"] += fn["arguments"]
-                    tc_output_idx = len(output_items) + (1 if current_msg_started else 0)
+                    tc_item["arguments"] += fn["arguments"]
                     yield _sse("response.function_call_arguments.delta", {
                         "type": "response.function_call_arguments.delta",
-                        "item_id": full_tool_calls[idx]["id"],
-                        "output_index": tc_output_idx,
-                        "call_id": full_tool_calls[idx]["call_id"],
+                        "item_id": tc_item["id"],
+                        "output_index": tc_item["output_index"],
+                        "call_id": tc_item["call_id"],
                         "delta": fn["arguments"],
                     })
 
@@ -559,47 +672,18 @@ async def translate_responses_stream(chat_stream, model: str):
         })
         return
 
-    # Close any open content parts
-    if current_msg_started:
-        yield _sse("response.output_text.done", {
-            "type": "response.output_text.done",
-            "item_id": msg_id,
-            "output_index": 0,
-            "content_index": 0,
-            "text": full_text,
-        })
-        yield _sse("response.content_part.done", {
-            "type": "response.content_part.done",
-            "item_id": msg_id,
-            "output_index": 0,
-            "content_index": 0,
-            "part": {"type": "output_text", "text": full_text, "annotations": []},
-        })
+    for event in finish_content_events():
+        yield event
 
-    # Close tool call argument streams
-    for idx in sorted(current_tool_call_started):
-        tc_output_idx = len(output_items) + (1 if current_msg_started else 0)
+    for idx in sorted(full_tool_calls):
         tc_item = full_tool_calls[idx]
         yield _sse("response.function_call_arguments.done", {
             "type": "response.function_call_arguments.done",
             "item_id": tc_item["id"],
-            "output_index": tc_output_idx,
+            "output_index": tc_item["output_index"],
             "call_id": tc_item["call_id"],
             "arguments": tc_item["arguments"],
         })
-
-    # Build final output items
-    if current_msg_started:
-        output_items.append({
-            "type": "message",
-            "id": msg_id,
-            "status": "completed",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": full_text, "annotations": []}],
-        })
-
-    for idx in sorted(full_tool_calls):
-        tc_item = full_tool_calls[idx]
         fc_item: dict = {
             "type": "function_call",
             "id": tc_item["id"],
@@ -610,30 +694,138 @@ async def translate_responses_stream(chat_stream, model: str):
         }
         if tc_item.get("extra_content"):
             fc_item["extra_content"] = tc_item["extra_content"]
-        output_items.append(fc_item)
-
-    # Emit output_item.done for each item
-    for i, item in enumerate(output_items):
+        indexed_output[tc_item["output_index"]] = fc_item
         yield _sse("response.output_item.done", {
             "type": "response.output_item.done",
-            "output_index": i,
-            "item": item,
+            "output_index": tc_item["output_index"],
+            "item": fc_item,
         })
 
-    # Build usage only from an authoritative upstream usage block.
-    resp_usage = openai_chat_usage_to_responses(usage_data)
-
-    # Final completed response
-    completed = _build_response_skeleton(model)
+    output_items = [indexed_output[index] for index in sorted(indexed_output)]
+    completed = dict(skeleton)
     completed["status"] = "completed"
     completed["completed_at"] = int(time.time())
     completed["output"] = output_items
-    completed["usage"] = resp_usage
-
+    completed["usage"] = openai_chat_usage_to_responses(usage_data)
     yield _sse("response.completed", {
         "type": "response.completed",
         "response": completed,
     })
+
+
+def responses_result_events(result: dict):
+    """Emit a complete translated response as protocol-correct Responses SSE."""
+    in_progress = {
+        **result,
+        "status": "in_progress",
+        "completed_at": None,
+        "output": [],
+        "usage": None,
+    }
+    yield _sse("response.created", {"type": "response.created", "response": in_progress})
+    yield _sse("response.in_progress", {"type": "response.in_progress", "response": in_progress})
+
+    for output_index, item in enumerate(result.get("output", [])):
+        item_type = item.get("type")
+        if item_type == "reasoning":
+            yield _sse("response.output_item.added", {
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {**item, "status": "in_progress", "summary": []},
+            })
+            for summary_index, part in enumerate(item.get("summary", [])):
+                text = part.get("text", "")
+                yield _sse("response.reasoning_summary_part.added", {
+                    "type": "response.reasoning_summary_part.added",
+                    "item_id": item["id"],
+                    "output_index": output_index,
+                    "summary_index": summary_index,
+                    "part": {"type": "summary_text", "text": ""},
+                })
+                yield _sse("response.reasoning_summary_text.delta", {
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": item["id"],
+                    "output_index": output_index,
+                    "summary_index": summary_index,
+                    "delta": text,
+                })
+                yield _sse("response.reasoning_summary_text.done", {
+                    "type": "response.reasoning_summary_text.done",
+                    "item_id": item["id"],
+                    "output_index": output_index,
+                    "summary_index": summary_index,
+                    "text": text,
+                })
+                yield _sse("response.reasoning_summary_part.done", {
+                    "type": "response.reasoning_summary_part.done",
+                    "item_id": item["id"],
+                    "output_index": output_index,
+                    "summary_index": summary_index,
+                    "part": part,
+                })
+        elif item_type == "message":
+            yield _sse("response.output_item.added", {
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {**item, "status": "in_progress", "content": []},
+            })
+            for content_index, part in enumerate(item.get("content", [])):
+                text = part.get("text", "")
+                yield _sse("response.content_part.added", {
+                    "type": "response.content_part.added",
+                    "item_id": item["id"],
+                    "output_index": output_index,
+                    "content_index": content_index,
+                    "part": {"type": "output_text", "text": "", "annotations": []},
+                })
+                yield _sse("response.output_text.delta", {
+                    "type": "response.output_text.delta",
+                    "item_id": item["id"],
+                    "output_index": output_index,
+                    "content_index": content_index,
+                    "delta": text,
+                })
+                yield _sse("response.output_text.done", {
+                    "type": "response.output_text.done",
+                    "item_id": item["id"],
+                    "output_index": output_index,
+                    "content_index": content_index,
+                    "text": text,
+                })
+                yield _sse("response.content_part.done", {
+                    "type": "response.content_part.done",
+                    "item_id": item["id"],
+                    "output_index": output_index,
+                    "content_index": content_index,
+                    "part": part,
+                })
+        elif item_type == "function_call":
+            yield _sse("response.output_item.added", {
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {**item, "status": "in_progress", "arguments": ""},
+            })
+            yield _sse("response.function_call_arguments.delta", {
+                "type": "response.function_call_arguments.delta",
+                "item_id": item["id"],
+                "output_index": output_index,
+                "call_id": item.get("call_id", ""),
+                "delta": item.get("arguments", ""),
+            })
+            yield _sse("response.function_call_arguments.done", {
+                "type": "response.function_call_arguments.done",
+                "item_id": item["id"],
+                "output_index": output_index,
+                "call_id": item.get("call_id", ""),
+                "arguments": item.get("arguments", ""),
+            })
+        yield _sse("response.output_item.done", {
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": item,
+        })
+
+    yield _sse("response.completed", {"type": "response.completed", "response": result})
 
 
 def _sse(event: str, data: dict) -> bytes:

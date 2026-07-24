@@ -15,6 +15,7 @@ models:
     context: 1048576
     max_output_tokens: 131072
     thinking: always
+    thinking_levels: [max]
     thinking_format: openai
     vision: true
     pricing:

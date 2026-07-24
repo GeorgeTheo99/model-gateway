@@ -71,6 +71,7 @@ def test_renders_alias_file(tmp_path):
     assert local_entry["omlx_id"] == "qwen3.6-35b-mlx"
     assert local_entry["alias"] == "qwen36"
     assert local_entry["thinking"] == "always"
+    assert local_entry["thinking_levels"] == ["minimal", "low", "medium", "high", "xhigh", "max"]
     assert local_entry["format"] == "mlx"
     assert local_entry["context"] == 262144
     assert local_entry["max_output_tokens"] == 32768
@@ -351,24 +352,18 @@ def test_gateway_does_not_own_pi_launchers():
     assert not (REPO_ROOT / "runtime" / "local_claude" / "zshrc-launcher.zsh").exists()
 
 
-def test_machine_catalog_renders(tmp_path):
-    """Smoke test against this machine's optional, gitignored catalog."""
-    mi = REPO_ROOT / "model-info.json"
-    if not mi.exists():
-        pytest.skip("model-info.json not present")
+def test_committed_fixture_catalog_renders(tmp_path):
+    """Smoke test against the machine-neutral committed model fixture."""
+    mi = REPO_ROOT / "tests" / "fixtures" / "model-info.json"
     cfg = tmp_path / "config.yaml"
     cfg.write_text(
         f"exports:\n"
         f"  model_aliases: {tmp_path}/aliases.json\n"
     )
-    r = _run(cfg, mi)
-    assert r.returncode == 0, r.stderr
+
+    result = _run(cfg, mi)
+
+    assert result.returncode == 0, result.stderr
     aliases = json.loads((tmp_path / "aliases.json").read_text())
-    assert aliases
-    catalog = json.loads(mi.read_text())
-    has_local = any(
-        str(entry.get("provider") or "omlx").lower() in {"local", "omlx"}
-        for entry in catalog.get("llm", [])
-    )
-    assert any(k.startswith("cloud:") for k in aliases)
-    assert any(not k.startswith("cloud:") for k in aliases) is has_local
+    assert aliases["test-local-upstream"]["alias"] == "testlocal"
+    assert aliases["test-local-upstream"]["omlx_id"] == "test-local-upstream"

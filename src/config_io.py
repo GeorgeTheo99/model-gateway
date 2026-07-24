@@ -27,7 +27,7 @@ from typing import Any
 
 import yaml
 
-from src.catalog import validate_pricing_policy
+from src.catalog import normalize_thinking_capabilities, validate_pricing_policy
 from src.config_lock import config_write_lock
 from src.providers import CONFIG_PATH, MODEL_INFO_PATH, MODEL_INFO_SOURCE_PATH
 
@@ -249,7 +249,7 @@ def _write_model_info(doc: dict) -> list[str]:
 # config.yaml model_overrides, not the machine-local catalog.
 _MODEL_FIELDS = [
     "name", "provider", "provider_model_id", "omlx_id", "alias", "context",
-    "max_output_tokens", "thinking", "thinking_format", "vision", "quirks",
+    "max_output_tokens", "thinking", "thinking_levels", "thinking_format", "vision", "quirks",
     "system_instruction", "pricing", "pricing_status", "desc",
 ]
 _PRICING_RATE_FIELDS = {"input", "output", "cache_read", "cache_write", "reasoning"}
@@ -344,12 +344,21 @@ def upsert_model(name: str, **fields) -> dict:
         entry.pop("provider_model_id", None)
     if omlx_id:
         entry["omlx_id"] = omlx_id
+    # JSON null means "leave unchanged" for optional admin fields. In
+    # particular it must not discard a narrow explicit thinking_levels list and
+    # replace it with the broad legacy fallback for the unchanged mode.
+    thinking_changed = fields.get("thinking") is not None and fields["thinking"] != entry.get("thinking", "")
+    if thinking_changed and "thinking_levels" not in fields:
+        # A mode change without an explicit level list requests the safe legacy
+        # fallback for that new mode rather than retaining stale capabilities.
+        entry.pop("thinking_levels", None)
     for f in ("alias", "context", "max_output_tokens", "thinking",
-              "thinking_format", "quirks", "system_instruction", "desc"):
+              "thinking_levels", "thinking_format", "quirks", "system_instruction", "desc"):
         if f in fields and fields[f] is not None:
             entry[f] = fields[f]
     _apply_pricing_update(entry, fields, provider)
     validate_pricing_policy(entry)
+    entry.update(normalize_thinking_capabilities(entry))
     if "vision" in fields and fields["vision"] is not None:
         entry["vision"] = bool(fields["vision"])
     # "enabled" is handled by set_model_enabled() writing config.yaml

@@ -138,6 +138,7 @@ def _exported_models(entries: list[dict]) -> list[dict]:
 # can make UI and request-shape decisions without calling the gateway.
 _ALIAS_FIELDS = (
     "thinking",
+    "thinking_levels",
     "thinking_format",
     "enable_thinking",
     "chat_template_kwargs",

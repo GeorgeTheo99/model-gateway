@@ -36,6 +36,7 @@ def test_minimal_draft_is_secret_free_and_marks_unknown_fields(tmp_path):
         "name": "kimi-k3",
         "provider": "moonshot",
         "provider_model_id": "kimi-k3",
+        "thinking_levels": [],
     }]
     assert profile["provenance"]["fields"]["/models/0/provider_model_id"] == {
         "source": "provider_models",
@@ -43,6 +44,27 @@ def test_minimal_draft_is_secret_free_and_marks_unknown_fields(tmp_path):
     }
     assert "alias" in profile["provenance"]["unresolved"]
     assert "api_key" not in yaml.safe_dump(profile)
+
+
+def test_draft_validates_and_writes_thinking_levels(tmp_path):
+    profile = generation.build_draft(
+        provider_id="moonshot",
+        base_url="https://api.moonshot.ai/v1",
+        model_ids=["kimi-k3"],
+        model_info_path=_catalog(tmp_path / "model-info.json"),
+        thinking="always",
+        thinking_levels=["max"],
+    )
+    assert profile["models"][0]["thinking_levels"] == ["max"]
+    with pytest.raises(OnboardingError, match="supports off only"):
+        generation.build_draft(
+            provider_id="moonshot",
+            base_url="https://api.moonshot.ai/v1",
+            model_ids=["bad"],
+            model_info_path=_catalog(tmp_path / "other-model-info.json"),
+            thinking="always",
+            thinking_levels=["off", "high"],
+        )
 
 
 def test_draft_uses_safe_bounded_profile_id(tmp_path):
@@ -92,6 +114,37 @@ def test_existing_metadata_is_never_removed_silently(tmp_path):
     assert "vision" not in preserved["models"][0]
     assert preserved["provenance"]["safety"]["metadata_removals"] == {"model-a": ["vision"]}
     generation.validate_generated_approvals(preserved, allow_metadata_removal=True)
+
+
+def test_explicit_disabled_thinking_clears_preserved_levels(tmp_path):
+    catalog = _catalog(tmp_path / "model-info.json", [{
+        "name": "model-a",
+        "provider": "example",
+        "provider_model_id": "model-a",
+        "thinking": "always",
+        "thinking_levels": ["max"],
+    }])
+
+    preserved = generation.build_draft(
+        provider_id="example",
+        base_url="https://api.example.com/v1",
+        model_ids=["model-a"],
+        model_info_path=catalog,
+        preserve_existing_metadata=True,
+    )
+    assert preserved["models"][0]["thinking"] == "always"
+    assert preserved["models"][0]["thinking_levels"] == ["max"]
+
+    disabled = generation.build_draft(
+        provider_id="example",
+        base_url="https://api.example.com/v1",
+        model_ids=["model-a"],
+        model_info_path=catalog,
+        thinking="",
+        preserve_existing_metadata=True,
+    )
+    assert disabled["models"][0]["thinking"] == ""
+    assert disabled["models"][0]["thinking_levels"] == []
 
 
 def test_generated_retirements_require_exact_confirmation(tmp_path):

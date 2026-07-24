@@ -9,6 +9,7 @@ import logging
 import secrets
 from collections.abc import AsyncIterator
 
+from src.reasoning import reasoning_alias_text, reasoning_text
 from src.signature_cache import store_from_extra_content
 from src.usage import openai_chat_usage_to_anthropic, usage_was_reported
 
@@ -27,28 +28,41 @@ def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
-def _flatten_list_content(parts: list) -> tuple[str, str]:
-    """Flatten list-valued OpenAI delta content into (text, reasoning).
-
-    Some upstreams (e.g. native serving invocations for reasoning models) emit
-    delta.content as a list of OpenAI content-part blocks instead of a string.
-    Shape-safe: only called when content is a list, so applied unconditionally.
-    """
-    text_segments: list[str] = []
-    reasoning_segments: list[str] = []
+def _list_content_channels(parts: list) -> list[tuple[str, str]]:
+    """Return list-valued OpenAI content as ordered text/reasoning runs."""
+    channels: list[tuple[str, str]] = []
     for part in parts:
         if not isinstance(part, dict):
             continue
         ptype = part.get("type")
-        if ptype == "text":
-            text_segments.append(part.get("text", ""))
+        channel = ""
+        text = ""
+        if ptype in {"text", "output_text"}:
+            channel = "text"
+            value = part.get("text", "")
+            text = value if isinstance(value, str) else ""
         elif ptype == "reasoning":
-            for s in part.get("summary", []) or []:
-                if isinstance(s, dict):
-                    reasoning_segments.append(s.get("text", ""))
-        elif ptype == "reasoning_content":
-            reasoning_segments.append(part.get("text", ""))
-    return "".join(text_segments), "".join(reasoning_segments)
+            channel = "reasoning"
+            text = reasoning_text(part)
+        elif ptype in {"reasoning_content", "reasoning_text"}:
+            channel = "reasoning"
+            text = reasoning_text(part)
+        if channel and text:
+            if channels and channels[-1][0] == channel:
+                previous_channel, previous_text = channels[-1]
+                channels[-1] = (previous_channel, previous_text + text)
+            else:
+                channels.append((channel, text))
+    return channels
+
+
+def _flatten_list_content(parts: list) -> tuple[str, str]:
+    """Flatten list-valued OpenAI content into grouped text and reasoning."""
+    channels = _list_content_channels(parts)
+    return (
+        "".join(text for channel, text in channels if channel == "text"),
+        "".join(text for channel, text in channels if channel == "reasoning"),
+    )
 
 
 async def translate_stream(
@@ -60,9 +74,9 @@ async def translate_stream(
     """Consume OpenAI SSE stream and yield Anthropic SSE events."""
     msg_id = _gen_msg_id()
     started = False
-    block_index = 0
-    text_block_open = False
-    thinking_block_open = False
+    next_block_index = 0
+    active_channel: str | None = None
+    active_block_index: int | None = None
     tool_blocks: dict[int, dict] = {}
     output_tokens = 0
     input_tokens = 0
@@ -137,56 +151,57 @@ async def translate_stream(
         # Reasoning/thinking content. Providers use several field names
         # (OpenAI-compatible local servers: reasoning_content; OpenRouter:
         # reasoning/reasoning_details).
-        reasoning_delta = delta.get("reasoning_content") or delta.get("reasoning")
-        if not reasoning_delta and delta.get("reasoning_details"):
-            parts = []
-            for item in delta.get("reasoning_details") or []:
-                if isinstance(item, dict):
-                    parts.append(item.get("text") or item.get("summary") or "")
-            reasoning_delta = "".join(parts)
-        # Some upstreams emit delta.content as a list of content-part blocks
-        # (mixing text and reasoning). Flatten before string handling below.
-        text_delta = delta.get("content")
-        if isinstance(text_delta, list):
-            text_delta, list_reasoning = _flatten_list_content(text_delta)
-            if list_reasoning:
-                reasoning_delta = (reasoning_delta or "") + list_reasoning
-        if reasoning_delta and thinking_enabled:
-            if not thinking_block_open:
-                thinking_block_open = True
+        reasoning_delta = reasoning_alias_text(delta)
+        # Preserve list-valued content-part order instead of grouping all
+        # reasoning before all text. A separate provider reasoning field is
+        # emitted first, matching the wire order of Chat Completions deltas.
+        content_channels: list[tuple[str, str]] = []
+        raw_content = delta.get("content")
+        if isinstance(raw_content, list):
+            list_channels = _list_content_channels(raw_content)
+            list_reasoning = "".join(
+                text for channel, text in list_channels if channel == "reasoning"
+            )
+            if reasoning_delta and reasoning_delta != list_reasoning:
+                content_channels.append(("reasoning", reasoning_delta))
+            content_channels.extend(list_channels)
+        else:
+            if reasoning_delta:
+                content_channels.append(("reasoning", reasoning_delta))
+            if isinstance(raw_content, str) and raw_content:
+                content_channels.append(("text", raw_content))
+
+        for channel, channel_delta in content_channels:
+            if channel == "reasoning" and not thinking_enabled:
+                continue
+            anthropic_channel = "thinking" if channel == "reasoning" else "text"
+            if active_channel != anthropic_channel:
+                if active_channel is not None and active_block_index is not None:
+                    yield _sse("content_block_stop", {
+                        "type": "content_block_stop",
+                        "index": active_block_index,
+                    })
+                active_channel = anthropic_channel
+                active_block_index = next_block_index
+                next_block_index += 1
+                content_block = (
+                    {"type": "thinking", "thinking": ""}
+                    if channel == "reasoning"
+                    else {"type": "text", "text": ""}
+                )
                 yield _sse("content_block_start", {
                     "type": "content_block_start",
-                    "index": block_index,
-                    "content_block": {"type": "thinking", "thinking": ""},
+                    "index": active_block_index,
+                    "content_block": content_block,
                 })
+            if channel == "reasoning":
+                event_delta = {"type": "thinking_delta", "thinking": channel_delta}
+            else:
+                event_delta = {"type": "text_delta", "text": channel_delta}
             yield _sse("content_block_delta", {
                 "type": "content_block_delta",
-                "index": block_index,
-                "delta": {"type": "thinking_delta", "thinking": reasoning_delta},
-            })
-
-        # Text content
-        if text_delta:
-            # Close thinking block if it was open
-            if thinking_block_open:
-                yield _sse("content_block_stop", {
-                    "type": "content_block_stop",
-                    "index": block_index,
-                })
-                block_index += 1
-                thinking_block_open = False
-
-            if not text_block_open:
-                text_block_open = True
-                yield _sse("content_block_start", {
-                    "type": "content_block_start",
-                    "index": block_index,
-                    "content_block": {"type": "text", "text": ""},
-                })
-            yield _sse("content_block_delta", {
-                "type": "content_block_delta",
-                "index": block_index,
-                "delta": {"type": "text_delta", "text": text_delta},
+                "index": active_block_index,
+                "delta": event_delta,
             })
 
         # Tool calls in delta
@@ -206,19 +221,19 @@ async def translate_stream(
                         store_from_extra_content(tool_blocks[tc_idx]["id"], ec)
 
                 if tc_idx not in tool_blocks:
-                    # Close text block if open
-                    if text_block_open:
+                    # Tool calls start a new Anthropic content channel.
+                    if active_channel is not None and active_block_index is not None:
                         yield _sse("content_block_stop", {
                             "type": "content_block_stop",
-                            "index": block_index,
+                            "index": active_block_index,
                         })
-                        block_index += 1
-                        text_block_open = False
+                        active_channel = None
+                        active_block_index = None
 
                     tool_id = tc.get("id") or _gen_tool_id()
                     tool_name = fn.get("name", "")
                     tool_blocks[tc_idx] = {
-                        "block_index": block_index,
+                        "block_index": next_block_index,
                         "id": tool_id,
                         "name": tool_name,
                     }
@@ -234,10 +249,10 @@ async def translate_stream(
                         store_from_extra_content(tool_id, ec)
                     yield _sse("content_block_start", {
                         "type": "content_block_start",
-                        "index": block_index,
+                        "index": next_block_index,
                         "content_block": content_block,
                     })
-                    block_index += 1
+                    next_block_index += 1
 
                 args_delta = fn.get("arguments", "")
                 if args_delta:
@@ -258,15 +273,10 @@ async def translate_stream(
         return
 
     # Close any open blocks
-    if thinking_block_open:
+    if active_channel is not None and active_block_index is not None:
         yield _sse("content_block_stop", {
             "type": "content_block_stop",
-            "index": block_index,
-        })
-    if text_block_open:
-        yield _sse("content_block_stop", {
-            "type": "content_block_stop",
-            "index": block_index,
+            "index": active_block_index,
         })
     for tb in tool_blocks.values():
         yield _sse("content_block_stop", {

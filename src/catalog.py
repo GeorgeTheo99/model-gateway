@@ -48,6 +48,72 @@ _PROVIDER_SYNONYMS = {
 _RETIRED_LOCAL_PROVIDERS = {"gguf", "llama", "llama_cpp", "llama.cpp"}
 _PRICING_RATE_FIELDS = {"input", "output", "cache_read", "cache_write", "reasoning"}
 
+# Canonical gateway thinking levels. ``off`` is a real explicit control while
+# Auto is represented by omitting a reasoning control from the request.
+THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+ENABLED_THINKING_LEVELS = THINKING_LEVELS[1:]
+_THINKING_MODES = {"", "optional", "always"}
+
+
+def _canonical_thinking_mode(entry: dict) -> str:
+    """Map legacy no-thinking spellings to the canonical empty mode."""
+    thinking = entry.get("thinking", "")
+    if thinking is None or thinking == "never":
+        return ""
+    if not isinstance(thinking, str) or thinking not in _THINKING_MODES:
+        raise ValueError(
+            f"model {entry.get('name')!r} thinking must be optional, always, or empty"
+        )
+    return thinking
+
+
+def normalized_thinking_levels(entry: dict) -> list[str]:
+    """Validate and return one model's effective canonical thinking levels.
+
+    Older catalog entries did not carry ``thinking_levels``. Keep those rows
+    readable with a conservative fallback derived from their existing
+    ``thinking`` mode; newly written rows can persist the returned explicit
+    list. No-thinking models intentionally expose no levels.
+    """
+    thinking = _canonical_thinking_mode(entry)
+
+    if "thinking_levels" not in entry:
+        if thinking == "optional":
+            return list(THINKING_LEVELS)
+        if thinking == "always":
+            return list(ENABLED_THINKING_LEVELS)
+        return []
+
+    raw = entry.get("thinking_levels")
+    if not isinstance(raw, list) or any(not isinstance(level, str) for level in raw):
+        raise ValueError(f"model {entry.get('name')!r} thinking_levels must be a list of strings")
+    if len(raw) != len(set(raw)):
+        raise ValueError(f"model {entry.get('name')!r} thinking_levels must not contain duplicates")
+    unknown = set(raw) - set(THINKING_LEVELS)
+    if unknown:
+        raise ValueError(
+            f"model {entry.get('name')!r} has unknown thinking level(s): "
+            + ", ".join(sorted(unknown))
+        )
+
+    levels = [level for level in THINKING_LEVELS if level in raw]
+    if not thinking and levels:
+        raise ValueError(f"model {entry.get('name')!r} cannot define thinking_levels without thinking")
+    if thinking and not any(level != "off" for level in levels):
+        raise ValueError(f"model {entry.get('name')!r} thinking requires at least one enabled thinking level")
+    if "off" in levels and thinking != "optional":
+        raise ValueError(f"model {entry.get('name')!r} supports off only when thinking is optional")
+    return levels
+
+
+def normalize_thinking_capabilities(entry: dict) -> dict:
+    """Return a copy with canonical thinking mode and effective levels."""
+    normalized = dict(entry)
+    if "thinking" in normalized:
+        normalized["thinking"] = _canonical_thinking_mode(normalized)
+    normalized["thinking_levels"] = normalized_thinking_levels(normalized)
+    return normalized
+
 
 def canonical_provider(provider: str | None) -> str:
     """Normalize a provider name to its canonical form."""
@@ -226,6 +292,7 @@ def load_catalog_entries(
         normalized = dict(entry)
         normalized["provider"] = provider
         validate_pricing_policy(normalized)
+        normalized = normalize_thinking_capabilities(normalized)
         routable = entry_routable_ids(normalized)
         if not routable:
             raise ValueError("catalog model entries require at least one routable identifier")
@@ -270,11 +337,19 @@ def load_catalog_entries(
             )
         base = by_id.get(base_primary) if base_primary else None
         normalized = {**base, **entry} if base else dict(entry)
+        if (
+            base
+            and "thinking" in entry
+            and entry.get("thinking") != base.get("thinking")
+            and "thinking_levels" not in entry
+        ):
+            normalized.pop("thinking_levels", None)
         provider = canonical_provider(normalized.get("provider", "local"))
         if not include_retired and provider in _RETIRED_LOCAL_PROVIDERS:
             continue
         normalized["provider"] = provider
         validate_pricing_policy(normalized)
+        normalized = normalize_thinking_capabilities(normalized)
         ids = entry_routable_ids(normalized)
         if not ids:
             raise ValueError("catalog model entries require at least one routable identifier")

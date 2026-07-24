@@ -8,6 +8,7 @@ GGUF/llama.cpp entries are skipped by default.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -104,6 +105,15 @@ def test_merge_overlay_inherits_omitted_capabilities(tmp_path):
     assert entry["context"] == 2000
     assert entry["vision"] is True
     assert entry["alias"] == "gv"
+
+
+def test_overlay_thinking_mode_change_reinfers_levels_when_omitted(tmp_path):
+    mi = tmp_path / "model-info.json"
+    _write_model_info(mi, [{"name": "model", "provider": "openai", "thinking": "optional"}])
+    entry = catalog.load_catalog_entries(
+        mi, overlay=[{"name": "model", "thinking": "always"}],
+    )[0]
+    assert entry["thinking_levels"] == list(catalog.ENABLED_THINKING_LEVELS)
 
 
 def test_merge_overlay_evicts_all_ids_of_replaced_entry(tmp_path):
@@ -251,6 +261,55 @@ def test_cloud_overlay_must_clear_inherited_unmetered_marker(tmp_path):
 
     cfg.write_text("models:\n  - name: local\n    provider: openai\n    pricing_status: null\n")
     assert catalog.load_catalog_entries(mi, cfg)[0]["provider"] == "openai"
+
+
+def test_thinking_levels_are_validated_and_inferred_per_model(tmp_path):
+    mi = tmp_path / "model-info.json"
+    _write_model_info(mi, [
+        {"name": "none", "provider": "openai"},
+        {"name": "optional", "provider": "openai", "thinking": "optional"},
+        {"name": "always", "provider": "openai", "thinking": "always"},
+        {
+            "name": "max-only", "provider": "moonshot", "thinking": "always",
+            "thinking_levels": ["max"],
+        },
+    ])
+    entries = {entry["name"]: entry for entry in catalog.load_catalog_entries(mi)}
+    assert entries["none"].get("thinking", "") == ""
+    assert entries["none"]["thinking_levels"] == []
+    assert entries["optional"]["thinking_levels"] == list(catalog.THINKING_LEVELS)
+    assert entries["always"]["thinking_levels"] == list(catalog.ENABLED_THINKING_LEVELS)
+    assert entries["max-only"]["thinking_levels"] == ["max"]
+
+    for bad, message in [
+        ({"thinking": "always", "thinking_levels": ["off", "high"]}, "supports off only"),
+        ({"thinking": "optional", "thinking_levels": ["turbo"]}, "unknown thinking level"),
+        ({"thinking_levels": ["high"]}, "without thinking"),
+    ]:
+        _write_model_info(mi, [{"name": "bad", "provider": "openai", **bad}])
+        with pytest.raises(ValueError, match=message):
+            catalog.load_catalog_entries(mi)
+
+
+@pytest.mark.parametrize("legacy_mode", ["never", None])
+def test_legacy_no_thinking_modes_are_canonicalized(tmp_path, legacy_mode):
+    mi = tmp_path / "model-info.json"
+    _write_model_info(mi, [{
+        "name": "legacy", "provider": "openai", "thinking": legacy_mode,
+    }])
+
+    entry = catalog.load_catalog_entries(mi)[0]
+    assert entry["thinking"] == ""
+    assert entry["thinking_levels"] == []
+
+
+def test_committed_kimi_onboarding_profile_is_strict_max_only():
+    from src.onboarding import load_profile
+
+    path = Path(__file__).resolve().parents[1] / "config" / "onboarding" / "moonshot-kimi-k3.yaml"
+    entries = {entry["name"]: entry for entry in load_profile(path)["models"]}
+    assert entries["kimi-k3"]["thinking"] == "always"
+    assert entries["kimi-k3"]["thinking_levels"] == ["max"]
 
 
 def test_routable_ids_includes_alternate_ids():

@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 import httpx
 import yaml
 
-from src.catalog import entry_routable_ids, validate_pricing_policy
+from src.catalog import entry_routable_ids, normalize_thinking_capabilities, validate_pricing_policy
 from src.config_lock import config_write_lock
 from src.secret_files import read_api_key_file, resolve_api_key_file
 
@@ -116,6 +116,7 @@ def validate_profile(data: object) -> dict:
                 raise OnboardingError(f"model {model['name']!r} pricing values must be finite non-negative numbers")
         try:
             validate_pricing_policy(model)
+            model.update(normalize_thinking_capabilities(model))
         except ValueError as exc:
             raise OnboardingError(str(exc)) from exc
     provenance = data.get("provenance")
@@ -223,6 +224,7 @@ def _build_candidates(profile: dict, config: dict, model_doc: dict, *, secret_fi
     for model in models:
         try:
             validate_pricing_policy(model)
+            model.update(normalize_thinking_capabilities(model))
         except ValueError as exc:
             raise OnboardingError(str(exc)) from exc
     retired = set((profile.get("retire") or {}).get("models") or [])
