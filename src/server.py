@@ -300,7 +300,7 @@ async def _forward_imported_if_known(request: Request, path: str, body: dict) ->
 
 ADAPTIVE_THINKING_ANTHROPIC_MODELS = {
     "claude-fable-5",
-    "claude-mythos-5",
+    "claude-opus-5",
     "claude-opus-4-7",
     "claude-opus-4-8",
 }
@@ -316,7 +316,7 @@ def _legacy_anthropic_budget_effort(budget: int | None) -> str:
 
 
 def _normalize_anthropic_adaptive_thinking(body: dict, info) -> None:
-    """Use Anthropic's adaptive thinking shape for Fable/Mythos/new Opus models."""
+    """Use Anthropic's adaptive thinking shape for Fable and newer Opus models."""
     if not _uses_adaptive_anthropic_thinking(info.provider_model_id):
         return
     thinking_param = body.get("thinking")
@@ -2719,7 +2719,7 @@ async def messages(request: Request):
 
     # Rewrite thinking param for models that require adaptive thinking.
     # Claude Opus 4.6 and earlier:       thinking.type = "enabled" + budget_tokens
-    # Opus 4.7+, Fable 5, and Mythos 5:  thinking.type = "adaptive" + output_config.effort
+    # Opus 4.7+ and Fable 5:             thinking.type = "adaptive" + output_config.effort
     _uses_adaptive_thinking = _uses_adaptive_anthropic_thinking(info.provider_model_id)
     _normalize_anthropic_adaptive_thinking(body, info)
 

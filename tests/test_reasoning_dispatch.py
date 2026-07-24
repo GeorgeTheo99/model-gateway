@@ -250,7 +250,11 @@ def test_dispatch_reuses_the_single_validated_reasoning_control(monkeypatch):
 
 def test_adaptive_anthropic_legacy_budget_preserves_prior_effort_inference():
     info = _info(
-        "anthropic", provider="anthropic", provider_model_id="claude-fable-5",
+        "anthropic",
+        thinking="optional",
+        thinking_levels=("off", "low", "medium", "high", "xhigh", "max"),
+        provider="anthropic",
+        provider_model_id="claude-opus-5",
     )
     body = {
         "messages": [],
@@ -259,6 +263,18 @@ def test_adaptive_anthropic_legacy_budget_preserves_prior_effort_inference():
     assert _apply_gateway_reasoning(body, info, target_api="chat") is True
     assert body["thinking"] == {"type": "adaptive"}
     assert body["output_config"] == {"effort": "medium"}
+
+
+def test_opus_5_rejects_unsupported_minimal_effort():
+    with pytest.raises(server_module.ThinkingValidationError, match="Thinking level 'minimal'"):
+        _run(
+            "anthropic",
+            {"messages": [], "reasoning_effort": "minimal"},
+            thinking="optional",
+            thinking_levels=("off", "low", "medium", "high", "xhigh", "max"),
+            provider="anthropic",
+            provider_model_id="claude-opus-5",
+        )
 
 
 def test_unknown_or_overridden_unsupported_level_is_never_silently_dropped():

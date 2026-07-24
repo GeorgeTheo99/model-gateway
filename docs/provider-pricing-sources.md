@@ -120,9 +120,8 @@ Use this to know which source to read for each model. Regenerate with:
 | Gateway model | Provider | Upstream model id | Source page |
 |---|---|---|---|
 | claude-fable-5 | anthropic | claude-fable-5 | anthropic |
-| claude-mythos-5 | anthropic | claude-mythos-5 | anthropic |
+| claude-opus-5 / 4.8 / 4.7 / 4.6 / 4.5 | anthropic | claude-opus-* | anthropic |
 | claude-sonnet-4.6 | anthropic | claude-sonnet-4-6 | anthropic |
-| claude-opus-4.8 / 4.7 / 4.6 / 4.5 | anthropic | claude-opus-4-* | anthropic |
 | gpt-5.4 | openai | gpt-5.4 | openai |
 | gpt-5.4-mini | openai | gpt-5.4-mini | openai |
 | deepseek-v4-pro-fw | fireworks | accounts/fireworks/models/deepseek-v4-pro | fireworks |
