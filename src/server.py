@@ -2308,6 +2308,7 @@ async def chat_completions(request: Request):
     log.info("OpenAI %s -> %s (stream=%s, thinking=%s)", model, info.provider, is_stream, thinking_enabled)
 
     if is_stream:
+        _maybe_stream_options(body, info)
         return await _passthrough_stream(endpoint, body, fwd, provider=info.provider, request=request)
     return await _passthrough_sync(endpoint, body, fwd, provider=info.provider, request=request)
 

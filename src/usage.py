@@ -63,7 +63,7 @@ def _anthropic_cache_write_tokens(usage: dict) -> tuple[int, int]:
 
 
 _OPENAI_CHAT_USAGE_KEYS = {
-    "prompt_tokens", "completion_tokens", "total_tokens",
+    "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens",
     "prompt_tokens_details", "completion_tokens_details",
 }
 _ANTHROPIC_USAGE_KEYS = {
@@ -87,12 +87,22 @@ def usage_was_reported(usage: object) -> bool:
     )
 
 
+def _openai_chat_cached_tokens(usage: dict) -> tuple[int, bool]:
+    """Return cache-read tokens from standard or Moonshot Chat usage."""
+    details = usage.get("prompt_tokens_details") or {}
+    if "cached_tokens" in details:
+        return _as_int(details.get("cached_tokens")), True
+    if "cached_tokens" in usage:
+        return _as_int(usage.get("cached_tokens")), True
+    return 0, False
+
+
 def openai_chat_usage_to_anthropic(usage: object) -> dict | None:
     """Convert authoritative Chat usage to Anthropic's exclusive-input shape."""
     if not isinstance(usage, dict) or not (set(usage) & _OPENAI_CHAT_USAGE_KEYS):
         return None
     details = usage.get("prompt_tokens_details") or {}
-    cached_read = _as_int(details.get("cached_tokens"))
+    cached_read, cache_read_reported = _openai_chat_cached_tokens(usage)
     cache_write = _as_int(details.get("cache_write_tokens"))
     cache_write_1h = _as_int(details.get("cache_write_1h_tokens"))
     completion_details = usage.get("completion_tokens_details") or {}
@@ -103,7 +113,7 @@ def openai_chat_usage_to_anthropic(usage: object) -> dict | None:
         ),
         "output_tokens": _as_int(usage.get("completion_tokens")),
     }
-    if "cached_tokens" in details:
+    if cache_read_reported:
         result["cache_read_input_tokens"] = cached_read
     if "cache_write_tokens" in details or "cache_write_1h_tokens" in details:
         result["cache_creation_input_tokens"] = cache_write + cache_write_1h
@@ -126,7 +136,8 @@ def openai_chat_usage_to_responses(usage: object) -> dict | None:
     completion = _as_int(usage.get("completion_tokens"))
     prompt_details = usage.get("prompt_tokens_details") or {}
     completion_details = usage.get("completion_tokens_details") or {}
-    input_details = {"cached_tokens": _as_int(prompt_details.get("cached_tokens"))}
+    cached_read, _ = _openai_chat_cached_tokens(usage)
+    input_details = {"cached_tokens": cached_read}
     if "cache_write_tokens" in prompt_details:
         input_details["cache_write_tokens"] = _as_int(prompt_details.get("cache_write_tokens"))
     if "cache_write_1h_tokens" in prompt_details:
@@ -242,11 +253,12 @@ def extract_usage(resp: dict | None) -> Usage:
         )
 
     # OpenAI Chat Completions shape: prompt_tokens / completion_tokens +
-    # prompt_tokens_details.cached_tokens + completion_tokens_details.reasoning_tokens.
+    # cached tokens in prompt_tokens_details (OpenAI) or at the top level
+    # (Moonshot), plus completion_tokens_details.reasoning_tokens.
     # prompt_tokens INCLUDES cached tokens; subtract to get cache-miss input.
     in_details = usage.get("prompt_tokens_details") or {}
     out_details = usage.get("completion_tokens_details") or {}
-    cached = _as_int(in_details.get("cached_tokens"))
+    cached, _ = _openai_chat_cached_tokens(usage)
     cache_write = _as_int(in_details.get("cache_write_tokens"))
     cache_write_1h = _as_int(in_details.get("cache_write_1h_tokens"))
     return Usage(

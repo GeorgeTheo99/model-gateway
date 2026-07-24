@@ -30,6 +30,31 @@ def test_extract_openai_chat_shape():
     assert u.reasoning_tokens == 50
 
 
+def test_extract_moonshot_top_level_cache_shape():
+    usage = {
+        "prompt_tokens": 1000,
+        "completion_tokens": 500,
+        "cached_tokens": 200,
+    }
+    expected = Usage(
+        input_tokens=800,
+        output_tokens=500,
+        cached_read_tokens=200,
+        reported=True,
+    )
+    assert extract_usage({"usage": usage}) == expected
+    assert openai_chat_usage_to_anthropic(usage) == {
+        "input_tokens": 800,
+        "output_tokens": 500,
+        "cache_read_input_tokens": 200,
+    }
+    assert extract_usage({"usage": openai_chat_usage_to_responses(usage)}) == expected
+
+    # Prefer the standard nested value if a provider emits both shapes.
+    usage["prompt_tokens_details"] = {"cached_tokens": 150}
+    assert extract_usage({"usage": usage}).cached_read_tokens == 150
+
+
 def test_extract_anthropic_shape():
     resp = {"usage": {
         "input_tokens": 800,

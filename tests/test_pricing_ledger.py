@@ -377,23 +377,26 @@ def test_composite_validation_error_keeps_resolution_receipt(tmp_ledger, monkeyp
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
-def test_streaming_usage_is_captured_across_chunk_boundaries(tmp_ledger, monkeypatch):
-    info = _info(provider="openai", provider_model_id="gpt-test")
+def test_direct_stream_requests_usage_and_prices_cache_hits(tmp_ledger, monkeypatch):
+    info = _info(provider="moonshot", provider_model_id="kimi-k3")
     import src.providers as providers
     monkeypatch.setattr(providers, "_models", {
-        "priced-stream": {
-            "name": "priced-stream",
-            "provider": "openai",
-            "provider_model_id": "gpt-test",
-            "pricing": {"input": 2.0, "output": 4.0},
+        "kimi-k3": {
+            "name": "kimi-k3",
+            "provider": "moonshot",
+            "provider_model_id": "kimi-k3",
+            "pricing": {"input": 3.0, "output": 15.0, "cache_read": 0.3},
         },
     })
-    monkeypatch.setattr(server_module, "resolve", lambda model: info if model == "priced-stream" else None)
+    monkeypatch.setattr(server_module, "resolve", lambda model: info if model == "kimi-k3" else None)
 
     async def fake_passthrough_stream(endpoint, body, headers, **kwargs):
+        assert body["stream_options"] == {"include_usage": True}
+
         async def chunks():
             yield b'data: {"choices":[],"us'
-            yield b'age":{"prompt_tokens":10,"completion_tokens":5}}\n'
+            yield b'age":{"prompt_tokens":100000,"completion_tokens":50000,'
+            yield b'"cached_tokens":40000}}\n'
             yield b'\ndata: [DONE]\n\n'
         return server_module.StreamingResponse(chunks(), media_type="text/event-stream")
 
@@ -401,15 +404,17 @@ def test_streaming_usage_is_captured_across_chunk_boundaries(tmp_ledger, monkeyp
 
     with TestClient(app) as c:
         response = c.post("/v1/chat/completions", json={
-            "model": "priced-stream", "messages": [], "stream": True,
+            "model": "kimi-k3", "messages": [], "stream": True,
         })
         assert response.status_code == 200
 
     row = ledger.recent()[0]
     assert row["usage_reported"] == 1
-    assert row["input_tokens"] == 10
-    assert row["output_tokens"] == 5
-    assert row["cost_usd"] == pytest.approx(0.00004)
+    assert row["input_tokens"] == 60000
+    assert row["cached_read_tokens"] == 40000
+    assert row["output_tokens"] == 50000
+    assert row["cost_usd"] == pytest.approx(0.942)
+    assert row["pricing_complete"] == 1
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
