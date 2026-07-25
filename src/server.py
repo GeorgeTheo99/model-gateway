@@ -1562,65 +1562,6 @@ def _enable_openrouter_gemini_prompt_cache(req: dict) -> None:
 # ── Request/usage ledger middleware ─────────────────────────────────────────
 
 _LEDGER_PATHS = {"/v1/chat/completions", "/v1/messages", "/v1/responses"}
-_SESSION_ID_HEADERS = (
-    "x-session-affinity",
-    "x-session-id",
-    "session_id",
-    "x-client-request-id",
-)
-
-
-def _requested_cache_retention(body: dict) -> str | None:
-    """Normalize explicit client cache controls without retaining prompt data."""
-    prompt_retention = body.get("prompt_cache_retention")
-    if prompt_retention in {"1h", "24h"}:
-        return "long"
-    saw_short = prompt_retention in {"in_memory", "in-memory"} or isinstance(
-        body.get("prompt_cache_key"), str
-    )
-
-    # Anthropic cache controls can appear on system/message content and tools.
-    # Bound the generic walk so malformed client payloads cannot create an
-    # unbounded observability-only traversal.
-    stack = [body.get("system"), body.get("messages"), body.get("tools")]
-    visited = 0
-    while stack and visited < 10_000:
-        value = stack.pop()
-        visited += 1
-        if isinstance(value, dict):
-            cache_control = value.get("cache_control")
-            if isinstance(cache_control, dict) and cache_control.get("type") == "ephemeral":
-                if cache_control.get("ttl") == "1h":
-                    return "long"
-                saw_short = True
-            stack.extend(value.values())
-        elif isinstance(value, list):
-            stack.extend(value)
-    return "short" if saw_short else None
-
-
-def _capture_cache_observation(request: Request, body: dict) -> None:
-    """Capture pseudonymous session/cache metadata for ledger analysis only."""
-    raw_session_id = None
-    session_source = None
-    for header in _SESSION_ID_HEADERS:
-        value = request.headers.get(header)
-        if value:
-            raw_session_id = value
-            session_source = header
-            break
-    if raw_session_id is None:
-        prompt_cache_key = body.get("prompt_cache_key")
-        if isinstance(prompt_cache_key, str) and prompt_cache_key:
-            raw_session_id = prompt_cache_key
-            session_source = "prompt_cache_key"
-
-    fingerprint = ledger.session_fingerprint(raw_session_id)
-    request.state.cache_observation = {
-        "session_fingerprint": fingerprint,
-        "session_source": session_source if fingerprint is not None else None,
-        "cache_retention_requested": _requested_cache_retention(body),
-    }
 
 
 def _set_ledger_ctx(request: Request, model: str, info, is_stream: bool = False) -> None:
@@ -1721,9 +1662,6 @@ def _ledger_record(
     provider_model_id: str | None, status: int | None, latency_ms: int | None,
     is_stream: bool, usage_dict: dict | None, pricing: dict | None,
     pricing_status: str = "unknown", error: str | None = None,
-    request_started_at: float | None = None,
-    session_fingerprint: str | None = None, session_source: str | None = None,
-    cache_retention_requested: str | None = None,
 ) -> None:
     """Best-effort: normalize usage, estimate cost, insert a ledger row."""
     try:
@@ -1732,10 +1670,7 @@ def _ledger_record(
         ledger.record(
             endpoint=endpoint, method=method, model=model, provider=provider,
             provider_model_id=provider_model_id, status=status, latency_ms=latency_ms,
-            is_stream=is_stream, usage=usage, cost=cost,
-            request_started_at=request_started_at,
-            session_fingerprint=session_fingerprint, session_source=session_source,
-            cache_retention_requested=cache_retention_requested, error=error,
+            is_stream=is_stream, usage=usage, cost=cost, error=error,
         )
     except Exception as exc:  # noqa: BLE001 - ledger must never break requests
         log.warning("ledger record failed: %s", exc)
@@ -1772,7 +1707,6 @@ async def ledger_middleware(request: Request, call_next):
         pricing = None
         pricing_status = "unknown"
     status = response.status_code
-    cache_observation = getattr(request.state, "cache_observation", None) or {}
 
     if is_stream:
         original_iter = response.body_iterator
@@ -1814,10 +1748,6 @@ async def ledger_middleware(request: Request, call_next):
                     request.url.path, "POST", model, provider, provider_model_id,
                     status, latency_ms, True, usage_capture["usage"], pricing,
                     pricing_status, usage_capture["error"],
-                    request_started_at=start,
-                    session_fingerprint=cache_observation.get("session_fingerprint"),
-                    session_source=cache_observation.get("session_source"),
-                    cache_retention_requested=cache_observation.get("cache_retention_requested"),
                 )
 
         response.body_iterator = wrapped_iter()
@@ -1842,10 +1772,6 @@ async def ledger_middleware(request: Request, call_next):
     _ledger_record(
         request.url.path, "POST", model, provider, provider_model_id,
         status, latency_ms, False, usage_dict, pricing, pricing_status,
-        request_started_at=start,
-        session_fingerprint=cache_observation.get("session_fingerprint"),
-        session_source=cache_observation.get("session_source"),
-        cache_retention_requested=cache_observation.get("cache_retention_requested"),
     )
 
     return Response(
@@ -1964,7 +1890,6 @@ async def create_response(request: Request):
         body = await request.json()
     except Exception:
         return _error_openai(400, "invalid_request_error", "Invalid JSON body")
-    _capture_cache_observation(request, body)
 
     model = body.get("model", "")
     is_stream = body.get("stream", False)
@@ -2323,7 +2248,6 @@ async def chat_completions(request: Request):
             status_code=400,
             content={"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
         )
-    _capture_cache_observation(request, body)
 
     model = body.get("model", "")
     inbound_source = getattr(request.state, "federation_source", None)
@@ -2733,7 +2657,6 @@ async def messages(request: Request):
         body = await request.json()
     except Exception:
         return _error(400, "invalid_request_error", "Invalid JSON body")
-    _capture_cache_observation(request, body)
 
     model = body.get("model", "")
     is_stream = body.get("stream", False)

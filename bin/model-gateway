@@ -50,7 +50,6 @@ if [ -f "$PLIST_DIR/$LABEL.plist" ] && [ -x /usr/libexec/PlistBuddy ]; then
 fi
 MODEL_INFO_SOURCE_PATH="${MODEL_GATEWAY_MODEL_INFO_SOURCE:-${ACTIVE_MODEL_INFO_SOURCE:-$ROOT_DIR/model-info.json}}"
 LEDGER_PATH="${MODEL_GATEWAY_LEDGER_PATH:-$HOME/srv/model-gateway/shared/ledger.db}"
-SESSION_FINGERPRINT_KEY_FILE="${MODEL_GATEWAY_SESSION_FINGERPRINT_KEY_FILE:-$(dirname "$LEDGER_PATH")/session-fingerprint.key}"
 UV_BIN="${UV_BIN:-$(command -v uv 2>/dev/null || true)}"
 
 # Colors (disabled when not a TTY).
@@ -230,7 +229,7 @@ ensure_runtime_paths_safe() {
 write_plist() {
   ensure_label_safe "overwrite"
   mkdir -p "$PLIST_DIR" "$LOG_DIR" "$(dirname "$LEDGER_PATH")"
-  local plist e_label e_uv e_root e_host e_port e_config e_model_info e_model_info_source e_ledger e_session_key e_log
+  local plist e_label e_uv e_root e_host e_port e_config e_model_info e_model_info_source e_ledger e_log
   plist="$(plist_path)"
   e_label="$(xml_escape "$LABEL")"
   e_uv="$(xml_escape "$UV_BIN")"
@@ -241,7 +240,6 @@ write_plist() {
   e_model_info="$(xml_escape "$MODEL_INFO_PATH")"
   e_model_info_source="$(xml_escape "$MODEL_INFO_SOURCE_PATH")"
   e_ledger="$(xml_escape "$LEDGER_PATH")"
-  e_session_key="$(xml_escape "$SESSION_FINGERPRINT_KEY_FILE")"
   e_log="$(xml_escape "$LOG_FILE")"
   cat >"$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -259,7 +257,6 @@ write_plist() {
   <key>MODEL_GATEWAY_MODEL_INFO</key><string>${e_model_info}</string>
   <key>MODEL_GATEWAY_MODEL_INFO_SOURCE</key><string>${e_model_info_source}</string>
   <key>MODEL_GATEWAY_LEDGER_PATH</key><string>${e_ledger}</string>
-  <key>MODEL_GATEWAY_SESSION_FINGERPRINT_KEY_FILE</key><string>${e_session_key}</string>
 </dict>
 <key>StandardOutPath</key><string>${e_log}</string>
 <key>StandardErrorPath</key><string>${e_log}</string>
@@ -366,7 +363,6 @@ status() {
   printf '%-24s %s\n' "health:" "$health"
   printf '%-24s %s\n' "config:" "$CONFIG_PATH"
   printf '%-24s %s\n' "model-info:" "$MODEL_INFO_PATH"
-  printf '%-24s %s\n' "session key:" "$SESSION_FINGERPRINT_KEY_FILE"
   printf '%-24s %s\n' "log:" "$LOG_FILE"
 }
 
@@ -396,7 +392,6 @@ MODEL_GATEWAY_CONFIG=$CONFIG_PATH
 MODEL_GATEWAY_MODEL_INFO=$MODEL_INFO_PATH
 MODEL_GATEWAY_MODEL_INFO_SOURCE=$MODEL_INFO_SOURCE_PATH
 MODEL_GATEWAY_LEDGER_PATH=$LEDGER_PATH
-MODEL_GATEWAY_SESSION_FINGERPRINT_KEY_FILE=$SESSION_FINGERPRINT_KEY_FILE
 HEALTH_URL=$(health_url)
 EOF
 }

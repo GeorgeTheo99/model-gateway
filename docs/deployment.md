@@ -39,8 +39,10 @@ Portable defaults are env-overridable:
 - `MODEL_GATEWAY_MODEL_INFO_SOURCE=<repo>/model-info.json`
 - `MODEL_GATEWAY_HOST=127.0.0.1`, `MODEL_GATEWAY_PORT=9111`
 - `MODEL_GATEWAY_LEDGER_PATH=~/srv/model-gateway/shared/ledger.db`
-- `MODEL_GATEWAY_SESSION_FINGERPRINT_KEY_FILE=<ledger-dir>/session-fingerprint.key`
 - `MODEL_GATEWAY_LOG_DIR=~/Library/Logs/model-gateway`
+
+The ledger database and any SQLite WAL/SHM sidecars are restricted to mode
+`0600`.
 
 After install, edit `config/config.yaml` to add provider secrets/auth. A fresh generated config intentionally has `providers: {}`, so catalog entries remain unavailable until providers are configured. If you deliberately expose the gateway beyond loopback (`MODEL_GATEWAY_HOST=0.0.0.0`), configure `auth.client_keys` and firewall rules first.
 
@@ -64,35 +66,6 @@ Pushes to `main` on `~/repos/model-gateway.git` run `hooks/post-receive`, which 
 ```
 
 The dev-server pipeline updates the runtime checkout, keeps `config/config.yaml` symlinked to shared config, syncs a runtime `.venv`, imports the app as a smoke check, restarts `com.local.model-gateway` for runtime-affecting changes, and verifies `/health`.
-
-## Cache-retention observability
-
-The request ledger can measure whether Anthropic's 5-minute prompt cache is being
-rewritten after a 5–60 minute session gap. Clients may send a session identifier
-in `x-session-affinity`, `x-session-id`, `session_id`, or
-`x-client-request-id`; `prompt_cache_key` is the fallback. The gateway never
-stores the raw value. It stores an HMAC-SHA256 fingerprint plus the identifier
-source and requested cache retention (`short` or `long`). These values are
-observability-only and are never used for authentication, routing, or upstream
-headers.
-
-On first startup the gateway creates a 32-byte key with mode `0600` beside the
-ledger. The SQLite database and any WAL/SHM sidecars are also created or
-migrated to mode `0600`. Override the key location with
-`MODEL_GATEWAY_SESSION_FINGERPRINT_KEY_FILE`. Back up this file with the ledger;
-losing or rotating it intentionally breaks longitudinal session correlation.
-An invalid or group/world-readable key disables fingerprinting rather than
-falling back to an unstable key.
-
-Authenticated `GET /admin/api/usage` responses include `cache_retention`, which
-reports session coverage, long/short request counts, and conservative 5–60
-minute same-session cold-rewrite candidates. A candidate requires contiguous
-successful short-retention requests, reported cache activity on the predecessor,
-then `cached_read_tokens = 0` and `cache_write_tokens > 0` on the current
-request. Ordering uses request ingress time, not response completion. The
-fingerprint itself is excluded from
-`/admin/api/requests` and every aggregate response. Existing ledger rows remain
-valid after the additive schema migration but have no session fingerprint.
 
 ## Provider config
 

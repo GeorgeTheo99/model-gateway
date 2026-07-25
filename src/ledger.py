@@ -16,15 +16,9 @@ table_info`` and adds missing columns.
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
-import logging
 import os
-import re
-import secrets
 import sqlite3
-import stat
 import threading
 import time
 import uuid
@@ -35,95 +29,18 @@ from src.usage import CostEstimate, Usage
 
 _DEFAULT_LEDGER_DIR = Path.home() / "srv" / "model-gateway" / "shared"
 _DEFAULT_LEDGER_PATH = _DEFAULT_LEDGER_DIR / "ledger.db"
-_SESSION_FINGERPRINT_KEY_BYTES = 32
-_SESSION_FINGERPRINT_KEY_NAME = "session-fingerprint.key"
-_MAX_SESSION_ID_CHARS = 2048
-_SESSION_FINGERPRINT_RE = re.compile(r"^h1:[0-9a-f]{64}$")
-_SESSION_SOURCES = frozenset({
-    "x-session-affinity",
-    "x-session-id",
-    "session_id",
-    "x-client-request-id",
-    "prompt_cache_key",
-})
-_CACHE_RETENTIONS = frozenset({"short", "long"})
 
 _lock = threading.Lock()
-log = logging.getLogger("model-gateway.ledger")
 
 # Columns added after the initial schema. Each is checked/applied on startup
 # so older ledger.db files upgrade in place.
 _ADDITIVE_COLUMNS: dict[str, str] = {
     "cache_write_1h_tokens": "INTEGER NOT NULL DEFAULT 0",
-    "request_started_at": "REAL",
-    "session_fingerprint": "TEXT",
-    "session_source": "TEXT",
-    "cache_retention_requested": "TEXT",
 }
 
 
 def ledger_path() -> Path:
     return Path(os.environ.get("MODEL_GATEWAY_LEDGER_PATH", str(_DEFAULT_LEDGER_PATH)))
-
-
-def session_fingerprint_key_path() -> Path:
-    """Return the stable local HMAC key path used for session pseudonyms."""
-    configured = os.environ.get("MODEL_GATEWAY_SESSION_FINGERPRINT_KEY_FILE")
-    if configured:
-        return Path(configured).expanduser()
-    return ledger_path().with_name(_SESSION_FINGERPRINT_KEY_NAME)
-
-
-def _load_or_create_session_fingerprint_key() -> bytes | None:
-    """Load a private stable key, creating it once with mode 0600.
-
-    Invalid or permissive key files disable fingerprinting rather than falling
-    back to an ephemeral key that would silently corrupt longitudinal metrics.
-    """
-    path = session_fingerprint_key_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            pass
-        else:
-            with os.fdopen(fd, "wb") as fh:
-                fh.write(secrets.token_bytes(_SESSION_FINGERPRINT_KEY_BYTES))
-                fh.flush()
-                os.fsync(fh.fileno())
-
-        mode = stat.S_IMODE(path.stat().st_mode)
-        if mode & 0o077:
-            log.warning(
-                "session fingerprint key has unsafe permissions %o; expected 600: %s",
-                mode,
-                path,
-            )
-            return None
-        key = path.read_bytes()
-        if len(key) != _SESSION_FINGERPRINT_KEY_BYTES:
-            log.warning(
-                "session fingerprint key must contain exactly %d bytes: %s",
-                _SESSION_FINGERPRINT_KEY_BYTES,
-                path,
-            )
-            return None
-        return key
-    except OSError as exc:
-        log.warning("session fingerprinting disabled: %s", exc)
-        return None
-
-
-def session_fingerprint(session_id: str | None) -> str | None:
-    """Return a stable HMAC pseudonym without retaining the raw session id."""
-    if not isinstance(session_id, str) or not session_id or len(session_id) > _MAX_SESSION_ID_CHARS:
-        return None
-    key = _load_or_create_session_fingerprint_key()
-    if key is None:
-        return None
-    digest = hmac.new(key, session_id.encode("utf-8", errors="surrogatepass"), hashlib.sha256).hexdigest()
-    return f"h1:{digest}"
 
 
 def _restrict_sqlite_permissions(path: Path) -> None:
@@ -165,7 +82,6 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS requests (
             id TEXT PRIMARY KEY,
             ts REAL NOT NULL,
-            request_started_at REAL,
             endpoint TEXT NOT NULL,
             method TEXT NOT NULL,
             model TEXT,
@@ -184,9 +100,6 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             cost_usd REAL,
             pricing_complete INTEGER NOT NULL DEFAULT 0,
             missing_pricing_classes TEXT,
-            session_fingerprint TEXT,
-            session_source TEXT,
-            cache_retention_requested TEXT,
             error TEXT
         )
         """
@@ -199,18 +112,12 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     for col, decl in _ADDITIVE_COLUMNS.items():
         if col not in cols:
             conn.execute(f"ALTER TABLE requests ADD COLUMN {col} {decl}")
-    # This index must be created after additive migration on existing ledgers.
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_requests_session_model_started "
-        "ON requests(session_fingerprint, model, request_started_at, ts)"
-    )
 
 
 def init() -> None:
-    """Create the schema and stable session-fingerprint key if needed."""
+    """Create the schema if needed. Safe to call at startup."""
     with _lock, _connect() as conn:
         _ensure_schema(conn)
-    _load_or_create_session_fingerprint_key()
 
 
 def record(
@@ -225,10 +132,6 @@ def record(
     is_stream: bool,
     usage: Usage,
     cost: CostEstimate,
-    request_started_at: float | None = None,
-    session_fingerprint: str | None = None,
-    session_source: str | None = None,
-    cache_retention_requested: str | None = None,
     error: str | None = None,
 ) -> str:
     """Insert one ledger row. Best-effort: logs and never raises.
@@ -237,33 +140,23 @@ def record(
     caller before insertion).
     """
     rid = uuid.uuid4().hex
-    if session_fingerprint is not None and not _SESSION_FINGERPRINT_RE.fullmatch(session_fingerprint):
-        # Enforce pseudonymization at the persistence boundary. Never log the
-        # rejected value because an internal caller may have passed a raw id.
-        session_fingerprint = None
-    if session_fingerprint is None or session_source not in _SESSION_SOURCES:
-        session_source = None
-    if cache_retention_requested not in _CACHE_RETENTIONS:
-        cache_retention_requested = None
     try:
         with _lock, _connect() as conn:
             _ensure_schema(conn)
             conn.execute(
                 """
                 INSERT INTO requests (
-                    id, ts, request_started_at, endpoint, method, model, provider, provider_model_id,
+                    id, ts, endpoint, method, model, provider, provider_model_id,
                     status, latency_ms, is_stream,
                     input_tokens, output_tokens, cached_read_tokens,
                     cache_write_tokens, cache_write_1h_tokens, reasoning_tokens,
                     usage_reported, cost_usd, pricing_complete,
-                    missing_pricing_classes, session_fingerprint, session_source,
-                    cache_retention_requested, error
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    missing_pricing_classes, error
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     rid,
                     time.time(),
-                    request_started_at,
                     endpoint,
                     method,
                     model,
@@ -282,9 +175,6 @@ def record(
                     cost.cost_usd,
                     1 if cost.pricing_complete else 0,
                     json.dumps(cost.missing_classes) if cost.missing_classes else None,
-                    session_fingerprint,
-                    session_source,
-                    cache_retention_requested,
                     error,
                 ),
             )
@@ -434,119 +324,17 @@ def summary(*, since: float | None = None, until: float | None = None, models: l
     return d
 
 
-def cache_retention_analysis(
-    *,
-    since: float | None = None,
-    until: float | None = None,
-    min_gap_seconds: float = 300,
-    max_gap_seconds: float = 3600,
-) -> dict:
-    """Aggregate conservative Anthropic short-cache rewrite candidates.
-
-    Ordering uses request ingress time rather than response/stream completion.
-    ``LAG`` sees every successful same-session/model request, including long or
-    usage-unreported requests and a predecessor just before ``since``. A gap is
-    eligible only when both contiguous requests selected short retention and
-    the predecessor reported real cache activity. Fingerprints never leave SQL.
-    """
-    if min_gap_seconds < 0 or max_gap_seconds < min_gap_seconds:
-        raise ValueError("gap window must satisfy 0 <= min_gap_seconds <= max_gap_seconds")
-    scan_since = since - max_gap_seconds if since is not None else None
-    sql = """
-        WITH raw_observed AS (
-            SELECT
-                *,
-                COALESCE(request_started_at, ts) AS event_ts
-            FROM requests
-            WHERE session_fingerprint IS NOT NULL
-              AND endpoint = '/v1/messages'
-              AND provider = 'anthropic'
-              AND status >= 200 AND status < 300
-              AND error IS NULL
-        ),
-        scan_observed AS (
-            SELECT * FROM raw_observed
-            WHERE (:scan_since IS NULL OR event_ts >= :scan_since)
-              AND (:until IS NULL OR event_ts < :until)
-        ),
-        ordered AS (
-            SELECT
-                *,
-                LAG(event_ts) OVER (
-                    PARTITION BY session_fingerprint, model ORDER BY event_ts, ts, id
-                ) AS previous_ts,
-                LAG(cache_retention_requested) OVER (
-                    PARTITION BY session_fingerprint, model ORDER BY event_ts, ts, id
-                ) AS previous_retention,
-                LAG(usage_reported) OVER (
-                    PARTITION BY session_fingerprint, model ORDER BY event_ts, ts, id
-                ) AS previous_usage_reported,
-                LAG(cached_read_tokens + cache_write_tokens + cache_write_1h_tokens) OVER (
-                    PARTITION BY session_fingerprint, model ORDER BY event_ts, ts, id
-                ) AS previous_cache_tokens
-            FROM scan_observed
-        ),
-        observed_window AS (
-            SELECT * FROM ordered
-            WHERE (:since IS NULL OR event_ts >= :since)
-        ),
-        short_requests AS (
-            SELECT * FROM observed_window
-            WHERE cache_retention_requested = 'short' AND usage_reported = 1
-        )
-        SELECT
-            (SELECT COUNT(*) FROM observed_window) AS session_observed_requests,
-            (SELECT COUNT(*) FROM observed_window WHERE cache_retention_requested = 'long') AS long_requests,
-            COUNT(*) AS short_requests,
-            COUNT(DISTINCT session_fingerprint || char(0) || COALESCE(model, '')) AS short_sessions,
-            COALESCE(SUM(CASE
-                WHEN previous_ts IS NOT NULL
-                 AND previous_retention = 'short'
-                 AND previous_usage_reported = 1
-                 AND previous_cache_tokens > 0
-                 AND event_ts - previous_ts >= :min_gap
-                 AND event_ts - previous_ts <= :max_gap
-                THEN 1 ELSE 0 END), 0) AS eligible_gap_requests,
-            COALESCE(SUM(CASE
-                WHEN previous_ts IS NOT NULL
-                 AND previous_retention = 'short'
-                 AND previous_usage_reported = 1
-                 AND previous_cache_tokens > 0
-                 AND event_ts - previous_ts >= :min_gap
-                 AND event_ts - previous_ts <= :max_gap
-                 AND cached_read_tokens = 0 AND cache_write_tokens > 0
-                THEN 1 ELSE 0 END), 0) AS rewrite_after_gap_requests,
-            COALESCE(SUM(CASE
-                WHEN previous_ts IS NOT NULL
-                 AND previous_retention = 'short'
-                 AND previous_usage_reported = 1
-                 AND previous_cache_tokens > 0
-                 AND event_ts - previous_ts >= :min_gap
-                 AND event_ts - previous_ts <= :max_gap
-                 AND cached_read_tokens = 0 AND cache_write_tokens > 0
-                THEN cache_write_tokens ELSE 0 END), 0) AS rewrite_after_gap_tokens
-        FROM short_requests
-    """
-    query_params = {
-        "scan_since": scan_since,
-        "since": since,
-        "until": until,
-        "min_gap": min_gap_seconds,
-        "max_gap": max_gap_seconds,
-    }
-    with _lock, _connect() as conn:
-        _ensure_schema(conn)
-        row = conn.execute(sql, query_params).fetchone()
-    result = dict(row) if row is not None else {}
-    result["min_gap_seconds"] = min_gap_seconds
-    result["max_gap_seconds"] = max_gap_seconds
-    return result
-
-
 def _row_to_dict(row: sqlite3.Row) -> dict:
     d = dict(row)
-    fingerprint = d.pop("session_fingerprint", None)
-    d["session_observed"] = fingerprint is not None
+    # Older ledgers may retain dormant cache-observability columns. Never
+    # expose their historical session metadata through recent-request APIs.
+    for column in (
+        "request_started_at",
+        "session_fingerprint",
+        "session_source",
+        "cache_retention_requested",
+    ):
+        d.pop(column, None)
     if d.get("missing_pricing_classes"):
         try:
             d["missing_pricing_classes"] = json.loads(d["missing_pricing_classes"])
