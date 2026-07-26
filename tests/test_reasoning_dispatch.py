@@ -277,6 +277,48 @@ def test_opus_5_rejects_unsupported_minimal_effort():
         )
 
 
+def test_fable_5_rejects_unsupported_minimal_effort():
+    with pytest.raises(server_module.ThinkingValidationError, match="Thinking level 'minimal'"):
+        _run(
+            "anthropic",
+            {"messages": [], "reasoning_effort": "minimal"},
+            thinking="always",
+            thinking_levels=("low", "medium", "high", "xhigh", "max"),
+            provider="anthropic",
+            provider_model_id="claude-fable-5",
+        )
+
+
+def test_adaptive_anthropic_strips_fixed_sampling_fields_when_thinking_enabled():
+    info = _info(
+        "anthropic",
+        thinking_levels=("low", "medium", "high", "xhigh", "max"),
+        provider="anthropic",
+        provider_model_id="claude-fable-5",
+    )
+    body = {
+        "messages": [],
+        "reasoning_effort": "high",
+        "temperature": 0,
+        "top_p": 0.9,
+    }
+
+    assert _apply_gateway_reasoning(body, info, target_api="messages") is True
+    assert "temperature" not in body
+    assert "top_p" not in body
+    assert body["thinking"] == {"type": "adaptive"}
+    assert body["output_config"] == {"effort": "high"}
+
+
+def test_adaptive_anthropic_opus_ids_match_provider_model_ids():
+    # The adaptive set is matched against info.provider_model_id (hyphenated),
+    # not the catalog name (dotted). Keep the two in sync with provider_model_id.
+    assert server_module._uses_adaptive_anthropic_thinking("claude-fable-5") is True
+    assert server_module._uses_adaptive_anthropic_thinking("claude-opus-5") is True
+    assert server_module._uses_adaptive_anthropic_thinking("claude-opus-4-7") is True
+    assert server_module._uses_adaptive_anthropic_thinking("claude-opus-4-8") is True
+
+
 def test_unknown_or_overridden_unsupported_level_is_never_silently_dropped():
     with pytest.raises(server_module.ThinkingValidationError, match="Unknown thinking level"):
         _run("openai", {"messages": [], "reasoning_effort": "turbo"}, thinking="optional")

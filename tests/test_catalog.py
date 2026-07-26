@@ -312,6 +312,21 @@ def test_committed_kimi_onboarding_profile_is_strict_max_only():
     assert entries["kimi-k3"]["thinking_levels"] == ["max"]
 
 
+def test_fable_5_explicit_levels_exclude_unsupported_values(tmp_path):
+    mi = tmp_path / "model-info.json"
+    _write_model_info(mi, [{
+        "name": "claude-fable-5",
+        "provider": "anthropic",
+        "thinking": "always",
+        "thinking_levels": ["low", "medium", "high", "xhigh", "max"],
+    }])
+
+    entry = catalog.load_catalog_entries(mi)[0]
+    assert entry["thinking_levels"] == ["low", "medium", "high", "xhigh", "max"]
+    assert "minimal" not in entry["thinking_levels"]
+    assert "off" not in entry["thinking_levels"]
+
+
 def test_routable_ids_includes_alternate_ids():
     ids = catalog.entry_routable_ids(
         {"name": "n", "alias": "a", "provider_model_id": "pm", "omlx_id": "omlx", "alternate_ids": ["x", "y"]}

@@ -1388,6 +1388,8 @@ def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat") -> bool:
                     "type": "enabled",
                     "budget_tokens": _reasoning_budget(req, effort, budget, info),
                 }
+            for key in ("temperature", "top_p"):
+                req.pop(key, None)
         return bool(enabled)
 
     if fmt == "openrouter":
