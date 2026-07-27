@@ -115,7 +115,8 @@ input/output per 1M tokens. No cache fields. Match by `provider_model_id`
 **ZhipuAI (`zhipuai`)**: the BigModel pricing page
 (https://open.bigmodel.cn/pricing) lists GLM models in CNY per 1M tokens.
 Convert CNY→USD at the current rate and note the conversion date in the commit
-message. `glm-5-turbo` and `glm-5.1` are the relevant IDs.
+message. `glm-5-turbo` is the current relevant ID; the former `glm-5.1` route
+was retired from this gateway catalog.
 
 ## Model → provider → upstream lookup (current catalog)
 
@@ -130,7 +131,7 @@ Use this to know which source to read for each model. Regenerate with:
 | gpt-5.4 | openai | gpt-5.4 | openai |
 | gpt-5.4-mini | openai | gpt-5.4-mini | openai |
 | deepseek-v4-pro-fw | fireworks | accounts/fireworks/models/deepseek-v4-pro | fireworks |
-| glm-5.1-fw | fireworks | accounts/fireworks/models/glm-5p1 | fireworks |
+| glm-5.2-fw | fireworks | accounts/fireworks/models/glm-5p2 | fireworks |
 | kimi-k3 | moonshot | kimi-k3 | Moonshot K3 pricing |
 | minimax-m3-fw | fireworks | accounts/fireworks/models/minimax-m3 | fireworks |
 | qwen3.7-plus-fw | fireworks | accounts/fireworks/models/qwen3p7-plus | fireworks |
@@ -139,5 +140,4 @@ Use this to know which source to read for each model. Regenerate with:
 | gemini-3-flash | openrouter | google/gemini-3-flash-preview | openrouter API |
 | gemini-3.5-flash | openrouter | google/gemini-3.5-flash | openrouter API |
 | glm-5.2-zai | zai_coding | glm-5.2 | z.ai |
-| glm-5.1-zai | zhipuai | glm-5.1 | zhipuai (CNY→USD) |
 | glm-5-zai-turbo | zhipuai | glm-5-turbo | zhipuai (CNY→USD) |

@@ -233,9 +233,6 @@ Clients that will break until updated:
 6. **Cost dashboard** ✅ (v1)
    - Pricing in model-info.json `pricing` field, per-provider/model breakdown,
      windowed aggregates, recent-requests table. Streaming usage supported.
-   - Follow-up: price the 8 unpriced cloud models (deepseek-v4-flash-or,
-     kimi-k2.7-code-fw, minimax-m3-fw, glm-5.2-zai, glm-5.1-zai, glm-5-turbo,
-     gpt-5.4, gpt-5.4-mini) so their costs stop recording as unknown.
 7. **Adapter refactor**
    - Move provider-specific behavior out of route bodies incrementally.
 
