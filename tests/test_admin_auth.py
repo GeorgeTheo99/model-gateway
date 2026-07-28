@@ -3,6 +3,7 @@ import json
 from fastapi.testclient import TestClient
 
 import src.admin as admin_module
+import src.auth as auth_module
 import src.providers as providers
 from src.server import app
 
@@ -23,6 +24,87 @@ def test_v1_auth_requires_configured_client_key(monkeypatch):
     assert client.get("/v1/models", headers={"Authorization": "Bearer bad"}).status_code == 401
     assert client.get("/v1/models", headers={"Authorization": "Bearer good-key"}).status_code == 200
     assert client.get("/v1/models", headers={"x-api-key": "good-key"}).status_code == 200
+
+
+def test_v1_auth_accepts_private_client_key_file(monkeypatch, tmp_path):
+    key_file = tmp_path / "client.keys"
+    key_file.write_text("file-key\n")
+    key_file.chmod(0o600)
+    monkeypatch.delenv("MODEL_GATEWAY_CLIENT_KEYS", raising=False)
+    monkeypatch.setenv("MODEL_GATEWAY_CLIENT_KEYS_FILE", str(key_file))
+
+    assert client.get("/v1/models").status_code == 401
+    response = client.get(
+        "/v1/models",
+        headers={"Authorization": "Bearer file-key"},
+    )
+    assert response.status_code == 200
+
+
+def test_v1_auth_file_misconfiguration_fails_closed(monkeypatch, tmp_path):
+    key_file = tmp_path / "client.keys"
+    key_file.write_text("exposed-key\n")
+    key_file.chmod(0o644)
+    monkeypatch.setenv("MODEL_GATEWAY_CLIENT_KEYS", "fallback-key")
+    monkeypatch.setenv("MODEL_GATEWAY_CLIENT_KEYS_FILE", str(key_file))
+
+    response = client.get(
+        "/v1/models",
+        headers={"Authorization": "Bearer fallback-key"},
+    )
+
+    assert response.status_code == 503
+    assert "misconfigured" in response.json()["detail"]
+
+
+def test_client_key_file_rejects_unsafe_and_invalid_paths(monkeypatch, tmp_path):
+    missing = tmp_path / "missing.keys"
+    empty = tmp_path / "empty.keys"
+    empty.write_text("")
+    empty.chmod(0o600)
+    oversized = tmp_path / "oversized.keys"
+    oversized.write_text("x" * 65537)
+    oversized.chmod(0o600)
+    target = tmp_path / "target.keys"
+    target.write_text("target-key\n")
+    target.chmod(0o600)
+    symlink = tmp_path / "linked.keys"
+    symlink.symlink_to(target)
+    fifo = tmp_path / "fifo.keys"
+    fifo.parent.mkdir(parents=True, exist_ok=True)
+    import os
+    os.mkfifo(fifo, 0o600)
+
+    for path in (missing, empty, oversized, symlink, fifo):
+        with monkeypatch.context() as scoped:
+            scoped.setenv("MODEL_GATEWAY_CLIENT_KEYS_FILE", str(path))
+            keys, valid = auth_module._key_file_values("MODEL_GATEWAY_CLIENT_KEYS_FILE")
+            assert keys == set()
+            assert valid is False
+
+
+def test_client_key_file_uses_one_open_inode_snapshot(monkeypatch, tmp_path):
+    key_file = tmp_path / "client.keys"
+    key_file.write_text("original-key\n")
+    key_file.chmod(0o600)
+    replacement = tmp_path / "replacement.keys"
+    replacement.write_text("replacement-key\n")
+    replacement.chmod(0o600)
+    real_open = auth_module.os.open
+
+    def swapping_open(path, flags):
+        fd = real_open(path, flags)
+        replacement.replace(key_file)
+        return fd
+
+    monkeypatch.setenv("MODEL_GATEWAY_CLIENT_KEYS_FILE", str(key_file))
+    monkeypatch.setattr(auth_module.os, "open", swapping_open)
+
+    keys, valid = auth_module._key_file_values("MODEL_GATEWAY_CLIENT_KEYS_FILE")
+
+    assert valid is True
+    assert keys == {"original-key"}
+    assert key_file.read_text().strip() == "replacement-key"
 
 
 def test_v1_auth_accepts_admin_key(monkeypatch):

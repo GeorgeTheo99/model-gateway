@@ -82,15 +82,24 @@ Do not use that when the gateway is reachable beyond trusted local development.
 
 Protects client/model APIs.
 
-- Affects: `/v1/models`, `/v1/debug/thinking`, `/v1/chat/completions`, `/v1/messages`, `/v1/responses`
+- Affects: `/v1/models`, `/v1/models/canonical`, `/v1/debug/thinking`, `/v1/chat/completions`, `/v1/messages`, `/v1/responses`
 - Does not affect: `/health`
-- Format: comma-separated accepted tokens.
+- Format: comma-separated accepted tokens, or a private key file selected by `MODEL_GATEWAY_CLIENT_KEYS_FILE`.
 
-Recommended least-breakage value when enabling client auth:
+Recommended portable value when enabling client auth:
 
 ```bash
 MODEL_GATEWAY_CLIENT_KEYS=cloud
 ```
+
+Full server deployments instead generate a mode-`0600` per-host key under the
+model-gateway shared runtime tree and set `MODEL_GATEWAY_CLIENT_KEYS_FILE` in
+the LaunchAgent. This keeps the generated credential itself out of readable
+plist files. The file may contain multiple newline-separated keys; the current
+server profile temporarily retains the historical `cloud` token for existing
+Pi/my-ai clients while Home Automation uses the generated first-line key. An
+explicitly configured but unreadable, symlinked, permissive, empty, or oversized
+key file fails closed with HTTP `503`.
 
 Clients must then send one of:
 
@@ -100,6 +109,13 @@ x-api-key: cloud
 ```
 
 Admin keys are also accepted on `/v1/*`, so an admin token can be used for debugging.
+
+`GET /v1/models/canonical` is the client-safe logical inventory for selectors and
+catalog consumers. Unlike alias-expanded `/v1/models`, it returns one row per
+logical model, includes unavailable models with sanitized availability reasons,
+and exposes only canonical IDs, safe capabilities, and cloud preset metadata.
+It never returns provider-native IDs, filesystem paths, pricing, credentials, or
+federated imports.
 
 ## Federation peer auth
 
@@ -192,4 +208,5 @@ Live service smoke check:
 curl -fsS http://127.0.0.1:9111/health
 curl -i http://127.0.0.1:9111/admin/api/status                       # 401 without key
 curl -fsS -H "Authorization: Bearer cloud" http://127.0.0.1:9111/v1/models | jq '.data | length'
+curl -fsS -H "Authorization: Bearer cloud" http://127.0.0.1:9111/v1/models/canonical | jq '.data | length'
 ```

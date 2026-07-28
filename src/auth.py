@@ -1,8 +1,8 @@
 """Inbound gateway authentication helpers.
 
 Auth is intentionally opt-in for trusted local clients. Set
-MODEL_GATEWAY_CLIENT_KEYS to protect /v1/* and MODEL_GATEWAY_ADMIN_KEY to
-protect /admin/api/*. Both may also be configured in config.yaml under an
+MODEL_GATEWAY_CLIENT_KEYS (or MODEL_GATEWAY_CLIENT_KEYS_FILE) to protect
+/v1/* and MODEL_GATEWAY_ADMIN_KEY to protect /admin/api/*. Both may also be configured in config.yaml under an
 ``auth`` section (``admin_keys`` / ``client_keys`` lists, or a comma-separated
 string); env vars take precedence over config.
 """
@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import os
 import secrets
+import stat
 from dataclasses import dataclass
+from pathlib import Path
 
 from fastapi import HTTPException, Request
 
@@ -55,11 +57,54 @@ def _config_keys(field: str) -> set[str]:
     return set()
 
 
-def _client_keys() -> set[str]:
-    # Env takes precedence so operators can override without editing config,
-    # but config.yaml is the canonical home for secrets (it is gitignored and
-    # already holds provider API keys).
+def _key_file_values(env_name: str) -> tuple[set[str], bool]:
+    configured = os.environ.get(env_name, "").strip()
+    if not configured:
+        return set(), True
+    path = Path(configured).expanduser()
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return set(), False
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) & 0o077:
+            return set(), False
+        if metadata.st_size > 65536:
+            return set(), False
+        with os.fdopen(fd, "r", closefd=False) as handle:
+            raw = handle.read(65537)
+    except (OSError, UnicodeError):
+        return set(), False
+    finally:
+        os.close(fd)
+    if len(raw.encode("utf-8")) > 65536:
+        return set(), False
+    keys = _split_keys(raw.replace("\n", ","))
+    return keys, bool(keys)
+
+
+def _client_auth_configured() -> bool:
+    return bool(
+        os.environ.get("MODEL_GATEWAY_CLIENT_KEYS", "").strip()
+        or os.environ.get("MODEL_GATEWAY_CLIENT_KEYS_FILE", "").strip()
+        or _config_keys("client_keys")
+    )
+
+
+def _client_keys(*, file_keys: set[str] | None = None) -> set[str]:
+    # Runtime key files keep generated per-host credentials out of LaunchAgent
+    # plists while config.yaml remains supported for portable installations.
     keys = _split_keys(os.environ.get("MODEL_GATEWAY_CLIENT_KEYS"))
+    if file_keys is None:
+        file_keys, _valid = _key_file_values("MODEL_GATEWAY_CLIENT_KEYS_FILE")
+    keys |= file_keys
     keys |= _config_keys("client_keys")
     return keys
 
@@ -109,12 +154,18 @@ def admin_writes_enabled() -> bool:
 
 
 def auth_mode() -> AuthMode:
-    client_keys = _client_keys()
+    file_keys, file_valid = _key_file_values("MODEL_GATEWAY_CLIENT_KEYS_FILE")
+    client_keys = _client_keys(file_keys=file_keys)
     admin_keys = _admin_keys()
     unsafe_admin = _unsafe_admin_without_key_enabled()
     warning = ""
-    if not client_keys:
-        warning = "/v1 client auth is disabled; set MODEL_GATEWAY_CLIENT_KEYS before exposing beyond trusted local clients."
+    if not file_valid:
+        warning = "/v1 client auth is misconfigured; the configured client key file is unreadable or invalid."
+    elif not client_keys:
+        if _client_auth_configured():
+            warning = "/v1 client auth is misconfigured; the configured client key source is unreadable or invalid."
+        else:
+            warning = "/v1 client auth is disabled; set MODEL_GATEWAY_CLIENT_KEYS before exposing beyond trusted local clients."
     if not admin_keys:
         if unsafe_admin:
             admin_warning = "/admin/api is unauthenticated because MODEL_GATEWAY_ALLOW_UNAUTHENTICATED_ADMIN is enabled."
@@ -138,8 +189,19 @@ def require_client_auth(request: Request) -> None:
     Admin keys are accepted as client keys too, so the admin UI can inspect
     existing /v1 debug endpoints with one token.
     """
-    keys = _client_keys()
+    file_keys, file_valid = _key_file_values("MODEL_GATEWAY_CLIENT_KEYS_FILE")
+    if not file_valid:
+        raise HTTPException(
+            status_code=503,
+            detail="model-gateway client authentication is misconfigured",
+        )
+    keys = _client_keys(file_keys=file_keys)
     if not keys:
+        if _client_auth_configured():
+            raise HTTPException(
+                status_code=503,
+                detail="model-gateway client authentication is misconfigured",
+            )
         return
     token = _extract_token(request)
     if _matches(token, keys) or _matches(token, _admin_keys()):

@@ -1062,6 +1062,7 @@ def effective_model_inventory() -> list[dict]:
     """
     result = []
     seen_entries: set[int] = set()
+    config = _load_config()
     for entry in _load_models().values():
         identity = id(entry)
         if identity in seen_entries:
@@ -1076,7 +1077,9 @@ def effective_model_inventory() -> list[dict]:
         row["available"] = bool(availability.get("available"))
         row["availability_reason"] = availability.get("reason", "")
         row["availability_message"] = availability.get("message", "")
-        row["effective_provider"] = availability.get("provider") or _pool_members(row, _load_config())[0]
+        row["declared_providers"] = _pool_members(row, config)
+        row["candidate_providers"] = _configured_pool_members(row, config)
+        row["effective_provider"] = availability.get("provider") or row["declared_providers"][0]
         result.append(row)
     return result
 

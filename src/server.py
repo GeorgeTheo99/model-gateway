@@ -27,7 +27,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from src.admin import router as admin_router
 from src.auth import require_client_auth
 from src.errors import upstream_error, upstream_error_openai
-from src.providers import list_available_models, list_models as list_routable_models, model_availability, pool_candidates, pricing_for, pricing_status_for, provider_quirks, resolve, snapshot_registry as snapshot_provider_registry
+from src.providers import effective_model_inventory, list_available_models, list_models as list_routable_models, model_availability, pool_candidates, pricing_for, pricing_status_for, provider_quirks, resolve, snapshot_registry as snapshot_provider_registry
 from src.upstream import (
     PoolContext,
     _retry_post,
@@ -40,7 +40,7 @@ from src.responses import chat_to_responses, responses_result_events, responses_
 from src.signature_cache import store_from_extra_content
 from src.streaming import _flatten_list_content, translate_stream
 from src.translator import anthropic_to_openai, anthropic_to_openai_chat, openai_chat_to_anthropic, openai_to_anthropic
-from src import catalog, federation, ledger
+from src import catalog, federation, ledger, providers
 from src.usage import (
     anthropic_usage_to_openai_chat as convert_anthropic_usage_to_openai_chat,
     anthropic_usage_to_responses,
@@ -1811,6 +1811,167 @@ def _direct_model_rows() -> list[dict]:
     return data
 
 
+def _bounded_catalog_string(value, *, limit: int = 512) -> str:
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    if any(ord(char) < 32 for char in value):
+        return ""
+    return value[:limit]
+
+
+def _canonical_model_id(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    if not value or len(value) > 256 or any(ord(char) < 32 for char in value):
+        return ""
+    return value
+
+
+def _nonnegative_catalog_int(value: object) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _canonical_model_rows(inventory: list[dict]) -> list[dict]:
+    """Project one safe client row per named logical model, without aliases."""
+    rows = []
+    for model in inventory:
+        model_id = _canonical_model_id(model.get("name"))
+        if not model_id:
+            continue
+        candidates = {
+            catalog.canonical_provider(provider)
+            for provider in model.get("declared_providers") or []
+            if provider
+        }
+        effective_provider = catalog.canonical_provider(
+            model.get("effective_provider") or model.get("provider") or ""
+        )
+        if not candidates and effective_provider:
+            candidates = {effective_provider}
+        scope = "local" if candidates == {"omlx"} else "cloud"
+        owner = effective_provider if len(candidates) <= 1 else "model_gateway"
+        caps = _thinking_capabilities(model)
+        rows.append({
+            "id": model_id,
+            "object": "model",
+            "created": 0,
+            "owned_by": owner,
+            "scope": scope,
+            "available": bool(model.get("available")),
+            "enabled": bool(model.get("enabled", True)),
+            "availability_reason": _bounded_catalog_string(
+                model.get("availability_reason"), limit=128
+            ),
+            # Provider-layer diagnostics can contain aliases or upstream IDs.
+            # Consumers get a stable reason code and render their own message.
+            "availability_message": "",
+            "context_length": _nonnegative_catalog_int(model.get("context")),
+            "max_output_tokens": _nonnegative_catalog_int(model.get("max_output_tokens")),
+            "thinking": caps["thinking"],
+            "thinking_levels": caps["thinking_levels"],
+            "vision": bool(model.get("vision")),
+        })
+    return rows
+
+
+def _canonical_cloud_id_map(inventory: list[dict], rows: list[dict]) -> dict[str, str]:
+    cloud_ids = {row["id"] for row in rows if row["scope"] == "cloud"}
+    result = {}
+    for model in inventory:
+        canonical = _canonical_model_id(model.get("name"))
+        if canonical not in cloud_ids:
+            continue
+        result[canonical] = canonical
+        for route_id in model.get("routable_ids") or []:
+            if isinstance(route_id, str) and route_id.strip():
+                result[route_id.strip()] = canonical
+    return result
+
+
+def _safe_cloud_model_config(value: object, canonical_ids: dict[str, str]) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for key in ("model", "text_model", "vision_model"):
+        if key not in value:
+            continue
+        raw_id = value.get(key)
+        if not isinstance(raw_id, str) or raw_id.strip() not in canonical_ids:
+            return {}
+        result[key] = canonical_ids[raw_id.strip()]
+    if not any(key in result for key in ("model", "text_model", "vision_model")):
+        return {}
+    for key, limit in (("label", 128), ("description", 1024), ("source_policy", 128)):
+        safe_value = _bounded_catalog_string(value.get(key), limit=limit)
+        if safe_value:
+            result[key] = safe_value
+    return result
+
+
+def _canonical_cloud_policy(inventory: list[dict], rows: list[dict]) -> tuple[dict, dict]:
+    """Return only safe cloud preset fields referencing canonical model IDs."""
+    try:
+        document = catalog.load_model_info_document(providers.MODEL_INFO_PATH)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        document = {}
+    if not isinstance(document, dict):
+        document = {}
+    canonical_ids = _canonical_cloud_id_map(inventory, rows)
+
+    raw_auto = document.get("auto_models")
+    raw_auto = raw_auto if isinstance(raw_auto, dict) else {}
+    auto_models: dict = {}
+    cloud_auto = _safe_cloud_model_config(raw_auto.get("cloud"), canonical_ids)
+    if cloud_auto:
+        auto_models["cloud"] = cloud_auto
+        if raw_auto.get("default_scope") == "cloud":
+            auto_models["default_scope"] = "cloud"
+        default_tier = _bounded_catalog_string(raw_auto.get("default_tier"), limit=64)
+        if default_tier:
+            auto_models["default_tier"] = default_tier
+
+    raw_presets = document.get("model_presets")
+    raw_presets = raw_presets if isinstance(raw_presets, dict) else {}
+    model_presets: dict = {}
+    version = raw_presets.get("version")
+    safe_presets = {}
+    presets = raw_presets.get("presets")
+    if isinstance(presets, dict):
+        for raw_tier, raw_config in presets.items():
+            tier = _bounded_catalog_string(raw_tier, limit=64)
+            if not tier or not isinstance(raw_config, dict):
+                continue
+            safe_config = {}
+            for key in ("label", "intent"):
+                value = _bounded_catalog_string(raw_config.get(key))
+                if value:
+                    safe_config[key] = value
+            cloud = _safe_cloud_model_config(raw_config.get("cloud"), canonical_ids)
+            if not cloud:
+                continue
+            safe_config["cloud"] = cloud
+            safe_presets[tier] = safe_config
+    if safe_presets:
+        model_presets["presets"] = safe_presets
+        if isinstance(version, int) and not isinstance(version, bool) and version >= 0:
+            model_presets["version"] = version
+        if raw_presets.get("default_scope") == "cloud":
+            model_presets["default_scope"] = "cloud"
+        default_tier = _bounded_catalog_string(raw_presets.get("default_tier"), limit=64)
+        if default_tier in safe_presets:
+            model_presets["default_tier"] = default_tier
+    if auto_models.get("default_tier") not in safe_presets:
+        auto_models.pop("default_tier", None)
+    return auto_models, model_presets
+
+
 @app.get("/v1/models")
 async def list_models(request: Request):
     require_client_auth(request)
@@ -1818,6 +1979,21 @@ async def list_models(request: Request):
     local_ids = {m.get("id") for m in list_routable_models()}
     data.extend(row for row in federation.manager().imported_rows() if row["id"] not in local_ids)
     return {"object": "list", "data": data}
+
+
+@app.get("/v1/models/canonical")
+async def list_canonical_models(request: Request):
+    """Return one authenticated, safe row per logical gateway model."""
+    require_client_auth(request)
+    inventory = effective_model_inventory()
+    rows = _canonical_model_rows(inventory)
+    auto_models, model_presets = _canonical_cloud_policy(inventory, rows)
+    return {
+        "object": "list",
+        "data": rows,
+        "auto_models": auto_models,
+        "model_presets": model_presets,
+    }
 
 
 @app.get("/v1/federation/catalog")
