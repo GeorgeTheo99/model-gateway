@@ -169,6 +169,59 @@ def test_dispatch_per_format(fmt, target_api, fragment, exp_enabled, exp_view):
     assert view == exp_view
 
 
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_fireworks_always_model_advertises_minimal_but_forwards_low(client, monkeypatch):
+    """Fireworks keeps the canonical minimal level public but receives low."""
+    entry = {
+        "name": "glm-5.2-fw",
+        "provider": "fireworks",
+        "provider_model_id": "accounts/fireworks/models/glm-5p2",
+        "thinking": "always",
+    }
+    monkeypatch.setattr(providers, "_config", {
+        "providers": {"fireworks": {"base_url": "http://up", "api_key": "k"}},
+    })
+    monkeypatch.setattr(providers, "_models", {entry["name"]: entry})
+
+    advertised = client.get("/v1/models")
+    assert advertised.status_code == 200
+    model = next(row for row in advertised.json()["data"] if row["id"] == entry["name"])
+    assert model["thinking_levels"] == ["minimal", "low", "medium", "high", "xhigh", "max"]
+
+    async def fake_passthrough(endpoint, body, headers, **kwargs):
+        assert endpoint == "http://up/chat/completions"
+        assert body["model"] == entry["provider_model_id"]
+        assert body["reasoning_effort"] == "low"
+        assert body["reasoning_effort"] != "minimal"
+        return server_module.JSONResponse(status_code=200, content={"ok": True})
+
+    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough)
+    response = client.post("/v1/chat/completions", json={
+        "model": entry["name"],
+        "messages": [{"role": "user", "content": "hello"}],
+        "reasoning_effort": "minimal",
+    })
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+
+
+@pytest.mark.parametrize("effort,expected", [("max", "xhigh"), ("medium", "medium")])
+def test_fireworks_default_format_preserves_other_effort_mappings(effort, expected):
+    _, view = _run(
+        "",
+        {"messages": [], "reasoning_effort": effort},
+        provider="fireworks",
+        provider_model_id="accounts/fireworks/models/glm-5p2",
+    )
+    assert view["reasoning_effort"] == expected
+
+
+@pytest.mark.parametrize("effort", ["minimal", "low"])
+def test_zai_still_maps_finer_efforts_to_native_high(effort):
+    _, view = _run("zai", {"messages": [], "reasoning_effort": effort})
+    assert view["reasoning_effort"] == "high"
+
+
 # ── contract: optional models get no params unless the client asks ───────────
 
 def test_optional_model_no_control_is_noop():

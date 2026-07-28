@@ -1370,7 +1370,8 @@ def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat") -> bool:
 
     if target_api == "responses" or fmt == "openai-responses":
         if enabled:
-            req["reasoning"] = {"effort": "xhigh" if effort == "max" else effort}
+            forwarded = "low" if effort == "minimal" else ("xhigh" if effort == "max" else effort)
+            req["reasoning"] = {"effort": forwarded}
         elif effort == "off":
             req["reasoning"] = {"effort": "none"}
         return bool(enabled)
@@ -1397,7 +1398,12 @@ def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat") -> bool:
         if budget:
             reasoning["max_tokens"] = budget
         elif effort:
-            reasoning["effort"] = "none" if effort == "off" else "xhigh" if effort == "max" else effort
+            reasoning["effort"] = (
+                "none" if effort == "off"
+                else "low" if effort == "minimal"
+                else "xhigh" if effort == "max"
+                else effort
+            )
         else:
             reasoning["enabled"] = bool(enabled)
         if exclude is not None:
@@ -1455,12 +1461,15 @@ def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat") -> bool:
     if fmt == "deepseek":
         req["thinking"] = {"type": "enabled" if enabled else "disabled"}
         if enabled and effort:
-            req["reasoning_effort"] = "xhigh" if effort == "max" else effort
+            req["reasoning_effort"] = "low" if effort == "minimal" else ("xhigh" if effort == "max" else effort)
         return bool(enabled)
 
-    # Default OpenAI-compatible shape.
+    # Default OpenAI-compatible shape. ``minimal`` is a canonical sub-low
+    # budget level that most OpenAI-compatible providers (notably Fireworks)
+    # do not accept as a literal reasoning_effort; clamp it to ``low``.
     if enabled and effort and effort != "off":
-        req["reasoning_effort"] = "xhigh" if effort == "max" else effort
+        forwarded = "low" if effort == "minimal" else ("xhigh" if effort == "max" else effort)
+        req["reasoning_effort"] = forwarded
     elif effort == "off":
         req["reasoning_effort"] = "none"
     return bool(enabled)
