@@ -258,6 +258,11 @@ def _anthropic_content_from_openai(content) -> str | list:
                     "type": "image",
                     "source": {"type": "base64", "media_type": media_type, "data": data},
                 })
+            elif isinstance(url, str) and url.startswith(("http://", "https://")):
+                blocks.append({
+                    "type": "image",
+                    "source": {"type": "url", "url": url},
+                })
     return blocks or ""
 
 
@@ -277,7 +282,18 @@ def openai_chat_to_anthropic(body: dict) -> dict:
                 system_parts.extend(str(p.get("text", "")) for p in content if isinstance(p, dict) and p.get("type") in {"text", "input_text"})
             continue
         if role == "tool":
-            tool_content = content if isinstance(content, str) else json.dumps(content)
+            if isinstance(content, str):
+                tool_content = content
+            elif isinstance(content, list) and all(
+                isinstance(part, dict) and (
+                    part.get("type") in {"text", "input_text", "image_url", "input_image"}
+                    or "image_url" in part
+                )
+                for part in content
+            ):
+                tool_content = _anthropic_content_from_openai(content)
+            else:
+                tool_content = json.dumps(content)
             messages.append({
                 "role": "user",
                 "content": [{

@@ -753,6 +753,48 @@ def test_openai_chat_anthropic_translation_roundtrip_shapes():
     assert req["tool_choice"] == {"type": "any"}
     assert req["max_tokens"] == 8192
 
+    tool_req = openai_chat_to_anthropic({
+        "messages": [{
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": [
+                {"type": "text", "text": "screenshot"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            ],
+        }],
+    })
+    assert tool_req["messages"] == [{
+        "role": "user",
+        "content": [{
+            "type": "tool_result",
+            "tool_use_id": "call_1",
+            "content": [
+                {"type": "text", "text": "screenshot"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+            ],
+        }],
+    }]
+
+    url_tool_req = openai_chat_to_anthropic({
+        "messages": [{
+            "role": "tool",
+            "tool_call_id": "call_url",
+            "content": [{
+                "type": "image_url",
+                "image_url": {"url": "https://example.test/screenshot.png"},
+            }],
+        }],
+    })
+    assert url_tool_req["messages"][0]["content"][0]["content"] == [{
+        "type": "image",
+        "source": {"type": "url", "url": "https://example.test/screenshot.png"},
+    }]
+
+    json_tool_req = openai_chat_to_anthropic({
+        "messages": [{"role": "tool", "tool_call_id": "call_2", "content": {"ok": True}}],
+    })
+    assert json_tool_req["messages"][0]["content"][0]["content"] == '{"ok": true}'
+
     resp = anthropic_to_openai_chat({
         "content": [{"type": "text", "text": "pong"}],
         "stop_reason": "end_turn",

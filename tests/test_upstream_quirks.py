@@ -279,6 +279,32 @@ def test_inline_image_only_quirk_rejects_public_url_and_accepts_data_url():
     assert _apply_openai_request_quirks(inline, info) is None
 
 
+def test_anthropic_tool_result_blocks_rewrites_only_tool_images():
+    info = SimpleNamespace(quirks=frozenset({"anthropic_tool_result_blocks"}))
+    user_image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,USER"}}
+    req = {"messages": [
+        {"role": "user", "content": [user_image]},
+        {"role": "tool", "tool_call_id": "call_1", "content": [
+            {"type": "text", "text": "inline screenshot"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            {"type": "image_url", "image_url": {"url": "https://example.test/screenshot.png"}},
+        ]},
+    ]}
+
+    assert _apply_openai_request_quirks(req, info) is None
+
+    assert req["messages"][0]["content"][0] == user_image
+    assert req["messages"][1]["content"] == [
+        {"type": "text", "text": "inline screenshot"},
+        {"type": "image", "source": {
+            "type": "base64", "media_type": "image/png", "data": "AAAA",
+        }},
+        {"type": "image", "source": {
+            "type": "url", "url": "https://example.test/screenshot.png",
+        }},
+    ]
+
+
 def test_per_model_quirks_merge_with_provider_quirks(tmp_config):
     _write_config(tmp_config, """
 providers:

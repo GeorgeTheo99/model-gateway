@@ -317,6 +317,7 @@ Supported reusable request quirks are:
 - `drop_fixed_sampling_fields`
 - `named_tool_choice_as_required`
 - `inline_image_urls_only`
+- `anthropic_tool_result_blocks`
 
 Provider-specific request code should only be added when the upstream cannot
 be described by these generic compatibility flags.

@@ -533,6 +533,32 @@ def _apply_openai_request_quirks(req: dict, info) -> str | None:
                             valid_inline = False
                     if not valid_inline:
                         return "This model accepts inline data:image URLs only; external or malformed image URLs are not supported."
+
+    if "anthropic_tool_result_blocks" in quirks:
+        messages = req.get("messages")
+        if isinstance(messages, list):
+            for message in messages:
+                if not isinstance(message, dict) or message.get("role") != "tool":
+                    continue
+                content = message.get("content")
+                if not isinstance(content, list):
+                    continue
+                for index, part in enumerate(content):
+                    if not isinstance(part, dict) or part.get("type") not in {"image_url", "input_image"}:
+                        continue
+                    url = _image_url_value(part)
+                    if not url:
+                        continue
+                    if url.startswith("data:image/") and ";base64," in url:
+                        header, data = url.split(";base64,", 1)
+                        source = {
+                            "type": "base64",
+                            "media_type": header.removeprefix("data:") or "image/png",
+                            "data": data,
+                        }
+                    else:
+                        source = {"type": "url", "url": url}
+                    content[index] = {"type": "image", "source": source}
     return None
 
 

@@ -47,6 +47,7 @@ ALLOWED_QUIRKS = {
     "drop_fixed_sampling_fields",
     "named_tool_choice_as_required",
     "inline_image_urls_only",
+    "anthropic_tool_result_blocks",
 }
 ALLOWED_PRICING_FIELDS = {
     "input", "output", "cache_read", "cache_write", "cache_write_1h", "reasoning",

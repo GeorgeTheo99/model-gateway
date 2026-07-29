@@ -112,6 +112,7 @@ providers:
   #   #   drop_fixed_sampling_fields   -> omit fixed sampling parameters
   #   #   named_tool_choice_as_required -> keep only the named tool, then require a tool call
   #   #   inline_image_urls_only       -> reject public HTTP(S) image URLs
+  #   #   anthropic_tool_result_blocks -> use Anthropic image tags inside OpenAI tool results
   #   quirks:
   #     - no_stream_options
   #     - no_reasoning_params
