@@ -604,8 +604,11 @@ async def refresh_oauth_token(provider: str, *, force: bool = False) -> str | No
         _last_token_refresh_attempt[provider] = now
 
         profile = entry.get("auth_profile", "")
-        # --host wants the workspace origin, not a path under it.
-        host = base_url.split("/serving-endpoints")[0] if base_url else ""
+        # --host wants the workspace origin, not an AI Gateway hostname or a
+        # path under /serving-endpoints. AI Gateway providers can set
+        # workspace_url specifically for auth/probes.
+        workspace_url = (entry.get("workspace_url") or "").rstrip("/")
+        host = workspace_url or (base_url.split("/serving-endpoints")[0] if base_url else "")
         cli_args = ["--profile", profile] if profile else ["--host", host]
 
         async def run_token() -> tuple[int, bytes, bytes]:

@@ -726,6 +726,56 @@ def test_refresh_oauth_token_runs_browser_sso_when_cli_cache_is_broken(tmp_confi
     assert "api_key: eyJnew" in text
 
 
+def test_refresh_oauth_token_uses_workspace_url_for_ai_gateway_login(tmp_config, monkeypatch):
+    _write_config(tmp_config, """providers:
+  ws:
+    base_url: https://12345.ai-gateway.cloud.databricks.com
+    workspace_url: https://workspace.example.com
+    api_key: eyJold
+    auth_refresh: databricks-cli
+    auth_profile: ws-profile
+""")
+    providers._last_token_refresh_attempt.clear()
+    providers._last_auth_login_attempt.clear()
+    monkeypatch.setattr(providers, "_databricks_cli", lambda: "databricks")
+    calls = []
+
+    class Proc:
+        def __init__(self, returncode: int, stdout: bytes = b"", stderr: bytes = b""):
+            self.returncode = returncode
+            self._stdout = stdout
+            self._stderr = stderr
+
+        async def communicate(self):
+            return self._stdout, self._stderr
+
+    async def fake_exec(*args, **kwargs):
+        calls.append(args)
+        if args[:3] == ("databricks", "auth", "token"):
+            token_calls = [c for c in calls if c[:3] == ("databricks", "auth", "token")]
+            if len(token_calls) == 1:
+                return Proc(1, stderr=b"OAuth is not configured for this host")
+            return Proc(0, stdout=b'{"access_token":"eyJnew"}')
+        if args[:3] == ("databricks", "auth", "login"):
+            return Proc(0)
+        raise AssertionError(f"unexpected subprocess args: {args}")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    token = asyncio.run(providers.refresh_oauth_token("ws", force=True))
+
+    assert token == "eyJnew"
+    assert calls[1] == (
+        "databricks",
+        "auth",
+        "login",
+        "--host",
+        "https://workspace.example.com",
+        "--profile",
+        "ws-profile",
+    )
+
+
 def test_stale_oauth_refresh_cannot_overwrite_admin_provider_update(
     tmp_config, monkeypatch,
 ):
