@@ -11,16 +11,16 @@ base URL, and exact upstream model ID:
 
 ```bash
 model-gateway onboard generate \
-  --provider moonshot \
-  --base-url https://api.moonshot.ai/v1 \
-  --model kimi-k3
+  --provider example \
+  --base-url https://api.example.com/v1 \
+  --model example-model
 ```
 
 Generation is non-destructive. By default it attempts read-only `/models`
 discovery and saves:
 
 ```text
-config/onboarding/drafts/moonshot-kimi-k3.yaml
+config/onboarding/drafts/example-example-model.yaml
 ```
 
 The file is never overwritten unless `--force` is explicit. Use `--output
@@ -192,6 +192,37 @@ outside this rollback guarantee.
 
 Profiles are idempotent: rerunning one updates the same provider/model without
 requiring an already retired model to remain present.
+
+### Kimi K3 Fireworks switchover
+
+The committed `fireworks-kimi-k3.yaml` profile replaces the logical `kimi-k3`
+route with Fireworks Standard while preserving its gateway and Pi IDs. Install
+the matching `pi-shared` renderer change before changing the live catalog, then
+apply and regenerate in this order:
+
+```bash
+model-gateway onboard config/onboarding/fireworks-kimi-k3.yaml --dry-run
+model-gateway onboard config/onboarding/fireworks-kimi-k3.yaml \
+  --non-interactive --yes --confirm-replace kimi-k3
+pi-catalog --aliases ~/.claude/model-aliases.json \
+  --models-out ~/.pi-omlx/agent/models.json \
+  --launchers-out ~/.pi/generated/pi-launchers.zsh \
+  --pi-agent-dir ~/.pi-omlx/agent --ls99-extras
+```
+
+Update any machine-local preset descriptions that name the old provider, then
+smoke-test the gateway, Pi, and consuming applications. Keep the Moonshot
+provider secret during the initial soak period. To roll back, apply the tracked
+profile without the obsolete retirement and regenerate Pi again:
+
+```bash
+model-gateway onboard config/onboarding/moonshot-kimi-k3-rollback.yaml \
+  --non-interactive --yes --confirm-replace kimi-k3
+pi-catalog --aliases ~/.claude/model-aliases.json \
+  --models-out ~/.pi-omlx/agent/models.json \
+  --launchers-out ~/.pi/generated/pi-launchers.zsh \
+  --pi-agent-dir ~/.pi-omlx/agent --ls99-extras
+```
 
 ## Explicit retirement
 

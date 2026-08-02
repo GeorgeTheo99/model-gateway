@@ -1,0 +1,29 @@
+schema_version: 1
+id: fireworks-kimi-k3
+
+provider:
+  id: fireworks
+  base_url: https://api.fireworks.ai/inference/v1
+  protocol: openai
+  secret_name: fireworks.api-key
+
+models:
+  - name: kimi-k3
+    provider: fireworks
+    provider_model_id: accounts/fireworks/models/kimi-k3
+    alias: kimi3
+    context: 1048576
+    max_output_tokens: 131072
+    thinking: always
+    thinking_levels: [max]
+    thinking_format: openai
+    vision: true
+    pricing:
+      input: 3.0
+      output: 15.0
+      cache_read: 0.3
+    quirks:
+      - force_reasoning_effort_max
+    pi:
+      id: kimi-k3
+    desc: Kimi K3 on Fireworks; always-thinking multimodal and tool-capable model with a 1M-token context

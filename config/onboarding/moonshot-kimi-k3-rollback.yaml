@@ -1,5 +1,5 @@
 schema_version: 1
-id: moonshot-kimi-k3
+id: moonshot-kimi-k3-rollback
 
 provider:
   id: moonshot
@@ -28,8 +28,6 @@ models:
       - drop_fixed_sampling_fields
       - named_tool_choice_as_required
       - inline_image_urls_only
+    pi:
+      id: kimi-k3
     desc: Kimi K3 via Moonshot; always-thinking multimodal and tool-capable model with a 1M-token context
-
-retire:
-  models:
-    - kimi-k2.7-code-fw

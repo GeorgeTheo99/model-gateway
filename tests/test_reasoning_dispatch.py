@@ -625,18 +625,18 @@ def test_chat_completions_applies_declarative_provider_onboarding_quirks(client,
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
-def test_kimi_max_only_preserves_named_tool_and_stream_passthrough(client, monkeypatch):
+def test_fireworks_kimi_max_only_forwards_native_named_tool_and_stream(client, monkeypatch):
     info = _info(
-        "openai", thinking_levels=("max",), provider="moonshot",
-        provider_model_id="kimi-k3", vision=True,
+        "openai", thinking_levels=("max",), provider="fireworks",
+        provider_model_id="accounts/fireworks/models/kimi-k3", vision=True,
     )
-    info.quirks = frozenset({"force_reasoning_effort_max", "named_tool_choice_as_required"})
+    info.quirks = frozenset({"force_reasoning_effort_max"})
     monkeypatch.setattr(server_module, "resolve", lambda model: info if model == "kimi-k3" else None)
 
     async def fake_stream(endpoint, body, headers, **kwargs):
         assert endpoint == "http://up/chat/completions"
         assert body["reasoning_effort"] == "max"
-        assert body["tool_choice"] == "required"
+        assert body["tool_choice"] == {"type": "function", "function": {"name": "lookup"}}
         assert body["stream"] is True
         return server_module.JSONResponse(status_code=200, content={"stream_path": True})
 

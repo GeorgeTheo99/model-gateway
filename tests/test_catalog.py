@@ -303,13 +303,29 @@ def test_legacy_no_thinking_modes_are_canonicalized(tmp_path, legacy_mode):
     assert entry["thinking_levels"] == []
 
 
-def test_committed_kimi_onboarding_profile_is_strict_max_only():
+def test_committed_kimi_onboarding_profile_routes_to_fireworks_with_stable_pi_id():
     from src.onboarding import load_profile
 
-    path = Path(__file__).resolve().parents[1] / "config" / "onboarding" / "moonshot-kimi-k3.yaml"
+    path = Path(__file__).resolve().parents[1] / "config" / "onboarding" / "fireworks-kimi-k3.yaml"
     entries = {entry["name"]: entry for entry in load_profile(path)["models"]}
-    assert entries["kimi-k3"]["thinking"] == "always"
-    assert entries["kimi-k3"]["thinking_levels"] == ["max"]
+    kimi = entries["kimi-k3"]
+    assert kimi["provider"] == "fireworks"
+    assert kimi["provider_model_id"] == "accounts/fireworks/models/kimi-k3"
+    assert kimi["thinking"] == "always"
+    assert kimi["thinking_levels"] == ["max"]
+    assert kimi["quirks"] == ["force_reasoning_effort_max"]
+    assert kimi["pi"]["id"] == "kimi-k3"
+
+
+def test_committed_kimi_moonshot_rollback_has_no_stale_retirement():
+    from src.onboarding import load_profile
+
+    path = Path(__file__).resolve().parents[1] / "config" / "onboarding" / "moonshot-kimi-k3-rollback.yaml"
+    profile = load_profile(path)
+    kimi = profile["models"][0]
+    assert kimi["provider"] == "moonshot"
+    assert kimi["provider_model_id"] == "kimi-k3"
+    assert profile.get("retire", {}).get("models", []) == []
 
 
 def test_fable_5_explicit_levels_exclude_unsupported_values(tmp_path):

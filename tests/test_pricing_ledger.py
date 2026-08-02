@@ -42,11 +42,11 @@ def test_pricing_for_local_unmetered_model_is_explicit(monkeypatch):
     assert pricing_status_for("qwen3.5-397b") == "unmetered"
 
 
-def test_kimi_k3_pricing_matches_moonshot_rates(monkeypatch):
+def test_kimi_k3_pricing_matches_fireworks_standard_rates(monkeypatch):
     import src.providers as providers
     monkeypatch.setattr(providers, "_models", {
         "kimi-k3": {
-            "name": "kimi-k3", "provider": "moonshot",
+            "name": "kimi-k3", "provider": "fireworks",
             "pricing": {"input": 3.0, "output": 15.0, "cache_read": 0.3},
         },
     })
@@ -378,13 +378,16 @@ def test_composite_validation_error_keeps_resolution_receipt(tmp_ledger, monkeyp
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
 def test_direct_stream_requests_usage_and_prices_cache_hits(tmp_ledger, monkeypatch):
-    info = _info(provider="moonshot", provider_model_id="kimi-k3")
+    info = _info(
+        provider="fireworks",
+        provider_model_id="accounts/fireworks/models/kimi-k3",
+    )
     import src.providers as providers
     monkeypatch.setattr(providers, "_models", {
         "kimi-k3": {
             "name": "kimi-k3",
-            "provider": "moonshot",
-            "provider_model_id": "kimi-k3",
+            "provider": "fireworks",
+            "provider_model_id": "accounts/fireworks/models/kimi-k3",
             "pricing": {"input": 3.0, "output": 15.0, "cache_read": 0.3},
         },
     })
@@ -396,7 +399,7 @@ def test_direct_stream_requests_usage_and_prices_cache_hits(tmp_ledger, monkeypa
         async def chunks():
             yield b'data: {"choices":[],"us'
             yield b'age":{"prompt_tokens":100000,"completion_tokens":50000,'
-            yield b'"cached_tokens":40000}}\n'
+            yield b'"prompt_tokens_details":{"cached_tokens":40000}}}\n'
             yield b'\ndata: [DONE]\n\n'
         return server_module.StreamingResponse(chunks(), media_type="text/event-stream")
 

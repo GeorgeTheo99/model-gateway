@@ -67,13 +67,13 @@ input typical) but no cache-write field. Map: input→input, output→output,
 Cached input→cache_read. Omit cache_write. Same OpenAI-shape cost-model caveat
 as Fireworks applies (see above).
 
-**Fireworks**: the serverless pricing docs page
+**Fireworks** (verified 2026-08-01): the serverless pricing docs page
 (https://docs.fireworks.ai/serverless/pricing) lists each headline model with
-three per-1M-token figures: **input / cached input / output**. The
-`https://fireworks.ai/pricing` marketing page defers to the docs page for
-actual rates — use the docs page. Map: input→input, "cached input"→cache_read,
-output→output. Omit cache_write (Fireworks reports cache reads only; the
-gateway receives `prompt_tokens_details.cached_tokens`).
+three per-1M-token figures: **input / cached input / output**. Kimi K3 Standard
+is `$3.00 / $0.30 / $15.00`. The `https://fireworks.ai/pricing` marketing page
+defers to the docs page for actual rates — use the docs page. Map: input→input,
+"cached input"→cache_read, output→output. Omit cache_write (Fireworks reports
+cache reads only; the gateway receives `prompt_tokens_details.cached_tokens`).
 
 ⚠️ **Cost-model caveat (OpenAI-shape providers: Fireworks, OpenAI, OpenRouter):**
 `prompt_tokens` *includes* cached tokens, while Anthropic's `input_tokens`
@@ -132,7 +132,7 @@ Use this to know which source to read for each model. Regenerate with:
 | gpt-5.4-mini | openai | gpt-5.4-mini | openai |
 | deepseek-v4-pro-fw | fireworks | accounts/fireworks/models/deepseek-v4-pro | fireworks |
 | glm-5.2-fw | fireworks | accounts/fireworks/models/glm-5p2 | fireworks |
-| kimi-k3 | moonshot | kimi-k3 | Moonshot K3 pricing |
+| kimi-k3 | fireworks | accounts/fireworks/models/kimi-k3 | fireworks |
 | minimax-m3-fw | fireworks | accounts/fireworks/models/minimax-m3 | fireworks |
 | qwen3.7-plus-fw | fireworks | accounts/fireworks/models/qwen3p7-plus | fireworks |
 | deepseek-v4-flash-or | openrouter | deepseek/deepseek-v4-flash | openrouter API |
