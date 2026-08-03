@@ -186,11 +186,17 @@ def record(
     return rid
 
 
-def recent(limit: int = 50, *, models: list[str] | None = None) -> list[dict]:
+def recent(
+    limit: int = 50,
+    *,
+    models: list[str] | None = None,
+    provider: str | None = None,
+) -> list[dict]:
     """Return the most recent ledger rows (newest first).
 
     If ``models`` is given, restrict to rows whose ``model`` column matches any
     of the supplied identifiers (used for per-model stats click-through).
+    If ``provider`` is given, restrict to rows routed through that provider.
     """
     clauses: list[str] = []
     params: list = []
@@ -198,6 +204,9 @@ def recent(limit: int = 50, *, models: list[str] | None = None) -> list[dict]:
         placeholders = ",".join("?" for _ in models)
         clauses.append(f"model IN ({placeholders})")
         params.extend(models)
+    if provider:
+        clauses.append("provider = ?")
+        params.append(provider)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with _lock, _connect() as conn:
         _ensure_schema(conn)
@@ -206,6 +215,16 @@ def recent(limit: int = 50, *, models: list[str] | None = None) -> list[dict]:
             (*params, int(limit)),
         ).fetchall()
     return [_row_to_dict(r) for r in rows]
+
+
+def get_request(request_id: str) -> dict | None:
+    """Return one ledger row by id (redacted like :func:`recent`), or None."""
+    with _lock, _connect() as conn:
+        _ensure_schema(conn)
+        row = conn.execute(
+            "SELECT * FROM requests WHERE id = ?", (request_id,)
+        ).fetchone()
+    return _row_to_dict(row) if row else None
 
 
 def aggregate(
@@ -265,11 +284,18 @@ def aggregate(
     return [dict(r) for r in rows]
 
 
-def summary(*, since: float | None = None, until: float | None = None, models: list[str] | None = None) -> dict:
+def summary(
+    *,
+    since: float | None = None,
+    until: float | None = None,
+    models: list[str] | None = None,
+    provider: str | None = None,
+) -> dict:
     """Return top-level totals for the dashboard header.
 
     If ``models`` is given, restrict to rows whose ``model`` column matches any
-    of the supplied identifiers (per-model stats).
+    of the supplied identifiers (per-model stats). If ``provider`` is given,
+    restrict to rows routed through that provider (per-provider stats).
     """
     clauses = []
     params: list = []
@@ -283,6 +309,9 @@ def summary(*, since: float | None = None, until: float | None = None, models: l
         placeholders = ",".join("?" for _ in models)
         clauses.append(f"model IN ({placeholders})")
         params.extend(models)
+    if provider:
+        clauses.append("provider = ?")
+        params.append(provider)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     sql = f"""
         SELECT

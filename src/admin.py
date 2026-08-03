@@ -182,29 +182,7 @@ async def admin_usage(request: Request):
       window  - shorthand: '1h', '24h', '7d', '30d' (sets `since`)
     """
     require_admin_auth(request)
-    import time as _time
-
-    params = request.query_params
-    since = None
-    until = None
-    window = params.get("window")
-    if window:
-        units = {"h": 3600, "d": 86400}
-        try:
-            secs = int(window[:-1]) * units[window[-1].lower()]
-            since = _time.time() - secs
-        except (KeyError, ValueError):
-            pass
-    if params.get("since"):
-        try:
-            since = float(params["since"])
-        except ValueError:
-            pass
-    if params.get("until"):
-        try:
-            until = float(params["until"])
-        except ValueError:
-            pass
+    since, until = _time_bounds(request.query_params)
 
     return {
         "summary": ledger.summary(since=since, until=until),
@@ -227,19 +205,10 @@ async def admin_requests(request: Request):
     return {"requests": ledger.recent(limit=limit)}
 
 
-@router.get("/admin/api/models/{model_name}/stats")
-async def admin_model_stats(model_name: str, request: Request):
-    """Per-model config + usage/cost + recent requests for a window.
-
-    Query params: window ('1h','24h','7d','30d'), since/until epoch seconds.
-    Matches ledger rows by every routable identifier for the model (name,
-    alias, provider_model_id, omlx_id) so stats follow whichever alias the
-    caller sent. Requires admin auth.
-    """
-    require_admin_auth(request)
+def _time_bounds(params) -> tuple[float | None, float | None]:
+    """Parse window ('1h','24h','7d','30d') / since / until query params."""
     import time as _time
 
-    params = request.query_params
     since = None
     until = None
     window = params.get("window")
@@ -260,6 +229,46 @@ async def admin_model_stats(model_name: str, request: Request):
             until = float(params["until"])
         except ValueError:
             pass
+    return since, until
+
+
+@router.get("/admin/api/requests/{request_id}")
+async def admin_request_detail(request_id: str, request: Request):
+    """One redacted ledger row by id, for the request drill-down panel."""
+    require_admin_auth(request)
+    row = ledger.get_request(request_id)
+    if row is None:
+        return _bad_request(f"request {request_id!r} not found", status=404)
+    return {"request": row}
+
+
+@router.get("/admin/api/providers/{provider_id}/stats")
+async def admin_provider_stats(provider_id: str, request: Request):
+    """Per-provider config + usage/cost + recent requests for a window."""
+    require_admin_auth(request)
+    since, until = _time_bounds(request.query_params)
+    rows = [p for p in provider_status() if p.get("id") == provider_id]
+    provider = rows[0] if rows else None
+    if provider:
+        usage = ledger.summary(since=since, until=until, provider=provider_id)
+        recent = ledger.recent(limit=25, provider=provider_id)
+    else:
+        usage = {}
+        recent = []
+    return {"provider": provider, "usage": usage, "recent": recent}
+
+
+@router.get("/admin/api/models/{model_name}/stats")
+async def admin_model_stats(model_name: str, request: Request):
+    """Per-model config + usage/cost + recent requests for a window.
+
+    Query params: window ('1h','24h','7d','30d'), since/until epoch seconds.
+    Matches ledger rows by every routable identifier for the model (name,
+    alias, provider_model_id, omlx_id) so stats follow whichever alias the
+    caller sent. Requires admin auth.
+    """
+    require_admin_auth(request)
+    since, until = _time_bounds(request.query_params)
 
     # Resolve the model config from model_status (find by name).
     rows = [m for m in model_status() if (m.get("name") or m.get("id")) == model_name]
@@ -727,9 +736,17 @@ _ADMIN_HTML = r"""
     .cost-callout .cost-label { font-size: 12px; color: var(--text-2); }
     .clickable { cursor: pointer; }
     .clickable:hover { color: var(--accent); }
+    tbody tr.clickable-row { cursor: pointer; }
     tbody tr.clickable-row:hover { background: var(--accent-soft); }
     .bymodel-clickable { cursor: pointer; }
     .bymodel-clickable:hover td { background: var(--accent-soft); color: var(--text); }
+    /* Visible affordance chevron on drill-down rows. */
+    td.chev { width: 22px; color: var(--muted); text-align: right; padding-right: 14px; font-size: 12px; }
+    tr.clickable-row:hover td.chev, tr.bymodel-clickable:hover td.chev { color: var(--accent); }
+    /* Filter box */
+    .filterbar { display: flex; align-items: center; gap: 8px; }
+    .filterbar input { width: 200px; }
+    tr.filtered-out { display: none; }
     .loading-bar { font-size: 12px; color: var(--muted); padding: 8px 0; }
     .preset-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
     .preset-card { border: 1px solid var(--rule); border-radius: var(--radius); background: var(--surface); padding: 13px 14px; display: grid; gap: 8px; }
@@ -791,10 +808,13 @@ _ADMIN_HTML = r"""
       </nav>
 
       <section class="tab-panel" data-tab-panel="providers" role="tabpanel">
-        <div class="sec-head"><h2>Providers</h2><span class="meta">config.yaml readiness</span></div>
-        <div class="scroll">
-          <table id="providers"><thead><tr><th>ID</th><th class="num">Models</th><th>Protocol</th><th>Base URL</th><th>Key</th><th>State</th><th>Issues</th><th></th></tr></thead><tbody></tbody></table>
+        <div class="sec-head"><h2>Providers</h2>
+          <div class="filterbar"><div class="field"><input id="providerFilter" type="search" placeholder="Filter providers" aria-label="Filter providers" /></div><span class="meta">config.yaml readiness</span></div>
         </div>
+        <div class="scroll">
+          <table id="providers"><thead><tr><th>ID</th><th class="num">Models</th><th>Protocol</th><th>Base URL</th><th>Key</th><th>State</th><th>Issues</th><th></th><th class="chev"></th></tr></thead><tbody></tbody></table>
+        </div>
+        <div id="providerDetail" class="detail hidden" aria-live="polite"></div>
         <details class="formset"><summary>Add or edit a provider</summary>
           <div class="form-body">
             <div class="form-grid">
@@ -816,9 +836,11 @@ _ADMIN_HTML = r"""
       </section>
 
       <section class="tab-panel" data-tab-panel="models" role="tabpanel">
-        <div class="sec-head"><h2>Models</h2><span class="meta" id="modelsMeta">grouped local / cloud</span></div>
+        <div class="sec-head"><h2>Models</h2>
+          <div class="filterbar"><div class="field"><input id="modelFilter" type="search" placeholder="Filter models" aria-label="Filter models" /></div><span class="meta" id="modelsMeta">grouped local / cloud</span></div>
+        </div>
         <div class="scroll">
-          <table id="models"><thead><tr><th>Name</th><th>Upstream id</th><th>Provider</th><th>Pricing</th><th class="num">Context</th><th class="num">Max out</th><th>Thinking</th><th>Vision</th><th>State</th><th></th></tr></thead><tbody></tbody></table>
+          <table id="models"><thead><tr><th>Name</th><th>Upstream id</th><th>Provider</th><th>Pricing</th><th class="num">Context</th><th class="num">Max out</th><th>Thinking</th><th>Vision</th><th>State</th><th></th><th class="chev"></th></tr></thead><tbody></tbody></table>
         </div>
         <div id="modelDetail" class="detail hidden" aria-live="polite"></div>
         <details class="formset"><summary>Add or edit a model</summary>
@@ -881,8 +903,9 @@ _ADMIN_HTML = r"""
           <div class="stat"><span class="label">Avg latency</span><span class="value" id="uLatency">—</span><span class="detail" id="uLatencyDetail">over window</span></div>
         </div>
         <div class="scroll"><table id="usageByModel"><thead><tr><th>Model</th><th class="num">Requests</th><th class="num">Usage</th><th class="num">Costed</th><th class="num">Errors</th><th class="num">In tok</th><th class="num">Out tok</th><th class="num">Cached</th><th class="num">Cost</th><th class="num">Avg ms</th></tr></thead><tbody></tbody></table></div>
-        <div class="sec-head" style="margin-top:4px;"><h2>Recent requests</h2><span class="meta">last 50</span></div>
-        <div class="scroll"><table id="recentReq"><thead><tr><th>Time</th><th>Endpoint</th><th>Model</th><th class="num">Status</th><th>Stream</th><th>Coverage</th><th class="num">In</th><th class="num">Out</th><th class="num">Cached</th><th class="num">Cost</th><th class="num">Latency</th></tr></thead><tbody></tbody></table></div>
+        <div class="sec-head" style="margin-top:4px;"><h2>Recent requests</h2><span class="meta">last 50 · click a row for details</span></div>
+        <div id="requestDetail" class="detail hidden" aria-live="polite"></div>
+        <div class="scroll"><table id="recentReq"><thead><tr><th>Time</th><th>Endpoint</th><th>Model</th><th class="num">Status</th><th>Stream</th><th>Coverage</th><th class="num">In</th><th class="num">Out</th><th class="num">Cached</th><th class="num">Cost</th><th class="num">Latency</th><th class="chev"></th></tr></thead><tbody></tbody></table></div>
         <div id="usageErr" class="inline-err hidden"></div>
       </section>
 
@@ -1005,8 +1028,9 @@ _ADMIN_HTML = r"""
       const issues = (p.issues||[]).map(i => idPill(i)).join(' ') || '<span class="muted">—</span>';
       const state = ready ? statePill('ok','ready') : statePill('warn','config');
       const keyCell = p.has_api_key ? '<span class="ok-c">present</span>' : '<span class="bad-c">missing</span>';
-      return '<tr><td>'+idPill(p.id)+'</td><td class="num">'+escapeHtml(p.enabled_models)+'</td><td>'+escapeHtml(p.protocol)+'</td><td class="id">'+escapeHtml(p.base_url)+'</td><td>'+keyCell+'</td><td>'+state+'</td><td>'+issues+'</td><td><button class="btn secondary" data-mgmt data-edit-provider="'+escapeHtml(p.id)+'">edit</button></td></tr>';
-    }).join('') || '<tr class="empty"><td colspan="8">No providers configured.</td></tr>';
+      return '<tr class="clickable-row" data-open-provider="'+escapeHtml(p.id)+'"><td>'+idPill(p.id)+'</td><td class="num">'+escapeHtml(p.enabled_models)+'</td><td>'+escapeHtml(p.protocol)+'</td><td class="id">'+escapeHtml(p.base_url)+'</td><td>'+keyCell+'</td><td>'+state+'</td><td>'+issues+'</td><td><button class="btn secondary" data-mgmt data-edit-provider="'+escapeHtml(p.id)+'">edit</button></td><td class="chev">›</td></tr>';
+    }).join('') || '<tr class="empty"><td colspan="9">No providers configured.</td></tr>';
+    applyFilter('providerFilter', '#providers');
   }
 
   function dedupeModels(rows){
@@ -1024,7 +1048,7 @@ _ADMIN_HTML = r"""
     const parts = [];
     function group(label, items){
       if (!items.length) return;
-      parts.push('<tr class="group-row"><td colspan="10">'+escapeHtml(label)+' · '+items.length+'</td></tr>');
+      parts.push('<tr class="group-row"><td colspan="11">'+escapeHtml(label)+' · '+items.length+'</td></tr>');
       for (const m of items) {
         const en = m.enabled !== false;
         const nm = escapeHtml(m.name || m.id);
@@ -1034,13 +1058,14 @@ _ADMIN_HTML = r"""
         const priceState = m.pricing_status || (m.pricing ? 'metered' : 'unknown');
         const price = statePill(priceState === 'unknown' ? 'warn' : 'ok', priceState);
         const toggle = '<button class="btn secondary" data-mgmt data-toggle-model="'+nm+'" data-enable="'+(!en)+'">'+(en?'disable':'enable')+'</button> <button class="btn secondary" data-mgmt data-edit-model="'+nm+'">edit</button>';
-        parts.push('<tr class="clickable-row" data-open-model="'+nm+'"><td>'+idPill(m.name || m.id)+'</td><td class="id">'+up+'</td><td>'+escapeHtml(m.provider)+'</td><td>'+price+'</td><td class="num">'+escapeHtml(m.context)+'</td><td class="num">'+escapeHtml(m.max_output_tokens)+'</td><td>'+th+'</td><td>'+(m.vision?'yes':'no')+'</td><td>'+state+'</td><td>'+toggle+'</td></tr>');
+        parts.push('<tr class="clickable-row" data-open-model="'+nm+'"><td>'+idPill(m.name || m.id)+'</td><td class="id">'+up+'</td><td>'+escapeHtml(m.provider)+'</td><td>'+price+'</td><td class="num">'+escapeHtml(m.context)+'</td><td class="num">'+escapeHtml(m.max_output_tokens)+'</td><td>'+th+'</td><td>'+(m.vision?'yes':'no')+'</td><td>'+state+'</td><td>'+toggle+'</td><td class="chev">›</td></tr>');
       }
     }
     group('Local (oMLX)', local);
     group('Cloud', cloud);
-    body.innerHTML = parts.join('') || '<tr class="empty"><td colspan="10">No models configured.</td></tr>';
+    body.innerHTML = parts.join('') || '<tr class="empty"><td colspan="11">No models configured.</td></tr>';
     document.getElementById('modelsMeta').textContent = local.length + ' local · ' + cloud.length + ' cloud';
+    applyFilter('modelFilter', '#models');
   }
 
   function resolveModelName(dim){
@@ -1108,11 +1133,48 @@ _ADMIN_HTML = r"""
     document.querySelector('#presets tbody').innerHTML = rows.join('') || '<tr class="empty"><td colspan="7">No presets configured.</td></tr>';
   }
 
-  function showTab(tab){
-    currentTab = tab || 'presets';
+  const TABS = ['presets','models','providers','usage','debug'];
+  function showTab(tab, opts){
+    currentTab = TABS.includes(tab) ? tab : 'presets';
     for (const b of document.querySelectorAll('[data-tab]')) b.setAttribute('aria-selected', String(b.dataset.tab === currentTab));
     for (const p of document.querySelectorAll('[data-tab-panel]')) p.classList.toggle('active', p.dataset.tabPanel === currentTab);
+    if (!opts || !opts.skipHash) setHash(currentTab);
   }
+
+  // ── Hash routing: #tab or #tab/detailName ───────────────────
+  let _suppressHash = false;
+  function setHash(tab, detail){
+    const h = '#' + tab + (detail ? '/' + encodeURIComponent(detail) : '');
+    if (window.location.hash === h) return;
+    _suppressHash = true;
+    window.location.hash = h;
+    setTimeout(() => { _suppressHash = false; }, 0);
+  }
+  function applyHash(){
+    if (_suppressHash) return;
+    const raw = (window.location.hash || '').replace(/^#/, '');
+    if (!raw) return;
+    const [tab, detail] = raw.split('/');
+    showTab(tab, {skipHash: true});
+    if (!unlocked) return;
+    const name = detail ? decodeURIComponent(detail) : '';
+    if (tab === 'models' && name) showModelDetail(name, {skipHash: true});
+    else if (tab === 'providers' && name) showProviderDetail(name, {skipHash: true});
+    else if (tab === 'usage' && name) showRequestDetail(name, {skipHash: true});
+  }
+  window.addEventListener('hashchange', applyHash);
+
+  // ── Table filter ───────────────────────────────────────
+  function applyFilter(inputId, tableSel){
+    const q = (document.getElementById(inputId).value || '').trim().toLowerCase();
+    for (const tr of document.querySelectorAll(tableSel + ' tbody tr')) {
+      if (tr.classList.contains('empty')) continue;
+      if (tr.classList.contains('group-row')) { tr.classList.toggle('filtered-out', !!q); continue; }
+      tr.classList.toggle('filtered-out', !!q && !tr.textContent.toLowerCase().includes(q));
+    }
+  }
+  document.getElementById('modelFilter').addEventListener('input', () => applyFilter('modelFilter', '#models'));
+  document.getElementById('providerFilter').addEventListener('input', () => applyFilter('providerFilter', '#providers'));
 
   // ── Usage ───────────────────────────────────────────────────
   const _winLabel = {'1h':'Last hour','24h':'Last 24 hours','7d':'Last 7 days','30d':'Last 30 days','':'All time'};
@@ -1146,7 +1208,7 @@ _ADMIN_HTML = r"""
         return '<tr class="'+cls+'"'+attr+'><td>'+idPill(r.dim||'—')+'</td><td class="num">'+fmtNum(r.requests)+'</td><td class="num">'+fmtNum(r.usage_reported_requests)+'</td><td class="num">'+fmtNum(r.known_cost_requests)+'</td><td class="num '+(r.errors?'bad-c':'ok-c')+'">'+fmtNum(r.errors)+'</td><td class="num">'+fmtNum(r.input_tokens)+'</td><td class="num">'+fmtNum(r.output_tokens)+'</td><td class="num">'+fmtNum(r.cached_read_tokens)+'</td><td class="num">'+fmtCost(r.cost_usd)+'</td><td class="num">'+fmtMs(r.avg_latency_ms)+'</td></tr>';
       }).join('') || '<tr class="empty"><td colspan="10">No requests in this window.</td></tr>';
       const reqs = recent.requests || [];
-      document.querySelector('#recentReq tbody').innerHTML = reqs.map(r => '<tr><td>'+escapeHtml(r.ts_iso||'—')+'</td><td>'+escapeHtml(r.endpoint||'—')+'</td><td>'+idPill(r.model||'—')+'</td><td class="num '+(!r.error && r.status && r.status < 400 ? 'ok-c' : 'bad-c')+'">'+(r.status||'—')+'</td><td>'+(r.is_stream?'stream':'sync')+'</td><td>'+requestCoverage(r)+'</td><td class="num">'+fmtNum(r.input_tokens)+'</td><td class="num">'+fmtNum(r.output_tokens)+'</td><td class="num">'+fmtNum(r.cached_read_tokens)+'</td><td class="num">'+fmtCost(r.cost_usd)+'</td><td class="num">'+fmtMs(r.latency_ms)+'</td></tr>').join('') || '<tr class="empty"><td colspan="11">No requests yet.</td></tr>';
+      document.querySelector('#recentReq tbody').innerHTML = reqs.map(r => '<tr class="clickable-row" data-open-request="'+escapeHtml(r.id||'')+'"><td>'+escapeHtml(r.ts_iso||'—')+'</td><td>'+escapeHtml(r.endpoint||'—')+'</td><td>'+(resolveModelName(r.model) ? modelLink(resolveModelName(r.model)) : idPill(r.model||'—'))+'</td><td class="num '+(!r.error && r.status && r.status < 400 ? 'ok-c' : 'bad-c')+'">'+(r.status||'—')+'</td><td>'+(r.is_stream?'stream':'sync')+'</td><td>'+requestCoverage(r)+'</td><td class="num">'+fmtNum(r.input_tokens)+'</td><td class="num">'+fmtNum(r.output_tokens)+'</td><td class="num">'+fmtNum(r.cached_read_tokens)+'</td><td class="num">'+fmtCost(r.cost_usd)+'</td><td class="num">'+fmtMs(r.latency_ms)+'</td><td class="chev">›</td></tr>').join('') || '<tr class="empty"><td colspan="12">No requests yet.</td></tr>';
     } catch (e) {
       if (e instanceof AuthError) { return; } // loadHealth drives the locked state on auth failure
       usageErr.textContent = e.message; usageErr.classList.remove('hidden');
@@ -1253,7 +1315,11 @@ _ADMIN_HTML = r"""
 
   // ── Model detail click-through ─────────────────────────────
   const modelDetail = document.getElementById('modelDetail');
-  function closeModelDetail(){ modelDetail.classList.add('hidden'); modelDetail.innerHTML = ''; }
+  const providerDetail = document.getElementById('providerDetail');
+  const requestDetail = document.getElementById('requestDetail');
+  function closeModelDetail(){ modelDetail.classList.add('hidden'); modelDetail.innerHTML = ''; if (currentTab === 'models') setHash('models'); }
+  function closeProviderDetail(){ providerDetail.classList.add('hidden'); providerDetail.innerHTML = ''; if (currentTab === 'providers') setHash('providers'); }
+  function closeRequestDetail(){ requestDetail.classList.add('hidden'); requestDetail.innerHTML = ''; if (currentTab === 'usage') setHash('usage'); }
   function pricingText(p){
     if (!p) return '—';
     const parts = [];
@@ -1265,8 +1331,10 @@ _ADMIN_HTML = r"""
     if (p.reasoning != null) parts.push('reason $'+Number(p.reasoning).toFixed(3));
     return parts.length ? parts.join(' · ') : JSON.stringify(p);
   }
-  async function showModelDetail(name){
+  async function showModelDetail(name, opts){
     if (!name) return;
+    if (currentTab !== 'models') showTab('models', {skipHash: true});
+    if (!opts || !opts.skipHash) setHash('models', name);
     modelDetail.classList.remove('hidden');
     modelDetail.innerHTML = '<div class="loading-bar">Loading '+escapeHtml(name)+'…</div>';
     modelDetail.scrollIntoView({behavior:'smooth', block:'nearest'});
@@ -1321,6 +1389,99 @@ _ADMIN_HTML = r"""
     modelDetail.innerHTML = html;
   }
 
+  // ── Provider detail click-through ─────────────────────────
+  async function showProviderDetail(id, opts){
+    if (!id) return;
+    if (currentTab !== 'providers') showTab('providers', {skipHash: true});
+    if (!opts || !opts.skipHash) setHash('providers', id);
+    providerDetail.classList.remove('hidden');
+    providerDetail.innerHTML = '<div class="loading-bar">Loading '+escapeHtml(id)+'…</div>';
+    providerDetail.scrollIntoView({behavior:'smooth', block:'nearest'});
+    try {
+      const q = currentWindow ? ('?window='+encodeURIComponent(currentWindow)) : '';
+      const data = await get('/admin/api/providers/'+encodeURIComponent(id)+'/stats'+q);
+      renderProviderDetail(id, data);
+    } catch (e) {
+      if (e instanceof AuthError) { showLocked(); return; }
+      providerDetail.innerHTML = '<div class="inline-err">Failed to load stats: '+escapeHtml(e.message)+'</div>';
+    }
+  }
+  function renderProviderDetail(id, data){
+    const p = data.provider || {};
+    const u = data.usage || {};
+    const winLabel = _winLabel[currentWindow] || currentWindow || 'All';
+    const kv = (k, v) => '<div class="kv-item"><span class="k">'+k+'</span><span class="v">'+v+'</span></div>';
+    const errs = u.errors || 0;
+    const ready = !(p.issues||[]).length;
+    let html = '<div class="detail-head"><h3>'+idPill(id)+'</h3>';
+    html += '<div class="toolbar"><span class="meta">'+(ready?statePill('ok','ready'):statePill('warn','config'))+'</span>';
+    html += '<button class="btn secondary" data-mgmt data-edit-provider="'+escapeHtml(id)+'">Edit</button>';
+    html += '<button class="close" type="button" data-close-provider-detail aria-label="Close">×</button></div></div>';
+    html += '<div class="cost-callout"><span class="cost-value">'+fmtCost(u.cost_usd)+'</span><span class="cost-label">estimated cost · '+escapeHtml(winLabel)+' · '+fmtNum(u.known_cost_requests)+'/'+fmtNum(u.requests)+' requests costed</span></div>';
+    html += '<div class="strip"><div class="stat"><span class="label">Requests</span><span class="value '+(errs?'warn-c':'ok-c')+'">'+fmtNum(u.requests)+'</span><span class="detail">'+fmtNum(u.ok)+' ok / '+fmtNum(errs)+' errors</span></div>';
+    html += '<div class="stat"><span class="label">Tokens</span><span class="value ok-c">'+fmtNum((u.input_tokens||0)+(u.output_tokens||0))+'</span><span class="detail">'+fmtNum(u.input_tokens)+' in / '+fmtNum(u.output_tokens)+' out</span></div>';
+    html += '<div class="stat"><span class="label">Avg latency</span><span class="value ok-c">'+fmtMs(u.avg_latency_ms)+'</span><span class="detail">over '+fmtNum(u.requests)+' requests</span></div>';
+    html += '<div class="stat"><span class="label">Models</span><span class="value ok-c">'+fmtNum(p.enabled_models)+'</span><span class="detail">enabled via this provider</span></div></div>';
+    html += '<div><div class="subhead">Configuration</div><div class="kv-grid">';
+    html += kv('Base URL', '<span class="id">'+escapeHtml(p.base_url||'—')+'</span>');
+    html += kv('Protocol', escapeHtml(p.protocol||'—'));
+    html += kv('API key', p.has_api_key ? '<span class="ok-c">present</span>' : '<span class="bad-c">missing</span>');
+    html += kv('Issues', (p.issues||[]).map(i => idPill(i)).join(' ') || '<span class="muted">none</span>');
+    html += '</div></div>';
+    const reqs = data.recent || [];
+    html += '<div><div class="subhead">Recent requests · this provider</div><div class="scroll"><table><thead><tr><th>Time</th><th>Model</th><th class="num">Status</th><th>Stream</th><th class="num">In</th><th class="num">Out</th><th class="num">Cost</th><th class="num">Latency</th></tr></thead><tbody>';
+    html += reqs.map(r => '<tr><td>'+escapeHtml(r.ts_iso||'—')+'</td><td>'+(resolveModelName(r.model) ? modelLink(resolveModelName(r.model)) : idPill(r.model||'—'))+'</td><td class="num '+(!r.error && r.status && r.status < 400 ? 'ok-c' : 'bad-c')+'">'+(r.status||'—')+'</td><td>'+(r.is_stream?'stream':'sync')+'</td><td class="num">'+fmtNum(r.input_tokens)+'</td><td class="num">'+fmtNum(r.output_tokens)+'</td><td class="num">'+fmtCost(r.cost_usd)+'</td><td class="num">'+fmtMs(r.latency_ms)+'</td></tr>').join('') || '<tr class="empty"><td colspan="8">No requests for this provider yet.</td></tr>';
+    html += '</tbody></table></div></div>';
+    providerDetail.innerHTML = html;
+  }
+
+  // ── Request detail click-through ──────────────────────────
+  async function showRequestDetail(id, opts){
+    if (!id) return;
+    if (currentTab !== 'usage') showTab('usage', {skipHash: true});
+    if (!opts || !opts.skipHash) setHash('usage', id);
+    requestDetail.classList.remove('hidden');
+    requestDetail.innerHTML = '<div class="loading-bar">Loading request…</div>';
+    requestDetail.scrollIntoView({behavior:'smooth', block:'nearest'});
+    try {
+      const data = await get('/admin/api/requests/'+encodeURIComponent(id));
+      renderRequestDetail(data.request || {});
+    } catch (e) {
+      if (e instanceof AuthError) { showLocked(); return; }
+      requestDetail.innerHTML = '<div class="inline-err">Failed to load request: '+escapeHtml(e.message)+'</div>';
+    }
+  }
+  function renderRequestDetail(r){
+    const kv = (k, v) => '<div class="kv-item"><span class="k">'+k+'</span><span class="v">'+v+'</span></div>';
+    const okReq = !r.error && r.status && r.status < 400;
+    let html = '<div class="detail-head"><h3>'+idPill(r.id||'request')+'</h3>';
+    html += '<div class="toolbar"><span class="meta">'+escapeHtml(r.ts_iso||'—')+' · '+(okReq?statePill('ok', String(r.status||'ok')):statePill('bad', String(r.status||'error')))+'</span>';
+    html += '<button class="close" type="button" data-close-request-detail aria-label="Close">×</button></div></div>';
+    if (r.error) html += '<div class="inline-err">'+escapeHtml(r.error)+'</div>';
+    html += '<div><div class="subhead">Request</div><div class="kv-grid">';
+    html += kv('Endpoint', '<span class="id">'+escapeHtml(r.endpoint||'—')+'</span>');
+    html += kv('Model', resolveModelName(r.model) ? modelLink(resolveModelName(r.model)) : escapeHtml(r.model||'—'));
+    html += kv('Provider', escapeHtml(r.provider||'—'));
+    html += kv('Upstream id', '<span class="id">'+escapeHtml(r.provider_model_id||'—')+'</span>');
+    html += kv('Mode', r.is_stream ? 'stream' : 'sync');
+    html += kv('Status', escapeHtml(r.status));
+    html += kv('Latency', fmtMs(r.latency_ms));
+    html += kv('Coverage', requestCoverage(r));
+    html += '</div></div>';
+    html += '<div><div class="subhead">Tokens &amp; cost</div><div class="kv-grid">';
+    html += kv('Input tokens', fmtNum(r.input_tokens));
+    html += kv('Output tokens', fmtNum(r.output_tokens));
+    html += kv('Cached read', fmtNum(r.cached_read_tokens));
+    html += kv('Cache write', fmtNum(r.cache_write_tokens));
+    html += kv('Reasoning tokens', fmtNum(r.reasoning_tokens));
+    html += kv('Cost', fmtCost(r.cost_usd));
+    html += kv('Pricing complete', r.pricing_complete ? 'yes' : 'no');
+    const mpc = r.missing_pricing_classes;
+    html += kv('Missing pricing', mpc && mpc.length ? escapeHtml(Array.isArray(mpc) ? mpc.join(', ') : String(mpc)) : '<span class="muted">none</span>');
+    html += '</div></div>';
+    requestDetail.innerHTML = html;
+  }
+
   // ── Wiring ──────────────────────────────────────────────────
   function unlock(){
     const key = keyInput.value.trim();
@@ -1330,9 +1491,9 @@ _ADMIN_HTML = r"""
     showDash();
     // Load health first so _modelsCache is populated before loadUsage renders
     // the by-model table (whose click-through resolves dims to model names).
-    loadHealth().then(() => loadUsage(currentWindow)).catch(()=>{});
+    loadHealth().then(() => loadUsage(currentWindow)).then(() => applyHash()).catch(()=>{});
   }
-  function refresh(){ if (!unlocked) return; closeModelDetail(); loadHealth(); loadUsage(currentWindow); }
+  function refresh(){ if (!unlocked) return; closeModelDetail(); closeProviderDetail(); closeRequestDetail(); loadHealth(); loadUsage(currentWindow); }
 
   unlockBtn.addEventListener('click', unlock);
   refreshBtn.addEventListener('click', refresh);
@@ -1347,18 +1508,25 @@ _ADMIN_HTML = r"""
   document.addEventListener('click', (e) => {
     const t = e.target;
     if (t.closest && t.closest('[data-close-detail]')) { closeModelDetail(); return; }
+    if (t.closest && t.closest('[data-close-provider-detail]')) { closeProviderDetail(); return; }
+    if (t.closest && t.closest('[data-close-request-detail]')) { closeRequestDetail(); return; }
     const tabBtn = t.closest && t.closest('[data-tab]');
     if (tabBtn) { showTab(tabBtn.dataset.tab); return; }
-    // Ignore clicks on buttons inside clickable rows (edit/toggle).
-    if (t.tagName === 'BUTTON' && (t.getAttribute('data-edit-model') || t.getAttribute('data-toggle-model') || t.getAttribute('data-edit-provider'))) return;
-    const openModel = (t.closest && t.closest('[data-open-model]')) || (t.getAttribute && t.getAttribute('data-open-model') ? t : null);
+    // Buttons inside clickable rows act on the row's entity, not the drill-down.
+    if (t.tagName === 'BUTTON') {
+      const ep = t.getAttribute('data-edit-provider');
+      const em = t.getAttribute('data-edit-model');
+      const tm = t.getAttribute('data-toggle-model');
+      if (ep) { editProvider(ep); return; }
+      if (em) { editModel(em); return; }
+      if (tm) { toggleModel(tm, t.getAttribute('data-enable') === 'true'); return; }
+    }
+    const openModel = t.closest && t.closest('[data-open-model]');
     if (openModel) { const nm = openModel.getAttribute('data-open-model'); if (nm) { showModelDetail(nm); return; } }
-    const ep = t.getAttribute && t.getAttribute('data-edit-provider');
-    if (ep) { editProvider(ep); return; }
-    const em = t.getAttribute && t.getAttribute('data-edit-model');
-    if (em) { editModel(em); return; }
-    const tm = t.getAttribute && t.getAttribute('data-toggle-model');
-    if (tm) { toggleModel(tm, t.getAttribute('data-enable') === 'true'); return; }
+    const openProvider = t.closest && t.closest('[data-open-provider]');
+    if (openProvider) { const id = openProvider.getAttribute('data-open-provider'); if (id) { showProviderDetail(id); return; } }
+    const openRequest = t.closest && t.closest('[data-open-request]');
+    if (openRequest) { const id = openRequest.getAttribute('data-open-request'); if (id) { showRequestDetail(id); return; } }
   });
 
   // Annotate model rows with dataset for editModel lookups after render.
@@ -1403,7 +1571,8 @@ _ADMIN_HTML = r"""
   // ── Boot ────────────────────────────────────────────────────
   let stored = '';
   try { stored = sessionStorage.getItem(STORAGE_KEY) || ''; } catch(e) {}
-  showTab(currentTab);
+  const initialHash = (window.location.hash || '').replace(/^#/, '').split('/')[0];
+  showTab(TABS.includes(initialHash) ? initialHash : currentTab, {skipHash: true});
   if (stored) { keyInput.value = stored; unlock(); }
   else showLocked();
 })();

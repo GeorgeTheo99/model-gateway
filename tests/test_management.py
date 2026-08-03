@@ -805,3 +805,66 @@ def test_model_info_writes_do_not_clamp(tmp_config, monkeypatch):
     )
 
     assert (mi.stat().st_mode & 0o777) == 0o644
+
+
+def test_admin_provider_stats_endpoint(client, monkeypatch):
+    """Per-provider stats returns config + usage + recent, filtered by provider."""
+    from src import ledger
+    from src.usage import Usage, CostEstimate
+    import tempfile
+    monkeypatch.setenv("MODEL_GATEWAY_LEDGER_PATH", str(tempfile.mkdtemp() + "/ledger.db"))
+    ledger.init()
+    ledger.record(endpoint="/v1/messages", method="POST", model="claude-test",
+                  provider="anthropic", provider_model_id="claude-test-1",
+                  status=200, latency_ms=90, is_stream=False,
+                  usage=Usage(input_tokens=10, output_tokens=5, cached_read_tokens=0,
+                              cache_write_tokens=0, reasoning_tokens=0, reported=True),
+                  cost=CostEstimate(0.001, True, []))
+    ledger.record(endpoint="/v1/messages", method="POST", model="other-model",
+                  provider="other", provider_model_id="other-1",
+                  status=200, latency_ms=50, is_stream=False,
+                  usage=Usage(input_tokens=1, output_tokens=1, cached_read_tokens=0,
+                              cache_write_tokens=0, reasoning_tokens=0, reported=True),
+                  cost=CostEstimate(0.002, True, []))
+    h = {"Authorization": "Bearer admin"}
+    resp = client.get("/admin/api/providers/anthropic/stats?window=24h", headers=h)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["provider"]["id"] == "anthropic"
+    assert body["usage"]["requests"] == 1  # only the anthropic row
+    assert len(body["recent"]) == 1
+    assert body["recent"][0]["provider"] == "anthropic"
+    # Unknown provider: null config, empty usage/recent.
+    resp2 = client.get("/admin/api/providers/nope/stats", headers=h)
+    assert resp2.status_code == 200
+    assert resp2.json()["provider"] is None
+    assert resp2.json()["recent"] == []
+    # Requires admin auth.
+    assert client.get("/admin/api/providers/anthropic/stats").status_code == 401
+    providers.reload()
+
+
+def test_admin_request_detail_endpoint(client, monkeypatch):
+    """Single ledger row lookup by id; 404 on unknown id; requires auth."""
+    from src import ledger
+    from src.usage import Usage, CostEstimate
+    import tempfile
+    monkeypatch.setenv("MODEL_GATEWAY_LEDGER_PATH", str(tempfile.mkdtemp() + "/ledger.db"))
+    ledger.init()
+    rid = ledger.record(endpoint="/v1/chat/completions", method="POST", model="claude-test",
+                        provider="anthropic", provider_model_id="claude-test-1",
+                        status=500, latency_ms=42, is_stream=True,
+                        usage=Usage(input_tokens=7, output_tokens=0, cached_read_tokens=0,
+                                    cache_write_tokens=0, reasoning_tokens=0, reported=False),
+                        cost=CostEstimate(None, False, []), error="upstream exploded")
+    h = {"Authorization": "Bearer admin"}
+    resp = client.get(f"/admin/api/requests/{rid}", headers=h)
+    assert resp.status_code == 200
+    row = resp.json()["request"]
+    assert row["id"] == rid
+    assert row["error"] == "upstream exploded"
+    assert row["status"] == 500
+    assert row["is_stream"] == 1
+    assert "ts_iso" in row
+    assert client.get("/admin/api/requests/nope", headers=h).status_code == 404
+    assert client.get(f"/admin/api/requests/{rid}").status_code == 401
