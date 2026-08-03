@@ -67,6 +67,22 @@ def test_messages_stream_preserves_explicit_zero_and_cached_input():
     }
 
 
+def test_messages_stream_merges_terminal_provider_cost_with_tokens():
+    upstream = _byte_stream(
+        b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+        b'data: {"choices":[],"usage":{"prompt_tokens":250000,"completion_tokens":12}}\n\n',
+        b'data: {"choices":[],"usage":{"cost":0.0004604}}\n\n',
+        b"data: [DONE]\n\n",
+    )
+    output = asyncio.run(_collect(translate_stream(upstream, "test")))
+    final = next(p for p in _sse_payloads(output) if p.get("type") == "message_delta")
+    assert final["usage"] == {
+        "input_tokens": 250_000,
+        "output_tokens": 12,
+        "cost": 0.0004604,
+    }
+
+
 def test_messages_stream_preserves_cache_write_ttls_and_reasoning_usage():
     upstream = _byte_stream(
         b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
@@ -192,6 +208,35 @@ def test_responses_stream_absent_vs_explicit_zero_usage():
     )
     assert zero_completed["usage"]["input_tokens"] == 0
     assert extract_usage(zero_completed).reported is True
+
+
+def test_responses_stream_merges_terminal_provider_cost_with_tokens():
+    upstream = _byte_stream(
+        b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+        b'data: {"choices":[],"usage":{"prompt_tokens":250000,"completion_tokens":12}}\n\n',
+        b'data: {"choices":[],"usage":{"cost":0.0004604}}\n\n',
+        b"data: [DONE]\n\n",
+    )
+    output = asyncio.run(_collect(translate_responses_stream(upstream, "test")))
+    completed = next(
+        p["response"] for p in _sse_payloads(output)
+        if p.get("type") == "response.completed"
+    )
+    assert completed["usage"]["input_tokens"] == 250_000
+    assert completed["usage"]["output_tokens"] == 12
+    assert completed["usage"]["cost"] == 0.0004604
+
+
+def test_sync_translations_preserve_provider_cost():
+    chat = {
+        "choices": [{
+            "message": {"role": "assistant", "content": "OK"},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 250_000, "completion_tokens": 12, "cost": 0.0004604},
+    }
+    assert chat_to_responses(chat, "test")["usage"]["cost"] == 0.0004604
+    assert openai_to_anthropic(chat, "test")["usage"]["cost"] == 0.0004604
 
 
 @pytest.mark.parametrize(
@@ -476,6 +521,15 @@ def test_sse_error_parser_accepts_nested_and_native_responses_shapes():
     ) == "native responses failure"
 
 
+def test_sse_usage_fragment_accepts_valid_cost_only_terminal_chunk():
+    assert _usage_fragment_from_sse_line(
+        'data: {"choices":[],"usage":{"cost":0.0004604}}'
+    ) == ("complete", {"cost": 0.0004604})
+    assert _usage_fragment_from_sse_line(
+        'data: {"choices":[],"usage":{"cost":"0.0004604"}}'
+    ) is None
+
+
 def test_sse_usage_fragments_distinguish_anthropic_start_and_final():
     initial = _usage_fragment_from_sse_line(
         'data: {"type":"message_start","message":{"usage":{"input_tokens":0,"output_tokens":0}}}'
@@ -507,6 +561,21 @@ def test_collect_anthropic_stream_keeps_initial_input_and_final_output():
         "input_tokens": 11,
         "cache_read_input_tokens": 3,
         "output_tokens": 7,
+    }
+
+
+def test_collect_openai_stream_merges_terminal_provider_cost_with_tokens():
+    response = _FakeResponse([
+        b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+        b'"usage":{"prompt_tokens":250000,"completion_tokens":12}}\n\n',
+        b'data: {"choices":[],"usage":{"cost":0.0004604}}\n\n',
+        b"data: [DONE]\n\n",
+    ])
+    result = asyncio.run(_collect_stream(response))
+    assert result["usage"] == {
+        "prompt_tokens": 250_000,
+        "completion_tokens": 12,
+        "cost": 0.0004604,
     }
 
 

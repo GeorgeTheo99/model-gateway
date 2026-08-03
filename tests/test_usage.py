@@ -1,5 +1,7 @@
 """Tests for usage normalization and cost estimation."""
 
+import pytest
+
 from src.usage import (
     Usage,
     anthropic_usage_to_openai_chat,
@@ -8,6 +10,7 @@ from src.usage import (
     estimate_cost,
     openai_chat_usage_to_anthropic,
     openai_chat_usage_to_responses,
+    usage_has_ledger_data,
     usage_was_reported,
 )
 
@@ -107,6 +110,36 @@ def test_extract_no_usage_returns_unreported():
     assert usage_was_reported({"input_tokens": 0, "output_tokens": 0}) is True
 
 
+def test_extract_provider_reported_cost_without_fabricating_token_coverage():
+    usage = extract_usage({"usage": {"cost": 0.0004604}})
+    assert usage.provider_cost_usd == 0.0004604
+    assert usage.reported is False
+    assert usage_has_ledger_data({"cost": 0.0004604}) is True
+    assert usage_was_reported({"cost": 0.0004604}) is False
+
+
+@pytest.mark.parametrize(
+    "value",
+    [-1, float("nan"), float("inf"), -float("inf"), 10**400, True, "0.5", None],
+)
+def test_extract_rejects_invalid_provider_reported_cost(value):
+    usage = extract_usage({"usage": {"cost": value}})
+    assert usage.provider_cost_usd is None
+    assert usage_has_ledger_data({"cost": value}) is False
+
+
+def test_usage_shape_conversions_preserve_provider_cost():
+    chat = {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.0004604}
+    anthropic = openai_chat_usage_to_anthropic(chat)
+    responses = openai_chat_usage_to_responses(chat)
+    assert anthropic["cost"] == 0.0004604
+    assert responses["cost"] == 0.0004604
+    assert anthropic_usage_to_openai_chat(anthropic)["cost"] == 0.0004604
+    assert anthropic_usage_to_responses(anthropic)["cost"] == 0.0004604
+    assert openai_chat_usage_to_anthropic({"cost": 0.0004604}) == {"cost": 0.0004604}
+    assert openai_chat_usage_to_responses({"cost": 0.0004604}) == {"cost": 0.0004604}
+
+
 def test_usage_shape_conversions_preserve_cache_semantics():
     chat = {
         "prompt_tokens": 1000,
@@ -168,6 +201,35 @@ def test_extract_anthropic_cache_write_ttls_and_costs_separately():
     assert cost.pricing_complete is True
 
 
+def test_provider_reported_cost_overrides_configured_and_unmetered_pricing():
+    usage = Usage(
+        input_tokens=250_000,
+        output_tokens=10,
+        provider_cost_usd=0.0004604,
+        reported=True,
+    )
+    for pricing_status in ("metered", "unmetered"):
+        cost = estimate_cost(
+            usage,
+            {"input": 2.0, "output": 6.0},
+            pricing_status=pricing_status,
+        )
+        assert cost.cost_usd == 0.0004604
+        assert cost.pricing_complete is True
+        assert cost.missing_classes == []
+
+
+def test_invalid_provider_cost_falls_back_to_configured_pricing():
+    usage = extract_usage({"usage": {
+        "prompt_tokens": 100,
+        "completion_tokens": 50,
+        "cost": "not-a-number",
+    }})
+    cost = estimate_cost(usage, {"input": 3.0, "output": 15.0})
+    assert cost.cost_usd == round((100 * 3.0 + 50 * 15.0) / 1_000_000, 6)
+    assert cost.pricing_complete is True
+
+
 def test_estimate_cost_full_pricing():
     # input_tokens is cache-miss (1M), cached_read 200k, cache_write 100k.
     # reasoning_tokens (50k) is a SUBSET of output_tokens for every current
@@ -212,6 +274,18 @@ def test_estimate_cost_no_pricing_is_unknown():
     cost = estimate_cost(usage, None)
     assert cost.cost_usd is None
     assert cost.pricing_complete is False
+
+
+def test_long_context_without_valid_provider_cost_or_pricing_stays_unknown():
+    for provider_cost in (None, -1, "0.5"):
+        usage_block = {"prompt_tokens": 250_000, "completion_tokens": 50}
+        if provider_cost is not None:
+            usage_block["cost"] = provider_cost
+        usage = extract_usage({"usage": usage_block})
+        cost = estimate_cost(usage, None)
+        assert usage.provider_cost_usd is None
+        assert cost.cost_usd is None
+        assert cost.pricing_complete is False
 
 
 def test_estimate_cost_unreported_usage_is_unknown():

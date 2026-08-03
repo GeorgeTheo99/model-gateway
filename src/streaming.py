@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator
 
 from src.reasoning import reasoning_alias_text, reasoning_text
 from src.signature_cache import store_from_extra_content
-from src.usage import openai_chat_usage_to_anthropic, usage_was_reported
+from src.usage import openai_chat_usage_to_anthropic, usage_has_ledger_data, usage_was_reported
 
 log = logging.getLogger("model-gateway")
 
@@ -86,6 +86,7 @@ async def translate_stream(
     cache_write_reported = False
     reasoning_tokens = 0
     reasoning_reported = False
+    provider_cost_usd: float | None = None
     usage_reported = False
     finish_reason = None
     saw_finish = False
@@ -118,24 +119,27 @@ async def translate_stream(
         # Extract only authoritative upstream usage. Field presence preserves a
         # valid explicit-zero report; an absent/empty block stays unknown.
         u = chunk.get("usage")
-        if usage_was_reported(u):
+        if usage_has_ledger_data(u):
             converted = openai_chat_usage_to_anthropic(u) or {}
-            input_tokens = converted.get("input_tokens", input_tokens)
-            output_tokens = converted.get("output_tokens", output_tokens)
-            cached_tokens = converted.get("cache_read_input_tokens", cached_tokens)
-            if "cache_creation_input_tokens" in converted:
-                cache_creation = converted.get("cache_creation") or {}
-                cache_write_tokens = cache_creation.get(
-                    "ephemeral_5m_input_tokens",
-                    converted["cache_creation_input_tokens"],
-                )
-                cache_write_1h_tokens = cache_creation.get("ephemeral_1h_input_tokens", 0)
-                cache_write_reported = True
-            output_details = converted.get("output_tokens_details") or {}
-            if "thinking_tokens" in output_details:
-                reasoning_tokens = output_details["thinking_tokens"]
-                reasoning_reported = True
-            usage_reported = True
+            if "cost" in converted:
+                provider_cost_usd = converted["cost"]
+            if usage_was_reported(u):
+                input_tokens = converted.get("input_tokens", input_tokens)
+                output_tokens = converted.get("output_tokens", output_tokens)
+                cached_tokens = converted.get("cache_read_input_tokens", cached_tokens)
+                if "cache_creation_input_tokens" in converted:
+                    cache_creation = converted.get("cache_creation") or {}
+                    cache_write_tokens = cache_creation.get(
+                        "ephemeral_5m_input_tokens",
+                        converted["cache_creation_input_tokens"],
+                    )
+                    cache_write_1h_tokens = cache_creation.get("ephemeral_1h_input_tokens", 0)
+                    cache_write_reported = True
+                output_details = converted.get("output_tokens_details") or {}
+                if "thinking_tokens" in output_details:
+                    reasoning_tokens = output_details["thinking_tokens"]
+                    reasoning_reported = True
+                usage_reported = True
 
         choice = (chunk.get("choices") or [{}])[0]
         delta = choice.get("delta", {})
@@ -329,7 +333,7 @@ async def translate_stream(
         "type": "message_delta",
         "delta": {"stop_reason": stop_reason},
     }
-    if usage_reported:
+    if usage_reported or provider_cost_usd is not None:
         final_delta["usage"] = {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -348,6 +352,7 @@ async def translate_stream(
                 {"output_tokens_details": {"thinking_tokens": reasoning_tokens}}
                 if reasoning_reported else {}
             ),
+            **({"cost": provider_cost_usd} if provider_cost_usd is not None else {}),
         }
     yield _sse("message_delta", final_delta)
 

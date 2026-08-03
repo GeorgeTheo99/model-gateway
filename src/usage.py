@@ -7,13 +7,14 @@ single :class:`Usage` record suitable for the request ledger, and computes an
 estimated cost from a model's ``pricing`` dict ($/Mtok).
 
 Design rules (from docs/productionization-plan.md):
-- Prefer exact provider-reported usage when present.
-- Use configured pricing per model.
+- Prefer exact provider-reported usage and total cost when present.
+- Fall back to configured pricing per model when provider cost is absent.
 - Show unknown cost when usage or pricing is missing; never guess silently.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 
 
@@ -21,10 +22,10 @@ from dataclasses import asdict, dataclass
 class Usage:
     """Normalized token usage for one request.
 
-    All fields are 0 when the provider did not report them. ``reported`` is
-    False when no usage block was present at all (e.g. a streamed response
-    whose final usage chunk was lost), so the ledger can mark tokens/cost as
-    unavailable rather than zero.
+    Token fields are 0 when the provider did not report them. ``reported`` is
+    False when no recognized token fields were present (e.g. a streamed
+    response whose final token chunk was lost). ``provider_cost_usd`` may still
+    hold an authoritative total from a separate terminal usage chunk.
     """
 
     input_tokens: int = 0
@@ -33,6 +34,7 @@ class Usage:
     cache_write_tokens: int = 0
     cache_write_1h_tokens: int = 0
     reasoning_tokens: int = 0
+    provider_cost_usd: float | None = None
     reported: bool = False
 
     def as_dict(self) -> dict:
@@ -77,14 +79,42 @@ _RESPONSES_USAGE_KEYS = {
 
 
 def usage_was_reported(usage: object) -> bool:
-    """Return whether a usage object contains recognized provider fields.
+    """Return whether a usage object contains recognized token fields.
 
     Field presence, not token magnitude, distinguishes a valid explicit-zero
-    report from a fabricated or absent empty object.
+    report from a fabricated or absent empty object. Provider-reported cost is
+    tracked separately and does not imply that token usage was reported.
     """
     return isinstance(usage, dict) and bool(
         set(usage) & (_OPENAI_CHAT_USAGE_KEYS | _ANTHROPIC_USAGE_KEYS | _RESPONSES_USAGE_KEYS)
     )
+
+
+def _provider_cost_usd(usage: object) -> float | None:
+    """Return a valid authoritative provider cost, otherwise ``None``."""
+    if not isinstance(usage, dict):
+        return None
+    value = usage.get("cost")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        cost = float(value)
+    except OverflowError:
+        return None
+    return cost if math.isfinite(cost) and cost >= 0 else None
+
+
+def usage_has_ledger_data(usage: object) -> bool:
+    """Return whether usage contains tokens or a valid provider total cost."""
+    return usage_was_reported(usage) or _provider_cost_usd(usage) is not None
+
+
+def _with_provider_cost(result: dict, usage: object) -> dict:
+    """Copy a validated provider total into a translated usage block."""
+    cost = _provider_cost_usd(usage)
+    if cost is not None:
+        result["cost"] = cost
+    return result
 
 
 def _openai_chat_cached_tokens(usage: dict) -> tuple[int, bool]:
@@ -99,8 +129,11 @@ def _openai_chat_cached_tokens(usage: dict) -> tuple[int, bool]:
 
 def openai_chat_usage_to_anthropic(usage: object) -> dict | None:
     """Convert authoritative Chat usage to Anthropic's exclusive-input shape."""
-    if not isinstance(usage, dict) or not (set(usage) & _OPENAI_CHAT_USAGE_KEYS):
+    if not usage_has_ledger_data(usage):
         return None
+    if not usage_was_reported(usage):
+        return _with_provider_cost({}, usage)
+    assert isinstance(usage, dict)
     details = usage.get("prompt_tokens_details") or {}
     cached_read, cache_read_reported = _openai_chat_cached_tokens(usage)
     cache_write = _as_int(details.get("cache_write_tokens"))
@@ -125,13 +158,16 @@ def openai_chat_usage_to_anthropic(usage: object) -> dict | None:
         result["output_tokens_details"] = {
             "thinking_tokens": _as_int(completion_details.get("reasoning_tokens")),
         }
-    return result
+    return _with_provider_cost(result, usage)
 
 
 def openai_chat_usage_to_responses(usage: object) -> dict | None:
     """Convert authoritative Chat usage to the Responses inclusive-input shape."""
-    if not isinstance(usage, dict) or not (set(usage) & _OPENAI_CHAT_USAGE_KEYS):
+    if not usage_has_ledger_data(usage):
         return None
+    if not usage_was_reported(usage):
+        return _with_provider_cost({}, usage)
+    assert isinstance(usage, dict)
     prompt = _as_int(usage.get("prompt_tokens"))
     completion = _as_int(usage.get("completion_tokens"))
     prompt_details = usage.get("prompt_tokens_details") or {}
@@ -142,7 +178,7 @@ def openai_chat_usage_to_responses(usage: object) -> dict | None:
         input_details["cache_write_tokens"] = _as_int(prompt_details.get("cache_write_tokens"))
     if "cache_write_1h_tokens" in prompt_details:
         input_details["cache_write_1h_tokens"] = _as_int(prompt_details.get("cache_write_1h_tokens"))
-    return {
+    return _with_provider_cost({
         "input_tokens": prompt,
         "input_tokens_details": input_details,
         "output_tokens": completion,
@@ -150,13 +186,16 @@ def openai_chat_usage_to_responses(usage: object) -> dict | None:
             "reasoning_tokens": _as_int(completion_details.get("reasoning_tokens")),
         },
         "total_tokens": _as_int(usage.get("total_tokens")) or prompt + completion,
-    }
+    }, usage)
 
 
 def anthropic_usage_to_openai_chat(usage: object) -> dict | None:
     """Convert authoritative Anthropic usage to Chat's inclusive-input shape."""
-    if not isinstance(usage, dict) or not (set(usage) & _ANTHROPIC_USAGE_KEYS):
+    if not usage_has_ledger_data(usage):
         return None
+    if not usage_was_reported(usage):
+        return _with_provider_cost({}, usage)
+    assert isinstance(usage, dict)
     input_tokens = _as_int(usage.get("input_tokens"))
     output_tokens = _as_int(usage.get("output_tokens"))
     cached_read = _as_int(usage.get("cache_read_input_tokens"))
@@ -179,7 +218,7 @@ def anthropic_usage_to_openai_chat(usage: object) -> dict | None:
         result["completion_tokens_details"] = {
             "reasoning_tokens": _as_int(output_details.get("thinking_tokens")),
         }
-    return result
+    return _with_provider_cost(result, usage)
 
 
 def anthropic_usage_to_responses(usage: object) -> dict | None:
@@ -207,12 +246,19 @@ def extract_usage(resp: dict | None) -> Usage:
     if not isinstance(resp, dict):
         return Usage()
     usage = resp.get("usage")
-    if not usage_was_reported(usage):
+    if not usage_has_ledger_data(usage):
         # Some OpenAI stream chunks put usage at the top level after reassembly.
-        if set(resp) & _OPENAI_CHAT_USAGE_KEYS:
+        if usage_has_ledger_data(resp):
             usage = resp
         else:
             return Usage()
+    tokens_reported = usage_was_reported(usage)
+    provider_cost_usd = _provider_cost_usd(usage)
+
+    # A provider may report its authoritative total in a separate terminal
+    # stream chunk without repeating token counts.
+    if not tokens_reported:
+        return Usage(provider_cost_usd=provider_cost_usd)
 
     # OpenAI Responses shape: input_tokens_details is protocol-specific. Do not
     # use output_tokens_details as the discriminator because newer Anthropic
@@ -233,6 +279,7 @@ def extract_usage(resp: dict | None) -> Usage:
             cache_write_tokens=cache_write,
             cache_write_1h_tokens=cache_write_1h,
             reasoning_tokens=_as_int(out_details.get("reasoning_tokens")),
+            provider_cost_usd=provider_cost_usd,
             reported=True,
         )
 
@@ -249,6 +296,7 @@ def extract_usage(resp: dict | None) -> Usage:
             cache_write_tokens=cache_write,
             cache_write_1h_tokens=cache_write_1h,
             reasoning_tokens=_as_int(out_details.get("thinking_tokens")),
+            provider_cost_usd=provider_cost_usd,
             reported=True,
         )
 
@@ -271,6 +319,7 @@ def extract_usage(resp: dict | None) -> Usage:
         cache_write_tokens=cache_write,
         cache_write_1h_tokens=cache_write_1h,
         reasoning_tokens=_as_int(out_details.get("reasoning_tokens")),
+        provider_cost_usd=provider_cost_usd,
         reported=True,
     )
 
@@ -333,12 +382,20 @@ def estimate_cost(
     reported; token coverage remains represented separately by
     :attr:`Usage.reported`.
 
-    Otherwise, returns ``cost_usd=None`` when pricing is missing entirely or
-    usage was not reported. When a non-zero token class has no matching price,
+    A valid provider-reported total is authoritative and returned unchanged,
+    including when local pricing is missing or incomplete. Otherwise, returns
+    ``cost_usd=None`` when pricing is missing entirely or usage was not
+    reported. When a non-zero token class has no matching price,
     the cost is still computed from the priced classes but
     ``pricing_complete`` is False and the unpriced classes are listed in
     ``missing_classes``.
     """
+    if usage.provider_cost_usd is not None:
+        return CostEstimate(
+            cost_usd=usage.provider_cost_usd,
+            pricing_complete=True,
+            missing_classes=[],
+        )
     if pricing_status == "unmetered":
         return CostEstimate(cost_usd=0.0, pricing_complete=True, missing_classes=[])
     if not usage.reported:

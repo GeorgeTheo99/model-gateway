@@ -22,7 +22,7 @@ import uuid
 from src.reasoning import reasoning_alias_text
 from src.signature_cache import inject_into_tool_call, store_from_extra_content
 from src.streaming import _list_content_channels
-from src.usage import openai_chat_usage_to_responses, usage_was_reported
+from src.usage import openai_chat_usage_to_responses, usage_has_ledger_data
 
 log = logging.getLogger("model-gateway")
 
@@ -576,8 +576,11 @@ async def translate_responses_stream(chat_stream, model: str):
                 yield _sse("error", {"type": "error", "error": error})
                 return
 
-            if usage_was_reported(data.get("usage")):
-                usage_data = data["usage"]
+            if usage_has_ledger_data(data.get("usage")):
+                usage_data = {
+                    **usage_data,
+                    **data["usage"],
+                }
 
             choices = data.get("choices", [])
             if not choices:

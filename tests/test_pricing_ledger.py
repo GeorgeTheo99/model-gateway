@@ -155,6 +155,50 @@ def test_non_streaming_request_records_ledger_with_cost(tmp_ledger, monkeypatch)
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_openrouter_provider_cost_overrides_missing_catalog_pricing(tmp_ledger, monkeypatch):
+    """OpenRouter's tier-aware total is authoritative and persists exactly."""
+    info = _info(provider="openrouter", provider_model_id="x-ai/grok-4.5")
+    import src.providers as providers
+    monkeypatch.setattr(providers, "_models", {
+        "grok-4.5": {
+            "name": "grok-4.5",
+            "provider": "openrouter",
+            "provider_model_id": "x-ai/grok-4.5",
+        },
+    })
+    monkeypatch.setattr(server_module, "resolve", lambda model: info if model == "grok-4.5" else None)
+
+    async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
+        return server_module.JSONResponse(status_code=200, content={
+            "choices": [{"message": {"role": "assistant", "content": "GROK45_OK"}}],
+            "usage": {
+                "prompt_tokens": 250_000,
+                "completion_tokens": 12,
+                "prompt_tokens_details": {"cached_tokens": 50_000},
+                "cost": 0.0004604,
+                "cost_details": {"upstream_inference_cost": 0.0004604},
+            },
+        })
+
+    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough_sync)
+
+    with TestClient(app) as client:
+        response = client.post("/v1/chat/completions", json={
+            "model": "grok-4.5",
+            "messages": [{"role": "user", "content": "Reply GROK45_OK"}],
+        })
+        assert response.status_code == 200
+
+    row = ledger.recent()[0]
+    assert row["usage_reported"] == 1
+    assert row["input_tokens"] == 200_000
+    assert row["cached_read_tokens"] == 50_000
+    assert row["output_tokens"] == 12
+    assert row["cost_usd"] == 0.0004604
+    assert row["pricing_complete"] == 1
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
 def test_native_anthropic_cache_usage_and_markers_are_preserved(tmp_ledger, monkeypatch):
     """New Anthropic usage details must not hide cache tokens from the ledger."""
     info = _info(provider="anthropic", provider_model_id="claude-opus-5")
@@ -417,6 +461,50 @@ def test_direct_stream_requests_usage_and_prices_cache_hits(tmp_ledger, monkeypa
     assert row["cached_read_tokens"] == 40000
     assert row["output_tokens"] == 50000
     assert row["cost_usd"] == pytest.approx(0.942)
+    assert row["pricing_complete"] == 1
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_streaming_terminal_provider_cost_merges_with_token_usage(tmp_ledger, monkeypatch):
+    """A cost-only terminal chunk must not discard an earlier token report."""
+    info = _info(provider="openrouter", provider_model_id="x-ai/grok-4.5")
+    import src.providers as providers
+    monkeypatch.setattr(providers, "_models", {
+        "grok-stream": {
+            "name": "grok-stream",
+            "provider": "openrouter",
+            "provider_model_id": "x-ai/grok-4.5",
+        },
+    })
+    monkeypatch.setattr(server_module, "resolve", lambda model: info if model == "grok-stream" else None)
+
+    async def fake_passthrough_stream(endpoint, body, headers, **kwargs):
+        assert body["stream_options"] == {"include_usage": True}
+
+        async def chunks():
+            yield b'data: {"choices":[],"usage":{"prompt_tokens":250000,'
+            yield b'"completion_tokens":12,"prompt_tokens_details":{"cached_tokens":50000}}}\n\n'
+            yield b'data: {"choices":[],"usage":{"co'
+            yield b'st":0.0004604,"cost_details":{"upstream_inference_cost":0.0004604}}}\n\n'
+            yield b'data: [DONE]\n\n'
+        return server_module.StreamingResponse(chunks(), media_type="text/event-stream")
+
+    monkeypatch.setattr(server_module, "_passthrough_stream", fake_passthrough_stream)
+
+    with TestClient(app) as client:
+        response = client.post("/v1/chat/completions", json={
+            "model": "grok-stream",
+            "messages": [],
+            "stream": True,
+        })
+        assert response.status_code == 200
+
+    row = ledger.recent()[0]
+    assert row["usage_reported"] == 1
+    assert row["input_tokens"] == 200_000
+    assert row["cached_read_tokens"] == 50_000
+    assert row["output_tokens"] == 12
+    assert row["cost_usd"] == 0.0004604
     assert row["pricing_complete"] == 1
 
 

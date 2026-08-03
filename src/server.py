@@ -46,6 +46,7 @@ from src.usage import (
     anthropic_usage_to_responses,
     extract_usage,
     estimate_cost,
+    usage_has_ledger_data,
     usage_was_reported,
 )
 
@@ -1652,17 +1653,17 @@ def _usage_fragment_from_sse_line(line: str) -> tuple[str, dict] | None:
     event_type = data.get("type")
     if event_type == "message_start":
         usage = (data.get("message") or {}).get("usage")
-        if usage_was_reported(usage):
+        if usage_has_ledger_data(usage):
             return "initial", usage
     if event_type == "message_delta":
         usage = data.get("usage")
-        if usage_was_reported(usage):
+        if usage_has_ledger_data(usage):
             return "final", usage
     usage = data.get("usage")
-    if usage_was_reported(usage):
+    if usage_has_ledger_data(usage):
         return "complete", usage
     resp = data.get("response")
-    if isinstance(resp, dict) and usage_was_reported(resp.get("usage")):
+    if isinstance(resp, dict) and usage_has_ledger_data(resp.get("usage")):
         return "complete", resp["usage"]
     return None
 
@@ -1766,7 +1767,10 @@ async def ledger_middleware(request: Request, call_next):
                     **usage,
                 }
             else:
-                usage_capture["usage"] = dict(usage)
+                usage_capture["usage"] = {
+                    **(usage_capture["usage"] or {}),
+                    **usage,
+                }
 
         async def wrapped_iter():
             nonlocal sse_buffer
@@ -2796,8 +2800,11 @@ async def _collect_stream(resp: httpx.Response) -> dict:
                     message = data.get("message") or raw_error
                 raise ValueError(str(message or "upstream stream error"))
 
-            if usage_was_reported(data.get("usage")):
-                usage = data["usage"]
+            if usage_has_ledger_data(data.get("usage")):
+                usage = {
+                    **usage,
+                    **data["usage"],
+                }
 
             choice = (data.get("choices") or [{}])[0]
             delta = choice.get("delta", {})
