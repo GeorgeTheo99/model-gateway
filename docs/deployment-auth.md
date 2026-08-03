@@ -110,6 +110,20 @@ x-api-key: cloud
 
 Admin keys are also accepted on `/v1/*`, so an admin token can be used for debugging.
 
+### Non-loopback bind safety
+
+Startup fails closed when `MODEL_GATEWAY_HOST` is not loopback
+(`127.x.x.x`, `localhost`, `::1`) and no `/v1` client keys are configured
+(via `MODEL_GATEWAY_CLIENT_KEYS`, `MODEL_GATEWAY_CLIENT_KEYS_FILE`, or
+`auth.client_keys` in config.yaml). An unauthenticated gateway on `0.0.0.0`
+would expose provider credentials as free model access to the whole network.
+
+For a trusted private network the check can be explicitly bypassed:
+
+```bash
+MODEL_GATEWAY_ALLOW_UNAUTHENTICATED_NONLOCAL=true
+```
+
 `GET /v1/models/canonical` is the client-safe logical inventory for selectors and
 catalog consumers. Unlike alias-expanded `/v1/models`, it returns one row per
 logical model, includes unavailable models with sanitized availability reasons,

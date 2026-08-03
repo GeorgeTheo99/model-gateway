@@ -67,15 +67,24 @@ def _resolve_target(path: Path) -> Path:
         return path
 
 
+def _is_secret_path(target: Path) -> bool:
+    """Whether the resolved target holds secrets (config.yaml with API keys)."""
+    return target == _resolve_target(CONFIG_PATH)
+
+
 def _atomic_write(path: Path, text: str) -> None:
     """Write text to path atomically: temp file in same dir, then rename.
 
     Resolves symlinks first so a symlinked config file (deployed config.yaml)
-    is updated in place rather than replaced with a real file.
+    is updated in place rather than replaced with a real file. Secret-bearing
+    files (config.yaml) are always clamped to 0600 — a pre-existing loose mode
+    is tightened rather than preserved.
     """
     target = _resolve_target(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     mode = target.stat().st_mode & 0o777 if target.exists() else 0o600
+    if _is_secret_path(target):
+        mode = 0o600
     tmp = target.with_suffix(target.suffix + f".tmp.{os.getpid()}")
     tmp.unlink(missing_ok=True)
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

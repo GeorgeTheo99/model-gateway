@@ -778,3 +778,30 @@ def test_admin_model_stats_endpoint(client, monkeypatch):
     assert client.get("/admin/api/models/claude-test/stats").status_code == 401
     # Reset the providers cache so later modules reload the real catalog.
     providers.reload()
+
+
+def test_config_writes_clamp_secret_file_to_0600(tmp_config, monkeypatch):
+    """A loose pre-existing config.yaml mode is tightened on every write."""
+    monkeypatch.setenv("MODEL_GATEWAY_LOG_DIR", str(tmp_config / "logs"))
+    config_io.log_dir = tmp_config / "logs"
+    cfg = config_io.CONFIG_PATH
+    cfg.chmod(0o644)
+
+    config_io.upsert_provider("openai", base_url="https://api.openai.com/v1", api_key="sk-new")
+
+    assert (cfg.stat().st_mode & 0o777) == 0o600
+
+
+def test_model_info_writes_do_not_clamp(tmp_config, monkeypatch):
+    """model-info.json is secret-free; its existing mode is preserved."""
+    monkeypatch.setenv("MODEL_GATEWAY_LOG_DIR", str(tmp_config / "logs"))
+    config_io.log_dir = tmp_config / "logs"
+    mi = config_io.MODEL_INFO_PATH
+    mi.chmod(0o644)
+
+    config_io.upsert_model(
+        "clamp-check", provider="anthropic", provider_model_id="clamp-check-1",
+        context=1000, max_output_tokens=100, pricing={"input": 1.0, "output": 2.0},
+    )
+
+    assert (mi.stat().st_mode & 0o777) == 0o644

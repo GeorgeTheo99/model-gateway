@@ -183,6 +183,32 @@ def auth_mode() -> AuthMode:
     )
 
 
+def _is_loopback_host(host: str) -> bool:
+    host = host.strip().lower()
+    return host == "localhost" or host == "::1" or host.startswith("127.")
+
+
+def check_bind_safety(host: str) -> None:
+    """Refuse a non-loopback bind unless /v1 client auth is configured.
+
+    An unauthenticated gateway on 0.0.0.0 (or any non-loopback interface)
+    exposes provider credentials as free model access to the whole network.
+    Fail closed at startup; trusted private networks may opt out explicitly
+    with MODEL_GATEWAY_ALLOW_UNAUTHENTICATED_NONLOCAL=true.
+    """
+    if _is_loopback_host(host):
+        return
+    if _client_auth_configured():
+        return
+    if _truthy_env("MODEL_GATEWAY_ALLOW_UNAUTHENTICATED_NONLOCAL"):
+        return
+    raise SystemExit(
+        f"refusing to bind {host!r} without /v1 client auth: configure "
+        "MODEL_GATEWAY_CLIENT_KEYS / MODEL_GATEWAY_CLIENT_KEYS_FILE / auth.client_keys, "
+        "or set MODEL_GATEWAY_ALLOW_UNAUTHENTICATED_NONLOCAL=true for a trusted private network."
+    )
+
+
 def require_client_auth(request: Request) -> None:
     """Protect /v1/* when MODEL_GATEWAY_CLIENT_KEYS is configured.
 

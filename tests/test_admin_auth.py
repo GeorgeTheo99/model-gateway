@@ -237,3 +237,48 @@ def test_config_client_keys_accepts_comma_string(monkeypatch):
     assert client.get("/v1/models", headers={"Authorization": "Bearer alpha"}).status_code == 200
     assert client.get("/v1/models", headers={"x-api-key": "beta"}).status_code == 200
     assert client.get("/v1/models").status_code == 401
+
+
+# ── non-loopback bind safety ─────────────────────────────────────────────────
+
+
+def _clear_client_auth(monkeypatch):
+    monkeypatch.delenv("MODEL_GATEWAY_CLIENT_KEYS", raising=False)
+    monkeypatch.delenv("MODEL_GATEWAY_CLIENT_KEYS_FILE", raising=False)
+    monkeypatch.delenv("MODEL_GATEWAY_ALLOW_UNAUTHENTICATED_NONLOCAL", raising=False)
+    monkeypatch.setattr(providers, "_config", {})
+
+
+def test_bind_safety_allows_loopback_without_auth(monkeypatch):
+    _clear_client_auth(monkeypatch)
+    auth_module.check_bind_safety("127.0.0.1")
+    auth_module.check_bind_safety("localhost")
+    auth_module.check_bind_safety("::1")
+
+
+def test_bind_safety_refuses_nonlocal_without_auth(monkeypatch):
+    import pytest
+
+    _clear_client_auth(monkeypatch)
+    with pytest.raises(SystemExit, match="refusing to bind"):
+        auth_module.check_bind_safety("0.0.0.0")
+    with pytest.raises(SystemExit, match="refusing to bind"):
+        auth_module.check_bind_safety("192.168.1.20")
+
+
+def test_bind_safety_allows_nonlocal_with_client_keys(monkeypatch):
+    _clear_client_auth(monkeypatch)
+    monkeypatch.setenv("MODEL_GATEWAY_CLIENT_KEYS", "some-key")
+    auth_module.check_bind_safety("0.0.0.0")
+
+
+def test_bind_safety_allows_nonlocal_with_config_keys(monkeypatch):
+    _clear_client_auth(monkeypatch)
+    monkeypatch.setattr(providers, "_config", {"auth": {"client_keys": ["cfg-key"]}})
+    auth_module.check_bind_safety("0.0.0.0")
+
+
+def test_bind_safety_explicit_unauthenticated_optout(monkeypatch):
+    _clear_client_auth(monkeypatch)
+    monkeypatch.setenv("MODEL_GATEWAY_ALLOW_UNAUTHENTICATED_NONLOCAL", "true")
+    auth_module.check_bind_safety("0.0.0.0")

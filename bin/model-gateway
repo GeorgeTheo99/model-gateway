@@ -87,9 +87,17 @@ check_prereqs() {
 ensure_config() {
   if [ -f "$CONFIG_PATH" ]; then
     log "Config exists: $CONFIG_PATH"
+    local real_config mode
+    real_config="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$CONFIG_PATH")"
+    mode="$(stat -f '%Lp' "$real_config" 2>/dev/null || stat -c '%a' "$real_config" 2>/dev/null || echo '')"
+    if [ -n "$mode" ] && [ "$mode" != "600" ]; then
+      chmod 600 "$real_config"
+      warn "Tightened config permissions to 0600 (was $mode): $real_config"
+    fi
     return 0
   fi
   mkdir -p "$(dirname "$CONFIG_PATH")"
+  ( umask 077; : >"$CONFIG_PATH" )
   cat >"$CONFIG_PATH" <<EOF
 # model-gateway runtime config.
 # Created by bin/model-gateway install. See config/config.yaml.example for the
@@ -109,11 +117,34 @@ providers: {}
 # exports:
 #   model_aliases: ~/.claude/model-aliases.json
 EOF
+  chmod 600 "$CONFIG_PATH"
   warn "Created empty config at $CONFIG_PATH; add provider secrets/auth before expecting models to route"
 }
 
 ensure_model_catalog() {
-  [ -f "$MODEL_INFO_PATH" ] || die "machine-local model catalog missing: $MODEL_INFO_PATH (provision a reviewed model-info.json; see docs/deployment.md)"
+  if [ ! -f "$MODEL_INFO_PATH" ]; then
+    # Fresh install: create a starter catalog so first run works out of the
+    # box. The placeholder routes nowhere (its provider is unconfigured) and
+    # is replaced by the first real 'model-gateway onboard' apply.
+    mkdir -p "$(dirname "$MODEL_INFO_PATH")"
+    cat >"$MODEL_INFO_PATH" <<'EOF'
+{
+  "updated": "1970-01-01T00:00:00+00:00",
+  "_note": "Starter catalog created by 'model-gateway install'. Replace the placeholder entry by onboarding a real provider: model-gateway onboard generate --provider <id> --base-url <url> --model <model>. See docs/provider-onboarding.md.",
+  "llm": [
+    {
+      "name": "starter-placeholder",
+      "provider": "starter",
+      "provider_model_id": "starter-placeholder",
+      "context": 8192,
+      "max_output_tokens": 4096,
+      "desc": "Placeholder entry; not routable until a real provider is onboarded. Safe to delete after onboarding your first model."
+    }
+  ]
+}
+EOF
+    warn "Created starter model catalog at $MODEL_INFO_PATH; onboard a real provider to route requests (see docs/provider-onboarding.md)"
+  fi
   (
     cd "$ROOT_DIR"
     "$UV_BIN" run python - "$MODEL_INFO_PATH" "$CONFIG_PATH" <<'PY'
@@ -279,9 +310,12 @@ bootout_service() {
   if service_loaded; then
     launchctl bootout "$(service_target)" >/dev/null 2>&1 || die "failed to unload launchd service: $LABEL"
   fi
-  if service_loaded; then
-    die "launchd service is still loaded after bootout: $LABEL"
-  fi
+  # bootout is asynchronous; poll briefly before declaring failure.
+  local i=0
+  while service_loaded; do
+    [ $i -lt 10 ] || die "launchd service is still loaded after bootout: $LABEL"
+    sleep 1; i=$((i+1))
+  done
 }
 
 bootstrap_service() {
