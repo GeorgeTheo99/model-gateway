@@ -868,3 +868,76 @@ def test_admin_request_detail_endpoint(client, monkeypatch):
     assert "ts_iso" in row
     assert client.get("/admin/api/requests/nope", headers=h).status_code == 404
     assert client.get(f"/admin/api/requests/{rid}").status_code == 401
+
+
+def test_admin_discover_provider_models(client, monkeypatch):
+    """Discovery lists upstream ids and marks already-registered ones."""
+    import src.admin as admin_module
+
+    def fake_discover(base_url, api_key=None):
+        return {"status": "verified", "http_status": 200,
+                "model_ids": ["claude-test-1", "brand-new-model"]}
+    import src.onboarding_generation as og
+    monkeypatch.setattr(og, "discover_models", fake_discover)
+    h = {"Authorization": "Bearer admin"}
+    resp = client.post("/admin/api/providers/anthropic/discover", headers=h)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "verified"
+    by_id = {m["id"]: m["registered"] for m in body["models"]}
+    # claude-test-1 is the tmp_config catalog entry's provider_model_id.
+    assert by_id == {"claude-test-1": True, "brand-new-model": False}
+    # Unknown provider 404s; unauthenticated 401s.
+    assert client.post("/admin/api/providers/nope/discover", headers=h).status_code == 404
+    assert client.post("/admin/api/providers/anthropic/discover").status_code == 401
+
+
+def test_admin_preview_model_valid(client):
+    """Preview validates and resolves the route without writing anything."""
+    h = {"Authorization": "Bearer admin"}
+    body = {"provider": "anthropic", "provider_model_id": "claude-new-1",
+            "context": 200000, "max_output_tokens": 8192,
+            "pricing": {"input": 3.0, "output": 15.0}}
+    resp = client.post("/admin/api/models/claude-new/preview", headers=h, json=body)
+    assert resp.status_code == 200
+    p = resp.json()
+    assert p["ok"] is True
+    assert p["routable"] is True
+    assert p["issues"] == []
+    assert p["clashes"] == []
+    assert p["route"] == [{"provider": "anthropic", "usable": True, "reason": None}]
+    assert p["exists"] is False
+    assert "claude-new" in p["routable_ids"]
+    # Nothing was written.
+    assert providers.resolve("claude-new") is None
+
+
+def test_admin_preview_model_reports_clash_and_issues(client):
+    h = {"Authorization": "Bearer admin"}
+    # Alias clash with the existing claude-test entry's name.
+    body = {"provider": "anthropic", "provider_model_id": "x-1", "alias": "claude-test",
+            "pricing": {"input": 1.0, "output": 2.0}}
+    resp = client.post("/admin/api/models/x-model/preview", headers=h, json=body)
+    p = resp.json()
+    assert p["ok"] is False
+    assert p["clashes"] == [{"id": "claude-test", "model": "claude-test"}]
+    # Missing provider_model_id for a cloud provider is an issue.
+    resp2 = client.post("/admin/api/models/y-model/preview", headers=h,
+                        json={"provider": "anthropic", "pricing": {"input": 1.0, "output": 2.0}})
+    p2 = resp2.json()
+    assert p2["ok"] is False
+    assert any("provider_model_id" in i for i in p2["issues"])
+    # Unusable provider route is flagged.
+    resp3 = client.post("/admin/api/models/z-model/preview", headers=h,
+                        json={"provider": "unconfigured-prov", "provider_model_id": "z-1",
+                              "pricing": {"input": 1.0, "output": 2.0}})
+    p3 = resp3.json()
+    assert p3["ok"] is True  # entry itself is valid
+    assert p3["routable"] is False
+    assert p3["route"][0]["usable"] is False
+
+
+def test_admin_preview_and_discover_require_writes(client_readonly):
+    h = {"Authorization": "Bearer admin"}
+    assert client_readonly.post("/admin/api/models/m/preview", headers=h, json={}).status_code == 403
+    assert client_readonly.post("/admin/api/providers/anthropic/discover", headers=h).status_code == 403

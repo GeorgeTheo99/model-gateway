@@ -385,7 +385,154 @@ async def admin_validate_provider(provider_id: str, request: Request):
         return {"ok": False, "status_code": None, "model_count": None, "error": str(exc)}
 
 
+@router.post("/admin/api/providers/{provider_id}/discover")
+async def admin_discover_provider_models(provider_id: str, request: Request):
+    """List upstream model ids from the provider's /models endpoint.
+
+    Read-only upstream probe (no config writes). Marks which ids are already
+    registered in the catalog so the UI can offer only new ones.
+    """
+    require_admin_auth(request)
+    require_admin_writes()
+    import src.providers as providers
+    from src.onboarding_generation import discover_models
+
+    provider_id = providers._canonical_provider(provider_id.strip().lower())
+    config = providers._load_config()
+    block = providers._effective_provider_config(config, provider_id)
+    if not block:
+        return _bad_request(f"provider {provider_id!r} not configured", status=404)
+    base_url = block.get("base_url", "")
+    if not base_url:
+        return _bad_request("provider missing base_url")
+
+    result = await asyncio.to_thread(
+        discover_models, base_url, block.get("api_key") or None
+    )
+    registered: set[str] = set()
+    for entry in {id(v): v for v in providers._load_models().values()}.values():
+        for key in ("provider_model_id", "omlx_id", "name", "alias"):
+            value = entry.get(key)
+            if value:
+                registered.add(str(value))
+    models = [
+        {"id": mid, "registered": mid in registered}
+        for mid in result.get("model_ids", [])
+    ]
+    return {
+        "status": result.get("status"),
+        "http_status": result.get("http_status"),
+        "models": models,
+    }
+
+
 # ── Model management (writeable) ────────────────────────────────────────────
+
+
+@router.post("/admin/api/models/{model_name}/preview")
+async def admin_preview_model(model_name: str, request: Request):
+    """Dry-run a model upsert: validate + resolve routing without writing.
+
+    Accepts the same body as the upsert endpoint. Returns the normalized
+    entry, validation issues, routable-id clashes with other models, and the
+    provider route (pool members + which are usable) the entry would take.
+    """
+    require_admin_auth(request)
+    require_admin_writes()
+    from src.catalog import (
+        entry_routable_ids,
+        normalize_thinking_capabilities,
+        validate_pricing_policy,
+    )
+    import src.providers as providers
+
+    try:
+        body = await request.json()
+    except Exception:
+        return _bad_request("Invalid JSON body")
+
+    name = (model_name or "").strip()
+    issues: list[str] = []
+    entry: dict = {"name": name}
+    if not name:
+        issues.append("model name is required")
+    provider = (body.get("provider") or "").strip().lower()
+    if not provider:
+        issues.append("provider is required")
+    else:
+        entry["provider"] = provider
+    for field in ("provider_model_id", "omlx_id", "alias", "context",
+                  "max_output_tokens", "thinking", "thinking_levels",
+                  "thinking_format", "desc", "pool"):
+        value = body.get(field)
+        if value is not None and value != "":
+            entry[field] = value
+    if provider and provider not in {"local", "omlx", "mlx"} and not entry.get("provider_model_id"):
+        issues.append("provider_model_id is required")
+    if provider in {"local", "omlx", "mlx"} and not entry.get("omlx_id") and not entry.get("provider_model_id"):
+        issues.append("omlx_id or provider_model_id is required for local/oMLX models")
+    # Mirror config_io._apply_pricing_update: 'unmetered' is the only stored
+    # marker; 'metered' keeps numeric pricing; 'unknown' stores neither.
+    pricing_status = (body.get("pricing_status") or "").strip().lower()
+    if pricing_status == "unmetered":
+        entry["pricing_status"] = "unmetered"
+    elif body.get("pricing") is not None and pricing_status != "unknown":
+        entry["pricing"] = body["pricing"]
+    if body.get("vision") is not None:
+        entry["vision"] = bool(body["vision"])
+
+    try:
+        validate_pricing_policy(entry)
+        entry.update(normalize_thinking_capabilities(entry))
+    except ValueError as exc:
+        issues.append(str(exc))
+
+    # Routable-id clashes with *other* catalog entries.
+    clashes: list[dict] = []
+    try:
+        candidate_ids = entry_routable_ids(entry)
+    except ValueError as exc:
+        candidate_ids = []
+        issues.append(str(exc))
+    models = providers._load_models()
+    for rid in candidate_ids:
+        existing = models.get(rid)
+        if existing is not None and existing.get("name") != name:
+            clashes.append({"id": rid, "model": existing.get("name")})
+
+    # Provider route the entry would take.
+    config = providers._load_config()
+    route: list[dict] = []
+    if provider:
+        for member in providers._pool_members(entry, config):
+            member_config = providers._effective_provider_config(config, member)
+            usable = bool(
+                member_config.get("base_url")
+                and member_config.get("api_key")
+                and member_config.get("enabled") is not False
+            )
+            reason = None
+            if not member_config:
+                reason = "not configured"
+            elif member_config.get("enabled") is False:
+                reason = "disabled"
+            elif not member_config.get("base_url"):
+                reason = "missing base_url"
+            elif not member_config.get("api_key"):
+                reason = "missing api_key"
+            route.append({"provider": member, "usable": usable, "reason": reason})
+    routable = not issues and not clashes and any(m["usable"] for m in route)
+
+    return {
+        "ok": not issues and not clashes,
+        "routable": routable,
+        "issues": issues,
+        "clashes": clashes,
+        "route": route,
+        "routable_ids": candidate_ids,
+        "entry": {k: v for k, v in entry.items() if k != "api_key"},
+        "exists": any(m.get("name") == name for m in {id(v): v for v in models.values()}.values()),
+    }
 
 
 @router.post("/admin/api/models/{model_name}")
@@ -826,8 +973,14 @@ _ADMIN_HTML = r"""
             <div class="toolbar">
               <button class="btn" id="saveProviderBtn" type="button">Save provider</button>
               <button class="btn secondary" id="validateProviderBtn" type="button">Validate connection</button>
+              <button class="btn secondary" id="discoverBtn" type="button">Discover models</button>
               <button class="btn danger" id="deleteProviderBtn" type="button">Delete</button>
               <span id="pMsg" class="msg"></span>
+            </div>
+            <div id="discoverPanel" class="hidden">
+              <div class="subhead">Upstream models <span class="meta" id="discoverMeta"></span></div>
+              <div class="scroll" style="max-height:260px;"><table id="discoverTable"><thead><tr><th>Upstream id</th><th>Status</th><th></th></tr></thead><tbody></tbody></table></div>
+              <p class="hint">Register pre-fills the model form below with this provider + upstream id; review pricing/limits before saving.</p>
             </div>
             <p class="hint">The api_key is write-only: leave blank to keep the existing key. Provider config lives in the gitignored config.yaml and persists across deploys.</p>
           </div>
@@ -864,10 +1017,12 @@ _ADMIN_HTML = r"""
               <label class="check"><input id="mEnabled" type="checkbox" checked /> enabled</label>
             </div>
             <div class="toolbar">
+              <button class="btn secondary" id="previewModelBtn" type="button">Preview routing</button>
               <button class="btn" id="saveModelBtn" type="button">Save model</button>
               <button class="btn danger" id="deleteModelBtn" type="button">Delete</button>
               <span id="mMsg" class="msg"></span>
             </div>
+            <div id="previewPanel" class="hidden"></div>
             <p class="hint">Writes are hot (immediate) and mirrored to the configured machine-local catalog copy. Back up reviewed catalog changes through the operator's private configuration workflow. Disabled models are hidden from /v1/models.</p>
           </div>
         </details>
@@ -1273,11 +1428,11 @@ _ADMIN_HTML = r"""
     document.getElementById('mEnabled').checked = m.enabled !== false;
     setMsg('mMsg', 'editing '+name, true);
   }
-  async function saveModel(){
+  function collectModelForm(){
     const name = document.getElementById('mName').value.trim();
-    if (!name) return setMsg('mMsg', 'name required', false);
+    if (!name) { setMsg('mMsg', 'name required', false); return null; }
     const body = {provider: document.getElementById('mProvider').value.trim(), provider_model_id: document.getElementById('mPmid').value.trim()};
-    if (!body.provider || !body.provider_model_id) return setMsg('mMsg', 'provider + provider_model_id required', false);
+    if (!body.provider || !body.provider_model_id) { setMsg('mMsg', 'provider + provider_model_id required', false); return null; }
     const alias = document.getElementById('mAlias').value.trim(); if (alias) body.alias = alias;
     const ctx = parseInt(document.getElementById('mContext').value); if (!isNaN(ctx)) body.context = ctx;
     const mo = parseInt(document.getElementById('mMaxOut').value); if (!isNaN(mo)) body.max_output_tokens = mo;
@@ -1289,16 +1444,83 @@ _ADMIN_HTML = r"""
     body.pricing_status = pricingStatus;
     const pr = document.getElementById('mPricing').value.trim();
     if (pricingStatus === 'metered') {
-      if (!pr) return setMsg('mMsg', 'metered pricing JSON required', false);
-      try { body.pricing = JSON.parse(pr); } catch(e){ return setMsg('mMsg', 'pricing JSON invalid', false); }
+      if (!pr) { setMsg('mMsg', 'metered pricing JSON required', false); return null; }
+      try { body.pricing = JSON.parse(pr); } catch(e){ setMsg('mMsg', 'pricing JSON invalid', false); return null; }
     } else {
       body.pricing = null;
     }
     const desc = document.getElementById('mDesc').value.trim(); if (desc) body.desc = desc;
     body.vision = document.getElementById('mVision').checked;
     body.enabled = document.getElementById('mEnabled').checked;
-    try { await send('POST', '/admin/api/models/'+encodeURIComponent(name), body); setMsg('mMsg', 'saved + reloaded (machine-local catalog updated)', true); loadHealth(); }
+    return {name, body};
+  }
+  async function saveModel(){
+    const form = collectModelForm();
+    if (!form) return;
+    try { await send('POST', '/admin/api/models/'+encodeURIComponent(form.name), form.body); setMsg('mMsg', 'saved + reloaded (machine-local catalog updated)', true); document.getElementById('previewPanel').classList.add('hidden'); loadHealth(); }
     catch(e){ if (e instanceof AuthError) return showLocked(); setMsg('mMsg', e.message, false); }
+  }
+  async function previewModel(){
+    const form = collectModelForm();
+    if (!form) return;
+    const panel = document.getElementById('previewPanel');
+    panel.classList.remove('hidden');
+    panel.innerHTML = '<div class="loading-bar">Previewing…</div>';
+    try {
+      const p = await send('POST', '/admin/api/models/'+encodeURIComponent(form.name)+'/preview', form.body);
+      let html = '<div class="subhead">Routing preview</div>';
+      const verdict = p.routable ? statePill('ok','will route') : (p.ok ? statePill('warn','valid, not routable') : statePill('bad','invalid'));
+      html += '<div class="toolbar">'+verdict+'<span class="meta">'+(p.exists ? 'updates existing entry' : 'creates new entry')+'</span></div>';
+      if ((p.issues||[]).length) html += '<div class="inline-err">'+p.issues.map(escapeHtml).join('<br>')+'</div>';
+      if ((p.clashes||[]).length) html += '<div class="inline-err">Id clash: '+p.clashes.map(c => escapeHtml(c.id)+' → '+escapeHtml(c.model)).join(', ')+'</div>';
+      html += '<div class="kv-grid">';
+      html += '<div class="kv-item"><span class="k">Route</span><span class="v">'+((p.route||[]).map(r => r.usable ? statePill('ok', r.provider) : statePill('bad', r.provider+' · '+(r.reason||'unusable'))).join(' ') || '—')+'</span></div>';
+      html += '<div class="kv-item"><span class="k">Routable ids</span><span class="v id">'+escapeHtml((p.routable_ids||[]).join(', ')||'—')+'</span></div>';
+      html += '<div class="kv-item"><span class="k">Thinking</span><span class="v">'+escapeHtml((p.entry&&p.entry.thinking)||'off')+' · levels '+escapeHtml(((p.entry&&p.entry.thinking_levels)||[]).join(', ')||'—')+'</span></div>';
+      html += '</div>';
+      panel.innerHTML = html;
+      setMsg('mMsg', p.routable ? 'preview ok — safe to save' : 'preview found problems', p.routable);
+    } catch(e){
+      if (e instanceof AuthError) return showLocked();
+      panel.innerHTML = '<div class="inline-err">'+escapeHtml(e.message)+'</div>';
+    }
+  }
+  async function discoverModels(){
+    const id = document.getElementById('pId').value.trim().toLowerCase();
+    if (!id) return setMsg('pMsg', 'provider id required', false);
+    const panel = document.getElementById('discoverPanel');
+    panel.classList.remove('hidden');
+    document.getElementById('discoverMeta').textContent = 'querying…';
+    document.querySelector('#discoverTable tbody').innerHTML = '';
+    try {
+      const r = await send('POST', '/admin/api/providers/'+encodeURIComponent(id)+'/discover');
+      const models = r.models || [];
+      document.getElementById('discoverMeta').textContent = r.status + ' · ' + models.length + ' models';
+      document.querySelector('#discoverTable tbody').innerHTML = models.map(m =>
+        '<tr><td class="id">'+escapeHtml(m.id)+'</td><td>'+(m.registered ? statePill('ok','registered') : statePill('warn','new'))+'</td>'+
+        '<td>'+(m.registered ? '' : '<button class="btn secondary" data-register-upstream="'+escapeHtml(m.id)+'" data-register-provider="'+escapeHtml(id)+'">register</button>')+'</td></tr>'
+      ).join('') || '<tr class="empty"><td colspan="3">No models reported ('+escapeHtml(r.status||'unknown')+').</td></tr>';
+    } catch(e){
+      if (e instanceof AuthError) return showLocked();
+      document.getElementById('discoverMeta').textContent = '';
+      document.querySelector('#discoverTable tbody').innerHTML = '<tr class="empty"><td colspan="3">'+escapeHtml(e.message)+'</td></tr>';
+    }
+  }
+  function registerFromDiscovery(provider, upstreamId){
+    // Pre-fill the model form; operator reviews limits/pricing then saves.
+    const modelForm = document.querySelector('[data-tab-panel="models"] .formset');
+    showTab('models');
+    modelForm.open = true;
+    const short = upstreamId.split('/').pop();
+    document.getElementById('mName').value = short;
+    document.getElementById('mProvider').value = provider;
+    document.getElementById('mPmid').value = upstreamId;
+    document.getElementById('mAlias').value = '';
+    document.getElementById('mPricingStatus').value = 'unknown';
+    document.getElementById('mPricing').value = '';
+    document.getElementById('mEnabled').checked = true;
+    setMsg('mMsg', 'pre-filled from discovery — set context/limits/pricing, preview, then save', true);
+    modelForm.scrollIntoView({behavior:'smooth', block:'start'});
   }
   async function deleteModel(){
     const name = document.getElementById('mName').value.trim();
@@ -1517,9 +1739,11 @@ _ADMIN_HTML = r"""
       const ep = t.getAttribute('data-edit-provider');
       const em = t.getAttribute('data-edit-model');
       const tm = t.getAttribute('data-toggle-model');
+      const ru = t.getAttribute('data-register-upstream');
       if (ep) { editProvider(ep); return; }
       if (em) { editModel(em); return; }
       if (tm) { toggleModel(tm, t.getAttribute('data-enable') === 'true'); return; }
+      if (ru) { registerFromDiscovery(t.getAttribute('data-register-provider'), ru); return; }
     }
     const openModel = t.closest && t.closest('[data-open-model]');
     if (openModel) { const nm = openModel.getAttribute('data-open-model'); if (nm) { showModelDetail(nm); return; } }
@@ -1556,6 +1780,8 @@ _ADMIN_HTML = r"""
   document.getElementById('validateProviderBtn').addEventListener('click', validateProvider);
   document.getElementById('saveModelBtn').addEventListener('click', saveModel);
   document.getElementById('deleteModelBtn').addEventListener('click', deleteModel);
+  document.getElementById('previewModelBtn').addEventListener('click', previewModel);
+  document.getElementById('discoverBtn').addEventListener('click', discoverModels);
   document.querySelectorAll('#winSeg button').forEach(b => b.addEventListener('click', () => {
     loadUsage(b.dataset.w);
     if (!modelDetail.classList.contains('hidden')) {
