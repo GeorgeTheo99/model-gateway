@@ -1321,16 +1321,14 @@ _ADMIN_HTML = r"""
   }
 
   // ── Hash routing: #tab or #tab/detailName ───────────────────
-  let _suppressHash = false;
   function setHash(tab, detail){
     const h = '#' + tab + (detail ? '/' + encodeURIComponent(detail) : '');
     if (window.location.hash === h) return;
-    _suppressHash = true;
-    window.location.hash = h;
-    setTimeout(() => { _suppressHash = false; }, 0);
+    // pushState (not location.hash=) so the browser never anchor-scrolls
+    // to elements whose ids match tab names (e.g. <table id="models">).
+    history.pushState(null, '', h);
   }
   function applyHash(){
-    if (_suppressHash) return;
     const raw = (window.location.hash || '').replace(/^#/, '');
     if (!raw) return;
     const [tab, detail] = raw.split('/');
