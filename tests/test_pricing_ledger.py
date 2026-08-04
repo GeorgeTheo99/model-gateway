@@ -8,6 +8,7 @@ from src.providers import CompositeRoute, ProviderInfo, pricing_for, pricing_sta
 import src.server as server_module
 from src.server import app
 from src import ledger
+from src.usage import CostEstimate, Usage
 
 try:
     from fastapi.testclient import TestClient
@@ -691,3 +692,36 @@ def test_admin_usage_endpoint_requires_admin_key(monkeypatch, tmp_ledger):
     with TestClient(app) as c:
         assert c.get("/admin/api/usage").status_code == 401
         assert c.get("/admin/api/requests").status_code == 401
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_admin_usage_exposes_configured_route_aggregation(monkeypatch, tmp_ledger):
+    monkeypatch.setenv("MODEL_GATEWAY_ADMIN_KEY", "admin-key")
+    usage = Usage(
+        input_tokens=10, output_tokens=5, cached_read_tokens=0,
+        cache_write_tokens=0, reasoning_tokens=0, reported=True,
+    )
+    for model in ("glm-5.2-zai", "glm-5.2"):
+        ledger.record(
+            endpoint="/v1/chat/completions", method="POST", model=model,
+            provider="zai_coding", provider_model_id="glm-5.2", status=200,
+            latency_ms=100, is_stream=False, usage=usage,
+            cost=CostEstimate(0.01, True, []),
+        )
+
+    with TestClient(app) as c:
+        response = c.get(
+            "/admin/api/usage", headers={"Authorization": "Bearer admin-key"},
+        )
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data["by_model"]) == 2
+    assert len(data["by_route"]) == 1
+    route = data["by_route"][0]
+    assert route["dim"] == "glm-5.2"
+    assert route["provider"] == "zai_coding"
+    assert route["provider_model_id"] == "glm-5.2"
+    assert route["route_complete"] == 1
+    assert route["requests"] == 2
+    assert route["input_tokens"] == 20
+    assert route["cost_usd"] == pytest.approx(0.02)

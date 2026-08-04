@@ -174,7 +174,7 @@ async def _regenerate_catalogs() -> str:
 
 @router.get("/admin/api/usage")
 async def admin_usage(request: Request):
-    """Aggregate usage/cost by provider, model, endpoint, and status.
+    """Aggregate usage/cost by provider, requested model, route, endpoint, and status.
 
     Query params:
       since   - epoch seconds (inclusive)
@@ -187,7 +187,10 @@ async def admin_usage(request: Request):
     return {
         "summary": ledger.summary(since=since, until=until),
         "by_provider": ledger.aggregate(since=since, until=until, group_by="provider"),
+        # Retain requested-model aggregation for API compatibility. The dashboard
+        # uses by_route so aliases for one configured model appear only once.
         "by_model": ledger.aggregate(since=since, until=until, group_by="model"),
+        "by_route": ledger.aggregate(since=since, until=until, group_by="route"),
         "by_endpoint": ledger.aggregate(since=since, until=until, group_by="endpoint"),
         "by_status": ledger.aggregate(since=since, until=until, group_by="status"),
     }
@@ -1247,11 +1250,13 @@ _ADMIN_HTML = r"""
     applyFilter('modelFilter', '#models');
   }
 
-  function resolveModelName(dim){
+  function resolveModelName(dim, provider){
     if (!dim) return null;
     for (const m of _modelsCache) {
       const name = m.name || m.id;
       if (!name) continue;
+      const candidateProviders = m.candidate_providers || [];
+      if (provider && m.provider && provider !== m.provider && !candidateProviders.includes(provider)) continue;
       if (dim === name || dim === m.alias || dim === m.provider_model_id || dim === m.omlx_id || (m.routable_ids || []).includes(dim)) return name;
     }
     return null;
@@ -1378,12 +1383,15 @@ _ADMIN_HTML = r"""
       const uLat = document.getElementById('uLatency');
       uLat.textContent = fmtMs(s.avg_latency_ms); uLat.className = 'value ok-c';
       document.getElementById('uLatencyDetail').textContent = s.requests ? 'over '+s.requests+' requests' : 'no requests';
-      const byModel = usage.by_model || [];
+      const byModel = usage.by_route || usage.by_model || [];
       document.querySelector('#usageByModel tbody').innerHTML = byModel.map(r => {
-        const name = resolveModelName(r.dim);
+        const name = r.route_complete !== 0 ? resolveModelName(r.dim, r.provider) : null;
         const cls = name ? 'bymodel-clickable' : '';
         const attr = name ? ' data-open-model="'+escapeHtml(name)+'"' : '';
-        return '<tr class="'+cls+'"'+attr+'><td>'+idPill(r.dim||'—')+'</td><td class="num">'+fmtNum(r.requests)+'</td><td class="num">'+fmtNum(r.usage_reported_requests)+'</td><td class="num">'+fmtNum(r.known_cost_requests)+'</td><td class="num '+(r.errors?'bad-c':'ok-c')+'">'+fmtNum(r.errors)+'</td><td class="num">'+fmtNum(r.input_tokens)+'</td><td class="num">'+fmtNum(r.output_tokens)+'</td><td class="num">'+fmtNum(r.cached_read_tokens)+'</td><td class="num">'+fmtCost(r.cost_usd)+'</td><td class="num">'+fmtMs(r.avg_latency_ms)+'</td></tr>';
+        const label = name || r.dim || '—';
+        const route = [r.provider, r.provider_model_id].filter(Boolean).join(' · ');
+        const routeMeta = route ? '<div class="small">'+escapeHtml(route)+'</div>' : '';
+        return '<tr class="'+cls+'"'+attr+'><td>'+idPill(label)+routeMeta+'</td><td class="num">'+fmtNum(r.requests)+'</td><td class="num">'+fmtNum(r.usage_reported_requests)+'</td><td class="num">'+fmtNum(r.known_cost_requests)+'</td><td class="num '+(r.errors?'bad-c':'ok-c')+'">'+fmtNum(r.errors)+'</td><td class="num">'+fmtNum(r.input_tokens)+'</td><td class="num">'+fmtNum(r.output_tokens)+'</td><td class="num">'+fmtNum(r.cached_read_tokens)+'</td><td class="num">'+fmtCost(r.cost_usd)+'</td><td class="num">'+fmtMs(r.avg_latency_ms)+'</td></tr>';
       }).join('') || '<tr class="empty"><td colspan="10">No requests in this window.</td></tr>';
       const reqs = recent.requests || [];
       document.querySelector('#recentReq tbody').innerHTML = reqs.map(r => '<tr class="clickable-row" data-open-request="'+escapeHtml(r.id||'')+'"><td>'+escapeHtml(r.ts_iso||'—')+'</td><td>'+escapeHtml(r.endpoint||'—')+'</td><td>'+(resolveModelName(r.model) ? modelLink(resolveModelName(r.model)) : idPill(r.model||'—'))+'</td><td class="num '+(!r.error && r.status && r.status < 400 ? 'ok-c' : 'bad-c')+'">'+(r.status||'—')+'</td><td>'+(r.is_stream?'stream':'sync')+'</td><td>'+requestCoverage(r)+'</td><td class="num">'+fmtNum(r.input_tokens)+'</td><td class="num">'+fmtNum(r.output_tokens)+'</td><td class="num">'+fmtNum(r.cached_read_tokens)+'</td><td class="num">'+fmtCost(r.cost_usd)+'</td><td class="num">'+fmtMs(r.latency_ms)+'</td><td class="chev">›</td></tr>').join('') || '<tr class="empty"><td colspan="12">No requests yet.</td></tr>';

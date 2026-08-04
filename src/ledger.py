@@ -235,10 +235,13 @@ def aggregate(
 ) -> list[dict]:
     """Aggregate requests/tokens/cost/latency/errors by a dimension.
 
-    ``group_by`` is one of: provider, model, endpoint, status. Time bounds are
-    epoch seconds (inclusive). Cost sums ignore NULL (unknown) rows.
+    ``group_by`` is one of: provider, model, route, endpoint, status. ``route``
+    groups requested aliases by the initially resolved
+    ``(provider, provider_model_id)`` pair and falls back to the requested model
+    when route metadata is unavailable. Time bounds are epoch seconds
+    (inclusive). Cost sums ignore NULL (unknown) rows.
     """
-    allowed = {"provider", "model", "endpoint", "status"}
+    allowed = {"provider", "model", "route", "endpoint", "status"}
     if group_by not in allowed:
         raise ValueError(f"group_by must be one of {sorted(allowed)}")
     clauses = []
@@ -251,9 +254,34 @@ def aggregate(
         params.append(until)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
 
+    if group_by == "route":
+        complete_route_sql = (
+            "NULLIF(provider, '') IS NOT NULL "
+            "AND NULLIF(provider_model_id, '') IS NOT NULL"
+        )
+        dimension_sql = (
+            f"CASE WHEN {complete_route_sql} "
+            "THEN provider_model_id ELSE model END"
+        )
+        route_columns_sql = (
+            f", CASE WHEN {complete_route_sql} THEN 1 ELSE 0 END AS route_complete, "
+            "NULLIF(provider, '') AS provider, "
+            f"CASE WHEN {complete_route_sql} "
+            "THEN provider_model_id END AS provider_model_id"
+        )
+        group_sql = (
+            f"CASE WHEN {complete_route_sql} THEN 1 ELSE 0 END, "
+            f"NULLIF(provider, ''), {dimension_sql}"
+        )
+    else:
+        dimension_sql = group_by
+        route_columns_sql = ""
+        group_sql = group_by
+
     sql = f"""
         SELECT
-            {group_by} AS dim,
+            {dimension_sql} AS dim
+            {route_columns_sql},
             COUNT(*) AS requests,
             SUM(CASE WHEN status >= 200 AND status < 300 AND error IS NULL THEN 1 ELSE 0 END) AS ok,
             SUM(CASE WHEN error IS NOT NULL OR (status IS NOT NULL AND status >= 400) THEN 1 ELSE 0 END) AS errors,
@@ -275,7 +303,7 @@ def aggregate(
             MAX(latency_ms) AS max_latency_ms
         FROM requests
         {where}
-        GROUP BY {group_by}
+        GROUP BY {group_sql}
         ORDER BY cost_usd DESC, requests DESC
     """
     with _lock, _connect() as conn:

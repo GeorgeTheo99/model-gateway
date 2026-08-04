@@ -132,6 +132,11 @@ def test_pool_candidates_by_alias_and_id(pooled_registry):
     assert providers.pool_candidates("unknown-model") == []
 
 
+def test_model_status_exposes_pool_candidate_providers(pooled_registry):
+    row = next(item for item in providers.model_status() if item["name"] == "pooled-model")
+    assert row["candidate_providers"] == ["ws-a", "ws-b"]
+
+
 def test_availability_ok_when_any_pool_member_configured(pooled_registry, monkeypatch):
     config = {
         "workspaces": {

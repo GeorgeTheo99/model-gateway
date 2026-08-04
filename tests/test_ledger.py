@@ -105,6 +105,63 @@ def test_aggregate_by_model(tmp_ledger):
     assert dims["b"]["unknown_cost_requests"] == 1
 
 
+def test_aggregate_by_route_collapses_aliases_without_merging_providers(tmp_ledger):
+    rows = [
+        ("glm-5.2-zai", "zai_coding", "glm-5.2", 100, 0.01),
+        ("glm-5.2", "zai_coding", "glm-5.2", 200, 0.02),
+        ("glm52zai", "zai_coding", "glm-5.2", 300, 0.03),
+        # The same upstream id at another provider remains a separate route.
+        ("other-glm", "other_provider", "glm-5.2", 400, 0.04),
+        # Missing route metadata falls back to the requested model. Empty and
+        # NULL route values normalize into the same group.
+        ("unresolved-a", None, None, 500, None),
+        ("unresolved-a", "", "", 700, None),
+        ("unresolved-b", None, None, 900, None),
+        ("unresolved-c", None, "upstream-only", 1000, None),
+        ("unresolved-d", "", "upstream-only", 1100, None),
+        # Complete and incomplete identities with the same visible values must
+        # remain separate namespaces.
+        ("logical-alias", "collision-provider", "collision-id", 1200, 0.05),
+        ("collision-id", "collision-provider", None, 1300, 0.06),
+    ]
+    for model, provider, provider_model_id, latency, cost in rows:
+        ledger.record(
+            endpoint="/v1/chat/completions", method="POST", model=model,
+            provider=provider, provider_model_id=provider_model_id, status=200,
+            latency_ms=latency, is_stream=False,
+            usage=_usage(input_tokens=10, output_tokens=5),
+            cost=CostEstimate(cost, cost is not None, []),
+        )
+
+    aggregated = ledger.aggregate(group_by="route")
+    routes = {
+        (row["provider"], row["dim"]): row
+        for row in aggregated
+        if row["provider"] != "collision-provider"
+    }
+    zai = routes[("zai_coding", "glm-5.2")]
+    assert zai["provider_model_id"] == "glm-5.2"
+    assert zai["requests"] == 3
+    assert zai["input_tokens"] == 30
+    assert zai["cost_usd"] == pytest.approx(0.06)
+    assert zai["avg_latency_ms"] == 200
+    assert routes[("other_provider", "glm-5.2")]["requests"] == 1
+    assert routes[(None, "unresolved-a")]["requests"] == 2
+    assert routes[(None, "unresolved-a")]["provider_model_id"] is None
+    assert routes[(None, "unresolved-b")]["requests"] == 1
+    assert routes[(None, "unresolved-c")]["requests"] == 1
+    assert routes[(None, "unresolved-c")]["provider_model_id"] is None
+    assert routes[(None, "unresolved-d")]["requests"] == 1
+
+    collisions = [
+        row for row in aggregated
+        if row["provider"] == "collision-provider" and row["dim"] == "collision-id"
+    ]
+    assert len(collisions) == 2
+    assert {row["route_complete"] for row in collisions} == {0, 1}
+    assert {row["requests"] for row in collisions} == {1}
+
+
 def test_aggregate_window_filters_by_time(tmp_ledger):
     ledger.record(endpoint="/v1/messages", method="POST", model="a",
                   provider="anthropic", provider_model_id="a", status=200,

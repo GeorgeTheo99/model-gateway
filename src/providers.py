@@ -1190,6 +1190,10 @@ def model_status() -> list[dict]:
             "routable_ids": model.get("routable_ids", []),
             "provider": provider,
             "configured_provider": _canonical_provider(model.get("provider", "")),
+            "candidate_providers": [
+                _canonical_provider(candidate)
+                for candidate in model.get("candidate_providers", [])
+            ],
             "provider_model_id": model.get("provider_model_id") or model.get("omlx_id") or model.get("name", ""),
             "omlx_id": model.get("omlx_id", ""),
             "provider_configured": provider in configured,
