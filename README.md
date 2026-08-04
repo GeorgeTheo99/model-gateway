@@ -119,6 +119,7 @@ loopback or behind your own reverse proxy on networks you trust.
 | `docs/provider-onboarding.md` | Provider/model onboarding flow |
 | `docs/federation.md` | Gateway-to-gateway federation |
 | `docs/productionization-plan.md` | Admin/control-plane roadmap |
+| `docs/admin-ui-roadmap.md` | Admin UI phases (first-run wizard, runtime visibility) |
 | `PRODUCT.md` | Product definition and design principles |
 
 ## Development
