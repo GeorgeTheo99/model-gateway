@@ -895,6 +895,29 @@ _ADMIN_HTML = r"""
     .filterbar input { width: 200px; }
     tr.filtered-out { display: none; }
     .loading-bar { font-size: 12px; color: var(--muted); padding: 8px 0; }
+
+    /* ── Detail drawer (right-side overlay) ───────────────── */
+    .drawer-scrim { position: fixed; inset: 0; z-index: 40; background: color-mix(in oklab, oklch(20% 0.02 250) 42%, transparent); }
+    .drawer {
+      position: fixed; top: 0; right: 0; bottom: 0; z-index: 41;
+      width: min(640px, 94vw); overflow-y: auto; overscroll-behavior: contain;
+      background: var(--surface); border-left: 1px solid var(--rule);
+      box-shadow: -12px 0 32px color-mix(in oklab, oklch(20% 0.02 250) 18%, transparent);
+    }
+    .drawer .drawer-body { border: 0; border-radius: 0; padding: 0 22px 28px; min-width: 0; }
+    .drawer .drawer-body > * { min-width: 0; }
+    .drawer .drawer-body .kv-grid, .drawer .drawer-body .strip { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); }
+    .drawer .detail-head {
+      position: sticky; top: 0; z-index: 1; background: var(--surface);
+      padding: 18px 22px 10px; margin: 0 -22px; border-bottom: 1px solid var(--rule);
+    }
+    body.drawer-open { overflow: hidden; }
+    @media (prefers-reduced-motion: no-preference) {
+      .drawer:not([hidden]) { animation: drawer-in 0.18s ease-out; }
+      .drawer-scrim:not([hidden]) { animation: scrim-in 0.18s ease-out; }
+    }
+    @keyframes drawer-in { from { transform: translateX(28px); opacity: 0.4; } to { transform: none; opacity: 1; } }
+    @keyframes scrim-in { from { opacity: 0; } to { opacity: 1; } }
     .preset-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
     .preset-card { border: 1px solid var(--rule); border-radius: var(--radius); background: var(--surface); padding: 13px 14px; display: grid; gap: 8px; }
     .preset-card h3 { font-size: 14px; }
@@ -961,7 +984,6 @@ _ADMIN_HTML = r"""
         <div class="scroll">
           <table id="providers"><thead><tr><th>ID</th><th class="num">Models</th><th>Protocol</th><th>Base URL</th><th>Key</th><th>State</th><th>Issues</th><th></th><th class="chev"></th></tr></thead><tbody></tbody></table>
         </div>
-        <div id="providerDetail" class="detail hidden" aria-live="polite"></div>
         <details class="formset"><summary>Add or edit a provider</summary>
           <div class="form-body">
             <div class="form-grid">
@@ -995,7 +1017,6 @@ _ADMIN_HTML = r"""
         <div class="scroll">
           <table id="models"><thead><tr><th>Name</th><th>Upstream id</th><th>Provider</th><th>Pricing</th><th class="num">Context</th><th class="num">Max out</th><th>Thinking</th><th>Vision</th><th>State</th><th></th><th class="chev"></th></tr></thead><tbody></tbody></table>
         </div>
-        <div id="modelDetail" class="detail hidden" aria-live="polite"></div>
         <details class="formset"><summary>Add or edit a model</summary>
           <div class="form-body">
             <div class="form-grid">
@@ -1059,7 +1080,6 @@ _ADMIN_HTML = r"""
         </div>
         <div class="scroll"><table id="usageByModel"><thead><tr><th>Model</th><th class="num">Requests</th><th class="num">Usage</th><th class="num">Costed</th><th class="num">Errors</th><th class="num">In tok</th><th class="num">Out tok</th><th class="num">Cached</th><th class="num">Cost</th><th class="num">Avg ms</th></tr></thead><tbody></tbody></table></div>
         <div class="sec-head" style="margin-top:4px;"><h2>Recent requests</h2><span class="meta">last 50 · click a row for details</span></div>
-        <div id="requestDetail" class="detail hidden" aria-live="polite"></div>
         <div class="scroll"><table id="recentReq"><thead><tr><th>Time</th><th>Endpoint</th><th>Model</th><th class="num">Status</th><th>Stream</th><th>Coverage</th><th class="num">In</th><th class="num">Out</th><th class="num">Cached</th><th class="num">Cost</th><th class="num">Latency</th><th class="chev"></th></tr></thead><tbody></tbody></table></div>
         <div id="usageErr" class="inline-err hidden"></div>
       </section>
@@ -1071,6 +1091,10 @@ _ADMIN_HTML = r"""
       </section>
     </div>
   </main>
+  <div id="drawerScrim" class="drawer-scrim" hidden></div>
+  <aside id="drawer" class="drawer" role="dialog" aria-modal="true" aria-label="Details" tabindex="-1" hidden>
+    <div id="drawerBody" class="detail drawer-body" aria-live="polite"></div>
+  </aside>
 <script>
 (function () {
   const STORAGE_KEY = 'mg-admin-key';
@@ -1316,6 +1340,7 @@ _ADMIN_HTML = r"""
     if (tab === 'models' && name) showModelDetail(name, {skipHash: true});
     else if (tab === 'providers' && name) showProviderDetail(name, {skipHash: true});
     else if (tab === 'usage' && name) showRequestDetail(name, {skipHash: true});
+    else closeDrawer({skipHash: true});
   }
   window.addEventListener('hashchange', applyHash);
 
@@ -1536,12 +1561,37 @@ _ADMIN_HTML = r"""
   }
 
   // ── Model detail click-through ─────────────────────────────
-  const modelDetail = document.getElementById('modelDetail');
-  const providerDetail = document.getElementById('providerDetail');
-  const requestDetail = document.getElementById('requestDetail');
-  function closeModelDetail(){ modelDetail.classList.add('hidden'); modelDetail.innerHTML = ''; if (currentTab === 'models') setHash('models'); }
-  function closeProviderDetail(){ providerDetail.classList.add('hidden'); providerDetail.innerHTML = ''; if (currentTab === 'providers') setHash('providers'); }
-  function closeRequestDetail(){ requestDetail.classList.add('hidden'); requestDetail.innerHTML = ''; if (currentTab === 'usage') setHash('usage'); }
+  const drawer = document.getElementById('drawer');
+  const drawerScrim = document.getElementById('drawerScrim');
+  const drawerBody = document.getElementById('drawerBody');
+  let drawerKind = null;   // 'model' | 'provider' | 'request' | null
+  let drawerName = null;   // current entity name/id shown in the drawer
+  let _drawerReturnFocus = null;
+  function openDrawer(kind, name){
+    drawerKind = kind; drawerName = name;
+    if (drawer.hidden) {
+      _drawerReturnFocus = document.activeElement;
+      drawer.hidden = false; drawerScrim.hidden = false;
+      document.body.classList.add('drawer-open');
+      drawer.focus({preventScroll: true});
+    }
+  }
+  function closeDrawer(opts){
+    if (drawer.hidden) return;
+    drawer.hidden = true; drawerScrim.hidden = true;
+    document.body.classList.remove('drawer-open');
+    drawerBody.innerHTML = '';
+    drawerKind = null; drawerName = null;
+    if (!opts || !opts.skipHash) setHash(currentTab);
+    if (_drawerReturnFocus && _drawerReturnFocus.isConnected) { try { _drawerReturnFocus.focus(); } catch(e) {} }
+    _drawerReturnFocus = null;
+  }
+  drawerScrim.addEventListener('click', () => closeDrawer());
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !drawer.hidden) { e.preventDefault(); closeDrawer(); } });
+  function openFormset(tab){
+    const fs = document.querySelector('[data-tab-panel="'+tab+'"] .formset');
+    if (fs) { fs.open = true; fs.scrollIntoView({behavior:'smooth', block:'start'}); }
+  }
   function pricingText(p){
     if (!p) return '—';
     const parts = [];
@@ -1557,16 +1607,15 @@ _ADMIN_HTML = r"""
     if (!name) return;
     if (currentTab !== 'models') showTab('models', {skipHash: true});
     if (!opts || !opts.skipHash) setHash('models', name);
-    modelDetail.classList.remove('hidden');
-    modelDetail.innerHTML = '<div class="loading-bar">Loading '+escapeHtml(name)+'…</div>';
-    modelDetail.scrollIntoView({behavior:'smooth', block:'nearest'});
+    openDrawer('model', name);
+    drawerBody.innerHTML = '<div class="loading-bar">Loading '+escapeHtml(name)+'…</div>';
     try {
       const q = currentWindow ? ('?window='+encodeURIComponent(currentWindow)) : '';
       const data = await get('/admin/api/models/'+encodeURIComponent(name)+'/stats'+q);
-      renderModelDetail(name, data);
+      if (drawerKind === 'model' && drawerName === name) renderModelDetail(name, data);
     } catch (e) {
       if (e instanceof AuthError) { showLocked(); return; }
-      modelDetail.innerHTML = '<div class="inline-err">Failed to load stats: '+escapeHtml(e.message)+'</div>';
+      drawerBody.innerHTML = '<div class="inline-err">Failed to load stats: '+escapeHtml(e.message)+'</div>';
     }
   }
   function renderModelDetail(name, data){
@@ -1608,7 +1657,7 @@ _ADMIN_HTML = r"""
     html += '<div><div class="subhead">Recent requests · this model · '+winLabel+'</div><div class="scroll"><table><thead><tr><th>Time</th><th class="num">Status</th><th>Stream</th><th>Coverage</th><th class="num">In</th><th class="num">Out</th><th class="num">Cached</th><th class="num">Cost</th><th class="num">Latency</th></tr></thead><tbody>';
     html += reqs2.map(r => '<tr><td>'+escapeHtml(r.ts_iso||'—')+'</td><td class="num '+(!r.error && r.status && r.status < 400 ? 'ok-c' : 'bad-c')+'">'+(r.status||'—')+'</td><td>'+(r.is_stream?'stream':'sync')+'</td><td>'+requestCoverage(r)+'</td><td class="num">'+fmtNum(r.input_tokens)+'</td><td class="num">'+fmtNum(r.output_tokens)+'</td><td class="num">'+fmtNum(r.cached_read_tokens)+'</td><td class="num">'+fmtCost(r.cost_usd)+'</td><td class="num">'+fmtMs(r.latency_ms)+'</td></tr>').join('') || '<tr class="empty"><td colspan="9">No requests for this model in '+escapeHtml(winLabel)+'.</td></tr>';
     html += '</tbody></table></div></div>';
-    modelDetail.innerHTML = html;
+    drawerBody.innerHTML = html;
   }
 
   // ── Provider detail click-through ─────────────────────────
@@ -1616,16 +1665,15 @@ _ADMIN_HTML = r"""
     if (!id) return;
     if (currentTab !== 'providers') showTab('providers', {skipHash: true});
     if (!opts || !opts.skipHash) setHash('providers', id);
-    providerDetail.classList.remove('hidden');
-    providerDetail.innerHTML = '<div class="loading-bar">Loading '+escapeHtml(id)+'…</div>';
-    providerDetail.scrollIntoView({behavior:'smooth', block:'nearest'});
+    openDrawer('provider', id);
+    drawerBody.innerHTML = '<div class="loading-bar">Loading '+escapeHtml(id)+'…</div>';
     try {
       const q = currentWindow ? ('?window='+encodeURIComponent(currentWindow)) : '';
       const data = await get('/admin/api/providers/'+encodeURIComponent(id)+'/stats'+q);
-      renderProviderDetail(id, data);
+      if (drawerKind === 'provider' && drawerName === id) renderProviderDetail(id, data);
     } catch (e) {
       if (e instanceof AuthError) { showLocked(); return; }
-      providerDetail.innerHTML = '<div class="inline-err">Failed to load stats: '+escapeHtml(e.message)+'</div>';
+      drawerBody.innerHTML = '<div class="inline-err">Failed to load stats: '+escapeHtml(e.message)+'</div>';
     }
   }
   function renderProviderDetail(id, data){
@@ -1638,7 +1686,7 @@ _ADMIN_HTML = r"""
     let html = '<div class="detail-head"><h3>'+idPill(id)+'</h3>';
     html += '<div class="toolbar"><span class="meta">'+(ready?statePill('ok','ready'):statePill('warn','config'))+'</span>';
     html += '<button class="btn secondary" data-mgmt data-edit-provider="'+escapeHtml(id)+'">Edit</button>';
-    html += '<button class="close" type="button" data-close-provider-detail aria-label="Close">×</button></div></div>';
+    html += '<button class="close" type="button" data-close-detail aria-label="Close">×</button></div></div>';
     html += '<div class="cost-callout"><span class="cost-value">'+fmtCost(u.cost_usd)+'</span><span class="cost-label">estimated cost · '+escapeHtml(winLabel)+' · '+fmtNum(u.known_cost_requests)+'/'+fmtNum(u.requests)+' requests costed</span></div>';
     html += '<div class="strip"><div class="stat"><span class="label">Requests</span><span class="value '+(errs?'warn-c':'ok-c')+'">'+fmtNum(u.requests)+'</span><span class="detail">'+fmtNum(u.ok)+' ok / '+fmtNum(errs)+' errors</span></div>';
     html += '<div class="stat"><span class="label">Tokens</span><span class="value ok-c">'+fmtNum((u.input_tokens||0)+(u.output_tokens||0))+'</span><span class="detail">'+fmtNum(u.input_tokens)+' in / '+fmtNum(u.output_tokens)+' out</span></div>';
@@ -1654,7 +1702,7 @@ _ADMIN_HTML = r"""
     html += '<div><div class="subhead">Recent requests · this provider</div><div class="scroll"><table><thead><tr><th>Time</th><th>Model</th><th class="num">Status</th><th>Stream</th><th class="num">In</th><th class="num">Out</th><th class="num">Cost</th><th class="num">Latency</th></tr></thead><tbody>';
     html += reqs.map(r => '<tr><td>'+escapeHtml(r.ts_iso||'—')+'</td><td>'+(resolveModelName(r.model) ? modelLink(resolveModelName(r.model)) : idPill(r.model||'—'))+'</td><td class="num '+(!r.error && r.status && r.status < 400 ? 'ok-c' : 'bad-c')+'">'+(r.status||'—')+'</td><td>'+(r.is_stream?'stream':'sync')+'</td><td class="num">'+fmtNum(r.input_tokens)+'</td><td class="num">'+fmtNum(r.output_tokens)+'</td><td class="num">'+fmtCost(r.cost_usd)+'</td><td class="num">'+fmtMs(r.latency_ms)+'</td></tr>').join('') || '<tr class="empty"><td colspan="8">No requests for this provider yet.</td></tr>';
     html += '</tbody></table></div></div>';
-    providerDetail.innerHTML = html;
+    drawerBody.innerHTML = html;
   }
 
   // ── Request detail click-through ──────────────────────────
@@ -1662,15 +1710,14 @@ _ADMIN_HTML = r"""
     if (!id) return;
     if (currentTab !== 'usage') showTab('usage', {skipHash: true});
     if (!opts || !opts.skipHash) setHash('usage', id);
-    requestDetail.classList.remove('hidden');
-    requestDetail.innerHTML = '<div class="loading-bar">Loading request…</div>';
-    requestDetail.scrollIntoView({behavior:'smooth', block:'nearest'});
+    openDrawer('request', id);
+    drawerBody.innerHTML = '<div class="loading-bar">Loading request…</div>';
     try {
       const data = await get('/admin/api/requests/'+encodeURIComponent(id));
-      renderRequestDetail(data.request || {});
+      if (drawerKind === 'request' && drawerName === id) renderRequestDetail(data.request || {});
     } catch (e) {
       if (e instanceof AuthError) { showLocked(); return; }
-      requestDetail.innerHTML = '<div class="inline-err">Failed to load request: '+escapeHtml(e.message)+'</div>';
+      drawerBody.innerHTML = '<div class="inline-err">Failed to load request: '+escapeHtml(e.message)+'</div>';
     }
   }
   function renderRequestDetail(r){
@@ -1678,7 +1725,7 @@ _ADMIN_HTML = r"""
     const okReq = !r.error && r.status && r.status < 400;
     let html = '<div class="detail-head"><h3>'+idPill(r.id||'request')+'</h3>';
     html += '<div class="toolbar"><span class="meta">'+escapeHtml(r.ts_iso||'—')+' · '+(okReq?statePill('ok', String(r.status||'ok')):statePill('bad', String(r.status||'error')))+'</span>';
-    html += '<button class="close" type="button" data-close-request-detail aria-label="Close">×</button></div></div>';
+    html += '<button class="close" type="button" data-close-detail aria-label="Close">×</button></div></div>';
     if (r.error) html += '<div class="inline-err">'+escapeHtml(r.error)+'</div>';
     html += '<div><div class="subhead">Request</div><div class="kv-grid">';
     html += kv('Endpoint', '<span class="id">'+escapeHtml(r.endpoint||'—')+'</span>');
@@ -1701,7 +1748,7 @@ _ADMIN_HTML = r"""
     const mpc = r.missing_pricing_classes;
     html += kv('Missing pricing', mpc && mpc.length ? escapeHtml(Array.isArray(mpc) ? mpc.join(', ') : String(mpc)) : '<span class="muted">none</span>');
     html += '</div></div>';
-    requestDetail.innerHTML = html;
+    drawerBody.innerHTML = html;
   }
 
   // ── Wiring ──────────────────────────────────────────────────
@@ -1715,7 +1762,7 @@ _ADMIN_HTML = r"""
     // the by-model table (whose click-through resolves dims to model names).
     loadHealth().then(() => loadUsage(currentWindow)).then(() => applyHash()).catch(()=>{});
   }
-  function refresh(){ if (!unlocked) return; closeModelDetail(); closeProviderDetail(); closeRequestDetail(); loadHealth(); loadUsage(currentWindow); }
+  function refresh(){ if (!unlocked) return; closeDrawer(); loadHealth(); loadUsage(currentWindow); }
 
   unlockBtn.addEventListener('click', unlock);
   refreshBtn.addEventListener('click', refresh);
@@ -1729,19 +1776,17 @@ _ADMIN_HTML = r"""
   // Delegated clicks for table action buttons and click-throughs.
   document.addEventListener('click', (e) => {
     const t = e.target;
-    if (t.closest && t.closest('[data-close-detail]')) { closeModelDetail(); return; }
-    if (t.closest && t.closest('[data-close-provider-detail]')) { closeProviderDetail(); return; }
-    if (t.closest && t.closest('[data-close-request-detail]')) { closeRequestDetail(); return; }
+    if (t.closest && t.closest('[data-close-detail]')) { closeDrawer(); return; }
     const tabBtn = t.closest && t.closest('[data-tab]');
-    if (tabBtn) { showTab(tabBtn.dataset.tab); return; }
+    if (tabBtn) { closeDrawer({skipHash: true}); showTab(tabBtn.dataset.tab); return; }
     // Buttons inside clickable rows act on the row's entity, not the drill-down.
     if (t.tagName === 'BUTTON') {
       const ep = t.getAttribute('data-edit-provider');
       const em = t.getAttribute('data-edit-model');
       const tm = t.getAttribute('data-toggle-model');
       const ru = t.getAttribute('data-register-upstream');
-      if (ep) { editProvider(ep); return; }
-      if (em) { editModel(em); return; }
+      if (ep) { closeDrawer({skipHash: true}); showTab('providers'); openFormset('providers'); editProvider(ep); return; }
+      if (em) { closeDrawer({skipHash: true}); showTab('models'); openFormset('models'); editModel(em); return; }
       if (tm) { toggleModel(tm, t.getAttribute('data-enable') === 'true'); return; }
       if (ru) { registerFromDiscovery(t.getAttribute('data-register-provider'), ru); return; }
     }
@@ -1784,10 +1829,8 @@ _ADMIN_HTML = r"""
   document.getElementById('discoverBtn').addEventListener('click', discoverModels);
   document.querySelectorAll('#winSeg button').forEach(b => b.addEventListener('click', () => {
     loadUsage(b.dataset.w);
-    if (!modelDetail.classList.contains('hidden')) {
-      const nm = modelDetail.querySelector('h3');
-      if (nm) { const n = nm.textContent.trim(); if (n) showModelDetail(n); }
-    }
+    if (drawerKind === 'model' && drawerName) showModelDetail(drawerName, {skipHash: true});
+    else if (drawerKind === 'provider' && drawerName) showProviderDetail(drawerName, {skipHash: true});
   }));
 
   document.addEventListener('keydown', (e) => {
