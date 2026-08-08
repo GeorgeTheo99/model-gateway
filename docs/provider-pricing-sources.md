@@ -27,13 +27,10 @@ useful only as a cross-check, never as the source of record.
   - Anthropic: `cache_read_input_tokens` + `cache_creation_input_tokens`, split
     by `cache_creation.ephemeral_5m_input_tokens` and
     `cache_creation.ephemeral_1h_input_tokens` ✓
-  - OpenAI / Fireworks / Z.ai: `prompt_tokens_details.cached_tokens` (cache
-    reads only) — set `cache_read` when the provider charges a distinct
-    cache-read rate and omit `cache_write`.
-  - OpenRouter: `prompt_tokens_details.cached_tokens` plus
-    `prompt_tokens_details.cache_write_tokens` for models with explicit cache
-    writes — set both `cache_read` and `cache_write` when the model API
-    publishes distinct prices.
+  - OpenAI / Fireworks / OpenRouter / Z.ai: `prompt_tokens_details.cached_tokens`
+    (cache reads only; cache writes are not reported by these providers) — set
+    `cache_read` when the provider charges a distinct cache-read rate, omit
+    `cache_write`.
 - `reasoning`: omit unless the provider bills reasoning tokens at a separate
   rate from output. None of the current providers do.
 - If a rate is genuinely unknown, **omit the whole `pricing` field** — the
@@ -50,7 +47,7 @@ useful only as a cross-check, never as the source of record.
 | `anthropic` | https://www.anthropic.com/pricing | HTML, per-model blocks | Write + Read |
 | `openai` | https://platform.openai.com/docs/pricing | HTML table | cached input (read only) |
 | `fireworks` | https://docs.fireworks.ai/serverless/pricing | HTML table (per-model: input / cached input / output) | cached input (read only) |
-| `openrouter` | https://openrouter.ai/api/v1/models | **JSON API** (machine-readable) | `input_cache_read` / `input_cache_write` (often null) |
+| `openrouter` | https://openrouter.ai/api/v1/models | **JSON API** (machine-readable) | `prompt_cache_read` / `prompt_cache_write` (often null) |
 | `moonshot` | https://platform.kimi.ai/docs/pricing/chat-k3 | HTML table | cached input (read only) |
 | `zai_coding` | https://docs.z.ai/guides/overview/pricing | HTML | none reported |
 | `zhipuai` | https://open.bigmodel.cn/pricing | HTML (Chinese site) | none reported |
@@ -79,11 +76,10 @@ defers to the docs page for actual rates — use the docs page. Map: input→inp
 cache reads only; the gateway receives `prompt_tokens_details.cached_tokens`).
 
 ⚠️ **Cost-model caveat (OpenAI-shape providers: Fireworks, OpenAI, OpenRouter):**
-`prompt_tokens` *includes* cache-read and cache-write tokens, while Anthropic's
-`input_tokens` *excludes* them. `src/usage.py` `extract_usage()` normalizes this
-so `input_tokens` is always cache-miss input (it subtracts `cached_tokens`,
-`cache_write_tokens`, and `cache_write_1h_tokens` from `prompt_tokens` for
-OpenAI-shape responses). This makes `estimate_cost()`
+`prompt_tokens` *includes* cached tokens, while Anthropic's `input_tokens`
+*excludes* them. `src/usage.py` `extract_usage()` normalizes this so
+`input_tokens` is always cache-miss input (it subtracts `cached_tokens` from
+`prompt_tokens` for OpenAI-shape responses). This makes `estimate_cost()`
 uniform across providers and avoids double-counting cached tokens. If you ever
 change that normalization, re-verify the cost math for both shapes.
 
@@ -93,18 +89,17 @@ change that normalization, re-verify the cost math for both shapes.
 > `glm-5.1-fw` got the wrong rate: the Z.ai GLM-5 price $1/$3 was used instead
 > of the Fireworks GLM-5.1 price $1.40/$4.40.)
 
-**OpenRouter** (JSON, verified 2026-08-07): `GET
+**OpenRouter** (JSON, verified 2026-06-28): `GET
 https://openrouter.ai/api/v1/models` returns `{data: [...]}`. Each model has
 `id` (matches `provider_model_id` in model-info.json, e.g.
 `google/gemini-3-flash-preview`) and `pricing` with `prompt`, `completion`
 (both **$/token** — multiply ×1,000,000 for $/Mtok), and optionally
-`input_cache_read` / `input_cache_write`. Match by `provider_model_id`.
+`prompt_cache_read` / `prompt_cache_write`. Match by `provider_model_id`.
 This is the only provider with a machine-readable source — prefer it for
-`openrouter` models. If either cache price is null, omit that catalog field.
-For explicit caching, OpenRouter reports `cached_tokens` and
-`cache_write_tokens` in Chat `usage.prompt_tokens_details` (and the equivalent
-Responses input details), which the gateway normalizes for cost accounting.
-Same OpenAI-shape cost-model caveat as Fireworks applies (see above).
+`openrouter` models. For `prompt_cache_read`/`prompt_cache_write`: if null,
+omit the cache field (Google via OpenRouter does not report cache tokens
+reliably). Same OpenAI-shape cost-model caveat as Fireworks applies (see
+above) when `prompt_cache_read` is non-null.
 
 **Moonshot** (verified 2026-07-20): Kimi K3 is priced per 1M tokens at
 `$3.00` cache-miss input, `$0.30` cache-hit input, and `$15.00` output. Map
@@ -140,7 +135,6 @@ Use this to know which source to read for each model. Regenerate with:
 | kimi-k3 | fireworks | accounts/fireworks/models/kimi-k3 | fireworks |
 | minimax-m3-fw | fireworks | accounts/fireworks/models/minimax-m3 | fireworks |
 | qwen3.7-plus-fw | fireworks | accounts/fireworks/models/qwen3p7-plus | fireworks |
-| qwen3.8-max | openrouter | qwen/qwen3.8-max | openrouter API |
 | deepseek-v4-flash-or | openrouter | deepseek/deepseek-v4-flash | openrouter API |
 | gemini-3.1-pro | openrouter | google/gemini-3.1-pro-preview | openrouter API |
 | gemini-3-flash | openrouter | google/gemini-3-flash-preview | openrouter API |

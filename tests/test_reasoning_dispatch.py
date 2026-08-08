@@ -30,7 +30,7 @@ except Exception:  # pragma: no cover - fastapi is a runtime dep
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _info(fmt: str, *, thinking: str = "always", thinking_levels=None,
-          provider: str = "x", provider_model_id: str = "m", quirks=frozenset(),
+          provider: str = "x", provider_model_id: str = "m",
           max_output_tokens: int = 32768, vision: bool = False) -> ProviderInfo:
     """Build a ProviderInfo with an explicit thinking_format."""
     return ProviderInfo(
@@ -39,7 +39,6 @@ def _info(fmt: str, *, thinking: str = "always", thinking_levels=None,
         api_key="k",
         provider_model_id=provider_model_id,
         protocol="openai",
-        quirks=quirks,
         context=0,
         max_output_tokens=max_output_tokens,
         thinking=thinking,
@@ -168,25 +167,6 @@ def test_dispatch_per_format(fmt, target_api, fragment, exp_enabled, exp_view):
     enabled, view = _run(fmt, req, target_api=target_api, thinking=mode)
     assert enabled is exp_enabled
     assert view == exp_view
-
-
-def test_openrouter_preserves_native_minimal_when_explicitly_supported():
-    enabled, view = _run(
-        "openrouter",
-        {"messages": [], "reasoning_effort": "minimal"},
-        thinking_levels=("minimal", "low", "medium", "high", "xhigh"),
-        quirks=frozenset({"native_minimal_reasoning"}),
-    )
-
-    assert enabled is True
-    assert view == {"reasoning": {"effort": "minimal"}}
-
-
-def test_openrouter_maps_minimal_to_low_without_explicit_native_support():
-    enabled, view = _run("openrouter", {"messages": [], "reasoning_effort": "minimal"})
-
-    assert enabled is True
-    assert view == {"reasoning": {"effort": "low"}}
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
