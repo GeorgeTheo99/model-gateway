@@ -303,6 +303,30 @@ def test_legacy_no_thinking_modes_are_canonicalized(tmp_path, legacy_mode):
     assert entry["thinking_levels"] == []
 
 
+def test_committed_qwen38_onboarding_profile_matches_openrouter_metadata():
+    from src.onboarding import load_profile
+
+    path = Path(__file__).resolve().parents[1] / "config" / "onboarding" / "openrouter-qwen3.8-max.yaml"
+    qwen = load_profile(path)["models"][0]
+    assert qwen["name"] == "qwen3.8-max"
+    assert qwen["provider"] == "openrouter"
+    assert qwen["provider_model_id"] == "qwen/qwen3.8-max"
+    assert qwen["alias"] == "qwen38"
+    assert qwen["context"] == 1_000_000
+    assert qwen["max_output_tokens"] == 131_072
+    assert qwen["thinking"] == "always"
+    assert qwen["thinking_levels"] == ["minimal", "low", "medium", "high", "xhigh"]
+    assert qwen["thinking_format"] == "openrouter"
+    assert qwen["vision"] is True
+    assert qwen["quirks"] == ["native_minimal_reasoning"]
+    assert qwen["pricing"] == {
+        "input": 2.0,
+        "output": 6.0,
+        "cache_read": 0.25,
+        "cache_write": 2.5,
+    }
+
+
 def test_committed_kimi_onboarding_profile_routes_to_fireworks_with_stable_pi_id():
     from src.onboarding import load_profile
 

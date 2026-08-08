@@ -1425,12 +1425,11 @@ def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat") -> bool:
         if budget:
             reasoning["max_tokens"] = budget
         elif effort:
-            reasoning["effort"] = (
-                "none" if effort == "off"
-                else "low" if effort == "minimal"
-                else "xhigh" if effort == "max"
-                else effort
-            )
+            if effort == "minimal":
+                native_minimal = "native_minimal_reasoning" in getattr(info, "quirks", frozenset())
+                reasoning["effort"] = "minimal" if native_minimal else "low"
+            else:
+                reasoning["effort"] = "none" if effort == "off" else "xhigh" if effort == "max" else effort
         else:
             reasoning["enabled"] = bool(enabled)
         if exclude is not None:

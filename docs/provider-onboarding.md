@@ -344,6 +344,7 @@ Supported reusable request quirks are:
 - `no_reasoning_params`
 - `reasoning_none_with_tools`
 - `force_reasoning_effort_max`
+- `native_minimal_reasoning`
 - `use_max_completion_tokens`
 - `drop_fixed_sampling_fields`
 - `named_tool_choice_as_required`
