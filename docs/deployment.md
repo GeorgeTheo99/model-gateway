@@ -40,9 +40,20 @@ Portable defaults are env-overridable:
 - `MODEL_GATEWAY_HOST=127.0.0.1`, `MODEL_GATEWAY_PORT=9111`
 - `MODEL_GATEWAY_LEDGER_PATH=~/srv/model-gateway/shared/ledger.db`
 - `MODEL_GATEWAY_LOG_DIR=~/Library/Logs/model-gateway`
+- `MODEL_GATEWAY_BACKUP_DIR=~/Library/Application Support/model-gateway/backups/config`
+  (always keep this private state outside diagnostic log trees)
 
 The ledger database and any SQLite WAL/SHM sidecars are restricted to mode
-`0600`.
+`0600`. Configuration/catalog backups are stored in a mode-`0700` directory as
+mode-`0600` files and retain 20 generations per managed file by default
+(`MODEL_GATEWAY_BACKUP_RETENTION`, bounded to 1–1000). On startup, legacy
+`<log-dir>/config-backups`, historical `~/.claude/config-backups`, and the
+former Home Server package path `~/Library/Application Support/HomeServer/ci/logs/config-backups`
+are validated, retention-pruned, clamped private, and atomically moved
+to the configured backup directory before serving requests. Log and backup
+roots may not overlap. Uvicorn request access logging is disabled because request
+URLs can contain temporary capabilities; structured usage remains available in
+the ledger.
 
 After install, edit `config/config.yaml` to add provider secrets/auth. A fresh generated config intentionally has `providers: {}`, so catalog entries remain unavailable until providers are configured. If you deliberately expose the gateway beyond loopback (`MODEL_GATEWAY_HOST=0.0.0.0`), configure `auth.client_keys` and firewall rules first.
 

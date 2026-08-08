@@ -17,6 +17,7 @@
 #   model-gateway onboard generate [options]     discover metadata and save a draft profile
 #   model-gateway env                            print resolved config
 set -euo pipefail
+umask 077
 
 # --------------------------------------------------------------------------- #
 # Config resolution.
@@ -37,6 +38,8 @@ LABEL="${MODEL_GATEWAY_LAUNCHD_LABEL:-com.local.model-gateway}"
 PLIST_DIR="${MODEL_GATEWAY_PLIST_DIR:-$HOME/Library/LaunchAgents}"
 LOG_DIR="${MODEL_GATEWAY_LOG_DIR:-$HOME/Library/Logs/model-gateway}"
 LOG_FILE="${MODEL_GATEWAY_LOG_FILE:-$LOG_DIR/model-gateway.log}"
+BACKUP_DIR="${MODEL_GATEWAY_BACKUP_DIR:-$HOME/Library/Application Support/model-gateway/backups/config}"
+LEGACY_BACKUP_DIRS="${MODEL_GATEWAY_LEGACY_BACKUP_DIRS:-$LOG_DIR/config-backups:$HOME/.claude/config-backups}"
 BIN_DIR="${MODEL_GATEWAY_BIN_DIR:-$HOME/.local/bin}"
 FORCE="${MODEL_GATEWAY_FORCE:-0}"
 
@@ -65,6 +68,27 @@ warn() { printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
 die()  { printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 
 require_cmd() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1 (install it and retry)"; }
+
+ensure_private_dir() {
+  local path="$1"
+  [ ! -L "$path" ] || die "refusing symlinked private directory: $path"
+  mkdir -p "$path"
+  [ -d "$path" ] && [ ! -L "$path" ] || die "private path is not a directory: $path"
+  [ "$(stat -f '%u' "$path")" = "$(id -u)" ] || die "private directory is not owned by this user: $path"
+  chmod 700 "$path"
+}
+
+ensure_private_file() {
+  local path="$1" metadata
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    [ -f "$path" ] && [ ! -L "$path" ] || die "refusing unsafe private file: $path"
+    metadata="$(stat -f '%u %l' "$path")"
+    [ "$metadata" = "$(id -u) 1" ] || die "private file has unsafe ownership or hard links: $path"
+  else
+    : > "$path"
+  fi
+  chmod 600 "$path"
+}
 
 check_macos() {
   [ "$(uname -s)" = "Darwin" ] || die "model-gateway installer currently supports macOS launchd only"
@@ -225,7 +249,8 @@ PY
 ensure_label_safe() {
   local action="$1" plist wd
   plist="$(plist_path)"
-  [ -f "$plist" ] || return 0
+  [ ! -e "$plist" ] && [ ! -L "$plist" ] && return 0
+  [ -f "$plist" ] && [ ! -L "$plist" ] || die "Refusing unsafe LaunchAgent plist: $plist"
   wd="$(plist_working_dir "$plist")"
   if [ "$wd" = "$ROOT_DIR" ]; then
     return 0
@@ -235,6 +260,14 @@ ensure_label_safe() {
     return 0
   fi
   die "Refusing to $action $LABEL: existing plist belongs to '${wd:-unknown}', not '$ROOT_DIR'. Re-run with --force (or MODEL_GATEWAY_FORCE=1) to adopt it."
+}
+
+ensure_log_backup_separation() {
+  local logs backups
+  logs="$(canonical_path "$LOG_DIR")"
+  backups="$(canonical_path "$BACKUP_DIR")"
+  case "$backups" in "$logs"|"$logs"/*) die "private backups must remain outside diagnostic logs" ;; esac
+  case "$logs" in "$backups"|"$backups"/*) die "diagnostic logs must remain outside private backups" ;; esac
 }
 
 ensure_runtime_paths_safe() {
@@ -259,9 +292,16 @@ ensure_runtime_paths_safe() {
 
 write_plist() {
   ensure_label_safe "overwrite"
-  mkdir -p "$PLIST_DIR" "$LOG_DIR" "$(dirname "$LEDGER_PATH")"
-  local plist e_label e_uv e_root e_host e_port e_config e_model_info e_model_info_source e_ledger e_log
+  ensure_log_backup_separation
+  ensure_private_dir "$PLIST_DIR"
+  ensure_private_dir "$LOG_DIR"
+  ensure_private_dir "$(dirname "$LEDGER_PATH")"
+  ensure_private_dir "$BACKUP_DIR"
+  ensure_private_file "$LOG_FILE"
+  local plist plist_tmp e_label e_uv e_root e_host e_port e_config e_model_info e_model_info_source e_ledger e_log_dir e_backup e_legacy_backups e_log
   plist="$(plist_path)"
+  plist_tmp="$(mktemp "$PLIST_DIR/.${LABEL}.plist.XXXXXX")"
+  chmod 600 "$plist_tmp"
   e_label="$(xml_escape "$LABEL")"
   e_uv="$(xml_escape "$UV_BIN")"
   e_root="$(xml_escape "$ROOT_DIR")"
@@ -271,8 +311,11 @@ write_plist() {
   e_model_info="$(xml_escape "$MODEL_INFO_PATH")"
   e_model_info_source="$(xml_escape "$MODEL_INFO_SOURCE_PATH")"
   e_ledger="$(xml_escape "$LEDGER_PATH")"
+  e_log_dir="$(xml_escape "$LOG_DIR")"
+  e_backup="$(xml_escape "$BACKUP_DIR")"
+  e_legacy_backups="$(xml_escape "$LEGACY_BACKUP_DIRS")"
   e_log="$(xml_escape "$LOG_FILE")"
-  cat >"$plist" <<EOF
+  cat >"$plist_tmp" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -288,17 +331,24 @@ write_plist() {
   <key>MODEL_GATEWAY_MODEL_INFO</key><string>${e_model_info}</string>
   <key>MODEL_GATEWAY_MODEL_INFO_SOURCE</key><string>${e_model_info_source}</string>
   <key>MODEL_GATEWAY_LEDGER_PATH</key><string>${e_ledger}</string>
+  <key>MODEL_GATEWAY_LOG_DIR</key><string>${e_log_dir}</string>
+  <key>MODEL_GATEWAY_BACKUP_DIR</key><string>${e_backup}</string>
+  <key>MODEL_GATEWAY_LEGACY_BACKUP_DIRS</key><string>${e_legacy_backups}</string>
 </dict>
 <key>StandardOutPath</key><string>${e_log}</string>
 <key>StandardErrorPath</key><string>${e_log}</string>
+<key>Umask</key><integer>63</integer>
 <key>KeepAlive</key><true/>
 <key>RunAtLoad</key><true/>
 <key>ThrottleInterval</key><integer>5</integer>
 </dict></plist>
 EOF
-  if command -v plutil >/dev/null 2>&1; then
-    plutil -lint "$plist" >/dev/null
+  if command -v plutil >/dev/null 2>&1 && ! plutil -lint "$plist_tmp" >/dev/null; then
+    rm -f "$plist_tmp"
+    die "generated LaunchAgent plist is invalid"
   fi
+  mv -f "$plist_tmp" "$plist"
+  chmod 600 "$plist"
   ok "Wrote $plist"
 }
 
@@ -401,7 +451,7 @@ status() {
 }
 
 cmd_logs() {
-  mkdir -p "$LOG_DIR"
+  ensure_private_dir "$LOG_DIR"
   local arg="${1:--50}"
   case "$arg" in
     -f|--follow) tail -f "$LOG_FILE" ;;
@@ -426,6 +476,9 @@ MODEL_GATEWAY_CONFIG=$CONFIG_PATH
 MODEL_GATEWAY_MODEL_INFO=$MODEL_INFO_PATH
 MODEL_GATEWAY_MODEL_INFO_SOURCE=$MODEL_INFO_SOURCE_PATH
 MODEL_GATEWAY_LEDGER_PATH=$LEDGER_PATH
+MODEL_GATEWAY_LOG_DIR=$LOG_DIR
+MODEL_GATEWAY_BACKUP_DIR=$BACKUP_DIR
+MODEL_GATEWAY_LEGACY_BACKUP_DIRS=$LEGACY_BACKUP_DIRS
 HEALTH_URL=$(health_url)
 EOF
 }

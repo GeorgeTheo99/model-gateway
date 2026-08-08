@@ -1,8 +1,10 @@
 """Tests for writeable provider/model management (milestones 4 & 5)."""
 
 import json
+import os
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -53,6 +55,250 @@ def test_upsert_provider_creates_new(tmp_config, monkeypatch):
     import yaml
     cfg = yaml.safe_load((tmp_config / "config.yaml").read_text())
     assert cfg["providers"]["openai"]["api_key"] == "sk-new"
+
+
+def test_config_backups_can_live_outside_log_tree(tmp_config, monkeypatch):
+    logs = tmp_config / "logs"
+    backups = tmp_config / "private-backups"
+    monkeypatch.setattr(config_io, "log_dir", logs)
+    monkeypatch.setenv("MODEL_GATEWAY_BACKUP_DIR", str(backups))
+
+    config_io.upsert_provider(
+        "openai",
+        base_url="https://api.openai.com/v1",
+        api_key="sk-new",
+    )
+
+    created = list(backups.glob("config.yaml.bak.*"))
+    assert len(created) == 1
+    assert created[0].stat().st_mode & 0o777 == 0o600
+    assert backups.stat().st_mode & 0o777 == 0o700
+    assert not logs.exists()
+
+
+def test_config_backup_retention_removes_old_credentials(tmp_config, monkeypatch):
+    backups = tmp_config / "private-backups"
+    monkeypatch.setenv("MODEL_GATEWAY_BACKUP_DIR", str(backups))
+    monkeypatch.setenv("MODEL_GATEWAY_BACKUP_RETENTION", "3")
+
+    config_io.upsert_provider(
+        "anthropic",
+        base_url="https://api.anthropic.com/v1",
+        api_key="replacement-secret",
+    )
+    for index in range(5):
+        config_io.upsert_provider(
+            "openai",
+            base_url=f"https://api{index}.openai.com/v1",
+            api_key=f"new-secret-{index}",
+        )
+
+    created = list(backups.glob("config.yaml.bak.*"))
+    assert len(created) == 3
+    assert all("secret-existing" not in path.read_text() for path in created)
+
+
+def test_config_backup_rejects_symlinked_parent(tmp_config, monkeypatch):
+    real_parent = tmp_config / "real-backups"
+    real_parent.mkdir()
+    linked_parent = tmp_config / "linked-backups"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    monkeypatch.setenv("MODEL_GATEWAY_BACKUP_DIR", str(linked_parent / "config"))
+
+    with pytest.raises(OSError):
+        config_io.upsert_provider(
+            "openai",
+            base_url="https://api.openai.com/v1",
+            api_key="sk-new",
+        )
+
+    assert not list(real_parent.rglob("*.bak.*"))
+
+
+def test_legacy_backups_migrate_out_of_logs_and_become_private(tmp_config, monkeypatch):
+    logs = tmp_config / "logs"
+    legacy = logs / "config-backups"
+    nested = legacy / "retirement-archive"
+    nested.mkdir(parents=True)
+    config_backup = legacy / "config.yaml.bak.100"
+    catalog_backup = legacy / "model-info.json.bak.101"
+    archived_catalog = nested / "private-catalog.json"
+    config_backup.write_text("api_key: legacy-secret\n")
+    catalog_backup.write_text('{"private": true}\n')
+    archived_catalog.write_text('{"archived": true}\n')
+    for path in (config_backup, catalog_backup, archived_catalog):
+        path.chmod(0o644)
+    nested.chmod(0o755)
+    legacy.chmod(0o755)
+    target = tmp_config / "private-backups"
+    monkeypatch.setattr(config_io, "log_dir", logs)
+    monkeypatch.setenv("MODEL_GATEWAY_BACKUP_DIR", str(target))
+
+    assert config_io.migrate_legacy_backups() == 3
+
+    assert not legacy.exists()
+    imports = list(target.glob("legacy-config-backups-*"))
+    assert len(imports) == 1
+    imported = imports[0]
+    assert (imported / config_backup.name).read_text() == "api_key: legacy-secret\n"
+    assert (imported / catalog_backup.name).read_text() == '{"private": true}\n'
+    assert (imported / nested.name / archived_catalog.name).read_text() == '{"archived": true}\n'
+    assert target.stat().st_mode & 0o777 == 0o700
+    assert imported.stat().st_mode & 0o777 == 0o700
+    assert (imported / config_backup.name).stat().st_mode & 0o777 == 0o600
+    assert (imported / nested.name).stat().st_mode & 0o777 == 0o700
+    assert (imported / nested.name / archived_catalog.name).stat().st_mode & 0o777 == 0o600
+
+
+def test_legacy_backup_migration_rejects_symlink_source_without_moving_target(tmp_config, monkeypatch):
+    logs = tmp_config / "logs"
+    victim = tmp_config / "victim"
+    victim.mkdir()
+    secret = victim / "config.yaml.bak.1"
+    secret.write_text("must-stay\n")
+    linked = logs / "config-backups"
+    logs.mkdir()
+    linked.symlink_to(victim, target_is_directory=True)
+    target = tmp_config / "private-backups"
+    monkeypatch.setattr(config_io, "log_dir", logs)
+    monkeypatch.setenv("MODEL_GATEWAY_BACKUP_DIR", str(target))
+    monkeypatch.setenv("MODEL_GATEWAY_LEGACY_BACKUP_DIRS", str(linked))
+
+    with pytest.raises(OSError):
+        config_io.migrate_legacy_backups()
+
+    assert victim.is_dir()
+    assert secret.read_text() == "must-stay\n"
+    assert linked.is_symlink()
+
+
+def test_former_package_backup_root_is_migrated_and_pruned(tmp_config, monkeypatch):
+    old_package_root = tmp_config / "HomeServer" / "ci" / "logs" / "config-backups"
+    old_package_root.mkdir(parents=True)
+    for index in range(25):
+        (old_package_root / f"config.yaml.bak.{index}").write_text(f"secret-{index}\n")
+    target = tmp_config / "private-backups"
+    monkeypatch.setattr(config_io, "log_dir", tmp_config / "new-logs")
+    monkeypatch.setenv("MODEL_GATEWAY_BACKUP_DIR", str(target))
+    monkeypatch.setenv("MODEL_GATEWAY_LEGACY_BACKUP_DIRS", str(old_package_root))
+    monkeypatch.setenv("MODEL_GATEWAY_BACKUP_RETENTION", "20")
+
+    assert config_io.migrate_legacy_backups() == 20
+
+    assert not old_package_root.exists()
+    imported = next(target.glob("legacy-config-backups-*"))
+    assert len(list(imported.glob("config.yaml.bak.*"))) == 20
+    assert imported.stat().st_mode & 0o777 == 0o700
+    assert all(path.stat().st_mode & 0o777 == 0o600 for path in imported.glob("*.bak.*"))
+
+
+def test_legacy_backup_migration_applies_retention_before_import(tmp_config, monkeypatch):
+    logs = tmp_config / "logs"
+    legacy = logs / "config-backups"
+    legacy.mkdir(parents=True)
+    for index in range(25):
+        (legacy / f"config.yaml.bak.{index}").write_text(f"secret-{index}\n")
+    target = tmp_config / "private-backups"
+    monkeypatch.setattr(config_io, "log_dir", logs)
+    monkeypatch.setenv("MODEL_GATEWAY_BACKUP_DIR", str(target))
+    monkeypatch.setenv("MODEL_GATEWAY_BACKUP_RETENTION", "20")
+
+    assert config_io.migrate_legacy_backups() == 20
+
+    imported = next(target.glob("legacy-config-backups-*"))
+    assert len(list(imported.glob("config.yaml.bak.*"))) == 20
+
+
+def test_multiple_legacy_imports_share_one_global_retention_cap(tmp_config, monkeypatch):
+    roots = [tmp_config / "legacy-one", tmp_config / "legacy-two"]
+    for root_index, root in enumerate(roots):
+        root.mkdir()
+        for index in range(15):
+            path = root / f"config.yaml.bak.{root_index * 100 + index}"
+            path.write_text(f"secret-{root_index}-{index}\n")
+            os.utime(path, ns=(1_000_000_000 + root_index * 100 + index,) * 2)
+    target = tmp_config / "private-backups"
+    monkeypatch.setattr(config_io, "log_dir", tmp_config / "logs")
+    monkeypatch.setenv("MODEL_GATEWAY_BACKUP_DIR", str(target))
+    monkeypatch.setenv("MODEL_GATEWAY_LEGACY_BACKUP_DIRS", os.pathsep.join(map(str, roots)))
+    monkeypatch.setenv("MODEL_GATEWAY_BACKUP_RETENTION", "20")
+
+    assert config_io.migrate_legacy_backups() == 30
+
+    retained = list(target.glob("legacy-config-backups-*/config.yaml.bak.*"))
+    assert len(retained) == 20
+
+
+def test_backup_runtime_rejects_log_directory_overlap(tmp_config, monkeypatch):
+    logs = tmp_config / "logs"
+    legacy = logs / "config-backups"
+    legacy.mkdir(parents=True)
+    (legacy / "config.yaml.bak.1").write_text("secret\n")
+    monkeypatch.setattr(config_io, "log_dir", logs)
+    monkeypatch.setenv("MODEL_GATEWAY_BACKUP_DIR", str(legacy))
+
+    with pytest.raises(RuntimeError, match="must not overlap"):
+        config_io.migrate_legacy_backups()
+
+    assert (legacy / "config.yaml.bak.1").read_text() == "secret\n"
+
+
+def test_legacy_backup_migration_rejects_cross_filesystem_before_move(tmp_config, monkeypatch):
+    logs = tmp_config / "logs"
+    legacy = logs / "config-backups"
+    legacy.mkdir(parents=True)
+    (legacy / "config.yaml.bak.1").write_text("secret\n")
+    target = tmp_config / "private-backups"
+    monkeypatch.setattr(config_io, "log_dir", logs)
+    monkeypatch.setenv("MODEL_GATEWAY_BACKUP_DIR", str(target))
+
+    real_open = config_io._open_private_backup_directory
+    real_fstat = os.fstat
+    opened: dict[str, int] = {}
+
+    def tracked_open(path):
+        fd, absolute = real_open(path)
+        opened[str(absolute)] = fd
+        return fd, absolute
+
+    def split_device_fstat(fd):
+        metadata = real_fstat(fd)
+        if fd == opened.get(str(target)):
+            return SimpleNamespace(st_dev=metadata.st_dev + 1, st_ino=metadata.st_ino)
+        return metadata
+
+    monkeypatch.setattr(config_io, "_open_private_backup_directory", tracked_open)
+    monkeypatch.setattr(config_io.os, "fstat", split_device_fstat)
+    with pytest.raises(RuntimeError, match="same filesystem"):
+        config_io.migrate_legacy_backups()
+
+    assert legacy.is_dir()
+    assert (legacy / "config.yaml.bak.1").read_text() == "secret\n"
+
+
+def test_config_backup_rejects_fifo_without_blocking(tmp_config, monkeypatch):
+    backups = tmp_config / "private-backups"
+    backups.mkdir()
+    os.mkfifo(backups / "config.yaml.bak.1", 0o600)
+    monkeypatch.setenv("MODEL_GATEWAY_BACKUP_DIR", str(backups))
+
+    with pytest.raises(RuntimeError, match="unsafe model-gateway backup entry"):
+        config_io.upsert_provider(
+            "openai",
+            base_url="https://api.openai.com/v1",
+            api_key="sk-new",
+        )
+
+
+def test_config_backup_rejects_fifo_source_without_blocking(tmp_config, monkeypatch):
+    source = tmp_config / "config-source.fifo"
+    os.mkfifo(source, 0o600)
+    monkeypatch.setenv("MODEL_GATEWAY_BACKUP_DIR", str(tmp_config / "private-backups"))
+
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="unsafe model-gateway backup source"):
+        config_io._backup(source)
+    assert time.monotonic() - started < 1
 
 
 def test_provider_write_lock_covers_full_read_modify_write(tmp_config, monkeypatch):

@@ -20,6 +20,7 @@ import json
 import math
 import os
 import shutil
+import stat
 import time
 from functools import wraps
 from pathlib import Path
@@ -32,6 +33,18 @@ from src.config_lock import config_write_lock
 from src.providers import CONFIG_PATH, MODEL_INFO_PATH, MODEL_INFO_SOURCE_PATH
 
 log_dir = Path(os.environ.get("MODEL_GATEWAY_LOG_DIR", str(Path.home() / ".claude")))
+
+
+def _config_backup_dir() -> Path:
+    """Return the private config/catalog backup directory.
+
+    Backups may contain provider credentials or a private model catalog, so a
+    deployment keeps them in private state outside the diagnostic log tree.
+    """
+    configured = os.environ.get("MODEL_GATEWAY_BACKUP_DIR", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / "Library" / "Application Support" / "model-gateway" / "backups" / "config"
 
 
 def _write_transaction(function):
@@ -97,15 +110,272 @@ def _atomic_write(path: Path, text: str) -> None:
         tmp.unlink(missing_ok=True)
 
 
+def _open_private_backup_directory(path: Path) -> tuple[int, Path]:
+    """Securely create/open an absolute directory without following symlinks."""
+    absolute = Path(os.path.abspath(os.fspath(path.expanduser())))
+    if not absolute.is_absolute():  # pragma: no cover - abspath is defensive
+        raise RuntimeError("model-gateway backup path must be absolute")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_fd = os.open("/", flags)
+    try:
+        for component in absolute.parts[1:]:
+            try:
+                os.mkdir(component, 0o700, dir_fd=directory_fd)
+            except FileExistsError:
+                pass
+            next_fd = os.open(component, flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        metadata = os.fstat(directory_fd)
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+            raise RuntimeError(f"model-gateway backup directory is not privately owned: {absolute}")
+        os.fchmod(directory_fd, 0o700)
+        return directory_fd, absolute
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def _secure_backup_tree(directory_fd: int) -> None:
+    """Recursively clamp an owned legacy backup tree without following links."""
+    for name in os.listdir(directory_fd):
+        entry_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+        try:
+            metadata = os.fstat(entry_fd)
+            if metadata.st_uid != os.getuid():
+                raise RuntimeError(f"legacy backup entry is not owned by this user: {name}")
+            if stat.S_ISREG(metadata.st_mode):
+                if metadata.st_nlink != 1:
+                    raise RuntimeError(f"legacy backup file has hard links: {name}")
+                os.fchmod(entry_fd, 0o600)
+            elif stat.S_ISDIR(metadata.st_mode):
+                os.fchmod(entry_fd, 0o700)
+                _secure_backup_tree(entry_fd)
+            else:
+                raise RuntimeError(f"legacy backup entry is not a regular file or directory: {name}")
+        finally:
+            os.close(entry_fd)
+
+
+def _validate_backup_separation() -> tuple[Path, Path]:
+    """Reject equal or nested diagnostic-log and private-backup roots."""
+    logs = Path(os.path.realpath(os.path.abspath(os.fspath(log_dir.expanduser()))))
+    backups = Path(os.path.realpath(os.path.abspath(os.fspath(_config_backup_dir()))))
+    common = Path(os.path.commonpath((logs, backups)))
+    if common in {logs, backups}:
+        raise RuntimeError("model-gateway diagnostic logs and private backups must not overlap")
+    return logs, backups
+
+
+def _migrate_legacy_backup_directory(legacy: Path) -> int:
+    if not os.path.lexists(legacy):
+        return 0
+    legacy_parent_fd, _ = _open_private_backup_directory(legacy.parent)
+    legacy_fd, _ = _open_private_backup_directory(legacy)
+    target_fd, _ = _open_private_backup_directory(_config_backup_dir())
+    try:
+        legacy_meta = os.fstat(legacy_fd)
+        target_meta = os.fstat(target_fd)
+        if (legacy_meta.st_dev, legacy_meta.st_ino) == (target_meta.st_dev, target_meta.st_ino):
+            raise RuntimeError("legacy backup directory still overlaps the configured private backup root")
+        if legacy_meta.st_dev != target_meta.st_dev:
+            raise RuntimeError(
+                "legacy and configured model-gateway backup directories must be on the same filesystem"
+            )
+        _secure_backup_tree(legacy_fd)
+        _prune_backups(legacy_fd, "config.yaml")
+        _prune_backups(legacy_fd, "model-info.json")
+        moved = len(os.listdir(legacy_fd))
+        destination = f"legacy-config-backups-{time.time_ns()}"
+        try:
+            os.stat(destination, dir_fd=target_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:  # pragma: no cover - nanosecond collision is defensive
+            raise RuntimeError(f"legacy backup migration destination already exists: {destination}")
+        os.rename(
+            legacy.name,
+            destination,
+            src_dir_fd=legacy_parent_fd,
+            dst_dir_fd=target_fd,
+        )
+        _prune_all_backup_generations(target_fd, "config.yaml")
+        _prune_all_backup_generations(target_fd, "model-info.json")
+        os.fsync(target_fd)
+        os.fsync(legacy_parent_fd)
+        return moved
+    finally:
+        os.close(target_fd)
+        os.close(legacy_fd)
+        os.close(legacy_parent_fd)
+
+
+def migrate_legacy_backups() -> int:
+    """Move every historical config/catalog backup root out of logs."""
+    logs, _ = _validate_backup_separation()
+    configured = os.environ.get("MODEL_GATEWAY_LEGACY_BACKUP_DIRS")
+    if configured is None:
+        candidates = [
+            logs / "config-backups",
+            Path.home() / ".claude" / "config-backups",
+            Path.home() / "Library" / "Application Support" / "HomeServer" / "ci" / "logs" / "config-backups",
+        ]
+    else:
+        candidates = [Path(value).expanduser() for value in configured.split(os.pathsep) if value]
+    moved = 0
+    seen: set[str] = set()
+    for candidate in candidates:
+        # Preserve the lexical source so the no-follow directory walk can
+        # reject symlinked roots/components before any rename. Never realpath a
+        # migration source into an unrelated same-user target.
+        lexical = os.path.abspath(os.fspath(candidate))
+        if lexical in seen:
+            continue
+        seen.add(lexical)
+        moved += _migrate_legacy_backup_directory(Path(lexical))
+    return moved
+
+
+def _backup_retention() -> int:
+    raw_retention = os.environ.get("MODEL_GATEWAY_BACKUP_RETENTION", "20").strip()
+    try:
+        retention = int(raw_retention)
+    except ValueError as exc:
+        raise RuntimeError("MODEL_GATEWAY_BACKUP_RETENTION must be an integer") from exc
+    if retention < 1 or retention > 1000:
+        raise RuntimeError("MODEL_GATEWAY_BACKUP_RETENTION must be between 1 and 1000")
+    return retention
+
+
+def _prune_backups(directory_fd: int, source_name: str) -> None:
+    """Retain a bounded private history for one managed file in one directory."""
+    retention = _backup_retention()
+    prefix = f"{source_name}.bak."
+    backups: list[tuple[int, str]] = []
+    for name in os.listdir(directory_fd):
+        if not name.startswith(prefix) or not name[len(prefix):].isdigit():
+            continue
+        entry_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+        try:
+            metadata = os.fstat(entry_fd)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_nlink != 1
+            ):
+                raise RuntimeError(f"unsafe model-gateway backup entry: {name}")
+            os.fchmod(entry_fd, 0o600)
+            backups.append((metadata.st_mtime_ns, name))
+        finally:
+            os.close(entry_fd)
+    backups.sort(reverse=True)
+    for _, name in backups[retention:]:
+        os.unlink(name, dir_fd=directory_fd)
+
+
+def _prune_all_backup_generations(directory_fd: int, source_name: str) -> None:
+    """Apply one global retention cap across current and imported generations."""
+    retention = _backup_retention()
+    prefix = f"{source_name}.bak."
+    found: list[tuple[int, str | None, str]] = []
+
+    def collect(parent_fd: int, parent_name: str | None) -> None:
+        for entry in os.listdir(parent_fd):
+            if not entry.startswith(prefix) or not entry[len(prefix):].isdigit():
+                continue
+            entry_fd = os.open(
+                entry,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            try:
+                metadata = os.fstat(entry_fd)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_nlink != 1:
+                    raise RuntimeError(f"unsafe model-gateway backup entry: {entry}")
+                os.fchmod(entry_fd, 0o600)
+                found.append((metadata.st_mtime_ns, parent_name, entry))
+            finally:
+                os.close(entry_fd)
+
+    collect(directory_fd, None)
+    archives: dict[str, int] = {}
+    try:
+        for name in os.listdir(directory_fd):
+            if not name.startswith("legacy-config-backups-"):
+                continue
+            archive_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            metadata = os.fstat(archive_fd)
+            if metadata.st_uid != os.getuid():
+                os.close(archive_fd)
+                raise RuntimeError(f"unsafe imported backup archive: {name}")
+            os.fchmod(archive_fd, 0o700)
+            archives[name] = archive_fd
+            collect(archive_fd, name)
+        found.sort(reverse=True)
+        for _, parent_name, name in found[retention:]:
+            os.unlink(name, dir_fd=directory_fd if parent_name is None else archives[parent_name])
+        for name, archive_fd in archives.items():
+            if not os.listdir(archive_fd):
+                os.rmdir(name, dir_fd=directory_fd)
+    finally:
+        for archive_fd in archives.values():
+            os.close(archive_fd)
+
+
 def _backup(path: Path) -> Path | None:
-    """Copy path to a timestamped .bak in the log dir; return the backup path."""
+    """Copy a managed file to a private, bounded timestamped backup."""
     if not path.exists():
         return None
-    backup_dir = log_dir / "config-backups"
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    bak = backup_dir / f"{path.name}.bak.{int(time.time())}"
-    shutil.copy2(path, bak)
-    return bak
+    _validate_backup_separation()
+    backup_fd, backup_dir = _open_private_backup_directory(_config_backup_dir())
+    name = f"{path.name}.bak.{time.time_ns()}"
+    bak = backup_dir / name
+    try:
+        _prune_all_backup_generations(backup_fd, path.name)
+        source_path = _resolve_target(path)
+        source_fd = os.open(source_path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        try:
+            source_meta = os.fstat(source_fd)
+            if (
+                not stat.S_ISREG(source_meta.st_mode)
+                or source_meta.st_uid != os.getuid()
+                or source_meta.st_nlink != 1
+            ):
+                raise RuntimeError(f"unsafe model-gateway backup source: {source_path}")
+            with os.fdopen(source_fd, "rb", closefd=False) as source:
+                destination_fd = os.open(
+                    name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=backup_fd,
+                )
+                try:
+                    with os.fdopen(destination_fd, "wb") as destination:
+                        shutil.copyfileobj(source, destination)
+                        destination.flush()
+                        os.fsync(destination.fileno())
+                except BaseException:
+                    os.unlink(name, dir_fd=backup_fd)
+                    raise
+        finally:
+            os.close(source_fd)
+        _prune_all_backup_generations(backup_fd, path.name)
+        os.fsync(backup_fd)
+        return bak
+    finally:
+        os.close(backup_fd)
 
 
 def snapshot_writable_files() -> dict[Path, str | None]:

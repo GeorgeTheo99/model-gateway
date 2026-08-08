@@ -40,7 +40,7 @@ from src.responses import chat_to_responses, responses_result_events, responses_
 from src.signature_cache import store_from_extra_content
 from src.streaming import _flatten_list_content, translate_stream
 from src.translator import anthropic_to_openai, anthropic_to_openai_chat, openai_chat_to_anthropic, openai_to_anthropic
-from src import catalog, federation, ledger, providers
+from src import catalog, config_io, federation, ledger, providers
 from src.usage import (
     anthropic_usage_to_openai_chat as convert_anthropic_usage_to_openai_chat,
     anthropic_usage_to_responses,
@@ -75,6 +75,9 @@ def _stream_error_event(message: str) -> str:
 async def _lifespan(_app: FastAPI):
     """Validate routing policy, initialize state, and start background services."""
     _validate_vision_fallback_policy()
+    migrated_backups = config_io.migrate_legacy_backups()
+    if migrated_backups:
+        log.info("migrated %s legacy config/catalog backup entries out of logs", migrated_backups)
     # Keep a last-known-good registry loaded so a rejected admin reload can
     # restore live routing even when no model request has arrived yet.
     snapshot_provider_registry()

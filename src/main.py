@@ -15,4 +15,8 @@ if __name__ == "__main__":
         host=host,
         port=int(os.environ.get("MODEL_GATEWAY_PORT", "9111")),
         log_level="info",
+        # Request URLs are not operational logs: they may carry temporary
+        # capabilities or future query credentials. The usage ledger provides
+        # structured request accounting without recording those URLs.
+        access_log=False,
     )
