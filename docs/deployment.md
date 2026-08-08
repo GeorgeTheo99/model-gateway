@@ -1,6 +1,6 @@
 # Deployment
 
-`model-gateway` is the canonical gateway service. The old `cloud-gateway` name is retired; do not create new `cloud-gateway` checkouts, bare repos, LaunchAgents, or environment variables.
+`model-gateway` is the canonical gateway service. `cloud-gateway` is retired; do not recreate legacy checkouts, bare repos, LaunchAgents, or environment variables.
 
 ## Portable macOS install (consumer machines)
 

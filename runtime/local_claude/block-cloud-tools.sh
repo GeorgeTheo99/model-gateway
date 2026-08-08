@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # PreToolUse hook: block WebSearch/WebFetch for local/cloud model sessions.
 # Anthropic's built-in WebSearch/WebFetch only work against the real Anthropic API.
-# When ANTHROPIC_BASE_URL is set (oMLX or cloud gateway), they silently fail or
+# When ANTHROPIC_BASE_URL is set (oMLX or another gateway), they silently fail or
 # return 0 results. This hook forces Claude to use the MCP websearch tools instead.
 #
 # When ANTHROPIC_BASE_URL is unset (claude-default / Anthropic direct),

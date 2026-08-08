@@ -1,6 +1,6 @@
 """Robust upstream HTTP machinery — retries, backoff, circuit breaker, auth refresh.
 
-Ported from cloud-gateway's server.py retry loop, generalized:
+The original retry loop was generalized to add:
   - Circuit key is the provider name (per-provider breaker, see src.circuit).
   - 401/403 triggers a single opt-in OAuth refresh via
     src.providers.refresh_oauth_token (no-op unless the provider config sets
