@@ -224,6 +224,35 @@ pi-catalog --aliases ~/.claude/model-aliases.json \
   --pi-agent-dir ~/.pi-omlx/agent --ls99-extras
 ```
 
+### Z.ai GLM-5.3 Coding Plan cutover
+
+The committed `zai-glm-5.3.yaml` profile exposes logical/Pi model `glm-5.3`
+while retaining upstream ID `glm-5.2`. This is intentional: Z.ai documents
+that Coding Plan requests for GLM-5.2/5.1 are automatically routed to GLM-5.3,
+while the exact `glm-5.3` ID may remain unavailable to an account during
+rollout. The profile retains the old gateway IDs and `pi-glm52zai` launcher as
+compatibility aliases.
+
+Deploy both code prerequisites before changing the live machine catalog:
+
+1. Deploy `pi-shared` with `pi.aliases` launcher support.
+2. Deploy model-gateway with `zai_glm53_thinking` request normalization.
+3. Apply the profile with explicit retirement confirmation.
+4. Regenerate aliases/Pi artifacts, then smoke-test both new and legacy IDs.
+
+```bash
+model-gateway onboard config/onboarding/zai-glm-5.3.yaml --dry-run
+model-gateway onboard config/onboarding/zai-glm-5.3.yaml \
+  --non-interactive --yes --confirm-retire glm-5.2-zai
+pi-catalog --aliases ~/.claude/model-aliases.json \
+  --models-out ~/.pi-omlx/agent/models.json \
+  --launchers-out ~/.pi/generated/pi-launchers.zsh \
+  --pi-agent-dir ~/.pi-omlx/agent --ls99-extras
+```
+
+Do not switch `provider_model_id` to exact `glm-5.3` until an authenticated
+text probe succeeds for the target Coding Plan account.
+
 ## Explicit retirement
 
 Retirement accepts exact gateway model names only:
@@ -349,6 +378,10 @@ Supported reusable request quirks are:
 - `named_tool_choice_as_required`
 - `inline_image_urls_only`
 - `anthropic_tool_result_blocks`
+- `zai_glm53_thinking` — normalize Coding Plan effort/toggle aliases to
+  GLM-5.3's native `low|high|max`, send the required
+  `thinking: {type: enabled}` shape, preserve `clear_thinking`, and default
+  unspecified or unknown effort to `max`
 
 Provider-specific request code should only be added when the upstream cannot
 be described by these generic compatibility flags.

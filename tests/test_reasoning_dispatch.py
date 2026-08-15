@@ -11,6 +11,7 @@ import asyncio
 import base64
 import io
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -31,7 +32,8 @@ except Exception:  # pragma: no cover - fastapi is a runtime dep
 
 def _info(fmt: str, *, thinking: str = "always", thinking_levels=None,
           provider: str = "x", provider_model_id: str = "m",
-          max_output_tokens: int = 32768, vision: bool = False) -> ProviderInfo:
+          max_output_tokens: int = 32768, vision: bool = False,
+          quirks=frozenset()) -> ProviderInfo:
     """Build a ProviderInfo with an explicit thinking_format."""
     return ProviderInfo(
         provider=provider,
@@ -45,6 +47,7 @@ def _info(fmt: str, *, thinking: str = "always", thinking_levels=None,
         thinking_levels=thinking_levels,
         thinking_format=fmt,
         vision=vision,
+        quirks=frozenset(quirks),
     )
 
 
@@ -220,6 +223,85 @@ def test_fireworks_default_format_preserves_other_effort_mappings(effort, expect
 def test_zai_still_maps_finer_efforts_to_native_high(effort):
     _, view = _run("zai", {"messages": [], "reasoning_effort": effort})
     assert view["reasoning_effort"] == "high"
+
+
+GLM53_LEVELS = ("minimal", "low", "medium", "high", "xhigh", "max")
+
+
+def test_zai_glm53_uses_required_thinking_shape_and_defaults_to_max():
+    enabled, view = _run(
+        "zai",
+        {"messages": []},
+        thinking_levels=GLM53_LEVELS,
+        quirks={"zai_glm53_thinking"},
+    )
+    assert enabled is True
+    assert view == {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "max",
+    }
+
+
+@pytest.mark.parametrize(
+    "effort,expected",
+    [
+        ("none", "low"),
+        ("minimal", "low"),
+        ("light", "low"),
+        ("low", "low"),
+        ("medium", "high"),
+        ("high", "high"),
+        ("xhigh", "max"),
+        ("max", "max"),
+        ("ultra", "max"),
+        ("unknown", "max"),
+    ],
+)
+def test_zai_glm53_maps_coding_plan_efforts(effort, expected):
+    enabled, view = _run(
+        "zai",
+        {"messages": [], "reasoning_effort": effort},
+        thinking_levels=GLM53_LEVELS,
+        quirks={"zai_glm53_thinking"},
+    )
+    assert enabled is True
+    assert view == {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": expected,
+    }
+
+
+def test_zai_glm53_explicit_effort_precedes_disabled_toggle_and_preserves_clear_thinking():
+    enabled, view = _run(
+        "zai",
+        {
+            "messages": [],
+            "reasoning_effort": "high",
+            "thinking": {"type": "disabled", "clear_thinking": False},
+        },
+        thinking_levels=GLM53_LEVELS,
+        quirks={"zai_glm53_thinking"},
+    )
+    assert enabled is True
+    assert view == {
+        "thinking": {"type": "enabled", "clear_thinking": False},
+        "reasoning_effort": "high",
+    }
+
+
+@pytest.mark.parametrize("thinking", [False, "disabled", {"type": "disabled"}])
+def test_zai_glm53_disabled_toggle_becomes_low(thinking):
+    enabled, view = _run(
+        "zai",
+        {"messages": [], "thinking": thinking},
+        thinking_levels=GLM53_LEVELS,
+        quirks={"zai_glm53_thinking"},
+    )
+    assert enabled is True
+    assert view == {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "low",
+    }
 
 
 # ── contract: optional models get no params unless the client asks ───────────
@@ -544,6 +626,50 @@ def test_vision_reroute_revalidates_thinking_against_served_model(client, monkey
     assert "supported levels: max" in body["error"]["message"]
     if endpoint == "/v1/messages":
         assert body["type"] == "error"
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_glm53_prevalidation_does_not_leak_controls_into_vision_reroute(client, monkeypatch):
+    requested = _info(
+        "zai",
+        thinking_levels=GLM53_LEVELS,
+        provider="zai_coding",
+        provider_model_id="glm-5.2",
+        vision=False,
+        quirks={"zai_glm53_thinking"},
+    )
+    served = _info(
+        "none",
+        thinking="",
+        thinking_levels=(),
+        provider="test",
+        provider_model_id="vision-upstream",
+        vision=True,
+    )
+
+    def fake_resolve(model, provider_override=None):
+        return {"glm-5.3": requested, "vision-fallback": served}.get(model)
+
+    async def fake_passthrough(endpoint, body, headers, **kwargs):
+        assert body["model"] == "vision-upstream"
+        assert "thinking" not in body
+        assert "reasoning_effort" not in body
+        return server_module.JSONResponse(status_code=200, content={"ok": True})
+
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
+    monkeypatch.setattr(server_module, "pool_candidates", lambda model: [])
+    monkeypatch.setattr(server_module, "resolve", fake_resolve)
+    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough)
+
+    response = client.post("/v1/chat/completions", json={
+        "model": "glm-5.3",
+        "messages": [{"role": "user", "content": [{
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,AAAA"},
+        }]}],
+    })
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
@@ -1966,6 +2092,62 @@ def test_debug_thinking_endpoint_matrix(client):
     assert "by_format" in body["summary"]
     assert "gateway_levels" not in body
     assert all("thinking_levels" in row for row in body["models"])
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_glm53_profile_observability_matches_actual_dispatch(client, monkeypatch):
+    from src.onboarding import load_profile
+
+    profile_path = Path(__file__).resolve().parents[1] / "config" / "onboarding" / "zai-glm-5.3.yaml"
+    entry = load_profile(profile_path)["models"][0]
+    monkeypatch.setattr(providers, "_config", {
+        "providers": {
+            "zai_coding": {
+                "base_url": "https://api.z.ai/api/coding/paas/v4",
+                "api_key": "test-key",
+            },
+        },
+    })
+    monkeypatch.setattr(
+        providers,
+        "_models",
+        {model_id: entry for model_id in providers._entry_routable_ids(entry)},
+    )
+
+    models_response = client.get("/v1/models")
+    assert models_response.status_code == 200
+    advertised = next(
+        row for row in models_response.json()["data"]
+        if row["id"] == "glm-5.3-zai"
+    )
+    assert advertised["default_enabled_level"] == "max"
+    assert advertised["forwarded_params"] == ["reasoning_effort", "thinking"]
+    assert advertised["max_reachable"] is True
+
+    debug_response = client.get("/v1/debug/thinking")
+    assert debug_response.status_code == 200
+    debug = next(
+        row for row in debug_response.json()["models"]
+        if row["name"] == "glm-5.3-zai"
+    )
+    assert debug["default_enabled_level"] == "max"
+    assert debug["forwarded_params"] == ["reasoning_effort", "thinking"]
+    assert debug["max_reachable"] is True
+
+    async def fake_passthrough(endpoint, body, headers, **kwargs):
+        assert endpoint == "https://api.z.ai/api/coding/paas/v4/chat/completions"
+        assert body["model"] == "glm-5.2"
+        assert body["thinking"] == {"type": "enabled"}
+        assert body["reasoning_effort"] == "max"
+        return server_module.JSONResponse(status_code=200, content={"ok": True})
+
+    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough)
+    routed = client.post("/v1/chat/completions", json={
+        "model": "glm-5.3",
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+    assert routed.status_code == 200
+    assert routed.json() == {"ok": True}
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")

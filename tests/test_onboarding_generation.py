@@ -454,6 +454,17 @@ def test_generated_profile_round_trips_through_schema_v1_loader(tmp_path):
     }
 
 
+def test_zai_glm53_quirk_is_allowed_in_generated_profile(tmp_path):
+    profile = generation.build_draft(
+        provider_id="zai_coding",
+        base_url="https://api.z.ai/api/coding/paas/v4",
+        model_ids=["glm-5.3"],
+        model_info_path=_catalog(tmp_path / "model-info.json"),
+        quirks=["zai_glm53_thinking"],
+    )
+    assert profile["models"][0]["quirks"] == ["zai_glm53_thinking"]
+
+
 def test_invalid_generated_metadata_is_rejected(tmp_path):
     catalog = _catalog(tmp_path / "model-info.json")
     with pytest.raises(OnboardingError, match="unsupported request quirk"):

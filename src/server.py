@@ -798,9 +798,104 @@ def _validate_reasoning_control(req: dict, info) -> dict:
     return control
 
 
+_ZAI_GLM53_CODING_EFFORT_MAP = {
+    "none": "low",
+    "disabled": "low",
+    "off": "low",
+    "minimal": "low",
+    "light": "low",
+    "low": "low",
+    "medium": "high",
+    "high": "high",
+    "xhigh": "max",
+    "max": "max",
+    "ultra": "max",
+}
+
+
+def _prepare_model_reasoning_control(req: dict, info) -> None:
+    """Normalize provider compatibility controls before canonical validation."""
+    quirks = getattr(info, "quirks", frozenset())
+    if "zai_glm53_thinking" not in quirks:
+        return
+
+    thinking = req.get("thinking")
+    clear_thinking = (
+        thinking.get("clear_thinking")
+        if isinstance(thinking, dict) and isinstance(thinking.get("clear_thinking"), bool)
+        else None
+    )
+
+    # Coding Plan accepts controls from several supported agent protocols.
+    # Explicit effort wins over the thinking toggle; absent/unknown values use
+    # its documented max default.
+    candidates = []
+    if req.get("reasoning_effort") is not None:
+        candidates.append(req.get("reasoning_effort"))
+    reasoning = req.get("reasoning")
+    if isinstance(reasoning, dict) and reasoning.get("effort") is not None:
+        candidates.append(reasoning.get("effort"))
+    output_config = req.get("output_config")
+    if isinstance(output_config, dict) and output_config.get("effort") is not None:
+        candidates.append(output_config.get("effort"))
+    chat_template_kwargs = req.get("chat_template_kwargs")
+    if isinstance(chat_template_kwargs, dict) and chat_template_kwargs.get("reasoning_effort") is not None:
+        candidates.append(chat_template_kwargs.get("reasoning_effort"))
+    if not candidates and isinstance(thinking, str) and thinking.strip().lower() not in {
+        "true", "enabled", "adaptive", "false", "disabled", "none", "off",
+    }:
+        candidates.append(thinking)
+
+    if candidates:
+        effort = _ZAI_GLM53_CODING_EFFORT_MAP.get(str(candidates[0]).strip().lower(), "max")
+    else:
+        disabled = thinking is False or (
+            isinstance(thinking, str)
+            and thinking.strip().lower() in {"false", "disabled", "none", "off"}
+        ) or (
+            isinstance(thinking, dict)
+            and str(thinking.get("type") or "").strip().lower() in {"disabled", "none", "off"}
+        )
+        effort = "low" if disabled else "max"
+
+    req["reasoning_effort"] = effort
+    normalized_thinking = {"type": "enabled"}
+    if clear_thinking is not None:
+        normalized_thinking["clear_thinking"] = clear_thinking
+    req["thinking"] = normalized_thinking
+
+    if isinstance(reasoning, dict):
+        reasoning = dict(reasoning)
+        reasoning.pop("effort", None)
+        if reasoning:
+            req["reasoning"] = reasoning
+        else:
+            req.pop("reasoning", None)
+    if isinstance(output_config, dict):
+        output_config = dict(output_config)
+        output_config.pop("effort", None)
+        if output_config:
+            req["output_config"] = output_config
+        else:
+            req.pop("output_config", None)
+    if isinstance(chat_template_kwargs, dict):
+        chat_template_kwargs = dict(chat_template_kwargs)
+        chat_template_kwargs.pop("reasoning_effort", None)
+        if chat_template_kwargs:
+            req["chat_template_kwargs"] = chat_template_kwargs
+        else:
+            req.pop("chat_template_kwargs", None)
+
+
 def _thinking_validation_response(req: dict, info, error_factory):
+    # Validation occurs before vision/composite routing finalizes the served
+    # model. Normalize a copy so GLM-5.3 defaults cannot leak into a different
+    # fallback model's second validation pass; dispatch mutates only after the
+    # final route is selected.
+    candidate = copy.deepcopy(req)
+    _prepare_model_reasoning_control(candidate, info)
     try:
-        _validate_reasoning_control(req, info)
+        _validate_reasoning_control(candidate, info)
     except ThinkingValidationError as exc:
         return error_factory(400, "invalid_request_error", str(exc))
     return None
@@ -1346,6 +1441,7 @@ def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat") -> bool:
     optional-thinking models receive no new params unless the client requested
     them; always-thinking models keep the prior auto-enable behavior.
     """
+    _prepare_model_reasoning_control(req, info)
     control = _validate_reasoning_control(req, info)
     enabled = control["enabled"]
 
@@ -1390,6 +1486,13 @@ def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat") -> bool:
     effort = control["effort"]
     budget = control["budget"]
     exclude = control["exclude"]
+    thinking_control = req.get("thinking")
+    clear_thinking = (
+        thinking_control.get("clear_thinking")
+        if isinstance(thinking_control, dict)
+        and isinstance(thinking_control.get("clear_thinking"), bool)
+        else None
+    )
 
     _strip_reasoning_controls(req)
     if target_api != "responses":
@@ -1480,11 +1583,23 @@ def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat") -> bool:
         return bool(enabled)
 
     if fmt == "zai":
+        if "zai_glm53_thinking" in quirks:
+            # GLM-5.3 requires the official thinking object, supports only
+            # low/high/max, and defaults to max when no effort is explicit.
+            # The catalog capability contract rejects every other level before
+            # dispatch reaches this branch.
+            req.pop("enable_thinking", None)
+            if enabled:
+                req["thinking"] = {"type": "enabled"}
+                if clear_thinking is not None:
+                    req["thinking"]["clear_thinking"] = clear_thinking
+                req["reasoning_effort"] = effort
+            return bool(enabled)
         req["enable_thinking"] = bool(enabled)
         if enabled and effort and effort != "off":
-            # Z.ai GLM-5.x accepts two effort levels. Preserve canonical max
-            # through validation, then map xhigh/max to native max and clamp
-            # finer-grained levels to native high.
+            # Earlier Z.ai GLM-5.x routes accept two effort levels. Preserve
+            # canonical max through validation, then map xhigh/max to native
+            # max and clamp finer-grained levels to native high.
             req["reasoning_effort"] = "max" if effort in {"xhigh", "max"} else "high"
         return bool(enabled)
 
@@ -1524,6 +1639,12 @@ def _forwarded_thinking_keys(req: dict) -> set[str]:
     return forwarded
 
 
+def _default_enabled_thinking_level_for_entry(entry: dict, levels: tuple[str, ...]) -> str | None:
+    if "zai_glm53_thinking" in set(entry.get("quirks") or ()):
+        return "max" if "max" in levels else _default_enabled_thinking_level(levels)
+    return _default_enabled_thinking_level(levels)
+
+
 def _probe_forwarded_params(entry: dict, levels: tuple[str, ...]) -> set[str]:
     """Probe dispatch at the model's strongest declared enabled level."""
     enabled_levels = [level for level in levels if level != "off"]
@@ -1537,6 +1658,7 @@ def _probe_forwarded_params(entry: dict, levels: tuple[str, ...]) -> set[str]:
         thinking_levels=levels,
         thinking_format=entry.get("thinking_format", ""),
         max_output_tokens=entry.get("max_output_tokens", 0) or 32768,
+        quirks=frozenset(entry.get("quirks") or ()),
     )
     forwarded: set[str] = set()
     for probe in (
@@ -1564,7 +1686,7 @@ def _thinking_capabilities(entry: dict) -> dict:
         "thinking": normalized.get("thinking", ""),
         "thinking_format": fmt,
         "thinking_levels": list(levels),
-        "default_enabled_level": _default_enabled_thinking_level(levels),
+        "default_enabled_level": _default_enabled_thinking_level_for_entry(normalized, levels),
         "off_supported": "off" in levels,
         "forwarded_params": sorted(forwarded),
         "max_reachable": bool(forwarded & set(_THINK_LEVEL_KEYS)),
@@ -1846,6 +1968,8 @@ def _direct_model_rows() -> list[dict]:
             "thinking": caps["thinking"],
             "thinking_format": caps["thinking_format"],
             "thinking_levels": caps["thinking_levels"],
+            "off_supported": caps["off_supported"],
+            "default_enabled_level": caps["default_enabled_level"],
             "max_reachable": caps["max_reachable"],
             "forwarded_params": caps["forwarded_params"],
             "vision": bool(m.get("vision")),
@@ -1918,6 +2042,8 @@ def _canonical_model_rows(inventory: list[dict]) -> list[dict]:
             "max_output_tokens": _nonnegative_catalog_int(model.get("max_output_tokens")),
             "thinking": caps["thinking"],
             "thinking_levels": caps["thinking_levels"],
+            "off_supported": caps["off_supported"],
+            "default_enabled_level": caps["default_enabled_level"],
             "vision": bool(model.get("vision")),
         })
     return rows

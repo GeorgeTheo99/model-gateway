@@ -111,6 +111,10 @@ input/output per 1M tokens. No cache fields. Match by `provider_model_id`
 (e.g. `glm-5.2`). Note: the `zai_coding` provider points at
 `api.z.ai/api/coding/paas/v4` (the coding tier) — confirm the price is for the
 **coding** endpoint, which sometimes differs from the standard Z.ai API tier.
+GLM-5.3's Coding Plan publishes credit multipliers rather than USD/Mtok prices,
+so `glm-5.3-zai` intentionally omits `pricing` until a directly comparable
+price is published. Its current compatibility route retains upstream ID
+`glm-5.2`, which Z.ai documents as automatically routed to GLM-5.3.
 
 **ZhipuAI (`zhipuai`)**: the BigModel pricing page
 (https://open.bigmodel.cn/pricing) lists GLM models in CNY per 1M tokens.
@@ -139,5 +143,5 @@ Use this to know which source to read for each model. Regenerate with:
 | gemini-3.1-pro | openrouter | google/gemini-3.1-pro-preview | openrouter API |
 | gemini-3-flash | openrouter | google/gemini-3-flash-preview | openrouter API |
 | gemini-3.5-flash | openrouter | google/gemini-3.5-flash | openrouter API |
-| glm-5.2-zai | zai_coding | glm-5.2 | z.ai |
+| glm-5.3-zai | zai_coding | glm-5.2 (documented GLM-5.3 compatibility route) | z.ai Coding Plan |
 | glm-5-zai-turbo | zhipuai | glm-5-turbo | zhipuai (CNY→USD) |
