@@ -21,6 +21,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from src.catalog import entry_routable_ids  # noqa: E402
 from src.onboarding import (  # noqa: E402
     OnboardingError,
     apply_profile,
@@ -219,7 +220,12 @@ def _add_secret_args(parser: argparse.ArgumentParser) -> None:
 
 def _reloaders(args: argparse.Namespace, profile: dict):
     new_models = {str(model["name"]) for model in profile["models"]}
-    retired_models = set((profile.get("retire") or {}).get("models") or [])
+    retained_ids = {
+        model_id
+        for model in profile["models"]
+        for model_id in entry_routable_ids(model)
+    }
+    retired_models = set((profile.get("retire") or {}).get("models") or []) - retained_ids
     if not args.launchd_label:
         return None, None
     common = dict(config_path=args.config, model_info_path=args.model_info)

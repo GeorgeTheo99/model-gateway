@@ -28,6 +28,36 @@ def test_operator_cli_resolves_its_installed_symlink(tmp_path):
     assert f"ROOT_DIR={SCRIPT.parents[1]}" in result.stdout
 
 
+def test_reload_verification_allows_retired_name_retained_as_compatibility_id(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_reloader(label, health_url, **kwargs):
+        calls.append(kwargs)
+        return lambda: None
+
+    monkeypatch.setattr(CLI, "_service_reloader", fake_reloader)
+    args = SimpleNamespace(
+        launchd_label="com.local.model-gateway",
+        health_url="http://127.0.0.1:9111/health",
+        config=tmp_path / "config.yaml",
+        model_info=tmp_path / "model-info.json",
+    )
+    profile = {
+        "models": [{
+            "name": "glm-5.3-zai",
+            "provider": "zai_coding",
+            "provider_model_id": "glm-5.2",
+            "alternate_ids": ["glm-5.3", "glm-5.2-zai"],
+        }],
+        "retire": {"models": ["glm-5.2-zai"]},
+    }
+
+    CLI._reloaders(args, profile)
+
+    assert calls[0]["expected_models"] == {"glm-5.3-zai"}
+    assert calls[0]["absent_models"] == set()
+
+
 def test_prompt_secret_fails_clearly_without_tty(monkeypatch):
     monkeypatch.setattr(CLI.sys, "stdin", SimpleNamespace(isatty=lambda: False))
     with pytest.raises(OnboardingError, match="no interactive terminal"):
