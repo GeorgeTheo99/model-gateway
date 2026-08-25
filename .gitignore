@@ -1,9 +1,31 @@
 # Real provider credentials — never commit
 config/config.yaml
 config/config.yaml.bak-*
+config/config.tmp*
+config/.config.yaml.*
 config/secrets/
 config/*.onboard.lock
 config/federation-cache.json
+
+# Common local credential files
+.env
+.env.*
+*.env
+*.env.*
+!*.env.example
+!*.env.*.example
+*.p8
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+secrets*.json
+secrets*.yaml
+secrets*.yml
+.npmrc
+.pypirc
+.netrc
 
 # Machine-local model catalog (per-machine; committed in error previously)
 model-info.json

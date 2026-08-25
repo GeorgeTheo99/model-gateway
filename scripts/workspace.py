@@ -34,6 +34,7 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -49,7 +50,7 @@ DEFAULT_CONFIG = Path(
     or Path(__file__).resolve().parents[1] / "config" / "config.yaml"
 )
 GATEWAY_URL = os.environ.get("MODEL_GATEWAY_URL", "http://localhost:9111")
-ADMIN_KEY = os.environ.get("MODEL_GATEWAY_ADMIN_KEY", "admin")
+ADMIN_KEY = os.environ.get("MODEL_GATEWAY_ADMIN_KEY", "").strip()
 
 
 def _fail(msg: str) -> "SystemExit":
@@ -191,18 +192,64 @@ def smoke_test(host: str, token: str, endpoint_names: set[str]) -> None:
 
 
 def _backup(path: Path) -> None:
+    """Create a collision-safe, owner-only backup of secret-bearing config."""
     backup = path.with_name(path.name + f".bak-{time.strftime('%Y%m%d-%H%M%S')}")
-    shutil.copy2(path, backup)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(backup, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with path.open("rb") as source, os.fdopen(fd, "wb") as target:
+            shutil.copyfileobj(source, target)
+            target.flush()
+            os.fsync(target.fileno())
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        backup.unlink(missing_ok=True)
+        raise
     print(f"  backup: {backup.name}")
 
 
 def _write_config(path: Path, config: dict) -> None:
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(yaml.safe_dump(config, sort_keys=False, default_flow_style=False))
-    tmp.replace(path)
+    """Persist secret-bearing config atomically with owner-only permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    tmp = Path(tmp_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            yaml.safe_dump(config, handle, sort_keys=False, default_flow_style=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp.replace(path)
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _require_admin_key() -> None:
+    if not ADMIN_KEY:
+        raise _fail("MODEL_GATEWAY_ADMIN_KEY is required for mutating workspace commands")
 
 
 def reload_gateway() -> None:
+    _require_admin_key()
     req = urllib.request.Request(
         f"{GATEWAY_URL}/admin/api/reload", method="POST",
         headers={"Authorization": f"Bearer {ADMIN_KEY}"},
@@ -278,6 +325,7 @@ def _insert_into_pools(config: dict, name: str, pool_names: list[str], position:
 
 
 def cmd_add(args) -> None:
+    _require_admin_key()
     host = normalize_host(args.host)
     profile = args.profile or args.name
     pool_names = [p.strip() for p in (args.pools or "").split(",") if p.strip()]
@@ -316,6 +364,7 @@ def cmd_add(args) -> None:
 
 
 def cmd_replace(args) -> None:
+    _require_admin_key()
     config = _load_config(args.config)
     providers = _providers_section(config)
     old = providers.get(args.old_name)
@@ -359,6 +408,7 @@ def cmd_repair(args) -> None:
       silent token → browser SSO → prompt to paste a replacement workspace URL
     (the paste-a-URL flow). Static-PAT workspaces are probe-checked only.
     """
+    _require_admin_key()
     config = _load_config(args.config)
     providers = _providers_section(config)
     broken: list[str] = []
@@ -392,6 +442,7 @@ def cmd_repair(args) -> None:
 
 
 def cmd_remove(args) -> None:
+    _require_admin_key()
     config = _load_config(args.config)
     providers = _providers_section(config)
     if args.name not in providers:

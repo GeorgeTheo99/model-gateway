@@ -7,11 +7,11 @@
 #   client_keys -> protects /v1/* (leave empty to keep /v1 open)
 # Each field accepts a list of keys or a single comma-separated string.
 # Env vars MODEL_GATEWAY_ADMIN_KEY / MODEL_GATEWAY_CLIENT_KEYS override these.
+# Never use fixed/example literals as real credentials. Generate random values
+# or use the owner-only MODEL_GATEWAY_CLIENT_KEYS_FILE runtime boundary.
 auth:
-  admin_keys:
-    - "admin"
-  # client_keys:
-  #   - "cloud"
+  admin_keys: []
+  # client_keys: []
 
 # Optional explicit one-hop federation. Omit this entire block on standalone
 # nodes. Node/peer IDs are lowercase DNS labels and become the route prefix:

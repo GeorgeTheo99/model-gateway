@@ -17,6 +17,41 @@ The dev server uses a dev/runtime split:
 - LaunchAgents: `com.local.model-gateway` (gateway, `127.0.0.1:9111`) and
   `com.local.omlx` (local oMLX model server, `:9110`)
 
+## Repository authority and publishing
+
+The development checkout keeps two distinct remotes:
+
+- `origin` — `~/repos/model-gateway.git`, the authoritative local bare
+  repository and deployment source
+- `github` — the public GitHub mirror used for distribution
+
+GitHub synchronization is intentionally **manual**. A push to the local bare
+repository deploys this server, but it does not push to GitHub. Publish the same
+commit separately when it is ready to be public:
+
+```bash
+git push origin main    # update authoritative bare repo and deploy locally
+git push github main    # update public mirror
+```
+
+Verify alignment with `git rev-parse HEAD origin/main github/main`. Consumer
+machines clone or update from GitHub using the portable flow in
+[deployment.md](deployment.md); they do not use this maintainer topology.
+
+Secret scanning is enforced in three layers: tracked pre-commit/pre-push hooks,
+the authoritative bare repository's pre-receive hook, and the pinned GitHub
+Gitleaks workflow. Install Gitleaks and activate the worktree hooks once per
+clone:
+
+```bash
+brew install gitleaks
+git config core.hooksPath .githooks
+```
+
+The custom configuration detects Zhipu/Z.ai's provider-specific key shape that
+GitHub's provider scanner may not recognize. Never bypass a failed scan or
+allowlist a whole credential-bearing file.
+
 ## Push-to-deploy
 
 Pushes to `main` on `~/repos/model-gateway.git` run `hooks/post-receive`, which
