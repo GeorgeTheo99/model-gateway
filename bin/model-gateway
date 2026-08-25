@@ -2,7 +2,7 @@
 # model-gateway — portable macOS launchd operator CLI.
 #
 # Self-contained installer/control surface for consumer machines that run this
-# repo directly (git clone + install), without ls99's server-ci deployment
+# repo directly (git clone + install), without the maintainer's CI-managed dev-server deployment
 # infrastructure.
 #
 # Usage:

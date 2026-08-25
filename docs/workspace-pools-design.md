@@ -6,7 +6,7 @@ Date: 2026-07-07
 ## Problem
 
 1. **Single-workspace routing.** Every model binds to exactly one provider
-   (`databricks` = AI Gateway workspace, `databricks-e2` = e2-demo-field-eng).
+   (`databricks` = AI Gateway workspace, `databricks-e2` = workspace-b-field-eng).
    If a workspace is deleted, rate-limited to death, or its endpoints are
    removed, those models hard-fail. `model_fallbacks` is a single-hop,
    same-catalog map and is the only cross-endpoint escape hatch.
@@ -48,37 +48,37 @@ Date: 2026-07-07
 ```yaml
 # config.yaml (new shape — old shape stays supported, see Migration)
 workspaces:
-  fevm-model-exp:                  # PRIMARY. NOTE: the existing "AI Gateway"
-    # provider URL 7474647777725369.ai-gateway.cloud.databricks.com is this
-    # same workspace (org id 7474647777725369 = fevm-model-exp) reached via
-    # its AI Gateway hostname — so "primary" is already fevm-model-exp today.
-    base_url: https://7474647777725369.ai-gateway.cloud.databricks.com
-    workspace_url: https://fevm-model-exp.cloud.databricks.com  # for auth/probes
+  workspace-a:                  # PRIMARY. NOTE: the existing "AI Gateway"
+    # provider URL <org-id>.ai-gateway.cloud.databricks.com is this
+    # same workspace (org id <org-id> = workspace-a) reached via
+    # its AI Gateway hostname — so "primary" is already workspace-a today.
+    base_url: https://<org-id>.ai-gateway.cloud.databricks.com
+    workspace_url: https://workspace-a.cloud.databricks.com  # for auth/probes
     kind: ai-gateway               # ai-gateway | serving-invocations
     auth: oauth-cli                # pat | oauth-cli
-    auth_profile: fevm-model-exp   # databricks CLI profile
+    auth_profile: workspace-a   # databricks CLI profile
     api_key: dapi...               # PAT, or last-known OAuth JWT
     path_prefixes: {anthropic: anthropic/v1, openai: mlflow/v1}
     quirks: [anthropic_bearer_auth]
-  e2-demo:
-    base_url: https://e2-demo-field-eng.cloud.databricks.com
+  workspace-b:
+    base_url: https://workspace-b.cloud.databricks.com
     kind: serving-invocations
     auth: oauth-cli
-    auth_profile: e2-demo-west     # databricks CLI profile
+    auth_profile: workspace-b-profile     # databricks CLI profile
     api_key: eyJ...                # rotated in place by refresh
     quirks: [no_stream_options, no_reasoning_params]
-  dogfood:
-    base_url: https://adb-2548836972759138.18.azuredatabricks.net
+  workspace-d:
+    base_url: https://adb-<workspace-id>.<n>.azuredatabricks.net
     kind: serving-invocations
     auth: oauth-cli
-    auth_profile: logfood
+    auth_profile: workspace-d-profile
 
 pools:
   # Ordered failover. Different models prefer different workspaces —
   # "across many workspaces" is the normal case, not the exception:
-  default-pool:  [fevm-model-exp, e2-demo]   # sonnet/opus/gpt: primary first
-  fable-pool:    [e2-demo, fevm-model-exp]   # fable lives on e2-demo
-  glm-pool:      [dogfood]                   # GLM52 only exists on dogfood
+  default-pool:  [workspace-a, workspace-b]   # sonnet/opus/gpt: primary first
+  fable-pool:    [workspace-b, workspace-a]   # fable lives on workspace-b
+  glm-pool:      [workspace-d]                   # GLM52 only exists on workspace-d
 ```
 
 Model→workspace affinity falls out of per-model `pool:` references: `fable`
@@ -235,10 +235,10 @@ preflight consults circuit/auth state via `/admin/api/stats`.
 ### 3b. One command: `manage.sh workspace add` (and `replace`)
 
 ```
-$ manage.sh workspace add fe-sandbox \
-    --host https://fe-sandbox-theodem.cloud.databricks.com \
+$ manage.sh workspace add workspace-c \
+    --host https://workspace-c.cloud.databricks.com \
     --pools databricks-anthropic-pool,databricks-openai-pool \
-    [--position 2] [--profile fe-sandbox-theodem] [--kind serving-invocations]
+    [--position 2] [--profile workspace-c-profile] [--kind serving-invocations]
 ```
 
 Steps (idempotent, each verified before the next):
@@ -290,14 +290,14 @@ If a routed workspace is deleted *right now*:
   launcher use (3a), or explicitly `manage.sh workspace replace <dead> --host
   <new-url>`. Both handle SSO, validation, smoke test, config write, reload,
   and catalog regeneration in one pass.
-- **Single-workspace pools (e.g. glm-pool/dogfood):** there is no failover
+- **Single-workspace pools (e.g. glm-pool/workspace-d):** there is no failover
   target, so the paste-a-URL prompt is the *primary* recovery mechanism, and
   the coverage check pivots: instead of requiring the new workspace to serve
   all pool models, it reports which currently-orphaned models the new
   workspace can serve and wires only those.
 - **Standby recommendation:** keep pools at 2 active members and validate a
   3rd cold-standby profile weekly via `workspace test` (candidates already in
-  `~/.databrickscfg`: fe-sandbox-theodem, logfood, ai-devtools). Adding the
+  `~/.databrickscfg`: workspace-c-profile, workspace-d-profile, ...). Adding the
   standby to pools then requires no new auth ceremony.
 
 ### 3d. What makes it "foolproof"
@@ -318,7 +318,7 @@ If a routed workspace is deleted *right now*:
 - **Back-compat:** `providers:` (current shape) keeps working; a `provider:`
   on a model is treated as a 1-member pool. Migration is
   `providers.databricks → workspaces.ai-gateway`, `providers.databricks-e2 →
-  workspaces.e2-demo` plus two pool definitions — mechanical.
+  workspaces.workspace-b` plus two pool definitions — mechanical.
 - **Phase 1 (biggest win, smallest diff):** catalog generation +
   drift check (kills the 4-way hand-maintenance; fable-class bugs impossible).
 - **Phase 2:** workspace pools + per-workspace circuit/failover in
@@ -329,9 +329,9 @@ If a routed workspace is deleted *right now*:
 
 ## Open questions
 
-1. Pool membership per model class is now decided (primary fevm-model-exp;
-   fable→e2-demo-first; GLM52→dogfood-only). Remaining: should default-pool
-   get a 3rd cold-standby member, and does e2-demo/dogfood have FMAPI parity
+1. Pool membership per model class is now decided (primary workspace-a;
+   fable→workspace-b-first; GLM52→workspace-d-only). Remaining: should default-pool
+   get a 3rd cold-standby member, and does workspace-b/workspace-d have FMAPI parity
    for the default models? `workspace test` output should confirm.
 2. AI-gateway workspace (`ai-gateway` kind) uses different path shapes than
    `serving-invocations` — pooling across kinds is supported by design
@@ -340,6 +340,6 @@ If a routed workspace is deleted *right now*:
 3. Should Pi's `/model` list pooled models once (gateway hides the pool —
    recommended) — vs. exposing per-workspace variants for debugging? Sketch
    assumes once; a `debug:` block in the generated Pi catalog could add
-   `fable@e2-demo`-style pinned ids later.
+   `fable@workspace-b`-style pinned ids later.
 4. `model-info.json` — fold into config.yaml as part of Phase 1 so there is
    exactly one curated file? (It duplicates thinking/vision metadata today.)

@@ -57,26 +57,13 @@ the ledger.
 
 After install, edit `config/config.yaml` to add provider secrets/auth. A fresh generated config intentionally has `providers: {}`, so catalog entries remain unavailable until providers are configured. If you deliberately expose the gateway beyond loopback (`MODEL_GATEWAY_HOST=0.0.0.0`), configure `auth.client_keys` and firewall rules first.
 
-The installer refuses to overwrite/stop/remove an existing `com.local.model-gateway` plist whose `WorkingDirectory` points somewhere else (for example an ls99 `server-ci` runtime checkout). Use `model-gateway install --force` or `MODEL_GATEWAY_FORCE=1` only when you intentionally want this clone to adopt that LaunchAgent label.
+The installer refuses to overwrite/stop/remove an existing `com.local.model-gateway` plist whose `WorkingDirectory` points somewhere else (for example a CI-managed runtime checkout). Use `model-gateway install --force` or `MODEL_GATEWAY_FORCE=1` only when you intentionally want this clone to adopt that LaunchAgent label.
 
-## ls99 dev-server deploy flow
+## Dev-server deploy flow (maintainer)
 
-ls99 still uses the dev/runtime split:
-
-- Development checkout: `~/local_code/model-gateway`
-- Bare repo: `~/repos/model-gateway.git`
-- Runtime checkout: `~/srv/model-gateway/current`
-- Shared secrets/config: `~/srv/model-gateway/shared/config/config.yaml`
-- LaunchAgent: `com.local.model-gateway`
-- Service port: `127.0.0.1:9111`
-
-Pushes to `main` on `~/repos/model-gateway.git` run `hooks/post-receive`, which delegates to:
-
-```bash
-/Users/localserver99/ci/server/bin/server-ci run-model-gateway <oldrev> <newrev> refs/heads/main
-```
-
-The dev-server pipeline updates the runtime checkout, keeps `config/config.yaml` symlinked to shared config, syncs a runtime `.venv`, imports the app as a smoke check, restarts `com.local.model-gateway` for runtime-affecting changes, and verifies `/health`.
+The maintainer's own CI-driven dev-server deployment is documented separately
+in [deployment-dev-server.md](deployment-dev-server.md). Consumer machines do
+not need it — use the portable install above.
 
 ## Provider config
 
@@ -128,12 +115,6 @@ reconfigures federation after manual config edits; there are no federation
 admin write APIs. See [federation.md](federation.md) for the full config,
 security, discovery, and forwarding contract.
 
-Manual deploy:
-
-```bash
-/Users/localserver99/ci/server/bin/server-ci deploy-model-gateway main
-```
-
 ## Downstream catalog exports
 
 `scripts/export_catalogs.py` renders the downstream alias catalog from the same
@@ -153,10 +134,12 @@ need an alias file omit the `exports:` section and the generator is a no-op.
 Generation runs on gateway start (`src/server.py` lifespan) and on
 `/admin/api/reload`; drift is checked with `scripts/export_catalogs.py --check`.
 
-`runtime/omlx-config/fan_out_settings.py` still owns the oMLX-local concerns
-(`~/.omlx/model_settings.json` sync + oMLX restart) but no longer generates
-aliases itself — it delegates to `export_catalogs.py --aliases-out`, so a manual
-`fan_out` run stays consistent with the gateway-generated catalog.
+On machines that run a local oMLX service, a machine-local `fan_out_settings.py`
+(kept in deployment shared state, outside this repository — see
+[deployment-dev-server.md](deployment-dev-server.md)) owns the oMLX-local
+concerns (`~/.omlx/model_settings.json` sync + oMLX restart) but no longer
+generates aliases itself — it delegates to `export_catalogs.py --aliases-out`,
+so a manual `fan_out` run stays consistent with the gateway-generated catalog.
 
 The catalog path is resolved directly from `MODEL_GATEWAY_MODEL_INFO` (or the
 checkout-local `model-info.json` default); there is no tracked runtime catalog
@@ -171,4 +154,4 @@ exports:
   model_aliases: ~/.claude/model-aliases.json
 ```
 
-The gateway regenerates that generic alias file on startup. Render Pi-specific artifacts separately with `pi-shared/bin/pi-catalog`; generated launchers define `pi-restart model-gw`, which now delegates to the portable `model-gateway restart` command when available and falls back to `server-ci restart --model-gw` on ls99/dev-server installs. Pi-owned generated artifacts should live under `~/.pi/` (for example, `~/.pi/generated/pi-launchers.zsh`), never under this repository or a model-gateway runtime directory.
+The gateway regenerates that generic alias file on startup. Render Pi-specific artifacts separately with `pi-shared/bin/pi-catalog`; generated launchers define `pi-restart model-gw`, which now delegates to the portable `model-gateway restart` command when available and falls back to `server-ci restart --model-gw` on the maintainer's dev-server install. Pi-owned generated artifacts should live under `~/.pi/` (for example, `~/.pi/generated/pi-launchers.zsh`), never under this repository or a model-gateway runtime directory.
