@@ -32,7 +32,9 @@ from src.catalog import normalize_thinking_capabilities, validate_pricing_policy
 from src.config_lock import config_write_lock
 from src.providers import CONFIG_PATH, MODEL_INFO_PATH, MODEL_INFO_SOURCE_PATH
 
-log_dir = Path(os.environ.get("MODEL_GATEWAY_LOG_DIR", str(Path.home() / ".claude")))
+log_dir = Path(
+    os.environ.get("MODEL_GATEWAY_LOG_DIR", str(Path.home() / "Library" / "Logs" / "model-gateway"))
+)
 
 
 def _config_backup_dir() -> Path:
@@ -221,7 +223,6 @@ def migrate_legacy_backups() -> int:
     if configured is None:
         candidates = [
             logs / "config-backups",
-            Path.home() / ".claude" / "config-backups",
             Path.home() / "Library" / "Application Support" / "HomeServer" / "ci" / "logs" / "config-backups",
         ]
     else:

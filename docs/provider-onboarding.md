@@ -204,7 +204,7 @@ apply and regenerate in this order:
 model-gateway onboard config/onboarding/fireworks-kimi-k3.yaml --dry-run
 model-gateway onboard config/onboarding/fireworks-kimi-k3.yaml \
   --non-interactive --yes --confirm-replace kimi-k3
-pi-catalog --aliases ~/.claude/model-aliases.json \
+pi-catalog --aliases ~/srv/model-gateway/shared/model-aliases.json \
   --models-out ~/.pi-omlx/agent/models.json \
   --launchers-out ~/.pi/generated/pi-launchers.zsh \
   --pi-agent-dir ~/.pi-omlx/agent --ls99-extras
@@ -218,7 +218,7 @@ profile without the obsolete retirement and regenerate Pi again:
 ```bash
 model-gateway onboard config/onboarding/moonshot-kimi-k3-rollback.yaml \
   --non-interactive --yes --confirm-replace kimi-k3
-pi-catalog --aliases ~/.claude/model-aliases.json \
+pi-catalog --aliases ~/srv/model-gateway/shared/model-aliases.json \
   --models-out ~/.pi-omlx/agent/models.json \
   --launchers-out ~/.pi/generated/pi-launchers.zsh \
   --pi-agent-dir ~/.pi-omlx/agent --ls99-extras
@@ -244,7 +244,7 @@ Deploy both code prerequisites before changing the live machine catalog:
 model-gateway onboard config/onboarding/zai-glm-5.3.yaml --dry-run
 model-gateway onboard config/onboarding/zai-glm-5.3.yaml \
   --non-interactive --yes --confirm-retire glm-5.2-zai
-pi-catalog --aliases ~/.claude/model-aliases.json \
+pi-catalog --aliases ~/srv/model-gateway/shared/model-aliases.json \
   --models-out ~/.pi-omlx/agent/models.json \
   --launchers-out ~/.pi/generated/pi-launchers.zsh \
   --pi-agent-dir ~/.pi-omlx/agent --ls99-extras

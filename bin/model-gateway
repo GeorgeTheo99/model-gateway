@@ -39,7 +39,7 @@ PLIST_DIR="${MODEL_GATEWAY_PLIST_DIR:-$HOME/Library/LaunchAgents}"
 LOG_DIR="${MODEL_GATEWAY_LOG_DIR:-$HOME/Library/Logs/model-gateway}"
 LOG_FILE="${MODEL_GATEWAY_LOG_FILE:-$LOG_DIR/model-gateway.log}"
 BACKUP_DIR="${MODEL_GATEWAY_BACKUP_DIR:-$HOME/Library/Application Support/model-gateway/backups/config}"
-LEGACY_BACKUP_DIRS="${MODEL_GATEWAY_LEGACY_BACKUP_DIRS:-$LOG_DIR/config-backups:$HOME/.claude/config-backups}"
+LEGACY_BACKUP_DIRS="${MODEL_GATEWAY_LEGACY_BACKUP_DIRS:-$LOG_DIR/config-backups}"
 BIN_DIR="${MODEL_GATEWAY_BIN_DIR:-$HOME/.local/bin}"
 FORCE="${MODEL_GATEWAY_FORCE:-0}"
 
@@ -139,7 +139,7 @@ providers: {}
 
 # Optional downstream alias export consumed by pi-shared/bin/pi-catalog:
 # exports:
-#   model_aliases: ~/.claude/model-aliases.json
+#   model_aliases: ~/srv/model-gateway/shared/model-aliases.json
 EOF
   chmod 600 "$CONFIG_PATH"
   warn "Created empty config at $CONFIG_PATH; add provider secrets/auth before expecting models to route"

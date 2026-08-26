@@ -2,7 +2,7 @@
 """Generate the downstream model catalog (alias file) from the gateway catalog.
 
 Renders:
-  1. model-aliases.json — ~/.claude/model-aliases.json, the PUBLIC CONTRACT
+  1. model-aliases.json — the gateway-owned PUBLIC CONTRACT
      consumed by Pi-side renderers (pi-shared/bin/pi-catalog) and any other
      tool that needs the model catalog. The gateway owns this generic catalog;
      Pi-specific artifacts (models.json, pi-launchers.zsh) are rendered by
@@ -18,7 +18,7 @@ Exports are OPT-IN via config.yaml — machines that don't need an alias file
 simply omit the section and this script is a no-op::
 
     exports:
-      model_aliases: ~/.claude/model-aliases.json
+      model_aliases: ~/srv/model-gateway/shared/model-aliases.json
 
 The ``--aliases-out`` CLI flag overrides config for ad-hoc runs.
 
@@ -207,7 +207,7 @@ def _provider_serveable(provider: str, config: dict, config_path: Path = DEFAULT
 def render_model_aliases(
     entries: list[dict], config: dict | None = None, config_path: Path = DEFAULT_CONFIG,
 ) -> dict:
-    """Render ~/.claude/model-aliases.json from merged catalog entries.
+    """Render the gateway-owned model-aliases.json from merged catalog entries.
 
     Local models (provider ``omlx``/``local``) are keyed by ``omlx_id``; cloud
     models by ``cloud:<provider_model_id>`` — the public schema consumed by
@@ -282,10 +282,10 @@ def render_model_aliases(
 def _resolve_write_target(path: Path) -> Path:
     """Resolve symlinks to the final target so we write THROUGH the link.
 
-    ``~/.claude/model-aliases.json`` is a symlink to
-    ``~/srv/server/shared/local_claude/model-aliases.json``. A naive
-    ``tmp.replace(path)`` would replace the symlink itself; we must write to the
-    resolved target so the symlink stays intact and the shared file updates.
+    Deployments may expose the gateway-owned catalog through a compatibility
+    symlink. A naive ``tmp.replace(path)`` would replace the symlink itself;
+    writing to the resolved target preserves that link while updating the
+    canonical shared file.
     """
     if path.is_symlink() or path.exists():
         try:

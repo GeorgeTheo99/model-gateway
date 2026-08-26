@@ -159,4 +159,4 @@ providers:
 # above); drift-checked via `scripts/export_catalogs.py --check`. Never
 # hand-edit the generated file — edit model-info.json / config.yaml instead.
 # exports:
-#   model_aliases: ~/.claude/model-aliases.json
+#   model_aliases: ~/srv/model-gateway/shared/model-aliases.json

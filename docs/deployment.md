@@ -47,9 +47,9 @@ The ledger database and any SQLite WAL/SHM sidecars are restricted to mode
 `0600`. Configuration/catalog backups are stored in a mode-`0700` directory as
 mode-`0600` files and retain 20 generations per managed file by default
 (`MODEL_GATEWAY_BACKUP_RETENTION`, bounded to 1–1000). On startup, legacy
-`<log-dir>/config-backups`, historical `~/.claude/config-backups`, and the
-former Home Server package path `~/Library/Application Support/HomeServer/ci/logs/config-backups`
-are validated, retention-pruned, clamped private, and atomically moved
+`<log-dir>/config-backups` and the former Home Server package path
+`~/Library/Application Support/HomeServer/ci/logs/config-backups` are validated,
+retention-pruned, clamped private, and atomically moved
 to the configured backup directory before serving requests. Log and backup
 roots may not overlap. Uvicorn request access logging is disabled because request
 URLs can contain temporary capabilities; structured usage remains available in
@@ -121,7 +121,7 @@ security, discovery, and forwarding contract.
 merge the router uses (`model-info.json` + the `config.yaml` `models:` overlay,
 overlay wins on id clash):
 
-- `exports.model_aliases` → `~/.claude/model-aliases.json`, the **public
+- `exports.model_aliases` → `~/srv/model-gateway/shared/model-aliases.json`, the **public
   contract** consumed by Pi-side renderers (`pi-shared/bin/pi-catalog`) and any
   other tool that needs the model catalog.
 
@@ -151,7 +151,7 @@ For Pi users, configure an alias export in `config/config.yaml` when desired:
 
 ```yaml
 exports:
-  model_aliases: ~/.claude/model-aliases.json
+  model_aliases: ~/srv/model-gateway/shared/model-aliases.json
 ```
 
 The gateway regenerates that generic alias file on startup. Render Pi-specific artifacts separately with `pi-shared/bin/pi-catalog`; generated launchers define `pi-restart model-gw`, which now delegates to the portable `model-gateway restart` command when available and falls back to `server-ci restart --model-gw` on the maintainer's dev-server install. Pi-owned generated artifacts should live under `~/.pi/` (for example, `~/.pi/generated/pi-launchers.zsh`), never under this repository or a model-gateway runtime directory.
