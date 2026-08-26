@@ -58,7 +58,7 @@ Pushes to `main` on `~/repos/model-gateway.git` run `hooks/post-receive`, which
 delegates to a machine-local CI runner (untracked, lives outside this repo):
 
 ```bash
-~/ci/server/bin/server-ci run-model-gateway <oldrev> <newrev> refs/heads/main
+~/ci/home-server/bin/server-ci run-model-gateway <oldrev> <newrev> refs/heads/main
 ```
 
 The pipeline updates the runtime checkout, keeps `config/config.yaml` symlinked
@@ -69,7 +69,7 @@ restarts `com.local.model-gateway` for runtime-affecting changes, and verifies
 Manual deploy:
 
 ```bash
-~/ci/server/bin/server-ci deploy-model-gateway main
+~/ci/home-server/bin/server-ci deploy-model-gateway main
 ```
 
 ## oMLX companion service
