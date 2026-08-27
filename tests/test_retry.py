@@ -10,6 +10,7 @@ suite stays fast; circuit state is cleaned via a fixture with teardown.
 
 import asyncio
 import json as jsonlib
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -276,5 +277,40 @@ def test_retry_post_with_model_fallback_switches_model(
         assert resp.json()["model"] == "model-b"
         # model-a exhausted its (shrunk) retry budget, then model-b succeeded.
         assert calls == ["model-a", "model-a", "model-b"]
+    finally:
+        providers.reload()
+
+
+def test_profile_request_keeps_same_route_retries_but_disables_model_fallback(
+    fast_retries, clean_circuit, tmp_path, monkeypatch,
+):
+    provider = clean_circuit("retry-prov-profile")
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("providers: {}\nmodel_fallbacks:\n  model-a: model-b\n")
+    monkeypatch.setattr(providers, "CONFIG_PATH", cfg)
+    monkeypatch.setattr(providers, "MODEL_INFO_PATH", tmp_path / "model-info.json")
+    (tmp_path / "model-info.json").write_text(jsonlib.dumps({"llm": []}))
+    providers.reload()
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = jsonlib.loads(request.content)
+        calls.append(body["model"])
+        return httpx.Response(503, text="saturated")
+
+    async def run():
+        request = _DisconnectedRequest(disconnected_after=100)
+        request.state = SimpleNamespace(disable_model_fallback=True)
+        async with _client(handler) as client:
+            return await upstream._retry_post_with_model_fallback(
+                client, "https://up.example.com/v1/chat/completions",
+                json={"model": "model-a"}, headers={}, provider=provider,
+                request=request,
+            )
+
+    try:
+        response = asyncio.run(run())
+        assert response.status_code == 503
+        assert calls == ["model-a", "model-a"]
     finally:
         providers.reload()

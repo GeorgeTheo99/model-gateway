@@ -36,6 +36,9 @@ _lock = threading.Lock()
 # so older ledger.db files upgrade in place.
 _ADDITIVE_COLUMNS: dict[str, str] = {
     "cache_write_1h_tokens": "INTEGER NOT NULL DEFAULT 0",
+    "profile_id": "TEXT",
+    "profile_namespace": "TEXT",
+    "profile_version": "INTEGER",
 }
 
 
@@ -133,6 +136,9 @@ def record(
     usage: Usage,
     cost: CostEstimate,
     error: str | None = None,
+    profile_id: str | None = None,
+    profile_namespace: str | None = None,
+    profile_version: int | None = None,
 ) -> str:
     """Insert one ledger row. Best-effort: logs and never raises.
 
@@ -151,8 +157,9 @@ def record(
                     input_tokens, output_tokens, cached_read_tokens,
                     cache_write_tokens, cache_write_1h_tokens, reasoning_tokens,
                     usage_reported, cost_usd, pricing_complete,
-                    missing_pricing_classes, error
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    missing_pricing_classes, error,
+                    profile_id, profile_namespace, profile_version
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     rid,
@@ -176,6 +183,9 @@ def record(
                     1 if cost.pricing_complete else 0,
                     json.dumps(cost.missing_classes) if cost.missing_classes else None,
                     error,
+                    profile_id,
+                    profile_namespace,
+                    profile_version,
                 ),
             )
     except Exception as exc:  # noqa: BLE001 - ledger must never break requests

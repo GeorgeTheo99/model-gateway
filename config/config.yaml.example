@@ -2,16 +2,37 @@
 # Copy to config.yaml and fill in API keys.
 # This file is symlinked to shared/ on the server (contains secrets).
 
-# Inbound auth for the gateway itself. Both fields are optional.
-#   admin_keys  -> protects /admin/api/* (fail-closed until at least one is set)
-#   client_keys -> protects /v1/* (leave empty to keep /v1 open)
-# Each field accepts a list of keys or a single comma-separated string.
-# Env vars MODEL_GATEWAY_ADMIN_KEY / MODEL_GATEWAY_CLIENT_KEYS override these.
-# Never use fixed/example literals as real credentials. Generate random values
-# or use the owner-only MODEL_GATEWAY_CLIENT_KEYS_FILE runtime boundary.
+# Inbound auth for the gateway itself. All fields are optional.
+#   admin_keys           -> protects /admin/api/* (fail-closed until configured)
+#   client_keys          -> migration-only shared credentials for ordinary /v1 routes
+#   consumer_credentials -> identity/ACL records for consumer-owned profiles
+# Env vars MODEL_GATEWAY_ADMIN_KEY / MODEL_GATEWAY_CLIENT_KEYS override shared
+# keys. Consumer key_file paths resolve beside this config and must be
+# non-symlinked, regular, mode 0600, and <=64 KiB. Inline `key` is supported
+# only for tests and portable configuration; prefer key_file in operation.
 auth:
   admin_keys: []
   # client_keys: []
+  # consumer_credentials:
+  #   - id: example-runtime
+  #     consumer: example
+  #     key_file: secrets/example-runtime.key
+  #     namespaces: [example]
+  #     permissions: [profiles:read, profiles:invoke]
+  #     allow_direct_models: false
+  #   - id: example-deployer
+  #     consumer: example
+  #     key_file: secrets/example-deployer.key
+  #     namespaces: [example]
+  #     permissions: [profiles:read, profiles:write]
+  #     allow_direct_models: false
+
+# Durable immutable consumer-profile snapshots. Relative paths resolve beside
+# config.yaml. The registry and lock are machine-local operational state and
+# must be backed up, not committed. Environment override:
+# MODEL_GATEWAY_PROFILE_REGISTRY=/absolute/path/to/consumer-profiles-registry.json
+profiles:
+  registry_path: consumer-profiles-registry.json
 
 # Optional explicit one-hop federation. Omit this entire block on standalone
 # nodes. Node/peer IDs are lowercase DNS labels and become the route prefix:

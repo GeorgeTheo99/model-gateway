@@ -25,7 +25,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from src.admin import router as admin_router
-from src.auth import require_client_auth
+from src.auth import require_client_auth, require_consumer_auth, validate_credential_separation
 from src.errors import upstream_error, upstream_error_openai
 from src.providers import effective_model_inventory, list_available_models, list_models as list_routable_models, model_availability, pool_candidates, pricing_for, pricing_status_for, provider_quirks, resolve, snapshot_registry as snapshot_provider_registry
 from src.upstream import (
@@ -40,7 +40,7 @@ from src.responses import chat_to_responses, responses_result_events, responses_
 from src.signature_cache import store_from_extra_content
 from src.streaming import _flatten_list_content, translate_stream
 from src.translator import anthropic_to_openai, anthropic_to_openai_chat, openai_chat_to_anthropic, openai_to_anthropic
-from src import catalog, config_io, federation, ledger, providers
+from src import catalog, config_io, federation, ledger, profiles, providers
 from src.usage import (
     anthropic_usage_to_openai_chat as convert_anthropic_usage_to_openai_chat,
     anthropic_usage_to_responses,
@@ -75,6 +75,7 @@ def _stream_error_event(message: str) -> str:
 async def _lifespan(_app: FastAPI):
     """Validate routing policy, initialize state, and start background services."""
     _validate_vision_fallback_policy()
+    validate_credential_separation()
     migrated_backups = config_io.migrate_legacy_backups()
     if migrated_backups:
         log.info("migrated %s legacy config/catalog backup entries out of logs", migrated_backups)
@@ -263,13 +264,100 @@ def _require_model_request_auth(request: Request, path: str) -> JSONResponse | N
     manager = federation.manager()
     if manager.has_forwarding_headers(request):
         try:
+            validate_credential_separation()
             manager.authenticate_forwarded_request(request)
         except HTTPException as exc:
             return _peer_forward_error(path, exc)
+        except (OSError, UnicodeError, ValueError):
+            return _peer_forward_error(
+                path,
+                HTTPException(status_code=503, detail="model-gateway authentication is misconfigured"),
+            )
     else:
         # Preserve the ordinary direct-client authentication contract, including
         # its existing FastAPI {detail} error response.
         require_client_auth(request)
+    return None
+
+
+def _profile_inference_error(path: str, error: profiles.ProfileError) -> JSONResponse:
+    error_type = "authentication_error" if error.status == 401 else "invalid_request_error"
+    if error.status >= 500:
+        error_type = "api_error"
+    detail = {"type": error_type, "code": error.code, "message": error.message}
+    if path == "/v1/messages":
+        return JSONResponse(
+            status_code=error.status,
+            content={"type": "error", "error": detail},
+        )
+    return JSONResponse(status_code=error.status, content={"error": detail})
+
+
+def _apply_profile_defaults(body: dict, defaults: dict, protocol: str) -> None:
+    if "temperature" in defaults and "temperature" not in body:
+        body["temperature"] = defaults["temperature"]
+    if "max_output_tokens" in defaults:
+        if protocol == "openai_responses":
+            if "max_output_tokens" not in body:
+                body["max_output_tokens"] = defaults["max_output_tokens"]
+        elif protocol == "anthropic_messages":
+            if "max_tokens" not in body:
+                body["max_tokens"] = defaults["max_output_tokens"]
+        elif not any(key in body for key in ("max_tokens", "max_completion_tokens")):
+            body["max_tokens"] = defaults["max_output_tokens"]
+    if "reasoning_effort" in defaults and not any(
+        key in body for key in ("reasoning_effort", "reasoning", "thinking", "output_config")
+    ):
+        if protocol == "openai_responses":
+            body["reasoning"] = {"effort": defaults["reasoning_effort"]}
+        else:
+            body["reasoning_effort"] = defaults["reasoning_effort"]
+
+
+def _prepare_profile_execution(
+    request: Request,
+    path: str,
+    body: dict,
+    *,
+    protocol: str,
+    has_image: bool,
+) -> JSONResponse | None:
+    """Authorize a selector or enforce a consumer principal's direct-route grant."""
+    model = body.get("model")
+    inbound_source = getattr(request.state, "federation_source", None)
+    if profiles.is_selector(model):
+        if inbound_source:
+            return _profile_inference_error(
+                path,
+                profiles.ProfileError(403, "profile_federation_denied", "Profile selectors cannot be invoked through federation"),
+            )
+        identity = getattr(request.state, "auth_identity", None)
+        principal = getattr(identity, "principal", None)
+        if principal is None:
+            return _profile_inference_error(
+                path,
+                profiles.ProfileError(401, "consumer_credential_required", "A consumer credential is required for profile invocation"),
+            )
+        try:
+            namespace, _profile_id = profiles.parse_selector(model)
+            if namespace not in principal.namespaces or "profiles:invoke" not in principal.permissions:
+                raise profiles.ProfileError(403, "profile_access_denied", "Consumer principal is not authorized for this profile")
+            execution = profiles.resolve_execution(model, protocol=protocol, has_image=has_image)
+        except profiles.ProfileError as exc:
+            return _profile_inference_error(path, exc)
+        body["model"] = execution.model
+        _apply_profile_defaults(body, execution.defaults, protocol)
+        request.state.disable_model_fallback = True
+        request.state.profile_execution = execution
+        return None
+
+    identity = getattr(request.state, "auth_identity", None)
+    principal = getattr(identity, "principal", None)
+    if principal is not None and not principal.allow_direct_models:
+        return _profile_inference_error(
+            path,
+            profiles.ProfileError(403, "direct_model_access_denied", "Consumer principal is not authorized to invoke direct models"),
+        )
     return None
 
 
@@ -1403,6 +1491,12 @@ async def _apply_chat_vision_fallback(
             log.info("vision_fallback endpoint=%s requested=%s served=%s mode=native outcome=bypass image_count=%d", endpoint_name, requested_model, requested_model, image_count)
         return body, requested_model, info, None
 
+    if getattr(request.state, "profile_execution", None) is not None and composite is None:
+        return body, requested_model, info, error_factory(
+            409,
+            "invalid_request_error",
+            "Profile vision route is no longer vision-capable; re-register the profile.",
+        )
     fallback_model, fallback_info, error = _resolve_vision_fallback(requested_model, info, error_factory)
     if error:
         log.info("vision_fallback endpoint=%s requested=%s served=none mode=%s outcome=rejected image_count=%d", endpoint_name, requested_model, mode, image_count)
@@ -1736,11 +1830,15 @@ def _set_ledger_ctx(request: Request, model: str, info, is_stream: bool = False)
     an SSE stream), which the middleware needs because Starlette wraps every
     response from ``call_next`` in a StreamingResponse regardless of type.
     """
+    profile_execution = getattr(request.state, "profile_execution", None)
     request.state.ledger_ctx = {
         "model": model,
         "provider": info.provider,
         "provider_model_id": info.provider_model_id,
         "is_stream": bool(is_stream),
+        "profile_id": getattr(profile_execution, "profile_id", None),
+        "profile_namespace": getattr(profile_execution, "namespace", None),
+        "profile_version": getattr(profile_execution, "gateway_version", None),
     }
     # Workspace-pool failover context: lets src.upstream retry the request
     # against the next pool member (other workspace serving the same model)
@@ -1825,6 +1923,8 @@ def _ledger_record(
     provider_model_id: str | None, status: int | None, latency_ms: int | None,
     is_stream: bool, usage_dict: dict | None, pricing: dict | None,
     pricing_status: str = "unknown", error: str | None = None,
+    profile_id: str | None = None, profile_namespace: str | None = None,
+    profile_version: int | None = None,
 ) -> None:
     """Best-effort: normalize usage, estimate cost, insert a ledger row."""
     try:
@@ -1834,6 +1934,8 @@ def _ledger_record(
             endpoint=endpoint, method=method, model=model, provider=provider,
             provider_model_id=provider_model_id, status=status, latency_ms=latency_ms,
             is_stream=is_stream, usage=usage, cost=cost, error=error,
+            profile_id=profile_id, profile_namespace=profile_namespace,
+            profile_version=profile_version,
         )
     except Exception as exc:  # noqa: BLE001 - ledger must never break requests
         log.warning("ledger record failed: %s", exc)
@@ -1861,6 +1963,9 @@ async def ledger_middleware(request: Request, call_next):
     model = ctx.get("model")
     provider = ctx.get("provider")
     provider_model_id = ctx.get("provider_model_id")
+    profile_id = ctx.get("profile_id")
+    profile_namespace = ctx.get("profile_namespace")
+    profile_version = ctx.get("profile_version")
     is_stream = bool(ctx.get("is_stream"))
     try:
         pricing = pricing_for(model) if model else None
@@ -1914,6 +2019,7 @@ async def ledger_middleware(request: Request, call_next):
                     request.url.path, "POST", model, provider, provider_model_id,
                     status, latency_ms, True, usage_capture["usage"], pricing,
                     pricing_status, usage_capture["error"],
+                    profile_id, profile_namespace, profile_version,
                 )
 
         response.body_iterator = wrapped_iter()
@@ -1938,6 +2044,7 @@ async def ledger_middleware(request: Request, call_next):
     _ledger_record(
         request.url.path, "POST", model, provider, provider_model_id,
         status, latency_ms, False, usage_dict, pricing, pricing_status,
+        None, profile_id, profile_namespace, profile_version,
     )
 
     return Response(
@@ -2140,6 +2247,123 @@ def _canonical_cloud_policy(inventory: list[dict], rows: list[dict]) -> tuple[di
     return auto_models, model_presets
 
 
+_PROFILE_VARY = "Authorization, X-API-Key, Api-Key, X-Gateway-Key"
+
+
+def _profile_api_error(status: int, code: str, message: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status,
+        content={"error": {"code": code, "message": message}},
+        headers={"Cache-Control": "no-store", "Vary": _PROFILE_VARY},
+    )
+
+
+def _reject_json_constant(value: str):
+    raise ValueError(f"non-finite JSON value {value!r} is not allowed")
+
+
+def _strict_json_object(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        result[key] = value
+    return result
+
+
+async def _read_profile_manifest(request: Request) -> tuple[object | None, JSONResponse | None]:
+    raw = await request.body()
+    if len(raw) > 1_048_576:
+        return None, _profile_api_error(413, "profile_manifest_too_large", "Profile manifest exceeds 1 MiB")
+    try:
+        body = json.loads(
+            raw,
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_strict_json_object,
+        )
+    except (UnicodeError, json.JSONDecodeError, ValueError):
+        return None, _profile_api_error(400, "invalid_json", "Invalid JSON body")
+    return body, None
+
+
+def _authorize_profile_api(request: Request, namespace: str, permission: str):
+    try:
+        return require_consumer_auth(request, permission=permission, namespace=namespace), None
+    except HTTPException as exc:
+        return None, _profile_api_error(exc.status_code, "profile_access_denied", str(exc.detail))
+
+
+@app.put("/v1/profiles/{namespace}/snapshot")
+async def register_profile_snapshot(namespace: str, request: Request):
+    _principal, auth_error = _authorize_profile_api(request, namespace, "profiles:write")
+    if auth_error is not None:
+        return auth_error
+    body, parse_error = await _read_profile_manifest(request)
+    if parse_error is not None:
+        return parse_error
+    try:
+        snapshot, etag, _changed = profiles.register(
+            namespace,
+            body,
+            if_match=request.headers.get("if-match"),
+            if_none_match=request.headers.get("if-none-match"),
+        )
+    except profiles.ProfileError as exc:
+        return _profile_api_error(exc.status, exc.code, exc.message)
+    version_path = f"/v1/profiles/{namespace}/snapshot/{snapshot['gateway_version']}"
+    return JSONResponse(
+        content=snapshot,
+        headers={
+            "ETag": etag,
+            "Cache-Control": "no-store",
+            "Vary": _PROFILE_VARY,
+            "Content-Location": version_path,
+        },
+    )
+
+
+@app.get("/v1/profiles/{namespace}/snapshot")
+async def get_latest_profile_snapshot(namespace: str, request: Request):
+    _principal, auth_error = _authorize_profile_api(request, namespace, "profiles:read")
+    if auth_error is not None:
+        return auth_error
+    try:
+        snapshot, etag = profiles.get_snapshot(namespace)
+    except profiles.ProfileError as exc:
+        return _profile_api_error(exc.status, exc.code, exc.message)
+    headers = {
+        "ETag": etag,
+        "Vary": _PROFILE_VARY,
+        "Cache-Control": profiles.cache_control(immutable=False),
+        "Content-Location": f"/v1/profiles/{namespace}/snapshot/{snapshot['gateway_version']}",
+    }
+    if profiles.if_none_match_matches(request.headers.get("if-none-match"), etag):
+        return Response(status_code=304, headers=headers)
+    return JSONResponse(content=snapshot, headers=headers)
+
+
+@app.get("/v1/profiles/{namespace}/snapshot/{gateway_version}")
+async def get_profile_snapshot_version(namespace: str, gateway_version: str, request: Request):
+    _principal, auth_error = _authorize_profile_api(request, namespace, "profiles:read")
+    if auth_error is not None:
+        return auth_error
+    if not gateway_version.isdigit() or int(gateway_version) < 1:
+        return _profile_api_error(404, "profile_not_found", "Profile snapshot version not found")
+    try:
+        snapshot, etag = profiles.get_snapshot(namespace, int(gateway_version))
+    except profiles.ProfileError as exc:
+        return _profile_api_error(exc.status, exc.code, exc.message)
+    headers = {
+        "ETag": etag,
+        "Vary": _PROFILE_VARY,
+        "Cache-Control": profiles.cache_control(immutable=True),
+        "Content-Location": f"/v1/profiles/{namespace}/snapshot/{gateway_version}",
+    }
+    if profiles.if_none_match_matches(request.headers.get("if-none-match"), etag):
+        return Response(status_code=304, headers=headers)
+    return JSONResponse(content=snapshot, headers=headers)
+
+
 @app.get("/v1/models")
 async def list_models(request: Request):
     require_client_auth(request)
@@ -2168,6 +2392,10 @@ async def list_canonical_models(request: Request):
 async def federation_catalog(request: Request):
     """Return direct local routes to an explicitly configured peer."""
     manager = federation.manager()
+    try:
+        validate_credential_separation()
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="model-gateway authentication is misconfigured") from exc
     manager.authenticate_catalog_request(request)
     payload = manager.build_catalog(_direct_model_rows())
     return JSONResponse(content=payload, headers={federation.SOURCE_HEADER: manager.config.node_id})
@@ -2237,6 +2465,16 @@ async def create_response(request: Request):
     except Exception:
         return _error_openai(400, "invalid_request_error", "Invalid JSON body")
 
+    profile_vision_body = responses_to_chat(body)
+    profile_error = _prepare_profile_execution(
+        request,
+        "/v1/responses",
+        body,
+        protocol="openai_responses",
+        has_image=_payload_has_image(profile_vision_body) or _payload_has_unsupported_image_file(profile_vision_body),
+    )
+    if profile_error is not None:
+        return profile_error
     model = body.get("model", "")
     is_stream = body.get("stream", False)
 
@@ -2595,6 +2833,15 @@ async def chat_completions(request: Request):
             content={"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
         )
 
+    profile_error = _prepare_profile_execution(
+        request,
+        "/v1/chat/completions",
+        body,
+        protocol="openai_chat",
+        has_image=_payload_has_image(body) or _payload_has_unsupported_image_file(body),
+    )
+    if profile_error is not None:
+        return profile_error
     model = body.get("model", "")
     inbound_source = getattr(request.state, "federation_source", None)
     if inbound_source:
@@ -3007,6 +3254,16 @@ async def messages(request: Request):
     except Exception:
         return _error(400, "invalid_request_error", "Invalid JSON body")
 
+    profile_vision_body = anthropic_to_openai(body)
+    profile_error = _prepare_profile_execution(
+        request,
+        "/v1/messages",
+        body,
+        protocol="anthropic_messages",
+        has_image=_payload_has_image(profile_vision_body) or _payload_has_unsupported_image_file(profile_vision_body),
+    )
+    if profile_error is not None:
+        return profile_error
     model = body.get("model", "")
     is_stream = body.get("stream", False)
     has_tools = bool(body.get("tools"))

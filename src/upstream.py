@@ -566,6 +566,8 @@ async def _retry_post_with_model_fallback(
         body = await resp.aread()
         body_text = body.decode(errors="replace")
 
+    if request is not None and getattr(request.state, "disable_model_fallback", False):
+        return resp
     decision = fallback_after_error(requested_model, resp.status_code, body_text)
     if not decision:
         return resp
@@ -608,6 +610,8 @@ async def _retry_send_stream_with_model_fallback(
         body = await resp.aread()
         body_text = body.decode(errors="replace")
 
+    if request is not None and getattr(request.state, "disable_model_fallback", False):
+        return resp
     decision = fallback_after_error(requested_model, resp.status_code, body_text)
     if not decision:
         return resp

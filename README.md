@@ -42,6 +42,8 @@ translation between them.
 - **Usage/cost ledger** — tokens, provider cost, estimates, latency and
   errors per request, in SQLite.
 - **Federation** — explicitly configured gateway-to-gateway routes.
+- **Consumer profiles** — authenticated, namespace-scoped, immutable routing
+  snapshots with enforced local-only execution for gateway-local oMLX routes.
 
 ## Requirements
 
@@ -89,7 +91,7 @@ Two layers (see `config/config.yaml.example` and `docs/`):
 
 | Layer | File | Contents |
 |---|---|---|
-| Providers | `config/config.yaml` | Base URLs, credentials (or 0600 key-file refs), protocol, headers, quirks, pools, auth keys |
+| Providers | `config/config.yaml` | Base URLs, credentials (or 0600 key-file refs), protocol, headers, quirks, pools, auth keys, consumer principals |
 | Model catalog | `model-info.json` (+ optional `models:` overlay in config) | Gateway model IDs, aliases, upstream IDs, context/output limits, capabilities, pricing, fallbacks |
 
 A model is exposed only when its referenced provider is configured and
@@ -106,9 +108,14 @@ API; direct edits are also supported.
   writes additionally require `MODEL_GATEWAY_ADMIN_WRITES=true`.
 - `config/config.yaml` and secret key files are kept at mode `0600`.
 - Provider keys are never returned by the admin API or UI after save.
+- Consumer profile APIs require identity-aware credentials; legacy, admin,
+  anonymous, and federation credentials cannot read, register, or invoke them.
+- A consumer principal without `allow_direct_models: true` cannot bypass its
+  profiles through an ordinary direct model invocation.
 
-There is no bundled TLS, rate limiting, or multi-tenancy: run it on
-loopback or behind your own reverse proxy on networks you trust.
+There is no bundled TLS or rate limiting. Consumer profile namespaces provide
+an authorization boundary, but ordinary direct routes are not general-purpose
+multi-tenant isolation; run the gateway on loopback or behind a trusted proxy.
 
 ## Documentation
 
@@ -118,6 +125,8 @@ loopback or behind your own reverse proxy on networks you trust.
 | `docs/deployment-auth.md` | Inbound auth configuration |
 | `docs/provider-onboarding.md` | Provider/model onboarding flow |
 | `docs/federation.md` | Gateway-to-gateway federation |
+| `docs/consumer-profiles.md` | Consumer credential, snapshot API, and profile execution contract |
+| `docs/adr/0001-consumer-profile-security.md` | Consumer-profile security boundary decision |
 | `docs/productionization-plan.md` | Admin/control-plane roadmap |
 | `docs/admin-ui-roadmap.md` | Admin UI phases (first-run wizard, runtime visibility) |
 | `PRODUCT.md` | Product definition and design principles |

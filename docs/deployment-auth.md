@@ -49,6 +49,21 @@ The launchd plist (`com.local.model-gateway`) only sets `MODEL_GATEWAY_*` path e
 auth env vars are intentionally not wired into the plist template in `server-ci`
 `install-launchagents` to avoid committing secrets.
 
+## Consumer profile credentials
+
+Identity-aware credentials are configured only under
+`auth.consumer_credentials`. Each credential maps one token to a consumer,
+namespace ACLs, profile permissions, and the separate `allow_direct_models`
+grant. Prefer a non-symlinked mode-`0600` `key_file`; inline `key` is retained
+for tests and portable configurations. Consumer, legacy, admin, and federation
+tokens must not overlap.
+
+Profile snapshot APIs and `profile:<namespace>/<name>` inference selectors never
+accept legacy, admin, anonymous, or federation identity. Adding at least one
+consumer credential also counts as configured `/v1` authentication for bind
+safety. See [consumer-profiles.md](consumer-profiles.md) for the manifest,
+registry, ETag, and execution contract.
+
 ## Auth environment variables
 
 These are optional overrides for the config-file keys above.
@@ -114,8 +129,9 @@ Admin keys are also accepted on `/v1/*`, so an admin token can be used for debug
 
 Startup fails closed when `MODEL_GATEWAY_HOST` is not loopback
 (`127.x.x.x`, `localhost`, `::1`) and no `/v1` client keys are configured
-(via `MODEL_GATEWAY_CLIENT_KEYS`, `MODEL_GATEWAY_CLIENT_KEYS_FILE`, or
-`auth.client_keys` in config.yaml). An unauthenticated gateway on `0.0.0.0`
+(via `MODEL_GATEWAY_CLIENT_KEYS`, `MODEL_GATEWAY_CLIENT_KEYS_FILE`,
+`auth.client_keys`, or `auth.consumer_credentials` in config.yaml). An
+unauthenticated gateway on `0.0.0.0`
 would expose provider credentials as free model access to the whole network.
 
 For a trusted private network the check can be explicitly bypassed:

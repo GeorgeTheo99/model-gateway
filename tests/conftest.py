@@ -15,6 +15,7 @@ import pytest
 # depends on the operator's Git-ignored model-info.json.
 os.environ["MODEL_GATEWAY_MODEL_INFO"] = str(Path(__file__).parent / "fixtures" / "model-info.json")
 
+import src.auth as auth
 import src.providers as providers
 
 
@@ -26,14 +27,16 @@ def _isolate_ledger(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _isolate_runtime_config(tmp_path, monkeypatch):
-    """Keep gitignored local provider config from changing test behavior."""
+    """Keep gitignored local provider/config state from changing test behavior."""
     cfg = tmp_path / "config.yaml"
+    monkeypatch.setenv("MODEL_GATEWAY_PROFILE_REGISTRY", str(tmp_path / "consumer-profiles-registry.json"))
     cfg.write_text("providers: {}\n")
     monkeypatch.setenv("MODEL_GATEWAY_BACKUP_DIR", str(tmp_path / "config-backups"))
     monkeypatch.setenv("MODEL_GATEWAY_LEGACY_BACKUP_DIRS", str(tmp_path / "logs" / "config-backups"))
     from src import config_io
     monkeypatch.setattr(config_io, "log_dir", tmp_path / "logs")
     monkeypatch.setattr(providers, "CONFIG_PATH", cfg)
+    monkeypatch.setattr(auth, "_client_auth_required_latched", False)
     providers.reload()
     yield
     providers.reload()

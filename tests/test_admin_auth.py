@@ -1,5 +1,6 @@
 import json
 
+import pytest
 from fastapi.testclient import TestClient
 
 import src.admin as admin_module
@@ -227,6 +228,40 @@ def test_env_and_config_keys_are_merged(monkeypatch):
     assert client.get("/v1/models", headers={"Authorization": "Bearer env-key"}).status_code == 200
     assert client.get("/v1/models", headers={"Authorization": "Bearer cfg-key"}).status_code == 200
     assert client.get("/v1/models", headers={"Authorization": "Bearer nope"}).status_code == 401
+
+
+def test_invalid_config_key_types_fail_closed(monkeypatch):
+    monkeypatch.delenv("MODEL_GATEWAY_CLIENT_KEYS", raising=False)
+    monkeypatch.delenv("MODEL_GATEWAY_ADMIN_KEY", raising=False)
+    monkeypatch.setattr(providers, "_config", {"auth": {"client_keys": 42, "admin_keys": [None]}})
+
+    assert client.get("/v1/models").status_code == 503
+    assert client.get("/v1/models", headers={"Authorization": "Bearer 42"}).status_code == 503
+    assert client.get("/admin/api/status", headers={"Authorization": "Bearer None"}).status_code == 503
+
+
+@pytest.mark.parametrize(
+    "auth_config",
+    [[], {"consumer_credentials": {}}],
+)
+def test_falsey_malformed_auth_shapes_fail_closed(monkeypatch, auth_config):
+    monkeypatch.delenv("MODEL_GATEWAY_CLIENT_KEYS", raising=False)
+    monkeypatch.delenv("MODEL_GATEWAY_ADMIN_KEY", raising=False)
+    monkeypatch.setattr(providers, "_config", {"auth": auth_config})
+
+    assert client.get("/v1/models").status_code == 503
+
+
+def test_env_admin_key_can_recover_malformed_config_root(monkeypatch):
+    monkeypatch.setenv("MODEL_GATEWAY_ADMIN_KEY", "recovery-admin")
+    monkeypatch.setattr(providers, "_config", ["not", "a", "mapping"])
+
+    response = client.get(
+        "/admin/api/status",
+        headers={"Authorization": "Bearer recovery-admin"},
+    )
+    assert response.status_code == 200
+    assert "malformed" in response.json()["auth"]["warning"]
 
 
 def test_config_client_keys_accepts_comma_string(monkeypatch):

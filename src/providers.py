@@ -363,7 +363,14 @@ def auth_config() -> dict:
     :mod:`src.auth` so admin/client keys can live in the gitignored
     config.yaml instead of the launchd plist environment.
     """
-    return _load_config().get("auth") or {}
+    config = _load_config()
+    if not isinstance(config, dict):
+        raise ValueError("config root must be an object")
+    if "auth" not in config or config["auth"] is None:
+        return {}
+    if not isinstance(config["auth"], dict):
+        raise ValueError("auth configuration must be an object")
+    return config["auth"]
 
 
 @_registry_locked

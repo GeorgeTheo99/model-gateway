@@ -6,6 +6,8 @@ config/.config.yaml.*
 config/secrets/
 config/*.onboard.lock
 config/federation-cache.json
+config/consumer-profiles-registry*.json
+config/consumer-profiles-registry*.json.lock
 
 # Common local credential files
 .env
