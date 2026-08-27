@@ -363,6 +363,40 @@ def test_committed_zai_glm53_profile_uses_documented_compatibility_route():
     assert profile["retire"]["models"] == ["glm-5.2-zai"]
 
 
+def test_committed_zai_glm53_flash_profile_uses_exact_multimodal_route():
+    from src.onboarding import load_profile
+
+    path = Path(__file__).resolve().parents[1] / "config" / "onboarding" / "zai-glm-5.3-flash.yaml"
+    profile = load_profile(path)
+    glm = profile["models"][0]
+    assert glm["name"] == "glm-5.3-flash-zai"
+    assert glm["provider"] == "zai_coding"
+    assert glm["provider_model_id"] == "glm-5.3-flash"
+    assert glm["alias"] == "glm53flash"
+    assert glm["alternate_ids"] == ["glm-5.3-flash"]
+    assert glm["context"] == 1_000_000
+    assert glm["max_output_tokens"] == 131_072
+    assert glm["thinking"] == "always"
+    assert glm["thinking_levels"] == ["minimal", "low", "medium", "high", "xhigh", "max"]
+    assert glm["thinking_format"] == "zai"
+    assert glm["vision"] is True
+    assert glm["quirks"] == ["zai_glm53_thinking"]
+    assert glm["pi"] == {
+        "id": "glm-5.3-flash",
+        "thinkingLevelMap": {
+            "off": "low",
+            "minimal": "minimal",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max",
+        },
+    }
+    assert "pricing" not in glm
+    assert profile.get("retire", {}).get("models", []) == []
+
+
 def test_fable_5_explicit_levels_exclude_unsupported_values(tmp_path):
     mi = tmp_path / "model-info.json"
     _write_model_info(mi, [{

@@ -1,0 +1,35 @@
+schema_version: 1
+id: zai-glm-5.3-flash
+
+provider:
+  id: zai_coding
+  base_url: https://api.z.ai/api/coding/paas/v4
+  protocol: openai
+  secret_name: zai_coding.api-key
+
+models:
+  - name: glm-5.3-flash-zai
+    provider: zai_coding
+    provider_model_id: glm-5.3-flash
+    alias: glm53flash
+    alternate_ids:
+      - glm-5.3-flash
+    context: 1000000
+    max_output_tokens: 131072
+    thinking: always
+    thinking_levels: [minimal, low, medium, high, xhigh, max]
+    thinking_format: zai
+    vision: true
+    quirks:
+      - zai_glm53_thinking
+    pi:
+      id: glm-5.3-flash
+      thinkingLevelMap:
+        "off": low
+        minimal: minimal
+        low: low
+        medium: medium
+        high: high
+        xhigh: xhigh
+        max: max
+    desc: GLM 5.3 Flash through Z.ai Coding Plan; native multimodal, always-thinking, 1M context / 128K output

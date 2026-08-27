@@ -253,6 +253,27 @@ pi-catalog --aliases ~/srv/model-gateway/shared/model-aliases.json \
 Do not switch `provider_model_id` to exact `glm-5.3` until an authenticated
 text probe succeeds for the target Coding Plan account.
 
+### Z.ai GLM-5.3-Flash Coding Plan
+
+The committed `zai-glm-5.3-flash.yaml` profile adds the exact upstream
+`glm-5.3-flash` model as gateway/Pi ID `glm-5.3-flash`, with launcher alias
+`pi-glm53flash`. It is native multimodal, always-thinking, and uses the same
+Coding Plan reasoning normalization as GLM-5.3.
+
+```bash
+model-gateway onboard config/onboarding/zai-glm-5.3-flash.yaml --dry-run
+model-gateway onboard config/onboarding/zai-glm-5.3-flash.yaml \
+  --non-interactive --yes
+pi-catalog --aliases ~/srv/model-gateway/shared/model-aliases.json \
+  --models-out ~/.pi-omlx/agent/models.json \
+  --launchers-out ~/.pi/generated/pi-launchers.zsh \
+  --pi-agent-dir ~/.pi-omlx/agent --ls99-extras
+```
+
+Before applying on another account, send a small authenticated text request to
+that account's Coding Plan endpoint with `model: glm-5.3-flash`; availability
+can vary by plan and rollout state.
+
 ## Explicit retirement
 
 Retirement accepts exact gateway model names only:

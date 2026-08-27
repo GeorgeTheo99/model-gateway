@@ -115,6 +115,8 @@ GLM-5.3's Coding Plan publishes credit multipliers rather than USD/Mtok prices,
 so `glm-5.3-zai` intentionally omits `pricing` until a directly comparable
 price is published. Its current compatibility route retains upstream ID
 `glm-5.2`, which Z.ai documents as automatically routed to GLM-5.3.
+GLM-5.3-Flash likewise omits USD pricing for the Coding Plan; Z.ai documents it
+in quota/points terms (with 3× the available quota compared with GLM-5.3).
 
 **ZhipuAI (`zhipuai`)**: the BigModel pricing page
 (https://open.bigmodel.cn/pricing) lists GLM models in CNY per 1M tokens.
@@ -144,4 +146,5 @@ Use this to know which source to read for each model. Regenerate with:
 | gemini-3-flash | openrouter | google/gemini-3-flash-preview | openrouter API |
 | gemini-3.5-flash | openrouter | google/gemini-3.5-flash | openrouter API |
 | glm-5.3-zai | zai_coding | glm-5.2 (documented GLM-5.3 compatibility route) | z.ai Coding Plan |
+| glm-5.3-flash-zai | zai_coding | glm-5.3-flash | z.ai Coding Plan |
 | glm-5-zai-turbo | zhipuai | glm-5-turbo | zhipuai (CNY→USD) |
