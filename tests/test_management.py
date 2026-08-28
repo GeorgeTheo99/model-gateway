@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from src import admin, config_io
+from src import admin, circuit, config_io
 import src.providers as providers
 from src.server import app
 
@@ -747,6 +747,80 @@ def test_admin_status_reports_writes_enabled_true(client):
 def test_admin_status_reports_writes_enabled_false(client_readonly):
     h = {"Authorization": "Bearer admin"}
     assert client_readonly.get("/admin/api/status", headers=h).json()["writes_enabled"] is False
+
+
+def test_admin_workspace_pools_reports_runtime_routing_without_secrets(
+    client_readonly, tmp_config, monkeypatch,
+):
+    config = {
+        "auth": {"admin_keys": ["admin"]},
+        "providers": {
+            "ws-primary": {
+                "base_url": "https://primary.cloud.databricks.com",
+                "api_key": "secret-primary-token",
+                "protocol": "openai",
+                "endpoint_style": "invocations",
+                "auth_refresh": "databricks-cli",
+                "auth_profile": "primary-profile",
+            },
+            "ws-standby": {
+                "base_url": "https://standby.cloud.databricks.com",
+                "api_key": "secret-standby-token",
+                "protocol": "openai",
+                "endpoint_style": "invocations",
+                "auth_refresh": "databricks-cli",
+                "auth_profile": "standby-profile",
+            },
+        },
+        "pools": {"default-pool": ["ws-primary", "ws-standby"]},
+    }
+    import yaml
+    (tmp_config / "config.yaml").write_text(yaml.safe_dump(config, sort_keys=False))
+    (tmp_config / "model-info.json").write_text(json.dumps({"llm": [{
+        "name": "pooled-model",
+        "provider": "ws-primary",
+        "pool": "default-pool",
+        "provider_model_id": "upstream-model",
+    }]}))
+    monkeypatch.setattr(circuit, "get_status", lambda: {
+        "ws-primary": {
+            "is_open": True,
+            "consecutive_failures": 3,
+            "last_failure_status": 503,
+            "last_failure_message": "upstream unavailable",
+            "seconds_since_failure": 2.0,
+            "probe_in_progress": False,
+        },
+    })
+    providers.reload()
+
+    assert client_readonly.get("/admin/api/workspace-pools").status_code == 401
+    response = client_readonly.get(
+        "/admin/api/workspace-pools", headers={"Authorization": "Bearer admin"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["summary"] == {
+        "pools": 1, "workspaces": 2, "healthy": 0, "degraded": 1, "down": 0,
+    }
+    pool = body["pools"][0]
+    assert pool["active_member"] == "ws-standby"
+    assert pool["models"] == ["pooled-model"]
+    assert pool["members"][0]["issues"] == ["circuit_open"]
+    assert pool["members"][0]["active"] is False
+    assert pool["members"][1]["active"] is True
+    assert pool["members"][1]["auth_profile"] == "standby-profile"
+    assert pool["members"][1]["credential_type"] == "oauth"
+    assert "secret-primary-token" not in response.text
+    assert "secret-standby-token" not in response.text
+
+
+def test_admin_ui_contains_workspace_pool_view():
+    html = TestClient(app).get("/admin").text
+    assert 'data-tab="pools"' in html
+    assert "/admin/api/workspace-pools" in html
+    assert "model-gateway workspace repair" in html
 
 
 def test_admin_reload_rejects_invalid_vision_fallback_and_restores_registry(

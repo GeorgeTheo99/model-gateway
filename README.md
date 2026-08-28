@@ -34,8 +34,8 @@ translation between them.
   metadata (context, vision, reasoning levels), and pricing in one registry.
 - **Reliability** — per-provider retries, circuit breakers, provider pools,
   and model-level fallback routes.
-- **Admin dashboard** — health, provider/model inventory, usage and cost, and
-  gated write controls at `/admin`.
+- **Admin dashboard** — health, provider/model inventory, Databricks workspace
+  pool routing, usage and cost, and gated write controls at `/admin`.
 - **Transactional onboarding** — `model-gateway onboard` discovers upstream
   models, writes a reviewable secret-free profile, stores credentials in
   0600 files, applies atomically, and rolls back on verification failure.

@@ -19,6 +19,7 @@ from src.providers import (
     config_validation,
     model_status,
     provider_status,
+    workspace_pool_status,
     registry_transaction as provider_registry_transaction,
     reload as reload_provider_registry,
     restore_registry as restore_provider_registry,
@@ -69,6 +70,43 @@ async def admin_providers(request: Request):
 async def admin_models(request: Request):
     require_admin_auth(request)
     return {"models": model_status()}
+
+
+@router.get("/admin/api/workspace-pools")
+async def admin_workspace_pools(request: Request):
+    """Workspace routing state plus bounded, redacted recent activity."""
+    require_admin_auth(request)
+    pools = workspace_pool_status()
+    for pool in pools:
+        for member in pool["members"]:
+            recent = ledger.recent(limit=100, provider=member["id"])
+            failures = [
+                row for row in recent
+                if row.get("error") or (row.get("status") is not None and row["status"] >= 400)
+            ]
+            rate_limits = sum(1 for row in recent if row.get("status") == 429)
+            member["recent"] = {
+                "requests": len(recent),
+                "failures": len(failures),
+                "rate_limits": rate_limits,
+                "last_status": recent[0].get("status") if recent else None,
+                "last_request_at": recent[0].get("ts") if recent else None,
+                "last_failure_status": failures[0].get("status") if failures else None,
+                "last_failure_at": failures[0].get("ts") if failures else None,
+            }
+    states = {"healthy": 0, "degraded": 0, "down": 0}
+    workspace_ids = set()
+    for pool in pools:
+        states[pool["state"]] += 1
+        workspace_ids.update(member["id"] for member in pool["members"])
+    return {
+        "summary": {
+            "pools": len(pools),
+            "workspaces": len(workspace_ids),
+            **states,
+        },
+        "pools": pools,
+    }
 
 
 @router.get("/admin/api/presets")
@@ -928,6 +966,31 @@ _ADMIN_HTML = r"""
     .preset-card h3 { font-size: 14px; }
     .small { font-size: 12px; color: var(--muted); }
 
+    /* ── Workspace pool routing ──────────────────────────────── */
+    .routing-overview { margin-top: 10px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; color: var(--text-2); font-size: 12px; }
+    .routing-overview .route-label { color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; font-size: 11px; font-weight: 650; }
+    .pool-grid { display: grid; gap: 14px; }
+    .pool-card { border: 1px solid var(--rule); border-radius: var(--radius); background: var(--surface); overflow: hidden; }
+    .pool-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; padding: 14px 16px; border-bottom: 1px solid var(--rule); background: var(--surface-2); }
+    .pool-title { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+    .pool-title h3 { font-size: 14px; }
+    .pool-route { font-size: 12px; color: var(--text-2); }
+    .member-list { display: grid; }
+    .member-row { display: grid; grid-template-columns: minmax(170px, 1fr) minmax(240px, 2fr) auto; gap: 14px; align-items: center; padding: 13px 16px; border-bottom: 1px solid var(--rule); }
+    .member-row:last-child { border-bottom: 0; }
+    .member-primary { display: grid; gap: 5px; min-width: 0; }
+    .member-name { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+    .member-url { color: var(--muted); font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .member-facts { display: grid; grid-template-columns: repeat(4, minmax(80px, 1fr)); gap: 10px; }
+    .member-fact { min-width: 0; }
+    .member-fact .k { display: block; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.055em; }
+    .member-fact .v { display: block; margin-top: 2px; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .member-actions { display: flex; gap: 6px; }
+    @media (max-width: 900px) {
+      .member-row { grid-template-columns: 1fr; }
+      .member-facts { grid-template-columns: repeat(2, minmax(100px, 1fr)); }
+    }
+
     /* ── Read-only mode (writes disabled) ─────────────────────── */
     body[data-writes="false"] .formset { display: none; }
     body[data-writes="false"] [data-mgmt] { display: none; }
@@ -972,12 +1035,14 @@ _ADMIN_HTML = r"""
           <div class="stat"><span class="label">Models</span><span class="value" id="sModels">—</span><span class="detail" id="sModelsDetail">routable</span></div>
           <div class="stat"><span class="label">Config</span><span class="value" id="sConfig">—</span><span class="detail" id="sConfigDetail">—</span></div>
         </div>
+        <div class="routing-overview" id="routingHealth"><span class="route-label">Workspace routing</span><span class="muted">Loading…</span></div>
       </section>
 
       <nav class="tabs" role="tablist" aria-label="Admin sections">
         <button class="tab" role="tab" type="button" data-tab="presets" aria-selected="true">Presets</button>
         <button class="tab" role="tab" type="button" data-tab="models" aria-selected="false">Models</button>
         <button class="tab" role="tab" type="button" data-tab="providers" aria-selected="false">Providers</button>
+        <button class="tab" role="tab" type="button" data-tab="pools" aria-selected="false">Workspace Pools</button>
         <button class="tab" role="tab" type="button" data-tab="usage" aria-selected="false">Usage</button>
         <button class="tab" role="tab" type="button" data-tab="debug" aria-selected="false">Debug</button>
       </nav>
@@ -1013,6 +1078,18 @@ _ADMIN_HTML = r"""
           </div>
         </details>
         <p class="mgmt-hint">Provider management is read-only. Set <code>MODEL_GATEWAY_ADMIN_WRITES=true</code> to add or edit providers.</p>
+      </section>
+
+      <section class="tab-panel" data-tab-panel="pools" role="tabpanel">
+        <div class="sec-head"><h2>Workspace Pools</h2><span class="meta" id="poolsMeta">ordered Databricks failover</span></div>
+        <div class="strip" id="poolStrip">
+          <div class="stat"><span class="label">Pools</span><span class="value" id="wpPools">—</span><span class="detail">configured routes</span></div>
+          <div class="stat"><span class="label">Workspaces</span><span class="value" id="wpWorkspaces">—</span><span class="detail">unique members</span></div>
+          <div class="stat"><span class="label">Healthy</span><span class="value" id="wpHealthy">—</span><span class="detail">all members ready</span></div>
+          <div class="stat"><span class="label">Attention</span><span class="value" id="wpAttention">—</span><span class="detail">degraded / down</span></div>
+        </div>
+        <div id="poolCards" class="pool-grid"></div>
+        <p class="hint">Health reflects local readiness plus live circuit state, not an on-demand upstream probe. Test and repair actions copy the transactional CLI command so authentication, endpoint coverage, smoke testing, restart verification, and rollback stay in one workflow.</p>
       </section>
 
       <section class="tab-panel" data-tab-panel="models" role="tabpanel">
@@ -1134,6 +1211,7 @@ _ADMIN_HTML = r"""
   function fmtCost(v){ return (v===null||v===undefined) ? '—' : '$'+Number(v).toFixed(4); }
   function fmtMs(v){ return (v===null||v===undefined) ? '—' : Math.round(v)+'ms'; }
   function fmtUptime(s){ if (s===undefined||s===null) return '—'; s = Math.round(s); const d=Math.floor(s/86400), h=Math.floor((s%86400)/3600), m=Math.floor((s%3600)/60); if (d) return d+'d '+h+'h'; if (h) return h+'h '+m+'m'; return m+'m'; }
+  function fmtWhen(epoch){ return epoch ? new Date(Number(epoch)*1000).toLocaleString() : 'none'; }
   function statePill(kind, label){ return '<span class="pill '+kind+'"><span class="dot"></span>'+escapeHtml(label)+'</span>'; }
   function requestCoverage(r){
     if (r.error) return statePill('bad','stream error');
@@ -1176,14 +1254,66 @@ _ADMIN_HTML = r"""
   async function loadHealth(){
     dashErr.classList.add('hidden');
     try {
-      const [status, providers, models, presets, validation] = await Promise.all([
-        get('/admin/api/status'), get('/admin/api/providers'), get('/admin/api/models'), get('/admin/api/presets'), get('/admin/api/config/validation')
+      const [status, providers, models, presets, validation, pools] = await Promise.all([
+        get('/admin/api/status'), get('/admin/api/providers'), get('/admin/api/models'), get('/admin/api/presets'), get('/admin/api/config/validation'), get('/admin/api/workspace-pools')
       ]);
       renderHealth(status, providers.providers||[], models.models||[], validation);
       renderProviders(providers.providers||[]);
       renderModels(models.models||[]);
       renderPresets(presets);
+      renderWorkspacePools(pools);
     } catch (e) { handleFatal(e); throw e; }
+  }
+
+  function poolStatePill(state){
+    const kind = state === 'healthy' ? 'ok' : (state === 'degraded' ? 'warn' : 'bad');
+    return statePill(kind, state || 'unknown');
+  }
+
+  function renderWorkspacePools(data){
+    const summary = data.summary || {};
+    const pools = data.pools || [];
+    const attention = Number(summary.degraded||0) + Number(summary.down||0);
+    document.getElementById('wpPools').textContent = fmtNum(summary.pools||0);
+    document.getElementById('wpWorkspaces').textContent = fmtNum(summary.workspaces||0);
+    document.getElementById('wpHealthy').textContent = fmtNum(summary.healthy||0);
+    document.getElementById('wpHealthy').className = 'value ' + (summary.healthy ? 'ok-c' : '');
+    document.getElementById('wpAttention').textContent = fmtNum(attention);
+    document.getElementById('wpAttention').className = 'value ' + (attention ? 'warn-c' : 'ok-c');
+    document.getElementById('poolsMeta').textContent = pools.length ? 'ordered Databricks failover · runtime state' : 'no pools configured';
+
+    const routing = document.getElementById('routingHealth');
+    routing.innerHTML = '<span class="route-label">Workspace routing</span>' + (pools.map(p => {
+      const active = p.active_member ? escapeHtml(p.active_member) : 'no route';
+      return poolStatePill(p.state) + '<span><strong>'+escapeHtml(p.id)+'</strong> → '+active+'</span>';
+    }).join('<span class="muted">·</span>') || '<span class="muted">No workspace pools configured.</span>');
+
+    document.getElementById('poolCards').innerHTML = pools.map(p => {
+      const route = p.active_member ? escapeHtml(p.active_member) : 'no routable member';
+      const models = (p.models||[]).map(idPill).join(' ') || '<span class="muted">no catalog models reference this pool</span>';
+      const members = (p.members||[]).map(m => {
+        const issueKind = m.ready ? 'ok' : (m.configured ? 'warn' : 'bad');
+        const issueLabel = m.ready ? 'ready' : ((m.issues||[]).join(', ') || 'unavailable');
+        const active = m.active ? statePill('ok','active') : '';
+        const recent = m.recent || {};
+        const activity = fmtNum(recent.failures||0)+' failures / '+fmtNum(recent.requests||0);
+        const circuit = m.circuit && m.circuit.is_open ? 'open' : 'closed';
+        const profile = m.auth_profile || 'default';
+        const credential = (m.credential_type||'unknown')+' · '+(m.token_state||'unknown');
+        const testCommand = 'model-gateway workspace test '+m.id;
+        return '<div class="member-row">'
+          +'<div class="member-primary"><div class="member-name"><span class="small">'+escapeHtml(m.position)+'.</span>'+idPill(m.id)+active+statePill(issueKind,issueLabel)+'</div><div class="member-url" title="'+escapeHtml(m.base_url)+'">'+escapeHtml(m.base_url)+'</div></div>'
+          +'<div class="member-facts">'
+            +'<div class="member-fact"><span class="k">Auth / profile</span><span class="v" title="'+escapeHtml(credential+' / '+profile)+'">'+escapeHtml(credential)+' / '+escapeHtml(profile)+'</span></div>'
+            +'<div class="member-fact"><span class="k">Circuit</span><span class="v">'+escapeHtml(circuit)+' · '+fmtNum((m.circuit||{}).consecutive_failures||0)+' failures</span></div>'
+            +'<div class="member-fact"><span class="k">Recent 100</span><span class="v">'+escapeHtml(activity)+' · '+fmtNum(recent.rate_limits||0)+' rate limits</span></div>'
+            +'<div class="member-fact"><span class="k">Last request</span><span class="v" title="'+escapeHtml(fmtWhen(recent.last_request_at))+'">'+escapeHtml(fmtWhen(recent.last_request_at))+'</span></div>'
+          +'</div>'
+          +'<div class="member-actions"><button class="btn secondary" type="button" data-copy-command="'+escapeHtml(testCommand)+'">copy test</button></div>'
+        +'</div>';
+      }).join('');
+      return '<article class="pool-card"><div class="pool-head"><div class="pool-title"><h3>'+escapeHtml(p.id)+'</h3>'+poolStatePill(p.state)+'<span class="pool-route">active → <strong>'+route+'</strong> · '+fmtNum(p.ready_members)+'/'+fmtNum((p.members||[]).length)+' ready</span></div><button class="btn secondary" type="button" data-copy-command="model-gateway workspace repair">copy repair</button></div><div class="member-list">'+members+'</div><div class="pool-head"><span class="small">Catalog coverage</span><span>'+models+'</span></div></article>';
+    }).join('') || '<div class="preset-card"><span class="muted">No workspace pools are configured.</span></div>';
   }
 
   function renderHealth(status, providerRows, modelRows, validation){
@@ -1319,7 +1449,7 @@ _ADMIN_HTML = r"""
     document.querySelector('#presets tbody').innerHTML = rows.join('') || '<tr class="empty"><td colspan="7">No presets configured.</td></tr>';
   }
 
-  const TABS = ['presets','models','providers','usage','debug'];
+  const TABS = ['presets','models','providers','pools','usage','debug'];
   function showTab(tab, opts){
     currentTab = TABS.includes(tab) ? tab : 'presets';
     for (const b of document.querySelectorAll('[data-tab]')) b.setAttribute('aria-selected', String(b.dataset.tab === currentTab));
@@ -1772,6 +1902,27 @@ _ADMIN_HTML = r"""
   }
   function refresh(){ if (!unlocked) return; closeDrawer(); loadHealth(); loadUsage(currentWindow); }
 
+  async function copyCommand(button){
+    const command = button.getAttribute('data-copy-command') || '';
+    if (!command) return;
+    try {
+      if (navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(command);
+      else {
+        const area = document.createElement('textarea');
+        area.value = command;
+        area.setAttribute('readonly', '');
+        area.style.position = 'fixed'; area.style.opacity = '0';
+        document.body.appendChild(area); area.select(); document.execCommand('copy'); area.remove();
+      }
+      const old = button.textContent;
+      button.textContent = 'copied';
+      window.setTimeout(() => { button.textContent = old; }, 1200);
+    } catch (e) {
+      dashErr.textContent = 'Could not copy command: ' + command;
+      dashErr.classList.remove('hidden');
+    }
+  }
+
   unlockBtn.addEventListener('click', unlock);
   refreshBtn.addEventListener('click', refresh);
   keyInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') unlock(); });
@@ -1785,6 +1936,8 @@ _ADMIN_HTML = r"""
   document.addEventListener('click', (e) => {
     const t = e.target;
     if (t.closest && t.closest('[data-close-detail]')) { closeDrawer(); return; }
+    const copyBtn = t.closest && t.closest('[data-copy-command]');
+    if (copyBtn) { copyCommand(copyBtn); return; }
     const tabBtn = t.closest && t.closest('[data-tab]');
     if (tabBtn) { closeDrawer({skipHash: true}); showTab(tabBtn.dataset.tab); return; }
     // Buttons inside clickable rows act on the row's entity, not the drill-down.

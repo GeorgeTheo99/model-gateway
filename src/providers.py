@@ -1222,6 +1222,115 @@ def model_status() -> list[dict]:
 
 
 @_registry_locked
+def workspace_pool_status() -> list[dict]:
+    """Return secret-free runtime status for configured workspace pools.
+
+    Pools remain a routing primitive rather than a second provider system. The
+    first configured member whose circuit is closed is the active member, which
+    mirrors :func:`resolve` without making an upstream request.
+    """
+    from src import circuit  # local import keeps the registry dependency one-way
+
+    config = _load_config()
+    circuits = circuit.get_status()
+    models_by_pool: dict[str, list[str]] = {}
+    for model in effective_model_inventory():
+        pool = str(model.get("pool") or "").strip()
+        name = str(model.get("name") or model.get("id") or "").strip()
+        if pool and name:
+            models_by_pool.setdefault(pool, []).append(name)
+
+    result = []
+    now = time.time()
+    for pool_id, configured_members in _pools(config).items():
+        members = []
+        for position, raw_member in enumerate(configured_members, start=1):
+            member_id = _canonical_provider(raw_member)
+            provider_config = _effective_provider_config(config, member_id)
+            circuit_state = circuits.get(member_id, {})
+            enabled = provider_config.get("enabled") is not False
+            has_base_url = bool(provider_config.get("base_url"))
+            has_api_key = bool(provider_config.get("api_key"))
+            configured = enabled and has_base_url and has_api_key
+            circuit_open = bool(circuit_state.get("is_open"))
+
+            token = str(provider_config.get("api_key") or "")
+            token_expires_at = _jwt_expiry_epoch(token)
+            if provider_config.get("auth_refresh") == "databricks-cli":
+                credential_type = "oauth"
+            elif token.startswith("dapi"):
+                credential_type = "pat"
+            elif token:
+                credential_type = "static"
+            else:
+                credential_type = "missing"
+
+            if token_expires_at is None:
+                token_state = "opaque" if token else "missing"
+            elif token_expires_at <= now:
+                token_state = "expired"
+            elif token_expires_at - now <= 300:
+                token_state = "expiring"
+            else:
+                token_state = "valid"
+
+            issues = []
+            if not enabled:
+                issues.append("disabled")
+            if not has_base_url:
+                issues.append("missing_base_url")
+            if not has_api_key:
+                issues.append("missing_api_key")
+            if circuit_open:
+                issues.append("circuit_open")
+
+            members.append({
+                "id": member_id,
+                "position": position,
+                "configured": configured,
+                "ready": configured and not circuit_open,
+                "base_url": _safe_url(str(provider_config.get("base_url") or "")),
+                "workspace_url": _safe_url(str(provider_config.get("workspace_url") or "")),
+                "protocol": provider_config.get("protocol", "openai"),
+                "endpoint_style": provider_config.get("endpoint_style", "standard"),
+                "auth_refresh": provider_config.get("auth_refresh", ""),
+                "auth_profile": provider_config.get("auth_profile", ""),
+                "credential_type": credential_type,
+                "token_state": token_state,
+                "token_expires_at": token_expires_at,
+                "issues": issues,
+                "circuit": {
+                    "is_open": circuit_open,
+                    "consecutive_failures": circuit_state.get("consecutive_failures", 0),
+                    "last_failure_status": circuit_state.get("last_failure_status", 0),
+                    "seconds_since_failure": circuit_state.get("seconds_since_failure"),
+                    "probe_in_progress": bool(circuit_state.get("probe_in_progress")),
+                },
+            })
+
+        active = next((member["id"] for member in members if member["ready"]), None)
+        ready_count = sum(1 for member in members if member["ready"])
+        if not active:
+            state = "down"
+        elif ready_count < len(members):
+            state = "degraded"
+        else:
+            state = "healthy"
+        for member in members:
+            member["active"] = member["id"] == active
+
+        result.append({
+            "id": pool_id,
+            "state": state,
+            "active_member": active,
+            "ready_members": ready_count,
+            "models": sorted(set(models_by_pool.get(pool_id, []))),
+            "members": members,
+        })
+    return result
+
+
+@_registry_locked
 def config_validation() -> dict:
     """Validate current provider/model config without exposing secrets."""
     providers = provider_status()
