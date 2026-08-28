@@ -39,6 +39,9 @@ translation between them.
 - **Transactional onboarding** — `model-gateway onboard` discovers upstream
   models, writes a reviewable secret-free profile, stores credentials in
   0600 files, applies atomically, and rolls back on verification failure.
+- **Databricks workspace management** — `model-gateway workspace` validates
+  OAuth, endpoint coverage, and a real smoke completion before changing an
+  ordered workspace pool; failed activation rolls back automatically.
 - **Usage/cost ledger** — tokens, provider cost, estimates, latency and
   errors per request, in SQLite.
 - **Federation** — explicitly configured gateway-to-gateway routes.
@@ -83,7 +86,16 @@ model-gateway status    # launchd state + /health probe
 model-gateway logs -f   # follow the service log
 model-gateway restart   # restart + verify
 model-gateway update    # git pull + uv sync + restart + verify
+model-gateway workspace list                    # show workspace pool order
+model-gateway workspace test <name>             # auth, coverage, smoke test
+model-gateway workspace repair                  # repair dead OAuth/workspaces
 ```
+
+Mutating Databricks workspace commands are similarly available as
+`workspace add`, `workspace replace`, and `workspace remove`. They verify the
+candidate before writing `config.yaml`, restart and health-check the gateway,
+and restore the prior configuration if activation fails. Run
+`model-gateway workspace --help` for the full syntax.
 
 ## Configuration
 
@@ -124,6 +136,7 @@ multi-tenant isolation; run the gateway on loopback or behind a trusted proxy.
 | `docs/deployment.md` | Deployment layout and operations |
 | `docs/deployment-auth.md` | Inbound auth configuration |
 | `docs/provider-onboarding.md` | Provider/model onboarding flow |
+| `docs/workspace-pools-design.md` | Databricks workspace pools and operations |
 | `docs/federation.md` | Gateway-to-gateway federation |
 | `docs/consumer-profiles.md` | Consumer credential, snapshot API, and profile execution contract |
 | `docs/adr/0001-consumer-profile-security.md` | Consumer-profile security boundary decision |

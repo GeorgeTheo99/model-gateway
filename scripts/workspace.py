@@ -2,22 +2,24 @@
 """Foolproof workspace management for model-gateway pools.
 
 Commands:
-    workspace.py list
-    workspace.py repair                 # interactive: fix dead auth / dead workspaces
-    workspace.py test <name>
-    workspace.py add <name> --host <url> [--pools p1,p2] [--position N]
-                            [--profile <cli-profile>] [--style invocations|ai-gateway]
-                            [--allow-partial]
-    workspace.py replace <old-name> --host <url> [--name <new-name>] [--allow-partial]
-    workspace.py remove <name>
+    model-gateway workspace list
+    model-gateway workspace repair      # interactive: fix dead auth / workspaces
+    model-gateway workspace test <name>
+    model-gateway workspace add <name> --host <url> [--pools p1,p2]
+                                [--position N] [--profile <cli-profile>]
+                                [--style invocations|ai-gateway] [--allow-partial]
+    model-gateway workspace replace <old-name> --host <url> [--name <new-name>]
+                                      [--allow-partial]
+    model-gateway workspace remove <name>
 
-`add`/`replace` are idempotent and verify BEFORE committing config:
+`add`/`replace` are idempotent and verify BEFORE committing config. If gateway
+activation fails, the previous config is restored and activated automatically:
   1. auth   — databricks CLI profile (browser SSO if refresh token is dead)
   2. probe  — GET /api/2.0/serving-endpoints reachability
   3. cover  — every pool model's provider_model_id exists on the workspace
   4. smoke  — one real completion per protocol used by affected models
-  5. commit — write config.yaml (backup first), POST /admin/api/reload
-              (which also regenerates pi-list/Pi catalogs)
+  5. commit — write config.yaml (backup first), then restart+verify through
+              the operator CLI or use the authenticated admin reload API
 
 `replace` gives the new workspace the old one's pool positions, then removes
 the old entry. `remove` refuses to empty a pool. `test` runs steps 1-4 only.
@@ -51,6 +53,7 @@ DEFAULT_CONFIG = Path(
 )
 GATEWAY_URL = os.environ.get("MODEL_GATEWAY_URL", "http://localhost:9111")
 ADMIN_KEY = os.environ.get("MODEL_GATEWAY_ADMIN_KEY", "").strip()
+RESTART_BIN = os.environ.get("MODEL_GATEWAY_RESTART_BIN", "").strip()
 
 
 def _fail(msg: str) -> "SystemExit":
@@ -191,8 +194,14 @@ def smoke_test(host: str, token: str, endpoint_names: set[str]) -> None:
             raise _fail(f"smoke completion failed on {name}: {exc}")
 
 
-def _backup(path: Path) -> None:
+def _config_target(path: Path) -> Path:
+    """Return the real config target so atomic writes preserve symlinks."""
+    return Path(os.path.realpath(path))
+
+
+def _backup(path: Path) -> Path:
     """Create a collision-safe, owner-only backup of secret-bearing config."""
+    path = _config_target(path)
     backup = path.with_name(path.name + f".bak-{time.strftime('%Y%m%d-%H%M%S')}")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(backup, flags, 0o600)
@@ -215,10 +224,12 @@ def _backup(path: Path) -> None:
         backup.unlink(missing_ok=True)
         raise
     print(f"  backup: {backup.name}")
+    return backup
 
 
 def _write_config(path: Path, config: dict) -> None:
     """Persist secret-bearing config atomically with owner-only permissions."""
+    path = _config_target(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     tmp = Path(tmp_name)
@@ -243,13 +254,46 @@ def _write_config(path: Path, config: dict) -> None:
         raise
 
 
-def _require_admin_key() -> None:
-    if not ADMIN_KEY:
-        raise _fail("MODEL_GATEWAY_ADMIN_KEY is required for mutating workspace commands")
+def _restore_backup(path: Path, backup: Path) -> None:
+    """Atomically restore a raw config backup without replacing symlinks."""
+    path = _config_target(path)
+    backup = _config_target(backup)
+    if not backup.is_file():
+        raise RuntimeError(f"rollback backup is missing: {backup}")
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.rollback.", dir=path.parent)
+    tmp = Path(tmp_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with backup.open("rb") as source, os.fdopen(fd, "wb") as target:
+            shutil.copyfileobj(source, target)
+            target.flush()
+            os.fsync(target.fileno())
+        tmp.replace(path)
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _require_activation_path() -> None:
+    if not RESTART_BIN and not ADMIN_KEY:
+        raise _fail(
+            "mutating workspace commands require MODEL_GATEWAY_RESTART_BIN "
+            "or MODEL_GATEWAY_ADMIN_KEY"
+        )
 
 
 def reload_gateway() -> None:
-    _require_admin_key()
+    if not ADMIN_KEY:
+        raise RuntimeError("MODEL_GATEWAY_ADMIN_KEY is required for API reload")
     req = urllib.request.Request(
         f"{GATEWAY_URL}/admin/api/reload", method="POST",
         headers={"Authorization": f"Bearer {ADMIN_KEY}"},
@@ -259,7 +303,58 @@ def reload_gateway() -> None:
             data = json.loads(resp.read())
         print(f"  reload: {data.get('message')} (catalogs: {data.get('catalogs')})")
     except urllib.error.URLError as exc:
-        print(f"  reload: WARN — gateway reload failed ({exc}); restart it manually")
+        raise RuntimeError(f"gateway reload failed: {exc}") from exc
+
+
+def restart_gateway() -> None:
+    if not RESTART_BIN:
+        raise RuntimeError("MODEL_GATEWAY_RESTART_BIN is not configured")
+    try:
+        proc = subprocess.run(
+            [RESTART_BIN, "restart"],
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"gateway restart failed: {exc}") from exc
+    if proc.stdout:
+        print(proc.stdout.rstrip())
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "unknown error").strip()[-1000:]
+        raise RuntimeError(f"gateway restart failed (exit {proc.returncode}): {detail}")
+    print("  activation: gateway restarted and verified")
+
+
+def activate_gateway() -> None:
+    if RESTART_BIN:
+        restart_gateway()
+    else:
+        reload_gateway()
+
+
+def _commit_and_activate(path: Path, config: dict) -> None:
+    """Commit verified config, activate it, and roll back on activation failure."""
+    backup = _backup(path)
+    _write_config(path, config)
+    print(f"  commit: {_config_target(path)}")
+    try:
+        activate_gateway()
+    except Exception as activation_error:
+        print(f"  activation: FAILED — {activation_error}")
+        print(f"  rollback: restoring {backup.name}")
+        try:
+            _restore_backup(path, backup)
+            activate_gateway()
+        except Exception as rollback_error:
+            raise _fail(
+                "activation failed and rollback could not be activated; "
+                f"config was restored from {backup}, but the gateway needs manual recovery: "
+                f"{rollback_error}"
+            ) from rollback_error
+        raise _fail(
+            f"activation failed; previous configuration restored and verified: {activation_error}"
+        ) from activation_error
 
 
 def cmd_list(args) -> None:
@@ -273,6 +368,13 @@ def cmd_list(args) -> None:
     print(f"{'WORKSPACE':22s} {'HOST':55s} {'AUTH':14s} POOLS")
     for name, entry in providers.items():
         if not isinstance(entry, dict) or not entry.get("base_url"):
+            continue
+        host = str(entry.get("workspace_url") or entry.get("base_url", ""))
+        if (
+            name not in member_of
+            and entry.get("auth_refresh") != "databricks-cli"
+            and "databricks" not in host
+        ):
             continue
         auth = entry.get("auth_profile") or ("pat" if str(entry.get("api_key", "")).startswith("dapi") else "static")
         print(f"{name:22s} {entry.get('base_url','')[:55]:55s} {auth:14s} {','.join(member_of.get(name, [])) or '-'}")
@@ -325,7 +427,7 @@ def _insert_into_pools(config: dict, name: str, pool_names: list[str], position:
 
 
 def cmd_add(args) -> None:
-    _require_admin_key()
+    _require_activation_path()
     host = normalize_host(args.host)
     profile = args.profile or args.name
     pool_names = [p.strip() for p in (args.pools or "").split(",") if p.strip()]
@@ -356,15 +458,12 @@ def cmd_add(args) -> None:
     providers[args.name] = {k: v for k, v in providers[args.name].items() if v is not None}
     _insert_into_pools(config, args.name, pool_names, args.position)
 
-    _backup(args.config)
-    _write_config(args.config, config)
-    print(f"  commit: {args.config}")
-    reload_gateway()
+    _commit_and_activate(args.config, config)
     print(f"workspace add: DONE — {args.name} is live")
 
 
 def cmd_replace(args) -> None:
-    _require_admin_key()
+    _require_activation_path()
     config = _load_config(args.config)
     providers = _providers_section(config)
     old = providers.get(args.old_name)
@@ -394,10 +493,7 @@ def cmd_replace(args) -> None:
         members = pools[pool]
         members[members.index(args.old_name)] = new_name
 
-    _backup(args.config)
-    _write_config(args.config, config)
-    print(f"  commit: {args.config}")
-    reload_gateway()
+    _commit_and_activate(args.config, config)
     print(f"workspace replace: DONE — {new_name} took over {args.old_name}'s pool positions")
 
 
@@ -408,7 +504,7 @@ def cmd_repair(args) -> None:
       silent token → browser SSO → prompt to paste a replacement workspace URL
     (the paste-a-URL flow). Static-PAT workspaces are probe-checked only.
     """
-    _require_admin_key()
+    _require_activation_path()
     config = _load_config(args.config)
     providers = _providers_section(config)
     broken: list[str] = []
@@ -442,7 +538,7 @@ def cmd_repair(args) -> None:
 
 
 def cmd_remove(args) -> None:
-    _require_admin_key()
+    _require_activation_path()
     config = _load_config(args.config)
     providers = _providers_section(config)
     if args.name not in providers:
@@ -459,15 +555,16 @@ def cmd_remove(args) -> None:
         if args.name in (members or []):
             members.remove(args.name)
     providers.pop(args.name)
-    _backup(args.config)
-    _write_config(args.config, config)
-    print(f"  commit: {args.config}")
-    reload_gateway()
+    _commit_and_activate(args.config, config)
     print(f"workspace remove: DONE — {args.name} removed")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        prog="model-gateway workspace",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     sub = parser.add_subparsers(dest="command", required=True)
 

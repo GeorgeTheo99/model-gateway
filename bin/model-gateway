@@ -15,6 +15,7 @@
 #   model-gateway update                         git pull + uv sync + restart + verify
 #   model-gateway onboard PROFILE [options]      apply a reviewed onboarding profile
 #   model-gateway onboard generate [options]     discover metadata and save a draft profile
+#   model-gateway workspace COMMAND [options]    manage Databricks workspace pools
 #   model-gateway env                            print resolved config
 set -euo pipefail
 umask 077
@@ -271,8 +272,9 @@ ensure_log_backup_separation() {
 }
 
 ensure_runtime_paths_safe() {
-  ensure_label_safe "onboard"
-  service_loaded || die "refusing onboarding: launchd service is not loaded: $LABEL"
+  local action="${1:-operation}"
+  ensure_label_safe "$action"
+  service_loaded || die "refusing $action: launchd service is not loaded: $LABEL"
   local plist actual expected key value
   plist="$(plist_path)"
   for key in MODEL_GATEWAY_CONFIG MODEL_GATEWAY_MODEL_INFO MODEL_GATEWAY_MODEL_INFO_SOURCE; do
@@ -283,10 +285,10 @@ ensure_runtime_paths_safe() {
     esac
     [ -n "$value" ] || continue
     actual="$(plist_env_value "$plist" "$key")"
-    [ -n "$actual" ] || die "refusing onboarding: $plist does not define $key"
+    [ -n "$actual" ] || die "refusing $action: $plist does not define $key"
     expected="$(canonical_path "$value")"
     [ "$(canonical_path "$actual")" = "$expected" ] \
-      || die "refusing onboarding: $key targets '$actual', not '$value'"
+      || die "refusing $action: $key targets '$actual', not '$value'"
   done
 }
 
@@ -543,9 +545,9 @@ cmd_onboard() {
     [ "$arg" = "--apply" ] && apply=1
   done
   if [ "$generate" = 0 ] && [ "$dry_run" = 0 ]; then
-    ensure_runtime_paths_safe
+    ensure_runtime_paths_safe "onboarding"
   elif [ "$generate" = 1 ] && [ "$apply" = 1 ]; then
-    ensure_runtime_paths_safe
+    ensure_runtime_paths_safe "onboarding"
   fi
   local cmd=("$UV_BIN" run --project "$ROOT_DIR" python "$ROOT_DIR/scripts/onboard_provider.py" "$@"
     --config "$CONFIG_PATH" --model-info "$MODEL_INFO_PATH"
@@ -559,6 +561,29 @@ cmd_onboard() {
   elif [ "$dry_run" = 0 ]; then
     ok "provider onboarding complete"
   fi
+}
+
+cmd_workspace() {
+  [ $# -ge 1 ] || die "usage: model-gateway workspace {list|repair|test|add|replace|remove} [options]"
+  check_prereqs
+  local requested_help=0 arg
+  for arg in "$@"; do
+    case "$arg" in -h|--help) requested_help=1 ;; esac
+  done
+  case "$1" in
+    list|test) ;;
+    repair|add|replace|remove)
+      [ "$requested_help" = 1 ] || ensure_runtime_paths_safe "workspace management"
+      ;;
+    -h|--help) ;;
+    help) shift; set -- --help "$@" ;;
+    *) die "unknown workspace command: $1" ;;
+  esac
+  MODEL_GATEWAY_CONFIG="$CONFIG_PATH" \
+  MODEL_GATEWAY_URL="http://127.0.0.1:$PORT" \
+  MODEL_GATEWAY_RESTART_BIN="$SOURCE_PATH" \
+    "$UV_BIN" run --project "$ROOT_DIR" python "$ROOT_DIR/scripts/workspace.py" \
+      --config "$CONFIG_PATH" "$@"
 }
 
 usage() {
@@ -583,6 +608,7 @@ main() {
     logs) shift; cmd_logs "$@" ;;
     update) cmd_update ;;
     onboard) shift; cmd_onboard "$@" ;;
+    workspace) shift; cmd_workspace "$@" ;;
     env) cmd_env ;;
     -h|--help|help) usage ;;
     *) die "unknown command: $1" ;;

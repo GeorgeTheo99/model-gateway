@@ -1,6 +1,8 @@
 # Design Sketch: Workspace Pools, Catalog Generation, and Foolproof Workspace Replacement
 
-Status: DRAFT (sketch only, nothing implemented)
+Status: PARTIALLY IMPLEMENTED — ordered pool routing and the operator CLI are
+live; automatic launcher repair, quarantine, admin pool visibility, and
+429-specific cooldown remain future work
 Date: 2026-07-07
 
 ## Problem
@@ -199,6 +201,9 @@ scripts/export_catalogs.py
 
 ### 3a. Interactive workspace replacement on OAuth failure (paste-a-URL flow)
 
+The manual `model-gateway workspace repair` flow is implemented. Automatically
+invoking it from the Pi launcher remains planned.
+
 Requirement: when OAuth to an existing workspace fails unrecoverably, the
 operator is **prompted to paste a new workspace URL** and the system rewires
 itself. Two contexts:
@@ -214,7 +219,7 @@ requested model's pool needs (derived from the generated aliases file):
      "Workspace '<name>' (<url>) is unreachable or auth is dead."
      "Paste a replacement workspace URL (or Enter to skip): "
 4. paste https://new-ws.cloud.databricks.com[/?o=...]  →
-     normalize URL → manage.sh workspace replace <name> --host <url>
+     normalize URL → model-gateway workspace replace <name> --host <url>
      (auth → probe → coverage check → smoke test → config rewrite:
       the new workspace takes the dead one's place in every pool it was in
       → gateway reload → regenerate catalogs)
@@ -224,21 +229,21 @@ requested model's pool needs (derived from the generated aliases file):
 
 The prompt happens in the **launcher/CLI**, never inside the gateway — the
 gateway is headless and must not block requests on a human. The same prompt
-is reachable on demand via `manage.sh workspace replace` (below).
+is reachable on demand via `model-gateway workspace replace` (below).
 
 **Headless (gateway runtime).** When refresh fails server-side, the workspace
-circuit stays OPEN and the admin dashboard + `manage.sh status` show
-`auth-dead: run 'manage.sh workspace replace <name>'`. Next launcher
+circuit stays OPEN and the admin dashboard + `model-gateway status` show
+`auth-dead: run 'model-gateway workspace replace <name>'`. Next launcher
 invocation triggers the interactive flow in step 2–4 automatically, because
 preflight consults circuit/auth state via `/admin/api/stats`.
 
-### 3b. One command: `manage.sh workspace add` (and `replace`)
+### 3b. One command: `model-gateway workspace add` (and `replace`)
 
 ```
-$ manage.sh workspace add workspace-c \
+$ model-gateway workspace add workspace-c \
     --host https://workspace-c.cloud.databricks.com \
     --pools databricks-anthropic-pool,databricks-openai-pool \
-    [--position 2] [--profile workspace-c-profile] [--kind serving-invocations]
+    [--position 2] [--profile workspace-c-profile] [--style invocations]
 ```
 
 Steps (idempotent, each verified before the next):
@@ -255,20 +260,21 @@ Steps (idempotent, each verified before the next):
    unless `--allow-partial`.
 4. **Smoke test**: send one tiny real completion per protocol
    (anthropic + openai) through the new workspace directly.
-5. **Commit**: write config.yaml, `POST /admin/api/reload` (no restart needed
-   for config reads; restart only if the process predates pool support).
+5. **Commit**: back up and atomically write config.yaml, then restart and
+   health-check through the local operator CLI. If activation fails, restore
+   the backup and verify the previous configuration.
 6. **Regenerate**: run `export_catalogs.py` + drift check.
 7. **Report**: final table of pools with member order and per-model coverage.
 
-`manage.sh workspace replace <old> --host <new-url>` = `add` with the new
+`model-gateway workspace replace <old> --host <new-url>` = `add` with the new
 workspace inheriting every pool membership (same positions) of the old one,
-then the old entry is quarantined (kept in config for audit, excluded from
-pools). This is the command the paste-a-URL prompt invokes.
+then removes the old entry when the replacement uses a new name. This is the
+command the paste-a-URL prompt invokes.
 
-`manage.sh workspace remove <name>` is the inverse of add: refuse if it would
+`model-gateway workspace remove <name>` is the inverse of add: refuse if it would
 leave any pool empty; otherwise remove, reload, regenerate.
 
-`manage.sh workspace test <name>` = steps 2–4 only (use in cron/launchd for
+`model-gateway workspace test <name>` = steps 2–4 only (use in cron/launchd for
 early warning that a standby workspace has drifted).
 
 URL normalization: accept pasted URLs in any of the common shapes —
@@ -287,7 +293,7 @@ If a routed workspace is deleted *right now*:
   every 10s and will never recover a deleted workspace — a `workspace
   quarantine` state (auto after N hours OPEN, or manual) stops probe noise.
 - **Recovery (bring capacity back):** either the paste-a-URL prompt on next
-  launcher use (3a), or explicitly `manage.sh workspace replace <dead> --host
+  launcher use (3a), or explicitly `model-gateway workspace replace <dead> --host
   <new-url>`. Both handle SSO, validation, smoke test, config write, reload,
   and catalog regeneration in one pass.
 - **Single-workspace pools (e.g. glm-pool/workspace-d):** there is no failover
@@ -319,13 +325,13 @@ If a routed workspace is deleted *right now*:
   on a model is treated as a 1-member pool. Migration is
   `providers.databricks → workspaces.ai-gateway`, `providers.databricks-e2 →
   workspaces.workspace-b` plus two pool definitions — mechanical.
-- **Phase 1 (biggest win, smallest diff):** catalog generation +
-  drift check (kills the 4-way hand-maintenance; fable-class bugs impossible).
-- **Phase 2:** workspace pools + per-workspace circuit/failover in
+- **Phase 1 (implemented):** catalog generation + drift check removes the
+  4-way hand-maintenance and prevents fable-class catalog drift.
+- **Phase 2 (implemented):** workspace pools + per-workspace circuit/failover in
   `upstream.py`/`providers.py` (~ the existing `model_fallback` retry-wrapper
   pattern, applied one level up).
-- **Phase 3:** `manage.sh workspace add/remove/test` + quarantine +
-  admin-UI pool panel.
+- **Phase 3:** `model-gateway workspace add/remove/test/repair` is implemented;
+  quarantine and the admin-UI pool panel remain.
 
 ## Open questions
 
