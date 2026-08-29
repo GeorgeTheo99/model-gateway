@@ -43,9 +43,29 @@ BACKUP_DIR="${MODEL_GATEWAY_BACKUP_DIR:-$HOME/Library/Application Support/model-
 LEGACY_BACKUP_DIRS="${MODEL_GATEWAY_LEGACY_BACKUP_DIRS:-$LOG_DIR/config-backups}"
 BIN_DIR="${MODEL_GATEWAY_BIN_DIR:-$HOME/.local/bin}"
 FORCE="${MODEL_GATEWAY_FORCE:-0}"
+INSTALL_CONFIG="$HOME/Library/Application Support/model-gateway/install.env"
 
-HOST="${MODEL_GATEWAY_HOST:-127.0.0.1}"
-PORT="${MODEL_GATEWAY_PORT:-9111}"
+installed_config_value() {
+  local metadata
+  [ -f "$INSTALL_CONFIG" ] && [ ! -L "$INSTALL_CONFIG" ] || return 0
+  metadata="$(stat -f '%u %l %Lp' "$INSTALL_CONFIG" 2>/dev/null || stat -c '%u %h %a' "$INSTALL_CONFIG" 2>/dev/null || true)"
+  [ "$metadata" = "$(id -u) 1 600" ] || return 0
+  awk -v prefix="$1=" 'index($0, prefix) == 1 {print substr($0, length(prefix) + 1); exit}' \
+    "$INSTALL_CONFIG"
+}
+
+installed_plist_env() {
+  local plist="$PLIST_DIR/$LABEL.plist"
+  [ -f "$plist" ] && [ ! -L "$plist" ] && [ -x /usr/libexec/PlistBuddy ] || return 0
+  /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:$1" "$plist" 2>/dev/null || true
+}
+
+INSTALLED_HOST="$(installed_config_value MODEL_GATEWAY_HOST)"
+INSTALLED_HOST="${INSTALLED_HOST:-$(installed_plist_env MODEL_GATEWAY_HOST)}"
+INSTALLED_PORT="$(installed_config_value MODEL_GATEWAY_PORT)"
+INSTALLED_PORT="${INSTALLED_PORT:-$(installed_plist_env MODEL_GATEWAY_PORT)}"
+HOST="${MODEL_GATEWAY_HOST:-${INSTALLED_HOST:-127.0.0.1}}"
+PORT="${MODEL_GATEWAY_PORT:-${INSTALLED_PORT:-9111}}"
 CONFIG_PATH="${MODEL_GATEWAY_CONFIG:-$ROOT_DIR/config/config.yaml}"
 MODEL_INFO_PATH="${MODEL_GATEWAY_MODEL_INFO:-$ROOT_DIR/model-info.json}"
 ACTIVE_MODEL_INFO_SOURCE=""
@@ -89,6 +109,32 @@ ensure_private_file() {
     : > "$path"
   fi
   chmod 600 "$path"
+}
+
+validate_bind_config() {
+  case "$HOST" in ''|*[[:space:]]*) die "MODEL_GATEWAY_HOST must be a nonempty host without whitespace" ;; esac
+  case "$PORT" in ''|*[!0-9]*) die "MODEL_GATEWAY_PORT must be an integer between 1 and 65535" ;; esac
+  if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+    die "MODEL_GATEWAY_PORT must be an integer between 1 and 65535"
+  fi
+}
+
+persist_install_config() {
+  validate_bind_config
+  ensure_private_dir "$(dirname "$INSTALL_CONFIG")"
+  local tmp metadata
+  if [ -e "$INSTALL_CONFIG" ] || [ -L "$INSTALL_CONFIG" ]; then
+    [ -f "$INSTALL_CONFIG" ] && [ ! -L "$INSTALL_CONFIG" ] \
+      || die "refusing unsafe private file: $INSTALL_CONFIG"
+    metadata="$(stat -f '%u %l' "$INSTALL_CONFIG" 2>/dev/null || stat -c '%u %h' "$INSTALL_CONFIG")"
+    [ "$metadata" = "$(id -u) 1" ] \
+      || die "private file has unsafe ownership or hard links: $INSTALL_CONFIG"
+  fi
+  tmp="$(mktemp "$(dirname "$INSTALL_CONFIG")/.install.env.XXXXXX")"
+  chmod 600 "$tmp"
+  printf 'MODEL_GATEWAY_HOST=%s\nMODEL_GATEWAY_PORT=%s\n' "$HOST" "$PORT" >"$tmp"
+  mv -f "$tmp" "$INSTALL_CONFIG"
+  chmod 600 "$INSTALL_CONFIG"
 }
 
 check_macos() {
@@ -349,6 +395,7 @@ EOF
     rm -f "$plist_tmp"
     die "generated LaunchAgent plist is invalid"
   fi
+  persist_install_config
   mv -f "$plist_tmp" "$plist"
   chmod 600 "$plist"
   ok "Wrote $plist"
@@ -447,6 +494,7 @@ status() {
   health="$(curl -fsS --max-time 3 "$(health_url)" 2>/dev/null || echo 'DOWN')"
   printf '%-24s %s\n' "launchd:" "${state:-unknown}"
   printf '%-24s %s\n' "health:" "$health"
+  printf '%-24s %s\n' "install-config:" "$INSTALL_CONFIG"
   printf '%-24s %s\n' "config:" "$CONFIG_PATH"
   printf '%-24s %s\n' "model-info:" "$MODEL_INFO_PATH"
   printf '%-24s %s\n' "log:" "$LOG_FILE"
@@ -474,6 +522,7 @@ BIN_DIR=$BIN_DIR
 UV_BIN=$UV_BIN
 MODEL_GATEWAY_HOST=$HOST
 MODEL_GATEWAY_PORT=$PORT
+MODEL_GATEWAY_INSTALL_CONFIG=$INSTALL_CONFIG
 MODEL_GATEWAY_CONFIG=$CONFIG_PATH
 MODEL_GATEWAY_MODEL_INFO=$MODEL_INFO_PATH
 MODEL_GATEWAY_MODEL_INFO_SOURCE=$MODEL_INFO_SOURCE_PATH
@@ -499,6 +548,7 @@ cmd_install() {
     shift
   done
   check_prereqs
+  validate_bind_config
   log "Installing model-gateway from $ROOT_DIR"
   ensure_config
   sync_venv
@@ -524,15 +574,21 @@ cmd_uninstall() {
   ok "Uninstalled (repo and venv retained; rerun 'install' to restore)"
 }
 
-cmd_update() {
+cmd_update_after_pull() {
   check_prereqs
-  log "Pulling model-gateway repo"
-  git -C "$ROOT_DIR" pull --ff-only
+  validate_bind_config
   sync_venv
   write_plist
   restart_service
   verify || die "verification failed after update"
   ok "model-gateway updated"
+}
+
+cmd_update() {
+  check_prereqs
+  log "Pulling model-gateway repo"
+  git -C "$ROOT_DIR" pull --ff-only
+  exec "$ROOT_DIR/bin/model-gateway" _update-after-pull
 }
 
 cmd_onboard() {
@@ -607,6 +663,7 @@ main() {
     verify) verify ;;
     logs) shift; cmd_logs "$@" ;;
     update) cmd_update ;;
+    _update-after-pull) cmd_update_after_pull ;;
     onboard) shift; cmd_onboard "$@" ;;
     workspace) shift; cmd_workspace "$@" ;;
     env) cmd_env ;;

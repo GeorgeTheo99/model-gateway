@@ -32,7 +32,9 @@ model-gateway update      # git pull --ff-only + uv sync + restart + verify
 model-gateway env
 ```
 
-Portable defaults are env-overridable:
+Portable defaults are env-overridable. During `install`, the resolved bind host and port are persisted in the owner-only `~/Library/Application Support/model-gateway/install.env`; later `update`, `restart`, `status`, and fresh shell sessions recover that assignment before falling back to the legacy defaults. Updates re-exec the newly pulled operator script before rewriting the LaunchAgent, so future installer changes use the current resolution logic. An explicit environment value still takes precedence when intentionally re-running `install`.
+
+When upgrading from a version that predates persisted bind configuration, first pull the checkout directly with `git -C <model-gateway-checkout> pull --ff-only`, then run `MODEL_GATEWAY_PORT=<currently-installed-port> model-gateway install --no-start` (and include `MODEL_GATEWAY_HOST` if customized). Normal `model-gateway update` commands are safe afterward. This one-time step is necessary because an already-running older Bash script cannot adopt update logic that has not yet been pulled.
 
 - `MODEL_GATEWAY_CONFIG=<repo>/config/config.yaml`
 - `MODEL_GATEWAY_MODEL_INFO=<repo>/model-info.json`
