@@ -93,21 +93,22 @@ Valid combinations are:
 - `cloud_explicit` + `gateway_managed`
 - `cloud_explicit` + `consumer_byok`
 
-Phase 1 executes only `local_only` + `gateway_local`. Valid cloud combinations are published as non-executable capabilities and return `403 profile_execution_unavailable` if invoked. Other combinations are rejected with `422`.
+`local_only` + `gateway_local` and `cloud_explicit` + `gateway_managed` are executable. `cloud_explicit` + `consumer_byok` remains a contracted, non-executable capability and returns `403 profile_execution_unavailable` until the gateway provides an explicit BYOK credential-reference contract. Other combinations are rejected with `422`.
 
 ### Route validation
 
 - Route targets must be canonical gateway model names, not aliases, provider-native IDs, profile selectors, or federated IDs.
 - A `local_only` route must have a complete closure containing only oMLX providers whose effective endpoint is trusted loopback (`localhost` or a loopback IP). Merely naming a remote provider `omlx` is rejected.
 - Provider pools must not mix local and cloud candidates.
-- Composite text and vision dependencies must both be local.
+- Every dependency of a `local_only` route must resolve exclusively through trusted local oMLX providers.
+- Every dependency of a `cloud_explicit` route must exclude oMLX and resolve through gateway-configured cloud providers.
 - Process-wide/global vision fallback is never used for a profile request.
-- Cross-model fallback is disabled for phase-1 profile execution. Same-route transport retry is allowed.
+- Cross-model fallback is disabled for profile execution. Same-route transport retry and provider-pool failover are allowed only within the registered route's validated locality closure.
 - The gateway records a digest of the validated route closure, including the effective non-secret endpoint identity and protocol. If catalog/config drift changes that closure, invocation fails closed until re-registration. Re-registering the unchanged manifest creates a new bound version when the closure changed.
 
 ### Defaults
 
-Defaults apply only when the request omitted an equivalent explicit control. The gateway never overwrites an explicit caller value. Supported phase-1 defaults are:
+Defaults apply only when the request omitted an equivalent explicit control. The gateway never overwrites an explicit caller value. Supported defaults are:
 
 - `temperature`
 - `max_output_tokens`
@@ -202,9 +203,10 @@ Request flow:
 4. Load the latest registered snapshot.
 5. Verify protocol permission and executable credential/locality policy.
 6. Select text or vision route from the actual request modality.
-7. Revalidate the route binding against the live catalog/config.
-8. Apply missing defaults and execute the concrete model.
-9. Keep the original profile identity in gateway audit metadata.
+7. Revalidate the route binding and defaults against the live catalog/config.
+8. Resolve the route with gateway-local or gateway-managed provider credentials.
+9. Apply missing defaults and execute the concrete model without forwarding the consumer credential upstream.
+10. Keep the original profile identity in gateway audit metadata.
 
 Headers such as `x-gateway-image-handling`, locality hints, or namespace hints cannot relax profile policy. A profile selector received from a federation peer is rejected and is never forwarded.
 

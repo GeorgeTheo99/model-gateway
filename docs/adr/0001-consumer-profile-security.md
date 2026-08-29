@@ -39,13 +39,13 @@ A profile declares both:
 - `locality`: `local_only` or `cloud_explicit`
 - `credential_policy`: `gateway_local`, `gateway_managed`, or `consumer_byok`
 
-Phase 1 executes only `local_only` + `gateway_local`. Cloud profiles may be represented by the contract, but execution fails closed until the matching credential plumbing exists.
+The gateway executes `local_only` + `gateway_local` and `cloud_explicit` + `gateway_managed`. Gateway-managed cloud execution resolves the registered canonical route with the gateway's provider credential; the inbound consumer credential is never forwarded upstream. `cloud_explicit` + `consumer_byok` remains representable but fails closed until an explicit credential-reference contract exists.
 
 Locality is derived from the authenticated principal and registered profile. Request headers and body fields cannot weaken it.
 
 For a local-only profile, the gateway validates the complete route closure: selected text/vision models, provider pools, composite dependencies, and configured model fallbacks. Every reachable provider must be local oMLX. Runtime checks remain in force after registration. Global vision fallback is disabled for profile execution; a profile must name a native vision model or an explicitly local composite.
 
-Ordinary retries may repeat an already-authorized route. A retry, pool transition, model fallback, vision route, or composite leg may not change locality or credential class. Phase 1 disables cross-model fallback for profile requests rather than allowing an unproven transition.
+Ordinary retries may repeat an already-authorized route. A retry, pool transition, model fallback, vision route, or composite leg may not change locality or credential class. Cross-model fallback remains disabled for profile requests rather than allowing an unproven transition. Same-route pool failover is permitted only when every candidate remains within the profile's validated locality and credential class.
 
 ### Versioning and degraded reads
 

@@ -286,7 +286,158 @@ def test_invalid_locality_credential_combinations_are_rejected(
     assert response.json()["error"]["code"] == "invalid_profile_manifest"
 
 
-def test_contracted_cloud_profile_is_discoverable_but_fails_closed(monkeypatch):
+def test_gateway_managed_cloud_profile_is_executable_with_gateway_credentials(monkeypatch):
+    cloud = {
+        "name": "cloud-model",
+        "provider": "cloud-test",
+        "provider_model_id": "native-cloud-id",
+        "pricing": {"input": 1.0, "output": 2.0},
+    }
+    _configure(
+        monkeypatch,
+        models=[cloud],
+        extra={"providers": {"cloud-test": {"base_url": "https://cloud.invalid/v1", "api_key": "provider-secret"}}},
+    )
+    response = _register(_manifest(
+        route="cloud-model",
+        locality="cloud_explicit",
+        credential_policy="gateway_managed",
+    ))
+    assert response.status_code == 200
+    assert response.json()["profiles"][0]["executable"] is True
+    captured = {}
+
+    async def stop_after_profile(request, body, requested_model, info, _endpoint, error_factory):
+        captured.update({
+            "model": requested_model,
+            "provider": info.provider,
+            "provider_key": info.api_key,
+            "profile_id": request.state.profile_execution.profile_id,
+        })
+        return body, requested_model, info, error_factory(418, "invalid_request_error", "captured")
+
+    monkeypatch.setattr(server, "_apply_chat_vision_fallback", stop_after_profile)
+    invocation = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={"model": "profile:ha/automatic-local", "messages": [{"role": "user", "content": "hello"}]},
+    )
+    assert invocation.status_code == 418
+    assert captured == {
+        "model": "cloud-model",
+        "provider": "cloud-test",
+        "provider_key": "provider-secret",
+        "profile_id": "ha/automatic-local",
+    }
+    assert captured["provider_key"] != TOKEN
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/v1/chat/completions", {"messages": [{"role": "user", "content": "hello"}]}),
+        ("/v1/responses", {"input": "hello"}),
+        ("/v1/messages", {"messages": [{"role": "user", "content": "hello"}]}),
+    ],
+)
+def test_gateway_managed_cloud_uses_provider_credential_for_every_protocol(monkeypatch, path, payload):
+    cloud = {
+        "name": "cloud-model",
+        "provider": "cloud-test",
+        "provider_model_id": "native-cloud-id",
+        "pricing": {"input": 1.0, "output": 2.0},
+    }
+    _configure(
+        monkeypatch,
+        models=[cloud],
+        extra={"providers": {"cloud-test": {"base_url": "https://cloud.invalid/v1", "api_key": "provider-secret"}}},
+    )
+    manifest = _manifest(
+        route="cloud-model",
+        locality="cloud_explicit",
+        credential_policy="gateway_managed",
+    )
+    assert _register(manifest).status_code == 200
+    captured = {}
+
+    async def stop_after_profile(request, body, requested_model, info, _endpoint, error_factory):
+        captured["provider_key"] = info.api_key
+        captured["profile_id"] = request.state.profile_execution.profile_id
+        return body, requested_model, info, error_factory(418, "invalid_request_error", "captured")
+
+    monkeypatch.setattr(server, "_apply_chat_vision_fallback", stop_after_profile)
+    response = client.post(path, headers=_headers(), json={"model": "profile:ha/automatic-local", **payload})
+    assert response.status_code == 418
+    assert captured == {"provider_key": "provider-secret", "profile_id": "ha/automatic-local"}
+    assert captured["provider_key"] != TOKEN
+
+
+def test_cloud_profile_rejects_local_or_mixed_provider_closure(monkeypatch):
+    mixed = {
+        "name": "mixed-model",
+        "pool": "mixed",
+        "provider_model_id": "mixed-native",
+        "pricing": {"input": 1.0, "output": 2.0},
+    }
+    _configure(
+        monkeypatch,
+        models=[mixed],
+        extra={"pools": {"mixed": ["omlx", "cloud-test"]}, "providers": {
+            "cloud-test": {"base_url": "https://cloud.invalid/v1", "api_key": "secret"},
+        }},
+    )
+    local = _register(_manifest(
+        locality="cloud_explicit",
+        credential_policy="gateway_managed",
+    ))
+    assert local.status_code == 422
+    assert local.json()["error"]["code"] == "invalid_profile_route"
+
+    mixed_response = _register(_manifest(
+        route="mixed-model",
+        locality="cloud_explicit",
+        credential_policy="gateway_managed",
+    ))
+    assert mixed_response.status_code == 422
+    assert mixed_response.json()["error"]["code"] == "invalid_profile_route"
+
+
+def test_profile_defaults_must_fit_every_route(monkeypatch):
+    cloud = {
+        "name": "cloud-model",
+        "provider": "cloud-test",
+        "provider_model_id": "native-cloud-id",
+        "max_output_tokens": 64,
+        "thinking": "always",
+        "thinking_levels": ["low", "high"],
+        "pricing": {"input": 1.0, "output": 2.0},
+    }
+    _configure(
+        monkeypatch,
+        models=[cloud],
+        extra={"providers": {"cloud-test": {"base_url": "https://cloud.invalid/v1", "api_key": "secret"}}},
+    )
+    manifest = _manifest(
+        route="cloud-model",
+        locality="cloud_explicit",
+        credential_policy="gateway_managed",
+    )
+    manifest["profiles"][0]["defaults"]["reasoning_effort"] = "off"
+    assert _register(manifest).status_code == 422
+
+    manifest["profiles"][0]["defaults"] = {"max_output_tokens": 65, "reasoning_effort": "high"}
+    assert _register(manifest).status_code == 422
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/v1/chat/completions", {"messages": [{"role": "user", "content": "hello"}]}),
+        ("/v1/responses", {"input": "hello"}),
+        ("/v1/messages", {"messages": [{"role": "user", "content": "hello"}]}),
+    ],
+)
+def test_contracted_cloud_profile_is_discoverable_but_fails_closed(monkeypatch, path, payload):
     cloud = {
         "name": "cloud-model",
         "provider": "cloud-test",
@@ -302,9 +453,9 @@ def test_contracted_cloud_profile_is_discoverable_but_fails_closed(monkeypatch):
     assert response.status_code == 200
     assert response.json()["profiles"][0]["executable"] is False
     invocation = client.post(
-        "/v1/chat/completions",
+        path,
         headers=_headers(),
-        json={"model": "profile:ha/automatic-local", "messages": [{"role": "user", "content": "hello"}]},
+        json={"model": "profile:ha/automatic-local", **payload},
     )
     assert invocation.status_code == 403
     assert invocation.json()["error"]["type"] == "invalid_request_error"
@@ -488,6 +639,43 @@ def test_profile_selector_from_federation_is_rejected_before_resolution(monkeypa
         request, "/v1/chat/completions", body, protocol="openai_chat", has_image=False
     )
     assert response.status_code == 403
+
+
+def test_secondary_pool_endpoint_drift_invalidates_profile_binding(monkeypatch):
+    pooled = {
+        "name": "pooled-cloud",
+        "pool": "cloud-pool",
+        "provider_model_id": "pooled-native",
+        "pricing": {"input": 1.0, "output": 2.0},
+    }
+    config = _configure(
+        monkeypatch,
+        models=[pooled],
+        extra={
+            "providers": {
+                "cloud-a": {"base_url": "https://a.invalid/v1", "api_key": "a-secret"},
+                "cloud-b": {"base_url": "https://b.invalid/v1", "api_key": "b-secret"},
+            },
+            "pools": {"cloud-pool": ["cloud-a", "cloud-b"]},
+        },
+    )
+    manifest = _manifest(
+        route="pooled-cloud",
+        locality="cloud_explicit",
+        credential_policy="gateway_managed",
+    )
+    registered = _register(manifest)
+    assert registered.status_code == 200
+
+    config["providers"]["cloud-b"]["base_url"] = "https://b-new.invalid/v1"
+    providers._models = None
+    drifted = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={"model": "profile:ha/automatic-local", "messages": []},
+    )
+    assert drifted.status_code == 409
+    assert drifted.json()["error"]["code"] == "profile_binding_changed"
 
 
 def test_identical_manifest_reregistration_repairs_binding_drift(monkeypatch):

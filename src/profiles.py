@@ -207,8 +207,13 @@ def _inventory_by_name() -> dict[str, dict]:
     }
 
 
-def _effective_endpoint_binding(model: str, *, local_only: bool) -> dict:
-    info = providers.resolve(model)
+def _effective_endpoint_binding(
+    model: str,
+    *,
+    locality: str,
+    provider_override: str | None = None,
+) -> dict:
+    info = providers.resolve(model, provider_override=provider_override)
     if info is None:
         raise ProfileError(422, "invalid_profile_route", f"Route target '{model}' is unavailable")
     parsed = urlsplit(info.base_url)
@@ -219,7 +224,7 @@ def _effective_endpoint_binding(model: str, *, local_only: bool) -> dict:
             is_loopback = ipaddress.ip_address(hostname).is_loopback
         except ValueError:
             is_loopback = False
-    if local_only and (
+    if locality == "local_only" and (
         catalog.canonical_provider(info.provider) != "omlx"
         or parsed.scheme not in {"http", "https"}
         or not is_loopback
@@ -259,7 +264,7 @@ def _fallback_target(entry: dict, inventory: dict[str, dict]) -> str | None:
     return matches[0]
 
 
-def _route_closure(model: str, *, local_only: bool, inventory: dict[str, dict], stack: tuple[str, ...] = ()) -> dict:
+def _route_closure(model: str, *, locality: str, inventory: dict[str, dict], stack: tuple[str, ...] = ()) -> dict:
     entry = inventory.get(model)
     if entry is None:
         raise ProfileError(422, "invalid_profile_route", f"Route target '{model}' is not a canonical gateway model")
@@ -268,13 +273,27 @@ def _route_closure(model: str, *, local_only: bool, inventory: dict[str, dict], 
     providers_declared = sorted({catalog.canonical_provider(p) for p in entry.get("declared_providers") or []})
     if not providers_declared:
         providers_declared = [catalog.canonical_provider(entry.get("provider"))]
-    if local_only and set(providers_declared) != {"omlx"}:
+    if locality == "local_only" and set(providers_declared) != {"omlx"}:
         raise ProfileError(422, "invalid_profile_route", f"Local-only route '{model}' can reach a non-local provider")
+    if locality == "cloud_explicit" and "omlx" in providers_declared:
+        raise ProfileError(422, "invalid_profile_route", f"Cloud-explicit route '{model}' can reach a local provider")
+
+    configured_candidates = providers.pool_candidates(model)
+    endpoint_bindings = [
+        _effective_endpoint_binding(
+            model,
+            locality=locality,
+            provider_override=provider,
+        )
+        for provider in configured_candidates
+    ]
+    if not endpoint_bindings:
+        endpoint_bindings = [_effective_endpoint_binding(model, locality=locality)]
 
     result: dict[str, Any] = {
         "model": model,
         "providers": providers_declared,
-        "endpoint": _effective_endpoint_binding(model, local_only=local_only),
+        "endpoints": endpoint_bindings,
         "provider_model_id": entry.get("provider_model_id") or entry.get("omlx_id") or entry.get("name"),
         "vision": bool(entry.get("vision")),
     }
@@ -289,19 +308,64 @@ def _route_closure(model: str, *, local_only: bool, inventory: dict[str, dict], 
         result["composite"] = {
             "image_handling": composite.get("image_handling", "extract_then_answer"),
             "max_images": composite.get("max_images", 4),
-            "text": _route_closure(text_model, local_only=local_only, inventory=inventory, stack=(*stack, model)),
-            "vision": _route_closure(vision_model, local_only=local_only, inventory=inventory, stack=(*stack, model)),
+            "text": _route_closure(text_model, locality=locality, inventory=inventory, stack=(*stack, model)),
+            "vision": _route_closure(vision_model, locality=locality, inventory=inventory, stack=(*stack, model)),
         }
     fallback = _fallback_target(entry, inventory)
     if fallback:
-        result["fallback"] = _route_closure(fallback, local_only=local_only, inventory=inventory, stack=(*stack, model))
+        result["fallback"] = _route_closure(fallback, locality=locality, inventory=inventory, stack=(*stack, model))
     return result
 
 
+def _profile_is_executable(profile: dict) -> bool:
+    return (
+        profile["locality"] == "local_only"
+        and profile["credential_policy"] == "gateway_local"
+    ) or (
+        profile["locality"] == "cloud_explicit"
+        and profile["credential_policy"] == "gateway_managed"
+    )
+
+
+def _validate_defaults_for_routes(profile: dict, inventory: dict[str, dict]) -> None:
+    defaults = profile.get("defaults") or {}
+    reasoning_effort = defaults.get("reasoning_effort")
+    max_output_tokens = defaults.get("max_output_tokens")
+    for model in set(profile["routes"].values()):
+        entry = inventory[model]
+        if reasoning_effort is not None:
+            try:
+                levels = catalog.normalized_thinking_levels(entry)
+            except ValueError as exc:
+                raise ProfileError(422, "invalid_profile_route", f"Route target '{model}' has invalid thinking capabilities") from exc
+            if reasoning_effort == "off":
+                supported = not levels or "off" in levels
+            else:
+                supported = reasoning_effort in levels
+            if not supported:
+                raise ProfileError(
+                    422,
+                    "invalid_profile_manifest",
+                    f"reasoning_effort default is not supported by route '{model}'",
+                )
+        route_limit = entry.get("max_output_tokens")
+        if (
+            max_output_tokens is not None
+            and isinstance(route_limit, int)
+            and not isinstance(route_limit, bool)
+            and route_limit > 0
+            and max_output_tokens > route_limit
+        ):
+            raise ProfileError(
+                422,
+                "invalid_profile_manifest",
+                f"max_output_tokens default exceeds route '{model}' limit",
+            )
+
+
 def _binding_for(profile: dict, inventory: dict[str, dict]) -> str:
-    local_only = profile["locality"] == "local_only"
     closure = {
-        role: _route_closure(model, local_only=local_only, inventory=inventory)
+        role: _route_closure(model, locality=profile["locality"], inventory=inventory)
         for role, model in sorted(profile["routes"].items())
     }
     vision_model = profile["routes"].get("vision")
@@ -309,6 +373,7 @@ def _binding_for(profile: dict, inventory: dict[str, dict]) -> str:
         vision_entry = inventory[vision_model]
         if not vision_entry.get("vision") and not isinstance(vision_entry.get("composite"), dict):
             raise ProfileError(422, "invalid_profile_route", f"Vision route '{vision_model}' is not vision-capable")
+    _validate_defaults_for_routes(profile, inventory)
     return hashlib.sha256(_canonical_bytes(closure)).hexdigest()
 
 
@@ -427,10 +492,7 @@ def _public_snapshot(record: dict) -> dict:
             "id": stored["id"],
             "locality": stored["locality"],
             "credential_policy": stored["credential_policy"],
-            "executable": (
-                stored["locality"] == "local_only"
-                and stored["credential_policy"] == "gateway_local"
-            ),
+            "executable": _profile_is_executable(stored),
             "protocols": copy.deepcopy(stored["protocols"]),
             "routes": copy.deepcopy(stored["routes"]),
             "defaults": copy.deepcopy(stored.get("defaults") or {}),
@@ -549,10 +611,7 @@ def resolve_execution(selector: object, *, protocol: str, has_image: bool) -> Ex
             raise ProfileError(404, "profile_not_found", "Profile not found")
         if protocol not in profile["protocols"]:
             raise ProfileError(403, "profile_protocol_denied", "Profile is not enabled for this protocol")
-        if not (
-            profile["locality"] == "local_only"
-            and profile["credential_policy"] == "gateway_local"
-        ):
+        if not _profile_is_executable(profile):
             raise ProfileError(403, "profile_execution_unavailable", "Profile execution is unavailable for this policy")
         role = "vision" if has_image else "text"
         model = profile["routes"].get(role)
