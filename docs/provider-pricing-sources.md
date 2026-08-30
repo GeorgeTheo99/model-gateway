@@ -49,7 +49,6 @@ useful only as a cross-check, never as the source of record.
 | `fireworks` | https://docs.fireworks.ai/serverless/pricing | HTML table (per-model: input / cached input / output) | cached input (read only) |
 | `openrouter` | https://openrouter.ai/api/v1/models | **JSON API** (machine-readable) | `prompt_cache_read` / `prompt_cache_write` (often null) |
 | `moonshot` | https://platform.kimi.ai/docs/pricing/chat-k3 | HTML table | cached input (read only) |
-| `zai_coding` | https://docs.z.ai/guides/overview/pricing | HTML | none reported |
 | `zhipuai` | https://open.bigmodel.cn/pricing | HTML (Chinese site) | none reported |
 
 ### Parsing notes per provider
@@ -67,13 +66,13 @@ input typical) but no cache-write field. Map: input→input, output→output,
 Cached input→cache_read. Omit cache_write. Same OpenAI-shape cost-model caveat
 as Fireworks applies (see above).
 
-**Fireworks** (verified 2026-08-01): the serverless pricing docs page
-(https://docs.fireworks.ai/serverless/pricing) lists each headline model with
-three per-1M-token figures: **input / cached input / output**. Kimi K3 Standard
-is `$3.00 / $0.30 / $15.00`. The `https://fireworks.ai/pricing` marketing page
-defers to the docs page for actual rates — use the docs page. Map: input→input,
-"cached input"→cache_read, output→output. Omit cache_write (Fireworks reports
-cache reads only; the gateway receives `prompt_tokens_details.cached_tokens`).
+**Fireworks** (verified 2026-08-30): each model page lists three
+per-1M-token figures: **input / cached input / output**. Current GLM rates are
+`$1.40 / $0.26 / $4.40` for GLM-5.3 and `$0.15 / $0.029 / $0.50` for
+GLM-5.3 Flash. The `https://fireworks.ai/pricing` marketing page defers to the
+model pages/docs for actual rates. Map: input→input, "cached input"→cache_read,
+output→output. Omit cache_write (Fireworks reports cache reads only; the
+gateway receives `prompt_tokens_details.cached_tokens`).
 
 ⚠️ **Cost-model caveat (OpenAI-shape providers: Fireworks, OpenAI, OpenRouter):**
 `prompt_tokens` *includes* cached tokens, while Anthropic's `input_tokens`
@@ -106,18 +105,6 @@ above) when `prompt_cache_read` is non-null.
 these to `input`, `cache_read`, and `output` respectively. Automatic context
 caching is included; no separate cache-write token class is reported.
 
-**Z.ai (`zai_coding`)**: the Z.ai docs pricing page lists GLM models with
-input/output per 1M tokens. No cache fields. Match by `provider_model_id`
-(e.g. `glm-5.2`). Note: the `zai_coding` provider points at
-`api.z.ai/api/coding/paas/v4` (the coding tier) — confirm the price is for the
-**coding** endpoint, which sometimes differs from the standard Z.ai API tier.
-GLM-5.3's Coding Plan publishes credit multipliers rather than USD/Mtok prices,
-so `glm-5.3-zai` intentionally omits `pricing` until a directly comparable
-price is published. Its current compatibility route retains upstream ID
-`glm-5.2`, which Z.ai documents as automatically routed to GLM-5.3.
-GLM-5.3-Flash likewise omits USD pricing for the Coding Plan; Z.ai documents it
-in quota/points terms (with 3× the available quota compared with GLM-5.3).
-
 **ZhipuAI (`zhipuai`)**: the BigModel pricing page
 (https://open.bigmodel.cn/pricing) lists GLM models in CNY per 1M tokens.
 Convert CNY→USD at the current rate and note the conversion date in the commit
@@ -137,7 +124,8 @@ Use this to know which source to read for each model. Regenerate with:
 | gpt-5.4 | openai | gpt-5.4 | openai |
 | gpt-5.4-mini | openai | gpt-5.4-mini | openai |
 | deepseek-v4-pro-fw | fireworks | accounts/fireworks/models/deepseek-v4-pro | fireworks |
-| glm-5.2-fw | fireworks | accounts/fireworks/models/glm-5p2 | fireworks |
+| glm-5.3-fw | fireworks | accounts/fireworks/models/glm-5p3 | fireworks |
+| glm-5.3-flash-fw | fireworks | accounts/fireworks/models/glm-5p3-flash | fireworks |
 | kimi-k3 | fireworks | accounts/fireworks/models/kimi-k3 | fireworks |
 | minimax-m3-fw | fireworks | accounts/fireworks/models/minimax-m3 | fireworks |
 | qwen3.8-max-fw | fireworks | accounts/fireworks/models/qwen3p8-max | fireworks |
@@ -145,6 +133,4 @@ Use this to know which source to read for each model. Regenerate with:
 | gemini-3.1-pro | openrouter | google/gemini-3.1-pro-preview | openrouter API |
 | gemini-3-flash | openrouter | google/gemini-3-flash-preview | openrouter API |
 | gemini-3.5-flash | openrouter | google/gemini-3.5-flash | openrouter API |
-| glm-5.3-zai | zai_coding | glm-5.2 (documented GLM-5.3 compatibility route) | z.ai Coding Plan |
-| glm-5.3-flash-zai | zai_coding | glm-5.3-flash | z.ai Coding Plan |
 | glm-5-zai-turbo | zhipuai | glm-5-turbo | zhipuai (CNY→USD) |

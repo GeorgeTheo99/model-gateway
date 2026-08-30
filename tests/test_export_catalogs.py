@@ -191,25 +191,25 @@ def test_relative_api_key_file_uses_selected_config_target(tmp_path):
 
 def test_overlay_merge_used_by_generator(tmp_path):
     mi = tmp_path / "model-info.json"
-    _write_model_info(mi, [{"name": "glm-5.2", "alias": "glm52zai", "provider": "zai", "provider_model_id": "glm-5.2-zai", "context": 1000}])
+    _write_model_info(mi, [{"name": "model-v1", "alias": "model-old", "provider": "zai", "provider_model_id": "upstream-old", "context": 1000}])
     cfg = tmp_path / "config.yaml"
     cfg.write_text(
         "models:\n"
-        "  - name: glm-5.2\n"
-        "    alias: glm52fw\n"
+        "  - name: model-v1\n"
+        "    alias: model-new\n"
         "    provider: fireworks\n"
-        "    provider_model_id: accounts/fireworks/models/glm-5p2\n"
+        "    provider_model_id: upstream-new\n"
         "    context: 2000\n"
         f"exports:\n  model_aliases: {tmp_path}/aliases.json\n"
     )
     r = _run(cfg, mi)
     assert r.returncode == 0, r.stderr
     aliases = json.loads((tmp_path / "aliases.json").read_text())
-    # Overlay wins: the cloud key is now the fireworks provider_model_id.
-    assert "cloud:accounts/fireworks/models/glm-5p2" in aliases
-    assert "cloud:glm-5.2-zai" not in aliases  # catalog entry fully evicted
-    assert aliases["cloud:accounts/fireworks/models/glm-5p2"]["alias"] == "glm52fw"
-    assert aliases["cloud:accounts/fireworks/models/glm-5p2"]["context"] == 2000
+    # Overlay wins: the cloud key is now the replacement provider_model_id.
+    assert "cloud:upstream-new" in aliases
+    assert "cloud:upstream-old" not in aliases  # catalog entry fully evicted
+    assert aliases["cloud:upstream-new"]["alias"] == "model-new"
+    assert aliases["cloud:upstream-new"]["context"] == 2000
 
 
 def test_pooled_model_exported_with_effective_provider(tmp_path):

@@ -44,17 +44,17 @@ def test_reload_verification_allows_retired_name_retained_as_compatibility_id(mo
     )
     profile = {
         "models": [{
-            "name": "glm-5.3-zai",
-            "provider": "zai_coding",
-            "provider_model_id": "glm-5.2",
-            "alternate_ids": ["glm-5.3", "glm-5.2-zai"],
+            "name": "replacement-model",
+            "provider": "test-provider",
+            "provider_model_id": "upstream-v2",
+            "alternate_ids": ["stable-model", "retired-model"],
         }],
-        "retire": {"models": ["glm-5.2-zai"]},
+        "retire": {"models": ["retired-model"]},
     }
 
     CLI._reloaders(args, profile)
 
-    assert calls[0]["expected_models"] == {"glm-5.3-zai"}
+    assert calls[0]["expected_models"] == {"replacement-model"}
     assert calls[0]["absent_models"] == set()
 
 

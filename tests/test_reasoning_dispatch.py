@@ -176,9 +176,9 @@ def test_dispatch_per_format(fmt, target_api, fragment, exp_enabled, exp_view):
 def test_fireworks_always_model_advertises_minimal_but_forwards_low(client, monkeypatch):
     """Fireworks keeps the canonical minimal level public but receives low."""
     entry = {
-        "name": "glm-5.2-fw",
+        "name": "glm-5.3-fw",
         "provider": "fireworks",
-        "provider_model_id": "accounts/fireworks/models/glm-5p2",
+        "provider_model_id": "accounts/fireworks/models/glm-5p3",
         "thinking": "always",
     }
     monkeypatch.setattr(providers, "_config", {
@@ -214,7 +214,7 @@ def test_fireworks_default_format_preserves_other_effort_mappings(effort, expect
         "",
         {"messages": [], "reasoning_effort": effort},
         provider="fireworks",
-        provider_model_id="accounts/fireworks/models/glm-5p2",
+        provider_model_id="accounts/fireworks/models/glm-5p3",
     )
     assert view["reasoning_effort"] == expected
 
@@ -2098,12 +2098,12 @@ def test_debug_thinking_endpoint_matrix(client):
 def test_glm53_profile_observability_matches_actual_dispatch(client, monkeypatch):
     from src.onboarding import load_profile
 
-    profile_path = Path(__file__).resolve().parents[1] / "config" / "onboarding" / "zai-glm-5.3.yaml"
+    profile_path = Path(__file__).resolve().parents[1] / "config" / "onboarding" / "fireworks-glm-5.3.yaml"
     entry = load_profile(profile_path)["models"][0]
     monkeypatch.setattr(providers, "_config", {
         "providers": {
-            "zai_coding": {
-                "base_url": "https://api.z.ai/api/coding/paas/v4",
+            "fireworks": {
+                "base_url": "https://api.fireworks.ai/inference/v1",
                 "api_key": "test-key",
             },
         },
@@ -2118,33 +2118,34 @@ def test_glm53_profile_observability_matches_actual_dispatch(client, monkeypatch
     assert models_response.status_code == 200
     advertised = next(
         row for row in models_response.json()["data"]
-        if row["id"] == "glm-5.3-zai"
+        if row["id"] == "glm-5.3-fw"
     )
-    assert advertised["default_enabled_level"] == "max"
-    assert advertised["forwarded_params"] == ["reasoning_effort", "thinking"]
+    assert advertised["default_enabled_level"] == "high"
+    assert advertised["forwarded_params"] == ["reasoning_effort"]
     assert advertised["max_reachable"] is True
 
     debug_response = client.get("/v1/debug/thinking")
     assert debug_response.status_code == 200
     debug = next(
         row for row in debug_response.json()["models"]
-        if row["name"] == "glm-5.3-zai"
+        if row["name"] == "glm-5.3-fw"
     )
-    assert debug["default_enabled_level"] == "max"
-    assert debug["forwarded_params"] == ["reasoning_effort", "thinking"]
+    assert debug["default_enabled_level"] == "high"
+    assert debug["forwarded_params"] == ["reasoning_effort"]
     assert debug["max_reachable"] is True
 
     async def fake_passthrough(endpoint, body, headers, **kwargs):
-        assert endpoint == "https://api.z.ai/api/coding/paas/v4/chat/completions"
-        assert body["model"] == "glm-5.2"
-        assert body["thinking"] == {"type": "enabled"}
-        assert body["reasoning_effort"] == "max"
+        assert endpoint == "https://api.fireworks.ai/inference/v1/chat/completions"
+        assert body["model"] == "accounts/fireworks/models/glm-5p3"
+        assert "thinking" not in body
+        assert body["reasoning_effort"] == "low"
         return server_module.JSONResponse(status_code=200, content={"ok": True})
 
     monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough)
     routed = client.post("/v1/chat/completions", json={
         "model": "glm-5.3",
         "messages": [{"role": "user", "content": "hello"}],
+        "reasoning_effort": "minimal",
     })
     assert routed.status_code == 200
     assert routed.json() == {"ok": True}
@@ -2152,14 +2153,12 @@ def test_glm53_profile_observability_matches_actual_dispatch(client, monkeypatch
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
 def test_debug_thinking_zai_max_reachable(client, monkeypatch):
-    """The zai branch now forwards reasoning_effort, so glm-5.2-zai is
-    max-reachable in the debug matrix: forwarded_params includes
-    reasoning_effort alongside enable_thinking."""
+    """The generic Z.ai branch forwards reasoning effort alongside thinking."""
     monkeypatch.setattr(providers, "_models", {
-        "glm-5.2-zai": {
-            "name": "glm-5.2-zai",
+        "zai-always-test": {
+            "name": "zai-always-test",
             "provider": "zai_coding",
-            "provider_model_id": "glm-5.2",
+            "provider_model_id": "zai-upstream-test",
             "thinking": "always",
             "thinking_format": "zai",
         },
@@ -2167,8 +2166,8 @@ def test_debug_thinking_zai_max_reachable(client, monkeypatch):
     resp = client.get("/v1/debug/thinking")
     assert resp.status_code == 200
     rows = {r["name"]: r for r in resp.json()["models"]}
-    assert "glm-5.2-zai" in rows, "glm-5.2-zai missing from debug matrix"
-    zai = rows["glm-5.2-zai"]
+    assert "zai-always-test" in rows
+    zai = rows["zai-always-test"]
     assert zai["thinking_format"] == "zai"
     assert zai["forwarded_params"] == ["enable_thinking", "reasoning_effort"]
     assert zai["max_reachable"] is True

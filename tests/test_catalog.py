@@ -78,16 +78,16 @@ def test_base_catalog_rejects_duplicate_routable_ids(tmp_path):
 
 def test_merge_overlay_wins_on_name_clash(tmp_path):
     mi = tmp_path / "model-info.json"
-    _write_model_info(mi, [{"name": "glm-5.2", "alias": "glm52", "provider": "zai", "context": 1000}])
+    _write_model_info(mi, [{"name": "model-v1", "alias": "model-old", "provider": "zai", "context": 1000}])
     cfg = tmp_path / "config.yaml"
     cfg.write_text(
-        "models:\n  - name: glm-5.2\n    alias: glm52fw\n    provider: fireworks\n    context: 2000\n"
+        "models:\n  - name: model-v1\n    alias: model-new\n    provider: fireworks\n    context: 2000\n"
     )
     entries = catalog.load_catalog_entries(mi, cfg)
     # Overlay wins: single entry, overlay fields.
     assert len(entries) == 1
-    assert entries[0]["name"] == "glm-5.2"
-    assert entries[0]["alias"] == "glm52fw"
+    assert entries[0]["name"] == "model-v1"
+    assert entries[0]["alias"] == "model-new"
     assert entries[0]["provider"] == "fireworks"
     assert entries[0]["context"] == 2000
 
@@ -120,18 +120,18 @@ def test_merge_overlay_evicts_all_ids_of_replaced_entry(tmp_path):
     mi = tmp_path / "model-info.json"
     _write_model_info(
         mi,
-        [{"name": "glm-5.2", "alias": "glm52", "provider_model_id": "glm-5.2-zai", "provider": "zai"}],
+        [{"name": "model-v1", "alias": "model-old", "provider_model_id": "upstream-old", "provider": "zai"}],
     )
     cfg = tmp_path / "config.yaml"
     # Overlay claims only the name; the catalog entry's alias/provider_model_id
     # must be evicted so the old alias doesn't linger pointing at the old entry.
-    cfg.write_text("models:\n  - name: glm-5.2\n    alias: glm52fw\n    provider: fireworks\n")
+    cfg.write_text("models:\n  - name: model-v1\n    alias: model-new\n    provider: fireworks\n")
     entries = catalog.load_catalog_entries(mi, cfg)
     assert len(entries) == 1
-    assert entries[0]["alias"] == "glm52fw"
+    assert entries[0]["alias"] == "model-new"
     # The old alias must not produce a second entry.
     names = [e["name"] for e in entries]
-    assert names == ["glm-5.2"]
+    assert names == ["model-v1"]
 
 
 def test_overlay_same_name_inherits_when_other_ids_collide(tmp_path):
@@ -328,73 +328,45 @@ def test_committed_kimi_moonshot_rollback_has_no_stale_retirement():
     assert profile.get("retire", {}).get("models", []) == []
 
 
-def test_committed_zai_glm53_profile_uses_documented_compatibility_route():
+def test_committed_fireworks_glm53_profile_uses_exact_serverless_routes():
     from src.onboarding import load_profile
 
-    path = Path(__file__).resolve().parents[1] / "config" / "onboarding" / "zai-glm-5.3.yaml"
+    path = Path(__file__).resolve().parents[1] / "config" / "onboarding" / "fireworks-glm-5.3.yaml"
     profile = load_profile(path)
-    glm = profile["models"][0]
-    assert glm["name"] == "glm-5.3-zai"
-    assert glm["provider"] == "zai_coding"
-    assert glm["provider_model_id"] == "glm-5.2"
-    assert glm["alias"] == "glm53zai"
-    assert glm["alternate_ids"] == ["glm-5.3", "glm-5.2-zai", "glm52zai"]
-    assert glm["context"] == 1_000_000
-    assert glm["max_output_tokens"] == 131_072
-    assert glm["thinking"] == "always"
-    assert glm["thinking_levels"] == ["minimal", "low", "medium", "high", "xhigh", "max"]
-    assert glm["thinking_format"] == "zai"
-    assert glm["vision"] is False
-    assert glm["quirks"] == ["zai_glm53_thinking"]
-    assert glm["pi"] == {
-        "id": "glm-5.3",
-        "aliases": ["glm52zai"],
-        "thinkingLevelMap": {
-            "off": "low",
-            "minimal": "minimal",
-            "low": "low",
-            "medium": "medium",
-            "high": "high",
-            "xhigh": "xhigh",
-            "max": "max",
-        },
-    }
-    assert "pricing" not in glm
-    assert profile["retire"]["models"] == ["glm-5.2-zai"]
+    models = {model["name"]: model for model in profile["models"]}
 
+    full = models["glm-5.3-fw"]
+    assert full["provider"] == "fireworks"
+    assert full["provider_model_id"] == "accounts/fireworks/models/glm-5p3"
+    assert full["alias"] == "glm53fw"
+    assert full["alternate_ids"] == ["glm-5.3"]
+    assert full["context"] == 1_048_576
+    assert full["max_output_tokens"] == 131_072
+    assert full["thinking"] == "always"
+    assert full["thinking_levels"] == ["minimal", "low", "medium", "high", "xhigh", "max"]
+    assert full["thinking_format"] == "openai"
+    assert full["vision"] is False
+    assert full["pricing"] == {"input": 1.4, "output": 4.4, "cache_read": 0.26}
 
-def test_committed_zai_glm53_flash_profile_uses_exact_multimodal_route():
-    from src.onboarding import load_profile
+    flash = models["glm-5.3-flash-fw"]
+    assert flash["provider"] == "fireworks"
+    assert flash["provider_model_id"] == "accounts/fireworks/models/glm-5p3-flash"
+    assert flash["alias"] == "glm53flashfw"
+    assert flash["alternate_ids"] == ["glm-5.3-flash"]
+    assert flash["context"] == 1_048_576
+    assert flash["max_output_tokens"] == 131_072
+    assert flash["thinking"] == "always"
+    assert flash["thinking_levels"] == ["minimal", "low", "medium", "high", "xhigh", "max"]
+    assert flash["thinking_format"] == "openai"
+    assert flash["vision"] is True
+    assert flash["pricing"] == {"input": 0.15, "output": 0.5, "cache_read": 0.029}
+    assert flash["pi"] == {"aliases": ["glm53flash"]}
 
-    path = Path(__file__).resolve().parents[1] / "config" / "onboarding" / "zai-glm-5.3-flash.yaml"
-    profile = load_profile(path)
-    glm = profile["models"][0]
-    assert glm["name"] == "glm-5.3-flash-zai"
-    assert glm["provider"] == "zai_coding"
-    assert glm["provider_model_id"] == "glm-5.3-flash"
-    assert glm["alias"] == "glm53flash"
-    assert glm["alternate_ids"] == ["glm-5.3-flash"]
-    assert glm["context"] == 1_000_000
-    assert glm["max_output_tokens"] == 131_072
-    assert glm["thinking"] == "always"
-    assert glm["thinking_levels"] == ["minimal", "low", "medium", "high", "xhigh", "max"]
-    assert glm["thinking_format"] == "zai"
-    assert glm["vision"] is True
-    assert glm["quirks"] == ["zai_glm53_thinking"]
-    assert glm["pi"] == {
-        "id": "glm-5.3-flash",
-        "thinkingLevelMap": {
-            "off": "low",
-            "minimal": "minimal",
-            "low": "low",
-            "medium": "medium",
-            "high": "high",
-            "xhigh": "xhigh",
-            "max": "max",
-        },
-    }
-    assert "pricing" not in glm
-    assert profile.get("retire", {}).get("models", []) == []
+    assert profile["retire"]["models"] == [
+        "glm-5.2-fw",
+        "glm-5.3-zai",
+        "glm-5.3-flash-zai",
+    ]
 
 
 def test_fable_5_explicit_levels_exclude_unsupported_values(tmp_path):

@@ -1,0 +1,56 @@
+schema_version: 1
+id: fireworks-glm-5.3
+
+provider:
+  id: fireworks
+  base_url: https://api.fireworks.ai/inference/v1
+  protocol: openai
+  secret_name: fireworks.api-key
+
+models:
+  - name: glm-5.3-fw
+    params: 743B
+    provider: fireworks
+    provider_model_id: accounts/fireworks/models/glm-5p3
+    alias: glm53fw
+    alternate_ids:
+      - glm-5.3
+    context: 1048576
+    max_output_tokens: 131072
+    thinking: always
+    thinking_levels: [minimal, low, medium, high, xhigh, max]
+    thinking_format: openai
+    vision: false
+    pricing:
+      input: 1.4
+      output: 4.4
+      cache_read: 0.26
+    desc: GLM 5.3 743B MoE on Fireworks, text and tools, 1M context / 128K max output
+
+  - name: glm-5.3-flash-fw
+    params: 320B
+    active: 18B
+    provider: fireworks
+    provider_model_id: accounts/fireworks/models/glm-5p3-flash
+    alias: glm53flashfw
+    alternate_ids:
+      - glm-5.3-flash
+    context: 1048576
+    max_output_tokens: 131072
+    thinking: always
+    thinking_levels: [minimal, low, medium, high, xhigh, max]
+    thinking_format: openai
+    vision: true
+    pricing:
+      input: 0.15
+      output: 0.5
+      cache_read: 0.029
+    pi:
+      aliases: [glm53flash]
+    desc: GLM 5.3 Flash 320B/18B-active multimodal model on Fireworks, 1M context / 128K max output
+
+retire:
+  models:
+    - glm-5.2-fw
+    - glm-5.3-zai
+    - glm-5.3-flash-zai

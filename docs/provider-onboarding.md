@@ -224,55 +224,37 @@ pi-catalog --aliases ~/srv/model-gateway/shared/model-aliases.json \
   --pi-agent-dir ~/.pi-omlx/agent --ls99-extras
 ```
 
-### Z.ai GLM-5.3 Coding Plan cutover
+### Fireworks GLM-5.3 cloud cutover
 
-The committed `zai-glm-5.3.yaml` profile exposes logical/Pi model `glm-5.3`
-while retaining upstream ID `glm-5.2`. This is intentional: Z.ai documents
-that Coding Plan requests for GLM-5.2/5.1 are automatically routed to GLM-5.3,
-while the exact `glm-5.3` ID may remain unavailable to an account during
-rollout. The profile retains the old gateway IDs and `pi-glm52zai` launcher as
-compatibility aliases.
+The committed `fireworks-glm-5.3.yaml` profile installs both exact Fireworks
+routes:
 
-Deploy both code prerequisites before changing the live machine catalog:
+- `glm-5.3-fw` → `accounts/fireworks/models/glm-5p3` (text/tools)
+- `glm-5.3-flash-fw` → `accounts/fireworks/models/glm-5p3-flash`
+  (native multimodal/tools)
 
-1. Deploy `pi-shared` with `pi.aliases` launcher support.
-2. Deploy model-gateway with `zai_glm53_thinking` request normalization.
-3. Apply the profile with explicit retirement confirmation.
-4. Regenerate aliases/Pi artifacts, then smoke-test both new and legacy IDs.
+Both models are always-thinking with a 1,048,576-token context. The profile
+retires the former Fireworks GLM-5.2 route and both Z.ai Coding Plan GLM-5.3
+routes. `pi-glm53flash` remains as a provider-neutral compatibility launcher
+for the new Fireworks Flash route; provider-specific retired launchers do not.
+Local GLM-5.2 and GLM-5.3 Flash entries are intentionally untouched.
 
 ```bash
-model-gateway onboard config/onboarding/zai-glm-5.3.yaml --dry-run
-model-gateway onboard config/onboarding/zai-glm-5.3.yaml \
-  --non-interactive --yes --confirm-retire glm-5.2-zai
+model-gateway onboard config/onboarding/fireworks-glm-5.3.yaml --dry-run
+model-gateway onboard config/onboarding/fireworks-glm-5.3.yaml \
+  --non-interactive --yes \
+  --confirm-retire glm-5.2-fw \
+  --confirm-retire glm-5.3-zai \
+  --confirm-retire glm-5.3-flash-zai
 pi-catalog --aliases ~/srv/model-gateway/shared/model-aliases.json \
   --models-out ~/.pi-omlx/agent/models.json \
   --launchers-out ~/.pi/generated/pi-launchers.zsh \
   --pi-agent-dir ~/.pi-omlx/agent --ls99-extras
 ```
 
-Do not switch `provider_model_id` to exact `glm-5.3` until an authenticated
-text probe succeeds for the target Coding Plan account.
-
-### Z.ai GLM-5.3-Flash Coding Plan
-
-The committed `zai-glm-5.3-flash.yaml` profile adds the exact upstream
-`glm-5.3-flash` model as gateway/Pi ID `glm-5.3-flash`, with launcher alias
-`pi-glm53flash`. It is native multimodal, always-thinking, and uses the same
-Coding Plan reasoning normalization as GLM-5.3.
-
-```bash
-model-gateway onboard config/onboarding/zai-glm-5.3-flash.yaml --dry-run
-model-gateway onboard config/onboarding/zai-glm-5.3-flash.yaml \
-  --non-interactive --yes
-pi-catalog --aliases ~/srv/model-gateway/shared/model-aliases.json \
-  --models-out ~/.pi-omlx/agent/models.json \
-  --launchers-out ~/.pi/generated/pi-launchers.zsh \
-  --pi-agent-dir ~/.pi-omlx/agent --ls99-extras
-```
-
-Before applying on another account, send a small authenticated text request to
-that account's Coding Plan endpoint with `model: glm-5.3-flash`; availability
-can vary by plan and rollout state.
+Before applying on another account, verify both upstream IDs in the
+authenticated Fireworks model inventory and run small text/tool probes plus an
+image probe against GLM-5.3 Flash.
 
 ## Explicit retirement
 
