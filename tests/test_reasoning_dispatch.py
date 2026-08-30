@@ -1308,7 +1308,7 @@ def test_chat_completions_image_request_uses_explicit_cloud_vision_fallback(clie
         "",
         thinking="optional",
         provider="fireworks",
-        provider_model_id="accounts/fireworks/models/qwen3p7-plus",
+        provider_model_id="accounts/fireworks/models/qwen3p8-max",
         vision=True,
     )
 
@@ -1321,7 +1321,7 @@ def test_chat_completions_image_request_uses_explicit_cloud_vision_fallback(clie
 
     async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
         assert endpoint == "http://up/chat/completions"
-        assert body["model"] == "accounts/fireworks/models/qwen3p7-plus"
+        assert body["model"] == "accounts/fireworks/models/qwen3p8-max"
         assert "prompt_cache_key" not in body
         assert "prompt_cache_retention" not in body
         assert "reasoning" not in body["messages"][0]
