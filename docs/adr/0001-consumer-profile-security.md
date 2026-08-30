@@ -82,4 +82,6 @@ There is no gateway-wide routing default suitable for every consumer. In particu
 4. Migrate HA behind its existing ownership flags while retaining direct oMLX as a disabled rollback path.
 5. Migrate my-ai to profile/catalog APIs with a bounded last-known-good cache.
 6. Observe each consumer independently.
-7. Remove legacy shared keys, direct HA oMLX, duplicated `best-local`/preset catalogs, and rollback flags only after successful observation.
+7. Remove legacy shared keys, direct HA oMLX, duplicated `best-local` catalogs, and rollback flags only after each dependent consumer completes migration. Gateway-owned auto/preset policy has been removed; registered consumer snapshots are authoritative.
+
+For `my-ai`, the profile-only compatibility floor is commit `4c17be5` plus a complete three-profile snapshot. A rollback below that floor is coupled: restore the prior gateway `auto_models`/`model_presets` catalog blocks and a compatible two-profile registry snapshot before starting the older consumer binary. Current binaries roll back with the complete snapshot and do not require gateway-owned policy.

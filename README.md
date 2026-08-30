@@ -46,7 +46,8 @@ translation between them.
   errors per request, in SQLite.
 - **Federation** — explicitly configured gateway-to-gateway routes.
 - **Consumer profiles** — authenticated, namespace-scoped, immutable routing
-  snapshots with enforced local-only execution for gateway-local oMLX routes.
+  snapshots with enforced gateway-local or gateway-managed cloud execution.
+  Consumer repositories own composite/default policy; the gateway catalog does not.
 
 ## Requirements
 
