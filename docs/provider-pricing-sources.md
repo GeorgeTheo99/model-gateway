@@ -140,7 +140,7 @@ Use this to know which source to read for each model. Regenerate with:
 | glm-5.2-fw | fireworks | accounts/fireworks/models/glm-5p2 | fireworks |
 | kimi-k3 | fireworks | accounts/fireworks/models/kimi-k3 | fireworks |
 | minimax-m3-fw | fireworks | accounts/fireworks/models/minimax-m3 | fireworks |
-| qwen3.7-plus-fw | fireworks | accounts/fireworks/models/qwen3p7-plus | fireworks |
+| qwen3.8-max-fw | fireworks | accounts/fireworks/models/qwen3p8-max | fireworks |
 | deepseek-v4-flash-or | openrouter | deepseek/deepseek-v4-flash | openrouter API |
 | gemini-3.1-pro | openrouter | google/gemini-3.1-pro-preview | openrouter API |
 | gemini-3-flash | openrouter | google/gemini-3-flash-preview | openrouter API |
