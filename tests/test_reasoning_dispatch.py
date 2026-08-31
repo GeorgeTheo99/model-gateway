@@ -985,7 +985,7 @@ def test_chat_completions_image_request_extracts_then_answers_with_opt_in_fallba
         assert fallback_model == "vision-fallback"
         assert fallback is fallback_info
         assert server_module._payload_has_image(body)
-        assert kwargs == {"max_images": 1, "require_inline_images": False}
+        assert kwargs == {"max_images": 4, "require_inline_images": False}
         return ["Visible: a concrete wall with a crack."]
 
     async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
@@ -1316,7 +1316,7 @@ def test_chat_completions_image_request_extracts_when_mode_env_configured(client
         return None
 
     async def fake_extract(request, body, fallback_model, fallback, error_factory, **kwargs):
-        assert kwargs == {"max_images": 1, "require_inline_images": False}
+        assert kwargs == {"max_images": 4, "require_inline_images": False}
         return ["Visible: a red pixel."]
 
     async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
@@ -1336,6 +1336,51 @@ def test_chat_completions_image_request_extracts_when_mode_env_configured(client
         "messages": [{"role": "user", "content": [
             {"type": "text", "text": "what color is it?"},
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]}],
+    })
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_chat_completions_image_request_extracts_multiple_images(client, monkeypatch):
+    """Global fallback extraction accepts several images per request by default."""
+    text_info = _info("none", thinking="", provider="test", provider_model_id="text-upstream")
+    fallback_info = _info("", thinking="optional", provider="test", provider_model_id="vision-upstream", vision=True)
+
+    def fake_resolve(model):
+        if model == "text-model":
+            return text_info
+        if model == "vision-fallback":
+            return fallback_info
+        return None
+
+    async def fake_extract(request, body, fallback_model, fallback, error_factory, **kwargs):
+        assert kwargs == {"max_images": 4, "require_inline_images": False}
+        return ["Visible: a red pixel.", "Visible: a blue square."]
+
+    async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
+        assert body["model"] == "text-upstream"
+        assert not server_module._payload_has_image(body)
+        joined = str(body["messages"])
+        assert "Visible: a red pixel." in joined
+        assert "Visible: a blue square." in joined
+        return server_module.JSONResponse(status_code=200, content={"ok": True})
+
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_MODE", "extract_then_answer")
+    monkeypatch.delenv("GATEWAY_VISION_FALLBACK_MAX_IMAGES", raising=False)
+    monkeypatch.setattr(server_module, "resolve", fake_resolve)
+    monkeypatch.setattr(server_module, "_extract_image_observations", fake_extract)
+    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough_sync)
+
+    resp = client.post("/v1/chat/completions", json={
+        "model": "text-model",
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            {"type": "text", "text": "and this one?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBBB"}},
         ]}],
     })
 
@@ -1694,6 +1739,19 @@ def test_startup_rejects_invalid_vision_fallback_mode(monkeypatch):
         server_module._validate_vision_fallback_policy()
 
 
+@pytest.mark.parametrize("raw", ["0", "9", "many"])
+def test_startup_rejects_invalid_vision_fallback_max_images(monkeypatch, raw):
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_MAX_IMAGES", raw)
+    monkeypatch.setattr(
+        server_module, "resolve",
+        lambda model: pytest.fail("invalid image limit must be rejected before resolving"),
+    )
+
+    with pytest.raises(RuntimeError, match="GATEWAY_VISION_FALLBACK_MAX_IMAGES"):
+        server_module._validate_vision_fallback_policy()
+
+
 def test_startup_rejects_protocol_incompatible_vision_fallback(monkeypatch):
     fallback_info = _info("none", provider="anthropic", vision=True)
     fallback_info.protocol = "anthropic"
@@ -1773,6 +1831,7 @@ def test_startup_logs_effective_opt_in_vision_policy(
     assert f"providers={provider}" in caplog.text
     assert f"cloud_egress={cloud_egress}" in caplog.text
     assert "mode=reroute" in caplog.text
+    assert "max_images=4" in caplog.text
 
 
 def test_startup_logs_both_scoped_vision_policies(monkeypatch, caplog):

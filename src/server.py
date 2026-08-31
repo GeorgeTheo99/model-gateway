@@ -152,6 +152,26 @@ def _configured_vision_fallback_mode() -> str:
     return "reroute"
 
 
+DEFAULT_VISION_FALLBACK_MAX_IMAGES = 4
+
+
+def _configured_vision_fallback_max_images() -> int:
+    """Per-request image limit for global (non-composite) fallback extraction."""
+    raw = os.environ.get("GATEWAY_VISION_FALLBACK_MAX_IMAGES", "").strip()
+    if not raw:
+        return DEFAULT_VISION_FALLBACK_MAX_IMAGES
+    error = RuntimeError(
+        f"GATEWAY_VISION_FALLBACK_MAX_IMAGES must be an integer from 1 through 8, not '{raw}'"
+    )
+    try:
+        value = int(raw)
+    except ValueError:
+        raise error from None
+    if not 1 <= value <= 8:
+        raise error
+    return value
+
+
 def _vision_route_locality(model: str, info=None) -> str:
     """Classify a model's complete configured provider pool as local or cloud."""
     candidates = pool_candidates(model)
@@ -203,6 +223,8 @@ def _validate_vision_fallback_policy(*, log_policy: bool = True) -> None:
             f"GATEWAY_VISION_FALLBACK_MODE must be 'reroute' or 'extract_then_answer', not '{fallback_mode}'"
         )
 
+    max_images = _configured_vision_fallback_max_images()
+
     for variable, fallback_model, required_locality in policies:
         candidates = pool_candidates(fallback_model)
         candidate_infos = (
@@ -244,14 +266,14 @@ def _validate_vision_fallback_policy(*, log_policy: bool = True) -> None:
         cloud_egress = actual_locality == "cloud"
         message = (
             "vision fallback policy: enabled model=%s scope=%s providers=%s "
-            "cloud_egress=%s mode=%s"
+            "cloud_egress=%s mode=%s max_images=%d"
         )
         scope = required_locality or "legacy-global"
         provider_list = ",".join(effective_providers)
         if log_policy and cloud_egress:
-            log.warning(message, fallback_model, scope, provider_list, "true", fallback_mode)
+            log.warning(message, fallback_model, scope, provider_list, "true", fallback_mode, max_images)
         elif log_policy:
-            log.info(message, fallback_model, scope, provider_list, "false", fallback_mode)
+            log.info(message, fallback_model, scope, provider_list, "false", fallback_mode, max_images)
 
 
 def _session_affinity_id(request: Request) -> str:
@@ -1644,7 +1666,11 @@ async def _apply_chat_vision_fallback(
             fallback_model,
             fallback_info,
             error_factory,
-            max_images=composite.max_images if composite is not None else 1,
+            max_images=(
+                composite.max_images
+                if composite is not None
+                else _configured_vision_fallback_max_images()
+            ),
             require_inline_images=composite is not None,
         )
         if isinstance(observations, JSONResponse):
