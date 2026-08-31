@@ -17,6 +17,10 @@ def _run_env(home: Path, overrides: dict[str, str] | None = None) -> str:
         "MODEL_GATEWAY_HOST",
         "MODEL_GATEWAY_PORT",
         "MODEL_GATEWAY_PLIST_DIR",
+        "GATEWAY_VISION_FALLBACK",
+        "GATEWAY_VISION_FALLBACK_LOCAL",
+        "GATEWAY_VISION_FALLBACK_CLOUD",
+        "GATEWAY_VISION_FALLBACK_MODE",
     ):
         env.pop(key, None)
     env["HOME"] = str(home)
@@ -88,6 +92,52 @@ def test_explicit_environment_overrides_the_persisted_assignment(tmp_path: Path)
     assert "MODEL_GATEWAY_PORT=29111" in output
 
 
+def test_env_exposes_scoped_vision_fallback_configuration(tmp_path: Path) -> None:
+    output = _run_env(
+        tmp_path,
+        {
+            "GATEWAY_VISION_FALLBACK_LOCAL": "local-vision",
+            "GATEWAY_VISION_FALLBACK_CLOUD": "cloud-vision",
+            "GATEWAY_VISION_FALLBACK_MODE": "extract_then_answer",
+        },
+    )
+    assert "GATEWAY_VISION_FALLBACK_LOCAL=local-vision" in output
+    assert "GATEWAY_VISION_FALLBACK_CLOUD=cloud-vision" in output
+    assert "GATEWAY_VISION_FALLBACK_MODE=extract_then_answer" in output
+
+
+def test_explicit_empty_vision_setting_clears_persisted_plist_value(tmp_path: Path) -> None:
+    plist_dir = tmp_path / "Library" / "LaunchAgents"
+    plist_dir.mkdir(parents=True)
+    (plist_dir / "com.local.model-gateway.plist").write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.local.model-gateway</string>
+<key>EnvironmentVariables</key><dict>
+  <key>GATEWAY_VISION_FALLBACK</key><string>legacy-vision</string>
+  <key>GATEWAY_VISION_FALLBACK_MODE</key><string>reroute</string>
+</dict>
+</dict></plist>
+""",
+        encoding="utf-8",
+    )
+
+    output = _run_env(
+        tmp_path,
+        {
+            "GATEWAY_VISION_FALLBACK": "",
+            "GATEWAY_VISION_FALLBACK_LOCAL": "local-vision",
+            "GATEWAY_VISION_FALLBACK_MODE": "",
+        },
+    )
+
+    assert "GATEWAY_VISION_FALLBACK=\n" in output
+    assert "GATEWAY_VISION_FALLBACK_LOCAL=local-vision" in output
+    assert "GATEWAY_VISION_FALLBACK_MODE=\n" in output
+    assert "legacy-vision" not in output
+
+
 def test_install_and_post_pull_update_validate_before_atomic_plist_write() -> None:
     script = SCRIPT.read_text(encoding="utf-8")
     install = script.split("cmd_install() {", 1)[1].split("cmd_uninstall() {", 1)[0]
@@ -101,4 +151,7 @@ def test_install_and_post_pull_update_validate_before_atomic_plist_write() -> No
     assert write_plist.index("persist_install_config") < write_plist.index('mv -f "$plist_tmp" "$plist"')
     assert "ensure_private_file" not in persist
     assert persist.index("mktemp") < persist.index('mv -f "$tmp" "$INSTALL_CONFIG"')
+    assert "GATEWAY_VISION_FALLBACK_LOCAL" in write_plist
+    assert "GATEWAY_VISION_FALLBACK_CLOUD" in write_plist
+    assert "GATEWAY_VISION_FALLBACK_MODE" in write_plist
     assert 'exec "$ROOT_DIR/bin/model-gateway" _update-after-pull' in update

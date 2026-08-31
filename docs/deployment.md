@@ -86,25 +86,37 @@ distinct during migration and shares the explicit `detail-local` route backed by
 Gemma 4 31B vision. Composite models always use their declared image-handling
 mode and cannot be redirected by client headers or request fields.
 
-For compatibility clients only, an operator may explicitly enable a process-wide
-fallback with `GATEWAY_VISION_FALLBACK=<native-vision-model>`. The fallback must
-use an OpenAI-compatible protocol. The gateway validates every configured pool
-candidate at startup and on admin reload, and refuses the policy when the model
-is missing, text-only, a composite, protocol-incompatible, or mixes local oMLX
-and cloud providers. A cloud-only fallback is explicit cloud egress and is
-logged as such at startup. Its default `reroute` mode sends the complete
-translated conversation, including images and surrounding text, to that model;
-compatibility clients may explicitly request `extract_then_answer` with the
-`x-gateway-image-handling` header or matching request control to send only image
-blocks for observation extraction. Operators can flip the process-wide default
-with `GATEWAY_VISION_FALLBACK_MODE=extract_then_answer` (validated at startup,
-must be `reroute` or `extract_then_answer`), which keeps the requesting text
-model as the answering model — the fallback model only extracts image
-observations — so subsequent turns in the session are not served by the
-fallback model. The same policy checks run before each
-fallback request so runtime registry changes cannot bypass them. Leaving the
-variable unset or empty never routes image content to another model or provider
-implicitly.
+For compatibility clients, an operator may configure locality-scoped helpers:
+
+```text
+GATEWAY_VISION_FALLBACK_LOCAL=<native-local-vision-model>
+GATEWAY_VISION_FALLBACK_CLOUD=<native-cloud-vision-model>
+```
+
+A text-only local route can use only the local helper, and a text-only cloud
+route can use only the cloud helper. If its matching variable is empty, that
+route fails closed. Source or fallback pools that mix local oMLX and cloud
+providers are rejected. Each fallback must be a native vision model using an
+OpenAI-compatible protocol; the gateway validates every configured pool
+candidate at startup, on admin reload, and again before each fallback request.
+Cloud helper use is explicit cloud egress and is logged as such.
+
+Scoped fallbacks default to `extract_then_answer`: the helper receives the image
+and returns bounded observations, then the originally requested text model
+answers. A caller can explicitly request `reroute`, or an operator can set
+`GATEWAY_VISION_FALLBACK_MODE=reroute`, to send the complete translated request
+to the fallback instead. The mode must be `reroute` or `extract_then_answer`.
+Because extraction is request-local and the gateway does not retain image
+state, a historical image that remains in a client's submitted conversation is
+extracted again on each later request; those later answers still come from the
+original text model.
+
+The legacy `GATEWAY_VISION_FALLBACK=<native-vision-model>` remains supported for
+existing deployments and retains its historical default mode of `reroute`. It
+cannot be combined with either scoped variable. New deployments should use the
+scoped variables so local images cannot cross into cloud providers implicitly.
+Consumer profile requests remain governed by their explicit profile vision
+route and never use these process-wide fallbacks.
 
 ## Optional federation
 

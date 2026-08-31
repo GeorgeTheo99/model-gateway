@@ -74,6 +74,26 @@ if [ -f "$PLIST_DIR/$LABEL.plist" ] && [ -x /usr/libexec/PlistBuddy ]; then
 fi
 MODEL_INFO_SOURCE_PATH="${MODEL_GATEWAY_MODEL_INFO_SOURCE:-${ACTIVE_MODEL_INFO_SOURCE:-$ROOT_DIR/model-info.json}}"
 LEDGER_PATH="${MODEL_GATEWAY_LEDGER_PATH:-$HOME/srv/model-gateway/shared/ledger.db}"
+if [ "${GATEWAY_VISION_FALLBACK+x}" = x ]; then
+  VISION_FALLBACK="$GATEWAY_VISION_FALLBACK"
+else
+  VISION_FALLBACK="$(installed_plist_env GATEWAY_VISION_FALLBACK)"
+fi
+if [ "${GATEWAY_VISION_FALLBACK_LOCAL+x}" = x ]; then
+  VISION_FALLBACK_LOCAL="$GATEWAY_VISION_FALLBACK_LOCAL"
+else
+  VISION_FALLBACK_LOCAL="$(installed_plist_env GATEWAY_VISION_FALLBACK_LOCAL)"
+fi
+if [ "${GATEWAY_VISION_FALLBACK_CLOUD+x}" = x ]; then
+  VISION_FALLBACK_CLOUD="$GATEWAY_VISION_FALLBACK_CLOUD"
+else
+  VISION_FALLBACK_CLOUD="$(installed_plist_env GATEWAY_VISION_FALLBACK_CLOUD)"
+fi
+if [ "${GATEWAY_VISION_FALLBACK_MODE+x}" = x ]; then
+  VISION_FALLBACK_MODE="$GATEWAY_VISION_FALLBACK_MODE"
+else
+  VISION_FALLBACK_MODE="$(installed_plist_env GATEWAY_VISION_FALLBACK_MODE)"
+fi
 UV_BIN="${UV_BIN:-$(command -v uv 2>/dev/null || true)}"
 
 # Colors (disabled when not a TTY).
@@ -346,7 +366,7 @@ write_plist() {
   ensure_private_dir "$(dirname "$LEDGER_PATH")"
   ensure_private_dir "$BACKUP_DIR"
   ensure_private_file "$LOG_FILE"
-  local plist plist_tmp e_label e_uv e_root e_host e_port e_config e_model_info e_model_info_source e_ledger e_log_dir e_backup e_legacy_backups e_log
+  local plist plist_tmp e_label e_uv e_root e_host e_port e_config e_model_info e_model_info_source e_ledger e_vision_fallback e_vision_local e_vision_cloud e_vision_mode e_log_dir e_backup e_legacy_backups e_log
   plist="$(plist_path)"
   plist_tmp="$(mktemp "$PLIST_DIR/.${LABEL}.plist.XXXXXX")"
   chmod 600 "$plist_tmp"
@@ -359,6 +379,10 @@ write_plist() {
   e_model_info="$(xml_escape "$MODEL_INFO_PATH")"
   e_model_info_source="$(xml_escape "$MODEL_INFO_SOURCE_PATH")"
   e_ledger="$(xml_escape "$LEDGER_PATH")"
+  e_vision_fallback="$(xml_escape "$VISION_FALLBACK")"
+  e_vision_local="$(xml_escape "$VISION_FALLBACK_LOCAL")"
+  e_vision_cloud="$(xml_escape "$VISION_FALLBACK_CLOUD")"
+  e_vision_mode="$(xml_escape "$VISION_FALLBACK_MODE")"
   e_log_dir="$(xml_escape "$LOG_DIR")"
   e_backup="$(xml_escape "$BACKUP_DIR")"
   e_legacy_backups="$(xml_escape "$LEGACY_BACKUP_DIRS")"
@@ -379,6 +403,10 @@ write_plist() {
   <key>MODEL_GATEWAY_MODEL_INFO</key><string>${e_model_info}</string>
   <key>MODEL_GATEWAY_MODEL_INFO_SOURCE</key><string>${e_model_info_source}</string>
   <key>MODEL_GATEWAY_LEDGER_PATH</key><string>${e_ledger}</string>
+  <key>GATEWAY_VISION_FALLBACK</key><string>${e_vision_fallback}</string>
+  <key>GATEWAY_VISION_FALLBACK_LOCAL</key><string>${e_vision_local}</string>
+  <key>GATEWAY_VISION_FALLBACK_CLOUD</key><string>${e_vision_cloud}</string>
+  <key>GATEWAY_VISION_FALLBACK_MODE</key><string>${e_vision_mode}</string>
   <key>MODEL_GATEWAY_LOG_DIR</key><string>${e_log_dir}</string>
   <key>MODEL_GATEWAY_BACKUP_DIR</key><string>${e_backup}</string>
   <key>MODEL_GATEWAY_LEGACY_BACKUP_DIRS</key><string>${e_legacy_backups}</string>
@@ -527,6 +555,10 @@ MODEL_GATEWAY_CONFIG=$CONFIG_PATH
 MODEL_GATEWAY_MODEL_INFO=$MODEL_INFO_PATH
 MODEL_GATEWAY_MODEL_INFO_SOURCE=$MODEL_INFO_SOURCE_PATH
 MODEL_GATEWAY_LEDGER_PATH=$LEDGER_PATH
+GATEWAY_VISION_FALLBACK=$VISION_FALLBACK
+GATEWAY_VISION_FALLBACK_LOCAL=$VISION_FALLBACK_LOCAL
+GATEWAY_VISION_FALLBACK_CLOUD=$VISION_FALLBACK_CLOUD
+GATEWAY_VISION_FALLBACK_MODE=$VISION_FALLBACK_MODE
 MODEL_GATEWAY_LOG_DIR=$LOG_DIR
 MODEL_GATEWAY_BACKUP_DIR=$BACKUP_DIR
 MODEL_GATEWAY_LEGACY_BACKUP_DIRS=$LEGACY_BACKUP_DIRS

@@ -9,6 +9,7 @@ Run:  cd model-gateway && uv run pytest
 
 import asyncio
 import base64
+import copy
 import io
 import logging
 from pathlib import Path
@@ -20,7 +21,7 @@ import src.providers as providers
 from src.providers import ProviderInfo, list_models
 import src.server as server_module
 from src.server import _apply_gateway_reasoning, _infer_thinking_format, app
-from src.translator import anthropic_to_openai_chat, openai_chat_to_anthropic
+from src.translator import anthropic_to_openai, anthropic_to_openai_chat, openai_chat_to_anthropic
 
 try:
     from fastapi.testclient import TestClient
@@ -1377,6 +1378,192 @@ def test_chat_completions_image_request_reroutes_when_mode_env_unset(client, mon
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+@pytest.mark.parametrize(
+    ("text_provider", "expected_fallback", "expected_upstream"),
+    [
+        ("omlx", "local-vision", "local-text-upstream"),
+        ("fireworks", "cloud-vision", "cloud-text-upstream"),
+    ],
+)
+def test_scoped_vision_fallback_matches_request_locality_and_extracts_by_default(
+    client, monkeypatch, text_provider, expected_fallback, expected_upstream,
+):
+    text_info = _info(
+        "none", thinking="", provider=text_provider,
+        provider_model_id=expected_upstream,
+    )
+    fallback_infos = {
+        "local-vision": _info(
+            "", thinking="optional", provider="omlx",
+            provider_model_id="local-vision-upstream", vision=True,
+        ),
+        "cloud-vision": _info(
+            "", thinking="optional", provider="fireworks",
+            provider_model_id="cloud-vision-upstream", vision=True,
+        ),
+    }
+
+    def fake_resolve(model):
+        if model == "text-model":
+            return text_info
+        return fallback_infos.get(model)
+
+    async def fake_extract(request, body, fallback_model, fallback, error_factory, **kwargs):
+        assert fallback_model == expected_fallback
+        assert fallback is fallback_infos[expected_fallback]
+        return ["Visible: a red pixel."]
+
+    async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
+        assert body["model"] == expected_upstream
+        assert not server_module._payload_has_image(body)
+        assert "Visible: a red pixel." in str(body["messages"])
+        return server_module.JSONResponse(status_code=200, content={"ok": True})
+
+    monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
+    monkeypatch.delenv("GATEWAY_VISION_FALLBACK_MODE", raising=False)
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_LOCAL", "local-vision")
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_CLOUD", "cloud-vision")
+    monkeypatch.setattr(server_module, "resolve", fake_resolve)
+    monkeypatch.setattr(server_module, "_extract_image_observations", fake_extract)
+    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough_sync)
+
+    response = client.post("/v1/chat/completions", json={
+        "model": "text-model",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what color is it?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]}],
+    })
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/v1/chat/completions", {
+            "model": "anthropic-text",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "first turn"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                ]},
+                {"role": "assistant", "content": "prior answer"},
+                {"role": "user", "content": "follow-up without a new image"},
+            ],
+        }),
+        ("/v1/responses", {
+            "model": "anthropic-text",
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "first turn"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                ]},
+                {"type": "message", "role": "assistant", "content": "prior answer"},
+                {"type": "message", "role": "user", "content": "follow-up without a new image"},
+            ],
+        }),
+        ("/v1/messages", {
+            "model": "anthropic-text",
+            "max_tokens": 128,
+            "system": [{
+                "type": "text", "text": "system",
+                "cache_control": {"type": "ephemeral"},
+            }],
+            "tools": [{
+                "name": "lookup", "description": "lookup",
+                "input_schema": {"type": "object"},
+                "cache_control": {"type": "ephemeral"},
+            }],
+            "tool_choice": {"type": "auto", "disable_parallel_tool_use": True},
+            "metadata": {"user_id": "vision-regression"},
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "first turn"},
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": "AAAA",
+                    }, "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "assistant", "content": "prior answer"},
+                {"role": "user", "content": "follow-up without a new image"},
+            ],
+        }),
+    ],
+)
+def test_scoped_extraction_keeps_anthropic_text_model_across_endpoints(
+    client, monkeypatch, path, payload,
+):
+    text_info = _info(
+        "anthropic", thinking="", provider="anthropic",
+        provider_model_id="claude-text-upstream",
+    )
+    text_info.protocol = "anthropic"
+    fallback_info = _info(
+        "", thinking="optional", provider="fireworks",
+        provider_model_id="cloud-vision-upstream", vision=True,
+    )
+    captured = {}
+
+    def fake_resolve(model):
+        if model == "anthropic-text":
+            return text_info
+        if model == "cloud-vision":
+            return fallback_info
+        return None
+
+    async def fake_extract(request, body, fallback_model, fallback, error_factory, **kwargs):
+        captured["extractions"] = captured.get("extractions", 0) + 1
+        assert fallback_model == "cloud-vision"
+        return ["Visible: a red pixel."]
+
+    async def fake_chat_anthropic(body, info, model, request, is_stream):
+        captured.update(model=model, upstream_chat=body)
+        return server_module.JSONResponse(status_code=200, content={"ok": True})
+
+    async def fake_responses_anthropic(body, info, model, request, *, chat_body=None):
+        captured.update(model=model, upstream_chat=chat_body)
+        return server_module.JSONResponse(status_code=200, content={"ok": True})
+
+    async def fake_messages_sync(endpoint, body, headers, **kwargs):
+        captured.update(
+            model="anthropic-text",
+            upstream_chat=anthropic_to_openai(body),
+            native_anthropic=copy.deepcopy(body),
+        )
+        return server_module.JSONResponse(status_code=200, content={"ok": True})
+
+    monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
+    monkeypatch.delenv("GATEWAY_VISION_FALLBACK_MODE", raising=False)
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_CLOUD", "cloud-vision")
+    monkeypatch.setattr(server_module, "resolve", fake_resolve)
+    monkeypatch.setattr(server_module, "_extract_image_observations", fake_extract)
+    monkeypatch.setattr(server_module, "_handle_chat_anthropic", fake_chat_anthropic)
+    monkeypatch.setattr(server_module, "_handle_responses_anthropic", fake_responses_anthropic)
+    monkeypatch.setattr(server_module, "_passthrough_anthropic_sync", fake_messages_sync)
+
+    response = client.post(path, json=payload)
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert captured["extractions"] == 1
+    assert captured["model"] == "anthropic-text"
+    assert captured["upstream_chat"] is not None
+    assert not server_module._payload_has_image(captured["upstream_chat"])
+    assert "Visible: a red pixel." in str(captured["upstream_chat"]["messages"])
+    if path == "/v1/messages":
+        native = captured["native_anthropic"]
+        assert native["system"][0]["cache_control"] == {"type": "ephemeral"}
+        assert native["tools"][0]["cache_control"] == {"type": "ephemeral"}
+        assert native["tool_choice"]["disable_parallel_tool_use"] is True
+        assert native["metadata"] == {"user_id": "vision-regression"}
+        replacement = native["messages"][0]["content"][1]
+        assert replacement["type"] == "text"
+        assert replacement["cache_control"] == {"type": "ephemeral"}
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
 def test_chat_completions_image_request_uses_explicit_cloud_vision_fallback(client, monkeypatch):
     text_info = _info("none", thinking="", provider="test", provider_model_id="text-upstream")
     fallback_info = _info(
@@ -1475,6 +1662,26 @@ def test_startup_rejects_invalid_opt_in_vision_fallback(
         server_module._validate_vision_fallback_policy()
 
 
+def test_startup_rejects_legacy_and_scoped_fallbacks_together(monkeypatch):
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "legacy-vision")
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_LOCAL", "local-vision")
+
+    with pytest.raises(RuntimeError, match="cannot be combined"):
+        server_module._validate_vision_fallback_policy()
+
+
+def test_startup_rejects_scoped_fallback_with_wrong_locality(monkeypatch):
+    monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_LOCAL", "cloud-vision")
+    monkeypatch.setattr(
+        server_module, "resolve",
+        lambda model: _info("none", provider="fireworks", vision=True),
+    )
+
+    with pytest.raises(RuntimeError, match="requires a local model"):
+        server_module._validate_vision_fallback_policy()
+
+
 def test_startup_rejects_invalid_vision_fallback_mode(monkeypatch):
     monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
     monkeypatch.setenv("GATEWAY_VISION_FALLBACK_MODE", "side-channel")
@@ -1566,6 +1773,70 @@ def test_startup_logs_effective_opt_in_vision_policy(
     assert f"providers={provider}" in caplog.text
     assert f"cloud_egress={cloud_egress}" in caplog.text
     assert "mode=reroute" in caplog.text
+
+
+def test_startup_logs_both_scoped_vision_policies(monkeypatch, caplog):
+    infos = {
+        "local-vision": _info("none", provider="omlx", vision=True),
+        "cloud-vision": _info("none", provider="fireworks", vision=True),
+    }
+    monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
+    monkeypatch.delenv("GATEWAY_VISION_FALLBACK_MODE", raising=False)
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_LOCAL", "local-vision")
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_CLOUD", "cloud-vision")
+    monkeypatch.setattr(server_module, "resolve", lambda model: infos[model])
+
+    with caplog.at_level(logging.INFO, logger="model-gateway"):
+        server_module._validate_vision_fallback_policy()
+
+    assert "model=local-vision scope=local providers=omlx cloud_egress=false" in caplog.text
+    assert "model=cloud-vision scope=cloud providers=fireworks cloud_egress=true" in caplog.text
+    assert caplog.text.count("mode=extract_then_answer") == 2
+
+
+def test_mixed_local_cloud_source_pool_cannot_select_scoped_fallback(monkeypatch):
+    text_infos = {
+        "omlx": _info("none", provider="omlx", vision=False),
+        "fireworks": _info("none", provider="fireworks", vision=False),
+    }
+    fallback_infos = {
+        "local-vision": _info("none", provider="omlx", vision=True),
+        "cloud-vision": _info("none", provider="fireworks", vision=True),
+    }
+    monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_LOCAL", "local-vision")
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_CLOUD", "cloud-vision")
+    monkeypatch.setattr(
+        server_module, "pool_candidates",
+        lambda model: list(text_infos) if model == "mixed-text" else [],
+    )
+
+    def fake_resolve(model, provider_override=None):
+        if model == "mixed-text":
+            return text_infos[provider_override]
+        return fallback_infos.get(model)
+
+    monkeypatch.setattr(server_module, "resolve", fake_resolve)
+
+    _, _, error = server_module._resolve_vision_fallback(
+        "mixed-text", text_infos["omlx"],
+    )
+
+    assert error.status_code == 502
+    assert b"mixes local and cloud providers" in error.body
+
+
+def test_historical_image_remains_visible_to_request_local_routing():
+    body = {"messages": [
+        {"role": "user", "content": [
+            {"type": "text", "text": "first turn"},
+            {"type": "image_url", "image_url": {"url": "one"}},
+        ]},
+        {"role": "assistant", "content": "prior answer"},
+        {"role": "user", "content": "follow-up without a new image"},
+    ]}
+
+    assert server_module._image_count(body) == 1
 
 
 def test_replace_image_preserves_order_and_all_content():
@@ -1996,7 +2267,7 @@ def test_chat_text_only_image_fails_closed_by_default(client, monkeypatch, fallb
     assert set(response.json()) == {"error"}
     message = response.json()["error"]["message"]
     assert "text-only" in message
-    assert "GATEWAY_VISION_FALLBACK=<model>" in message
+    assert "GATEWAY_VISION_FALLBACK_CLOUD=<model>" in message
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
