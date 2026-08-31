@@ -96,7 +96,10 @@ Mutating Databricks workspace commands are similarly available as
 `workspace add`, `workspace replace`, and `workspace remove`. They verify the
 candidate before writing `config.yaml`, restart and health-check the gateway,
 and restore the prior configuration if activation fails. Run
-`model-gateway workspace --help` for the full syntax.
+`model-gateway workspace --help` for the full syntax. For
+`--style ai-gateway`, pass the **workspace URL** as `--host`; the routed
+`<org-id>.ai-gateway.cloud.databricks.com` base URL is derived from the
+workspace token (an explicit gateway hostname is still accepted).
 
 ## Configuration
 

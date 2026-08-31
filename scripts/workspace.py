@@ -25,11 +25,17 @@ activation fails, the previous config is restored and activated automatically:
 the old entry. `remove` refuses to empty a pool. `test` runs steps 1-4 only.
 
 Accepted --host shapes: https://host, https://host/?o=123, bare host.
+For --style ai-gateway, pass the WORKSPACE URL (e.g. https://e2-demo-field-eng
+.cloud.databricks.com); the routed <org-id>.ai-gateway.cloud.databricks.com
+base_url is derived from the workspace token's aud claim. An explicit
+gateway hostname is still accepted (the workspace URL is then recovered
+from the token's iss claim for probes/auth).
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import os
 import json
@@ -118,6 +124,64 @@ def ensure_auth(host: str, profile: str) -> str:
     return token
 
 
+def _is_ai_gateway_host(host: str) -> bool:
+    """Whether host is an explicit <org-id>.ai-gateway.cloud.databricks.com origin."""
+    netloc = urllib.parse.urlsplit(host).netloc
+    prefix = netloc.split(".", 1)[0]
+    return netloc.endswith(".ai-gateway.cloud.databricks.com") and prefix.isdigit()
+
+
+def _jwt_claims(token: str) -> dict:
+    """Decode the unverified payload of a Databricks CLI OAuth JWT (for routing hints only)."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        return claims if isinstance(claims, dict) else {}
+    except (IndexError, ValueError):
+        return {}
+
+
+def derive_ai_gateway_host(token: str) -> str:
+    """Derive https://<org-id>.ai-gateway.cloud.databricks.com from a workspace token.
+
+    The workspace's org id is the numeric `aud` claim of its OAuth token
+    (verified against e2-demo-field-eng and fevm-model-exp), and the AI
+    Gateway hostname for a workspace is <org-id>.ai-gateway.cloud.databricks.com.
+    """
+    aud = _jwt_claims(token).get("aud")
+    candidates = [str(a) for a in (aud if isinstance(aud, list) else [aud]) if str(a).isdigit()]
+    if len(candidates) != 1:
+        raise _fail(
+            "cannot derive the AI Gateway host from the workspace token "
+            f"(aud={aud!r}); pass the explicit <org-id>.ai-gateway.cloud.databricks.com "
+            "hostname as --host instead"
+        )
+    return f"https://{candidates[0]}.ai-gateway.cloud.databricks.com"
+
+
+def _resolve_ai_gateway_host(host: str, profile: str) -> tuple[str, str, str]:
+    """Resolve (workspace_host, gateway_base_url, token) for ai-gateway style.
+
+    Accepts either the workspace URL (auth/probes against it; the gateway
+    base_url is derived from the token's aud claim) or an explicit gateway
+    hostname (the workspace URL is recovered from the token's iss claim,
+    since gateway hostnames don't serve the REST API).
+    """
+    token = ensure_auth(host, profile)
+    claims = _jwt_claims(token)
+    if _is_ai_gateway_host(host):
+        iss = str(claims.get("iss") or "")
+        workspace = iss[: -len("/oidc")] if iss.endswith("/oidc") else ""
+        if not workspace:
+            raise _fail(
+                f"cannot recover the workspace URL from the token (iss={iss!r}); "
+                f"pass the workspace URL instead of the {host} gateway hostname"
+            )
+        return workspace, host, token
+    return host, derive_ai_gateway_host(token), token
+
+
 def _get_json(url: str, token: str, timeout: int = 20) -> dict:
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -134,18 +198,22 @@ def probe_endpoints(host: str, token: str) -> set[str]:
     return names
 
 
-def _models_in_pools(config: dict, pool_names: list[str]) -> list[dict]:
+def _affected_models(config: dict, pool_names: list[str], provider_names: list[str] = ()) -> list[dict]:
+    """Models served by the given pools OR bound directly to the given providers."""
     models = []
     for entry in config.get("models") or []:
-        if isinstance(entry, dict) and entry.get("pool") in pool_names:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("pool") in pool_names or entry.get("provider") in provider_names:
             models.append(entry)
     return models
 
 
-def check_coverage(config: dict, pool_names: list[str], endpoint_names: set[str], allow_partial: bool) -> None:
-    models = _models_in_pools(config, pool_names)
+def check_coverage(config: dict, pool_names: list[str], endpoint_names: set[str], allow_partial: bool,
+                   provider_names: list[str] = ()) -> None:
+    models = _affected_models(config, pool_names, provider_names)
     if not models:
-        print("  coverage: no pooled models affected — skipped")
+        print("  coverage: no models bound to these pools/providers — skipped")
         return
     missing = []
     print("  coverage:")
@@ -383,10 +451,11 @@ def cmd_list(args) -> None:
         print(f"  {pool}: {' → '.join(members or [])}")
 
 
-def _verify(config: dict, host: str, profile: str, pool_names: list[str], allow_partial: bool) -> None:
-    token = ensure_auth(host, profile)
+def _verify(config: dict, host: str, profile: str, pool_names: list[str], allow_partial: bool,
+            token: str | None = None, provider_names: list[str] = ()) -> None:
+    token = token or ensure_auth(host, profile)
     endpoint_names = probe_endpoints(host, token)
-    check_coverage(config, pool_names, endpoint_names, allow_partial)
+    check_coverage(config, pool_names, endpoint_names, allow_partial, provider_names)
     smoke_test(host, token, endpoint_names)
 
 
@@ -409,7 +478,7 @@ def cmd_test(args) -> None:
         if not token:
             raise _fail(f"workspace {args.name!r} has no api_key configured")
     endpoint_names = probe_endpoints(host, token)
-    check_coverage(config, pools, endpoint_names, allow_partial=True)
+    check_coverage(config, pools, endpoint_names, allow_partial=True, provider_names=[args.name])
     smoke_test(host, token, endpoint_names)
     print("workspace test: PASSED")
 
@@ -433,29 +502,41 @@ def cmd_add(args) -> None:
     pool_names = [p.strip() for p in (args.pools or "").split(",") if p.strip()]
     config = _load_config(args.config)
 
-    print(f"Adding workspace {args.name!r} ({host}) to pools: {', '.join(pool_names) or 'none'}")
+    # ai-gateway style: --host may be the workspace URL (recommended) or the
+    # <org-id>.ai-gateway hostname. Auth and probes always go through the
+    # workspace REST API; only base_url is the gateway hostname.
+    verify_host = base_url = host
+    token = None
+    if args.style != "invocations":
+        verify_host, base_url, token = _resolve_ai_gateway_host(host, profile)
+        print(f"  ai-gateway: {base_url} (workspace {verify_host})")
+
+    print(f"Adding workspace {args.name!r} ({verify_host}) to pools: {', '.join(pool_names) or 'none'}")
     # Verify against a config copy that already contains the new pool layout so
     # coverage checks the models this workspace WILL serve.
     staged = copy.deepcopy(config)
     _insert_into_pools(staged, args.name, pool_names, args.position)
-    _verify(staged, host, profile, pool_names, args.allow_partial)
+    _verify(staged, verify_host, profile, pool_names, args.allow_partial, token=token,
+            provider_names=[args.name])
 
     providers = _providers_section(config)
-    token = ensure_auth(host, profile)  # cheap: token is cached by the CLI
-    providers[args.name] = {
-        "base_url": host,
+    if token is None:
+        token = ensure_auth(host, profile)  # cheap: token is cached by the CLI
+    entry = {
+        "base_url": base_url,
         "api_key": token,
         "protocol": "openai",
-        "endpoint_style": "invocations" if args.style == "invocations" else None,
+        "endpoint_style": "invocations",
         "auth_refresh": "databricks-cli",
         "auth_profile": profile,
         "quirks": ["no_stream_options", "no_reasoning_params"],
     }
     if args.style != "invocations":
-        providers[args.name].pop("endpoint_style")
-        providers[args.name]["path_prefixes"] = {"anthropic": "anthropic/v1", "openai": "mlflow/v1"}
-        providers[args.name]["quirks"] = ["anthropic_bearer_auth"]
-    providers[args.name] = {k: v for k, v in providers[args.name].items() if v is not None}
+        entry.pop("endpoint_style")
+        entry["path_prefixes"] = {"anthropic": "anthropic/v1", "openai": "mlflow/v1"}
+        entry["quirks"] = ["anthropic_bearer_auth"]
+        entry["workspace_url"] = verify_host
+    providers[args.name] = {k: v for k, v in entry.items() if v is not None}
     _insert_into_pools(config, args.name, pool_names, args.position)
 
     _commit_and_activate(args.config, config)
@@ -477,15 +558,28 @@ def cmd_replace(args) -> None:
     affected = [p for p, members in pools.items() if args.old_name in (members or [])]
     print(f"Replacing workspace {args.old_name!r} with {new_name!r} ({host}) in pools: {', '.join(affected) or 'none'}")
 
+    # Inherit the old entry's style. ai-gateway entries (path_prefixes, no
+    # invocations endpoint_style) need the same host derivation as `add`.
+    ai_gw = isinstance(old.get("path_prefixes"), dict) and old.get("endpoint_style") != "invocations"
+    verify_host = base_url = host
+    token = None
+    if ai_gw:
+        verify_host, base_url, token = _resolve_ai_gateway_host(host, profile)
+        print(f"  ai-gateway: {base_url} (workspace {verify_host})")
+
     staged = copy.deepcopy(config)
     for pool in affected:  # stage: swap in place, keep position
         members = staged["pools"][pool]
         members[members.index(args.old_name)] = new_name
-    _verify(staged, host, profile, affected, args.allow_partial)
+    _verify(staged, verify_host, profile, affected, args.allow_partial, token=token,
+            provider_names=[new_name])
 
-    token = ensure_auth(host, profile)
+    if token is None:
+        token = ensure_auth(host, profile)
     entry = {k: v for k, v in old.items()}  # inherit style/quirks from the old entry
-    entry.update({"base_url": host, "api_key": token, "auth_refresh": "databricks-cli", "auth_profile": profile})
+    entry.update({"base_url": base_url, "api_key": token, "auth_refresh": "databricks-cli", "auth_profile": profile})
+    if ai_gw:
+        entry["workspace_url"] = verify_host
     providers[new_name] = entry
     if new_name != args.old_name:
         providers.pop(args.old_name, None)
@@ -576,7 +670,9 @@ def main() -> None:
 
     p = sub.add_parser("add")
     p.add_argument("name")
-    p.add_argument("--host", required=True)
+    p.add_argument("--host", required=True,
+                   help="workspace URL (recommended for both styles; for --style "
+                        "ai-gateway the <org-id>.ai-gateway host is derived from it)")
     p.add_argument("--pools", default="")
     p.add_argument("--position", type=int, default=None)
     p.add_argument("--profile", default=None)
