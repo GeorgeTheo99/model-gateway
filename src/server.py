@@ -128,6 +128,11 @@ def _configured_vision_fallback_model() -> str:
     return os.environ.get("GATEWAY_VISION_FALLBACK", DEFAULT_VISION_FALLBACK_MODEL).strip()
 
 
+def _configured_vision_fallback_mode() -> str:
+    """Default image-handling mode for the global (non-composite) vision fallback."""
+    return os.environ.get("GATEWAY_VISION_FALLBACK_MODE", "reroute").strip().lower()
+
+
 def _validate_vision_fallback_policy(*, log_policy: bool = True) -> None:
     """Fail startup/reload on an invalid opt-in and make cloud egress visible."""
     fallback_model = _configured_vision_fallback_model()
@@ -135,6 +140,12 @@ def _validate_vision_fallback_policy(*, log_policy: bool = True) -> None:
         if log_policy:
             log.info("vision fallback policy: disabled; image input to text-only models fails closed")
         return
+
+    fallback_mode = _configured_vision_fallback_mode()
+    if fallback_mode not in {"reroute", IMAGE_HANDLING_EXTRACT_THEN_ANSWER}:
+        raise RuntimeError(
+            f"GATEWAY_VISION_FALLBACK_MODE must be 'reroute' or 'extract_then_answer', not '{fallback_mode}'"
+        )
 
     candidates = pool_candidates(fallback_model)
     candidate_infos = (
@@ -172,13 +183,13 @@ def _validate_vision_fallback_policy(*, log_policy: bool = True) -> None:
         )
     cloud_egress = False in localities
     message = (
-        "vision fallback policy: enabled model=%s providers=%s cloud_egress=%s"
+        "vision fallback policy: enabled model=%s providers=%s cloud_egress=%s mode=%s"
     )
     provider_list = ",".join(effective_providers)
     if log_policy and cloud_egress:
-        log.warning(message, fallback_model, provider_list, "true")
+        log.warning(message, fallback_model, provider_list, "true", fallback_mode)
     elif log_policy:
-        log.info(message, fallback_model, provider_list, "false")
+        log.info(message, fallback_model, provider_list, "false", fallback_mode)
 
 
 def _session_affinity_id(request: Request) -> str:
@@ -1454,7 +1465,11 @@ async def _apply_chat_vision_fallback(
 ):
     """Apply staged vision handling to a Chat-shaped request."""
     composite = getattr(info, "composite", None)
-    default_mode = composite.image_handling if composite is not None else "reroute"
+    default_mode = (
+        composite.image_handling
+        if composite is not None
+        else _configured_vision_fallback_mode()
+    )
     requested_mode = _gateway_image_handling_mode(request, body)
     _strip_gateway_controls(body)
     if composite is not None and requested_mode and requested_mode != default_mode:

@@ -1302,6 +1302,81 @@ def test_native_openai_responses_body_controls_are_not_forwarded(
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_chat_completions_image_request_extracts_when_mode_env_configured(client, monkeypatch):
+    """GATEWAY_VISION_FALLBACK_MODE=extract_then_answer makes the text model answer."""
+    text_info = _info("none", thinking="", provider="test", provider_model_id="text-upstream")
+    fallback_info = _info("", thinking="optional", provider="test", provider_model_id="vision-upstream", vision=True)
+
+    def fake_resolve(model):
+        if model == "text-model":
+            return text_info
+        if model == "vision-fallback":
+            return fallback_info
+        return None
+
+    async def fake_extract(request, body, fallback_model, fallback, error_factory, **kwargs):
+        assert kwargs == {"max_images": 1, "require_inline_images": False}
+        return ["Visible: a red pixel."]
+
+    async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
+        assert body["model"] == "text-upstream"
+        assert not server_module._payload_has_image(body)
+        assert "Visible: a red pixel." in str(body["messages"])
+        return server_module.JSONResponse(status_code=200, content={"ok": True})
+
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_MODE", "extract_then_answer")
+    monkeypatch.setattr(server_module, "resolve", fake_resolve)
+    monkeypatch.setattr(server_module, "_extract_image_observations", fake_extract)
+    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough_sync)
+
+    resp = client.post("/v1/chat/completions", json={
+        "model": "text-model",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what color is it?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]}],
+    })
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_chat_completions_image_request_reroutes_when_mode_env_unset(client, monkeypatch):
+    """Without GATEWAY_VISION_FALLBACK_MODE the global fallback keeps rerouting."""
+    text_info = _info("none", thinking="", provider="test", provider_model_id="text-upstream")
+    fallback_info = _info("", thinking="optional", provider="test", provider_model_id="vision-upstream", vision=True)
+
+    def fake_resolve(model):
+        if model == "text-model":
+            return text_info
+        if model == "vision-fallback":
+            return fallback_info
+        return None
+
+    async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
+        assert body["model"] == "vision-upstream"
+        return server_module.JSONResponse(status_code=200, content={"ok": True})
+
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
+    monkeypatch.delenv("GATEWAY_VISION_FALLBACK_MODE", raising=False)
+    monkeypatch.setattr(server_module, "resolve", fake_resolve)
+    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough_sync)
+
+    resp = client.post("/v1/chat/completions", json={
+        "model": "text-model",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what color is it?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]}],
+    })
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
 def test_chat_completions_image_request_uses_explicit_cloud_vision_fallback(client, monkeypatch):
     text_info = _info("none", thinking="", provider="test", provider_model_id="text-upstream")
     fallback_info = _info(
@@ -1400,6 +1475,18 @@ def test_startup_rejects_invalid_opt_in_vision_fallback(
         server_module._validate_vision_fallback_policy()
 
 
+def test_startup_rejects_invalid_vision_fallback_mode(monkeypatch):
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_MODE", "side-channel")
+    monkeypatch.setattr(
+        server_module, "resolve",
+        lambda model: pytest.fail("invalid mode must be rejected before resolving"),
+    )
+
+    with pytest.raises(RuntimeError, match="GATEWAY_VISION_FALLBACK_MODE"):
+        server_module._validate_vision_fallback_policy()
+
+
 def test_startup_rejects_protocol_incompatible_vision_fallback(monkeypatch):
     fallback_info = _info("none", provider="anthropic", vision=True)
     fallback_info.protocol = "anthropic"
@@ -1478,6 +1565,7 @@ def test_startup_logs_effective_opt_in_vision_policy(
     assert "vision fallback policy: enabled model=vision-fallback" in caplog.text
     assert f"providers={provider}" in caplog.text
     assert f"cloud_egress={cloud_egress}" in caplog.text
+    assert "mode=reroute" in caplog.text
 
 
 def test_replace_image_preserves_order_and_all_content():

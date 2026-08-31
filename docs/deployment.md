@@ -96,7 +96,12 @@ logged as such at startup. Its default `reroute` mode sends the complete
 translated conversation, including images and surrounding text, to that model;
 compatibility clients may explicitly request `extract_then_answer` with the
 `x-gateway-image-handling` header or matching request control to send only image
-blocks for observation extraction. The same policy checks run before each
+blocks for observation extraction. Operators can flip the process-wide default
+with `GATEWAY_VISION_FALLBACK_MODE=extract_then_answer` (validated at startup,
+must be `reroute` or `extract_then_answer`), which keeps the requesting text
+model as the answering model — the fallback model only extracts image
+observations — so subsequent turns in the session are not served by the
+fallback model. The same policy checks run before each
 fallback request so runtime registry changes cannot bypass them. Leaving the
 variable unset or empty never routes image content to another model or provider
 implicitly.
