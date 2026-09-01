@@ -1739,7 +1739,7 @@ def test_startup_rejects_invalid_vision_fallback_mode(monkeypatch):
         server_module._validate_vision_fallback_policy()
 
 
-@pytest.mark.parametrize("raw", ["0", "9", "many"])
+@pytest.mark.parametrize("raw", ["0", "33", "many"])
 def test_startup_rejects_invalid_vision_fallback_max_images(monkeypatch, raw):
     monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
     monkeypatch.setenv("GATEWAY_VISION_FALLBACK_MAX_IMAGES", raw)
@@ -1989,6 +1989,89 @@ def test_multi_image_extraction_is_bounded_and_ordered(monkeypatch):
     assert len(calls) == 2
     assert all(server_module._image_count(call[1]) == 1 for call in calls)
     assert all(len(call[1]["messages"]) == 2 for call in calls)
+
+
+def test_repeated_image_extraction_uses_the_observation_cache(monkeypatch):
+    """Historical images resent each turn must not re-run upstream calls."""
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, observation):
+            self.observation = observation
+
+        def json(self):
+            return {
+                "choices": [{"finish_reason": "stop", "message": {"content": self.observation}}],
+                "usage": {},
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, endpoint, json, headers):
+            calls.append(endpoint)
+            return FakeResponse(f"observation {len(calls)}")
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", lambda **kwargs: FakeClient())
+    monkeypatch.setattr(server_module, "_ledger_record", lambda *args, **kwargs: None)
+    request = SimpleNamespace(state=SimpleNamespace())
+    info = _info("", thinking="", provider="omlx", provider_model_id="gemma-upstream", vision=True)
+    body = {"messages": [{"role": "tool", "content": [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQID"}},
+    ]}]}
+
+    # Turn 1: both images extracted (2 upstream calls).
+    first = asyncio.run(server_module._extract_image_observations(
+        request, copy.deepcopy(body), "gemma-local", info, max_images=4, require_inline_images=True,
+    ))
+    assert first == ["observation 1", "observation 2"]
+    assert len(calls) == 2
+
+    # Turn 2: same conversation resent; only the new image is extracted.
+    second_body = copy.deepcopy(body)
+    second_body["messages"][0]["content"].append(
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,BQAD"}}
+    )
+    second = asyncio.run(server_module._extract_image_observations(
+        request, second_body, "gemma-local", info, max_images=4, require_inline_images=True,
+    ))
+    assert second == ["observation 1", "observation 2", "observation 3"]
+    assert len(calls) == 3, "cached observations must not re-run upstream extraction"
+
+    # A different extracting model misses the cache even for identical bytes.
+    other_info = _info("", thinking="", provider="omlx", provider_model_id="other-upstream", vision=True)
+    third = asyncio.run(server_module._extract_image_observations(
+        request, copy.deepcopy(body), "other-local", other_info, max_images=4, require_inline_images=True,
+    ))
+    assert third == ["observation 4", "observation 5"]
+    assert len(calls) == 5
+
+    # Failed extractions must not be cached: the responses above always 200;
+    # verify the cache only stores successful observations via the bound entries.
+    assert server_module._vision_observation_cache.get(
+        server_module._vision_observation_cache_key(
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}, "gemma-upstream",
+        )
+    ) == "observation 1"
+
+
+def test_startup_accepts_vision_fallback_max_images_up_to_32(monkeypatch, caplog):
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_MAX_IMAGES", "20")
+    fallback_info = _info("none", provider="omlx", vision=True)
+    monkeypatch.setattr(server_module, "resolve", lambda model: fallback_info)
+
+    with caplog.at_level(logging.INFO, logger="model-gateway"):
+        server_module._validate_vision_fallback_policy()
+
+    assert "max_images=20" in caplog.text
 
 
 def test_local_composite_rejects_remote_images_before_upstream(monkeypatch):

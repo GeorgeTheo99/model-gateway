@@ -18,6 +18,7 @@ import os
 import secrets
 import time
 from contextlib import asynccontextmanager
+from collections import OrderedDict
 from types import SimpleNamespace
 
 import httpx
@@ -153,6 +154,34 @@ def _configured_vision_fallback_mode() -> str:
 
 
 DEFAULT_VISION_FALLBACK_MAX_IMAGES = 4
+MAX_VISION_FALLBACK_MAX_IMAGES = 32
+VISION_OBSERVATION_CACHE_MAX_ENTRIES = 256
+
+# Per-process LRU of successful image observations keyed by exact image
+# content + extracting model. Sessions resend historical images every turn;
+# without this, each turn re-runs one upstream vision call per image.
+_vision_observation_cache: OrderedDict[str, str] = OrderedDict()
+
+
+def _vision_observation_cache_key(image_part: dict, provider_model_id: str) -> str:
+    digest = hashlib.sha256(
+        json.dumps(image_part, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return f"{provider_model_id}:{digest}"
+
+
+def _vision_observation_cache_get(key: str) -> str | None:
+    value = _vision_observation_cache.get(key)
+    if value is not None:
+        _vision_observation_cache.move_to_end(key)
+    return value
+
+
+def _vision_observation_cache_put(key: str, value: str) -> None:
+    _vision_observation_cache[key] = value
+    _vision_observation_cache.move_to_end(key)
+    while len(_vision_observation_cache) > VISION_OBSERVATION_CACHE_MAX_ENTRIES:
+        _vision_observation_cache.popitem(last=False)
 
 
 def _configured_vision_fallback_max_images() -> int:
@@ -161,13 +190,14 @@ def _configured_vision_fallback_max_images() -> int:
     if not raw:
         return DEFAULT_VISION_FALLBACK_MAX_IMAGES
     error = RuntimeError(
-        f"GATEWAY_VISION_FALLBACK_MAX_IMAGES must be an integer from 1 through 8, not '{raw}'"
+        f"GATEWAY_VISION_FALLBACK_MAX_IMAGES must be an integer from 1 through "
+        f"{MAX_VISION_FALLBACK_MAX_IMAGES}, not '{raw}'"
     )
     try:
         value = int(raw)
     except ValueError:
         raise error from None
-    if not 1 <= value <= 8:
+    if not 1 <= value <= MAX_VISION_FALLBACK_MAX_IMAGES:
         raise error
     return value
 
@@ -1529,8 +1559,15 @@ async def _extract_image_observations(
             del request.state.api_key
     endpoint = _upstream_endpoint(fallback_info, "/chat/completions")
     results: list[str] = []
+    cache_hits = 0
     async with httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS) as client:
         for image_index, image_part in enumerate(image_parts, start=1):
+            cache_key = _vision_observation_cache_key(image_part, fallback_info.provider_model_id)
+            cached = _vision_observation_cache_get(cache_key)
+            if cached is not None:
+                cache_hits += 1
+                results.append(cached)
+                continue
             extraction_body = {
                 "model": fallback_info.provider_model_id,
                 "messages": [
@@ -1594,7 +1631,13 @@ async def _extract_image_observations(
                 result = ""
             if not result:
                 return error_factory(502, "api_error", f"Vision fallback returned empty observations for image {image_index}.")
+            _vision_observation_cache_put(cache_key, result)
             results.append(result)
+    if image_parts:
+        log.info(
+            "vision_extract model=%s images=%d cache_hits=%d",
+            fallback_model, len(image_parts), cache_hits,
+        )
     return results
 
 

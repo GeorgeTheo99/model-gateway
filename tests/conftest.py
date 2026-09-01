@@ -17,6 +17,15 @@ os.environ["MODEL_GATEWAY_MODEL_INFO"] = str(Path(__file__).parent / "fixtures" 
 
 import src.auth as auth
 import src.providers as providers
+import src.server as server
+
+
+@pytest.fixture(autouse=True)
+def _clear_vision_observation_cache():
+    """Extraction results are cached process-wide; keep tests independent."""
+    server._vision_observation_cache.clear()
+    yield
+    server._vision_observation_cache.clear()
 
 
 @pytest.fixture(autouse=True)

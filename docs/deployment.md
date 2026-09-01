@@ -110,8 +110,11 @@ Because extraction is request-local and the gateway does not retain image
 state, a historical image that remains in a client's submitted conversation is
 extracted again on each later request; those later answers still come from the
 original text model. Extraction accepts up to 4 images per request by default;
-operators can adjust the limit with `GATEWAY_VISION_FALLBACK_MAX_IMAGES=<1-8>`
-(validated at startup with the other fallback policy checks).
+operators can adjust the limit with `GATEWAY_VISION_FALLBACK_MAX_IMAGES=<1-32>`
+(validated at startup with the other fallback policy checks). Successful
+observations are cached per process keyed on exact image bytes and the
+extracting model (bounded LRU, 256 entries), so the historical images that
+clients resend every turn are extracted once and then served from the cache.
 
 The legacy `GATEWAY_VISION_FALLBACK=<native-vision-model>` remains supported for
 existing deployments and retains its historical default mode of `reroute`. It
