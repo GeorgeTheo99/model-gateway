@@ -29,6 +29,8 @@ Per-model export controls in config.yaml (all optional)::
       alias: opus48
       ...
       export: true            # false = gateway-only model, skip the alias catalog
+      pi:
+        image_input: disabled # opt out of derived gateway-assisted vision
 
 Modes:
     export_catalogs.py                 # write the configured alias catalog
@@ -41,6 +43,8 @@ import argparse
 import difflib
 import json
 import os
+import plistlib
+import stat
 import sys
 from pathlib import Path
 
@@ -136,6 +140,10 @@ def _exported_models(entries: list[dict]) -> list[dict]:
 
 # Fields carried through to the generic alias contract so downstream consumers
 # can make UI and request-shape decisions without calling the gateway.
+PI_IMAGE_INPUT_ASSISTED = "gateway-assisted"
+PI_IMAGE_INPUT_DISABLED = "disabled"
+
+
 _ALIAS_FIELDS = (
     "thinking",
     "thinking_levels",
@@ -150,6 +158,130 @@ _ALIAS_FIELDS = (
     "provider_model_id",
     "pi",
 )
+
+
+_VISION_POLICY_KEYS = (
+    "GATEWAY_VISION_FALLBACK",
+    "GATEWAY_VISION_FALLBACK_LOCAL",
+    "GATEWAY_VISION_FALLBACK_CLOUD",
+    "GATEWAY_VISION_FALLBACK_MODE",
+)
+
+
+def _installed_vision_policy(environ: dict[str, str]) -> dict[str, str]:
+    """Read exact policy values from a private, owner-controlled LaunchAgent."""
+    plist_dir = Path(
+        environ.get("MODEL_GATEWAY_PLIST_DIR")
+        or Path(environ.get("HOME") or Path.home()) / "Library" / "LaunchAgents"
+    )
+    plist_path = plist_dir / "com.local.model-gateway.plist"
+    try:
+        file_stat = plist_path.lstat()
+        if (
+            plist_path.is_symlink()
+            or not stat.S_ISREG(file_stat.st_mode)
+            or file_stat.st_uid != os.getuid()
+            or file_stat.st_mode & 0o022
+        ):
+            return {}
+        with plist_path.open("rb") as handle:
+            document = plistlib.load(handle)
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return {}
+    values = document.get("EnvironmentVariables") if isinstance(document, dict) else None
+    if not isinstance(values, dict):
+        return {}
+    return {
+        key: str(values[key])
+        for key in _VISION_POLICY_KEYS
+        if isinstance(values.get(key), str)
+    }
+
+
+def _scoped_assisted_vision_localities(environ: dict[str, str] | None = None) -> set[str]:
+    """Localities whose validated process policy provides extract-then-answer."""
+    env = dict(os.environ if environ is None else environ)
+    installed = _installed_vision_policy(env)
+    values = {
+        key: str(env[key]) if key in env else installed.get(key, "")
+        for key in _VISION_POLICY_KEYS
+    }
+    legacy = values["GATEWAY_VISION_FALLBACK"].strip()
+    local = values["GATEWAY_VISION_FALLBACK_LOCAL"].strip()
+    cloud = values["GATEWAY_VISION_FALLBACK_CLOUD"].strip()
+    if legacy or not (local or cloud):
+        return set()
+    mode = values["GATEWAY_VISION_FALLBACK_MODE"].strip().lower()
+    if mode and mode != "extract_then_answer":
+        return set()
+    return {
+        locality
+        for locality, fallback in (("local", local), ("cloud", cloud))
+        if fallback
+    }
+
+
+def _route_locality(entry: dict, config: dict) -> str | None:
+    """Return a direct route's stable locality, or None for mixed/empty pools."""
+    pool_name = entry.get("pool")
+    members = (config.get("pools") or {}).get(str(pool_name)) if pool_name else None
+    if isinstance(members, str):
+        members = [members]
+    providers = list(members or [_effective_provider(entry, config)])
+    if not providers:
+        return None
+    localities = set()
+    for provider in providers:
+        normalized = str(provider).strip().lower()
+        if catalog_mod is not None:
+            normalized = catalog_mod.canonical_provider(normalized)
+        localities.add("local" if normalized in {"omlx", "local"} else "cloud")
+    return next(iter(localities)) if len(localities) == 1 else None
+
+
+def _apply_assisted_vision_policy(
+    entry: dict,
+    alias_entry: dict,
+    config: dict,
+    assisted_localities: set[str],
+) -> None:
+    """Derive Pi's effective image input from validated scoped gateway policy."""
+    hints = dict(alias_entry.get("pi") or {})
+    image_input = hints.get("image_input")
+    if image_input not in {None, PI_IMAGE_INPUT_ASSISTED, PI_IMAGE_INPUT_DISABLED}:
+        raise ValueError(
+            f"model {entry.get('name')!r} pi.image_input must be "
+            f"'{PI_IMAGE_INPUT_ASSISTED}' or '{PI_IMAGE_INPUT_DISABLED}'"
+        )
+    if entry.get("composite") is not None:
+        if entry.get("vision") is not True:
+            raise ValueError(
+                f"composite model {entry.get('name')!r} must declare vision: true"
+            )
+        if image_input is not None:
+            raise ValueError(
+                f"composite model {entry.get('name')!r} cannot set pi.image_input"
+            )
+        return
+    if entry.get("vision") is True:
+        if image_input is not None:
+            raise ValueError(
+                f"native vision model {entry.get('name')!r} cannot set pi.image_input"
+            )
+        return
+    if image_input == PI_IMAGE_INPUT_DISABLED:
+        alias_entry["pi"] = hints
+        return
+    locality = _route_locality(entry, config)
+    if locality in assisted_localities:
+        hints["image_input"] = PI_IMAGE_INPUT_ASSISTED
+        alias_entry["pi"] = hints
+        return
+    if image_input == PI_IMAGE_INPUT_ASSISTED:
+        raise ValueError(
+            f"model {entry.get('name')!r} requests assisted image input without a "
+            "matching locality-scoped extract_then_answer fallback"
+        )
 
 
 def _effective_provider(entry: dict, config: dict) -> str:
@@ -219,6 +351,7 @@ def render_model_aliases(
     config = config or {}
     aliases: dict[str, dict] = {}
     seen: dict[str, str] = {}
+    assisted_localities = _scoped_assisted_vision_localities()
     collisions: list[tuple[str, str, str]] = []
     for entry in entries:
         if entry.get("export") is False:
@@ -257,6 +390,7 @@ def render_model_aliases(
         for field in _ALIAS_FIELDS:
             if entry.get(field) is not None:
                 alias_entry[field] = entry.get(field)
+        _apply_assisted_vision_policy(entry, alias_entry, config, assisted_localities)
 
         if supported is False:
             alias_entry["supported"] = False

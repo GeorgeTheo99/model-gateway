@@ -74,7 +74,7 @@ Manual deploy:
 
 ### Promoting machine-local catalog changes
 
-`model-info.json` is intentionally Git-ignored and is not copied by the code deploy. When a reviewed change adds deployment-specific metadata such as `pi.image_input: gateway-assisted`, promote it separately and in this order:
+`model-info.json` is intentionally Git-ignored and is not copied by the code deploy. When any reviewed machine-catalog change is required, promote it separately and in this order. Gateway-assisted image capability itself is normally derived from the validated runtime fallback policy and does not require per-route catalog annotations.
 
 1. Deploy the tracked gateway and `pi-shared` code first, with both test suites passing.
 2. Validate the source catalog with `jq empty`, back up the current private runtime catalog, then copy through a mode-0600 temporary file in the runtime directory and rename it atomically:

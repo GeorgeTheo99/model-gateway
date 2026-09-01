@@ -192,11 +192,13 @@ exports:
 
 The gateway regenerates that generic alias file on startup. Render Pi-specific artifacts separately with `pi-shared/bin/pi-catalog`; generated launchers define `pi-restart model-gw`, which now delegates to the portable `model-gateway restart` command when available and falls back to `server-ci restart --model-gw` on the maintainer's dev-server install. Pi-owned generated artifacts should live under `~/.pi/` (for example, `~/.pi/generated/pi-launchers.zsh`), never under this repository or a model-gateway runtime directory.
 
-Pi removes image blocks before transport for models declared text-only. A route that deliberately relies on the validated process-wide fallback must therefore opt in through catalog metadata:
+Pi removes image blocks before transport for models declared text-only. When the running gateway has a validated locality-scoped helper and `extract_then_answer` mode, the alias exporter therefore derives `pi.image_input: gateway-assisted` automatically for every text-only direct route with a stable matching locality. `pi-shared/bin/pi-catalog` preserves image input for those routes and labels them `assisted vision`. Legacy global fallback, `reroute` mode, and mixed-locality pools never receive the derived capability.
+
+A route can explicitly opt out when image processing is unsuitable:
 
 ```yaml
 pi:
-  image_input: gateway-assisted
+  image_input: disabled
 ```
 
-The alias exporter carries this field through unchanged; `pi-shared/bin/pi-catalog` renders the route with image input enabled and labels it `assisted vision`. Use it only for direct routes whose locality-scoped fallback is guaranteed on that deployment. Native models continue to use `vision: true`, and explicit composites continue to advertise their own public vision capability.
+Native models continue to use `vision: true`, and explicit composites continue to advertise their own public vision capability. The automatic capability is deployment-derived: changing fallback policy requires a gateway restart (to regenerate aliases) followed by `pi-regen`.

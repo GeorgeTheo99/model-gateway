@@ -29,6 +29,7 @@ def _write_model_info(path: Path, llm: list[dict], **extra) -> None:
 def _run(config_path: Path, model_info_path: Path, *extra, env: dict | None = None) -> subprocess.CompletedProcess:
     e = dict(os.environ)
     e["PYTHONPATH"] = str(REPO_ROOT) + (os.pathsep + e.get("PYTHONPATH", ""))
+    e["MODEL_GATEWAY_PLIST_DIR"] = str(config_path.parent / ".test-launchagents")
     if env:
         e.update(env)
     return subprocess.run(
@@ -111,6 +112,40 @@ def test_composite_exports_as_ordinary_local_vision_alias(tmp_path):
     assert entry["thinking_format"] == "glm-chat-template"
     assert entry["context"] == 202752
     assert "composite" not in entry
+
+
+@pytest.mark.parametrize("vision", [None, False])
+@pytest.mark.parametrize("image_handling", ["reroute", "extract_then_answer"])
+def test_composites_must_declare_public_vision_capability(
+    tmp_path, vision, image_handling,
+):
+    mi = tmp_path / "model-info.json"
+    entry = {
+        "name": "composite", "alias": "composite", "provider": "omlx",
+        "omlx_id": "composite",
+        "composite": {
+            "text_model": "text-local",
+            "vision_model": "vision-local",
+            "image_handling": image_handling,
+        },
+    }
+    if vision is not None:
+        entry["vision"] = vision
+    _write_model_info(mi, [entry])
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(f"exports:\n  model_aliases: {tmp_path}/aliases.json\n")
+
+    result = _run(
+        cfg,
+        mi,
+        env={
+            "GATEWAY_VISION_FALLBACK_LOCAL": "local-vision",
+            "GATEWAY_VISION_FALLBACK_MODE": "extract_then_answer",
+        },
+    )
+
+    assert result.returncode != 0
+    assert "composite model 'composite' must declare vision: true" in result.stderr
 
 
 def test_balanced_and_legacy_detail_composites_export_as_distinct_routes(tmp_path):
@@ -245,14 +280,20 @@ def test_pooled_model_exported_with_effective_provider(tmp_path):
         "    context: 1000000\n"
         "    pi:\n"
         "      name: Fable via Databricks\n"
-        "      image_input: gateway-assisted\n"
         "  - name: gpt-5.5\n"
         "    pool: my-pool\n"
         "    alias: gpt\n"
         "    provider_model_id: databricks-gpt-5-5\n"
         f"exports:\n  model_aliases: {tmp_path}/aliases.json\n"
     )
-    r = _run(cfg, mi)
+    r = _run(
+        cfg,
+        mi,
+        env={
+            "GATEWAY_VISION_FALLBACK_CLOUD": "cloud-vision",
+            "GATEWAY_VISION_FALLBACK_MODE": "extract_then_answer",
+        },
+    )
     assert r.returncode == 0, r.stderr
     aliases = json.loads((tmp_path / "aliases.json").read_text())
     fable = aliases["cloud:databricks-claude-fable-5"]
@@ -267,6 +308,129 @@ def test_pooled_model_exported_with_effective_provider(tmp_path):
     gpt = aliases["cloud:databricks-gpt-5-5"]
     # Protocol falls back to the provider config's protocol.
     assert gpt["protocol"] == "openai"
+
+
+def test_scoped_extract_policy_automatically_marks_stable_text_routes(tmp_path):
+    mi = tmp_path / "model-info.json"
+    _write_model_info(
+        mi,
+        [
+            {
+                "name": "local-text", "alias": "localtext", "provider": "omlx",
+                "omlx_id": "local-text", "vision": False,
+            },
+            {
+                "name": "cloud-text", "alias": "cloudtext", "provider": "fireworks",
+                "provider_model_id": "cloud-text", "vision": False,
+            },
+            {
+                "name": "native-vision", "alias": "nativevision", "provider": "omlx",
+                "omlx_id": "native-vision", "vision": True,
+            },
+            {
+                "name": "local-opt-out", "alias": "localoptout", "provider": "omlx",
+                "omlx_id": "local-opt-out", "vision": False,
+                "pi": {"image_input": "disabled"},
+            },
+            {
+                "name": "mixed-text", "alias": "mixedtext", "pool": "mixed",
+                "provider_model_id": "mixed-text", "vision": False,
+            },
+        ],
+    )
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        f"pools:\n  mixed: [fireworks, omlx]\n"
+        f"exports:\n  model_aliases: {tmp_path}/aliases.json\n"
+    )
+    r = _run(
+        cfg,
+        mi,
+        env={
+            "GATEWAY_VISION_FALLBACK_LOCAL": "local-vision",
+            "GATEWAY_VISION_FALLBACK_CLOUD": "cloud-vision",
+            "GATEWAY_VISION_FALLBACK_MODE": "extract_then_answer",
+        },
+    )
+    assert r.returncode == 0, r.stderr
+    aliases = json.loads((tmp_path / "aliases.json").read_text())
+    assert aliases["local-text"]["pi"]["image_input"] == "gateway-assisted"
+    assert aliases["cloud:cloud-text"]["pi"]["image_input"] == "gateway-assisted"
+    assert "pi" not in aliases["native-vision"]
+    assert aliases["local-opt-out"]["pi"]["image_input"] == "disabled"
+    assert "pi" not in aliases["cloud:mixed-text"]
+
+
+def test_assisted_policy_recovers_from_private_installed_plist(tmp_path):
+    mi = tmp_path / "model-info.json"
+    _write_model_info(mi, [{
+        "name": "local-text", "alias": "localtext", "provider": "omlx",
+        "omlx_id": "local-text", "vision": False,
+    }])
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(f"exports:\n  model_aliases: {tmp_path}/aliases.json\n")
+    plist_dir = tmp_path / ".test-launchagents"
+    plist_dir.mkdir()
+    plist = plist_dir / "com.local.model-gateway.plist"
+    plist.write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>EnvironmentVariables</key><dict>
+<key>GATEWAY_VISION_FALLBACK_LOCAL</key><string>local-vision</string>
+<key>GATEWAY_VISION_FALLBACK_MODE</key><string>extract_then_answer</string>
+</dict></dict></plist>
+"""
+    )
+    plist.chmod(0o600)
+
+    recovered = _run(cfg, mi)
+    assert recovered.returncode == 0, recovered.stderr
+    alias = json.loads((tmp_path / "aliases.json").read_text())["local-text"]
+    assert alias["pi"]["image_input"] == "gateway-assisted"
+
+    explicitly_disabled = _run(
+        cfg,
+        mi,
+        env={
+            "GATEWAY_VISION_FALLBACK": "",
+            "GATEWAY_VISION_FALLBACK_LOCAL": "",
+            "GATEWAY_VISION_FALLBACK_CLOUD": "",
+            "GATEWAY_VISION_FALLBACK_MODE": "",
+        },
+    )
+    assert explicitly_disabled.returncode == 0, explicitly_disabled.stderr
+    assert "pi" not in json.loads((tmp_path / "aliases.json").read_text())["local-text"]
+
+
+def test_assisted_vision_is_not_inferred_for_reroute_or_legacy_policy(tmp_path):
+    mi = tmp_path / "model-info.json"
+    _write_model_info(mi, [{
+        "name": "cloud-text", "alias": "cloudtext", "provider": "fireworks",
+        "provider_model_id": "cloud-text", "vision": False,
+    }])
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(f"exports:\n  model_aliases: {tmp_path}/aliases.json\n")
+
+    reroute = _run(
+        cfg,
+        mi,
+        env={
+            "GATEWAY_VISION_FALLBACK_CLOUD": "cloud-vision",
+            "GATEWAY_VISION_FALLBACK_MODE": "reroute",
+        },
+    )
+    assert reroute.returncode == 0, reroute.stderr
+    assert "pi" not in json.loads((tmp_path / "aliases.json").read_text())["cloud:cloud-text"]
+
+    legacy = _run(
+        cfg,
+        mi,
+        env={
+            "GATEWAY_VISION_FALLBACK": "legacy-vision",
+            "GATEWAY_VISION_FALLBACK_MODE": "extract_then_answer",
+        },
+    )
+    assert legacy.returncode == 0, legacy.stderr
+    assert "pi" not in json.loads((tmp_path / "aliases.json").read_text())["cloud:cloud-text"]
 
 
 def test_duplicate_alias_hard_fails(tmp_path):
