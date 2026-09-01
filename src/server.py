@@ -72,6 +72,33 @@ def _stream_error_event(message: str) -> str:
     )
 
 
+class _RequestBodyTooLarge(Exception):
+    pass
+
+
+async def _read_json_body_bounded(request: Request) -> dict:
+    """Read one JSON object without buffering an unbounded request body."""
+    content_length = request.headers.get("content-length", "").strip()
+    if content_length:
+        try:
+            if int(content_length) > MODEL_GATEWAY_MAX_REQUEST_BODY_BYTES:
+                raise _RequestBodyTooLarge
+        except ValueError:
+            pass
+    raw = bytearray()
+    async for chunk in request.stream():
+        if len(raw) + len(chunk) > MODEL_GATEWAY_MAX_REQUEST_BODY_BYTES:
+            raise _RequestBodyTooLarge
+        raw.extend(chunk)
+    try:
+        body = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError("Invalid JSON body") from exc
+    if not isinstance(body, dict):
+        raise ValueError("JSON body must be an object")
+    return body
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     """Validate routing policy, initialize state, and start background services."""
@@ -104,8 +131,8 @@ app = FastAPI(title="Model Gateway", lifespan=_lifespan)
 app.include_router(admin_router)
 
 DEFAULT_VISION_FALLBACK_MODEL = ""
-DEFAULT_COMPOSITE_IMAGE_MAX_BYTES = 20_000_000
-DEFAULT_COMPOSITE_IMAGE_TOTAL_MAX_BYTES = 32_000_000
+DEFAULT_VISION_FALLBACK_IMAGE_MAX_BYTES = 20_000_000
+DEFAULT_VISION_FALLBACK_IMAGE_TOTAL_MAX_BYTES = 32_000_000
 DEFAULT_FIREWORKS_IMAGE_MAX_BYTES = 1_000_000
 DEFAULT_FIREWORKS_IMAGE_MAX_DIMENSION = 1600
 DEFAULT_FIREWORKS_IMAGE_TOTAL_MAX_BYTES = 8_000_000
@@ -156,32 +183,145 @@ def _configured_vision_fallback_mode() -> str:
 DEFAULT_VISION_FALLBACK_MAX_IMAGES = 4
 MAX_VISION_FALLBACK_MAX_IMAGES = 32
 VISION_OBSERVATION_CACHE_MAX_ENTRIES = 256
+DEFAULT_VISION_OBSERVATION_CACHE_TTL_SECONDS = 3600
+MAX_VISION_OBSERVATION_CACHE_TTL_SECONDS = 86_400
+DEFAULT_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS = max(1, min(STREAM_READ_TIMEOUT_SECONDS, 3600))
+MAX_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS = 3600
+VISION_OBSERVATION_MAX_CHARS_PER_IMAGE = 16_000
+VISION_OBSERVATION_MAX_TOTAL_CHARS = 256_000
+VISION_EXTRACTION_UPSTREAM_RESPONSE_MAX_BYTES = 1_000_000
+MODEL_GATEWAY_MAX_REQUEST_BODY_BYTES = 64_000_000
+VISION_OBSERVATION_CACHE_POLICY_VERSION = "vision-observation-v2"
+VISION_OBSERVATION_PROMPT_SHA256 = hashlib.sha256(VISION_OBSERVATION_PROMPT.encode()).hexdigest()
 
-# Per-process LRU of successful image observations keyed by exact image
-# content + extracting model. Sessions resend historical images every turn;
-# without this, each turn re-runs one upstream vision call per image.
-_vision_observation_cache: OrderedDict[str, str] = OrderedDict()
+# Per-process LRU of successful inline-image observations. Cache generations
+# prevent an extraction started before a registry reload from repopulating the
+# new generation with stale observations.
+_vision_observation_cache: OrderedDict[tuple[int, str], tuple[float, str]] = OrderedDict()
+_vision_observation_cache_generation = 0
 
 
-def _vision_observation_cache_key(image_part: dict, provider_model_id: str) -> str:
-    digest = hashlib.sha256(
-        json.dumps(image_part, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    return f"{provider_model_id}:{digest}"
+def _inline_image_bytes(image_part: dict) -> bytes | None:
+    """Return validated inline image bytes, or None for a remote/non-image part."""
+    url = _image_url_value(image_part)
+    if not isinstance(url, str) or not url.startswith("data:image/") or ";base64," not in url:
+        return None
+    encoded = url.split(";base64,", 1)[1]
+    try:
+        return base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("Vision fallback received malformed base64 image data") from exc
 
 
-def _vision_observation_cache_get(key: str) -> str | None:
-    value = _vision_observation_cache.get(key)
-    if value is not None:
-        _vision_observation_cache.move_to_end(key)
+def _vision_observation_cache_key(
+    image_part: dict,
+    fallback_model: str,
+    fallback_info,
+    *,
+    generation: int | None = None,
+) -> tuple[int, str] | None:
+    """Key an inline image by bytes, request options, and extractor contract."""
+    image_bytes = _inline_image_bytes(image_part)
+    if image_bytes is None:
+        return None
+    normalized_part = copy.deepcopy(image_part)
+    url = _image_url_value(normalized_part)
+    prefix = url.split(";base64,", 1)[0]
+    _set_image_url_value(
+        normalized_part,
+        f"{prefix};sha256,{hashlib.sha256(image_bytes).hexdigest()}",
+    )
+    extractor = {
+        "version": VISION_OBSERVATION_CACHE_POLICY_VERSION,
+        "fallback_model": fallback_model,
+        "provider": fallback_info.provider,
+        "base_url": fallback_info.base_url,
+        "provider_model_id": fallback_info.provider_model_id,
+        "protocol": fallback_info.protocol,
+        "endpoint_suffix": fallback_info.endpoint_suffix,
+        "system_instruction": fallback_info.system_instruction,
+        "observation_prompt_sha256": VISION_OBSERVATION_PROMPT_SHA256,
+        "max_tokens": 1800,
+        "fireworks_image_max_dimension": _env_int(
+            "GATEWAY_FIREWORKS_IMAGE_MAX_DIMENSION", DEFAULT_FIREWORKS_IMAGE_MAX_DIMENSION,
+        ),
+        "fireworks_image_max_bytes": _env_int(
+            "GATEWAY_FIREWORKS_IMAGE_MAX_BYTES", DEFAULT_FIREWORKS_IMAGE_MAX_BYTES,
+        ),
+        "fireworks_image_total_max_bytes": _env_int(
+            "GATEWAY_FIREWORKS_IMAGE_TOTAL_MAX_BYTES", DEFAULT_FIREWORKS_IMAGE_TOTAL_MAX_BYTES,
+        ),
+        "image_part": normalized_part,
+    }
+    identity = json.dumps(extractor, sort_keys=True, separators=(",", ":")).encode()
+    cache_generation = _vision_observation_cache_generation if generation is None else generation
+    return cache_generation, hashlib.sha256(identity).hexdigest()
+
+
+def _configured_vision_observation_cache_ttl_seconds() -> int:
+    raw = os.environ.get("GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_VISION_OBSERVATION_CACHE_TTL_SECONDS
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if not 0 <= value <= MAX_VISION_OBSERVATION_CACHE_TTL_SECONDS:
+        raise RuntimeError(
+            "GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS must be an integer from 0 through "
+            f"{MAX_VISION_OBSERVATION_CACHE_TTL_SECONDS}, not '{raw}'"
+        )
     return value
 
 
-def _vision_observation_cache_put(key: str, value: str) -> None:
-    _vision_observation_cache[key] = value
+def _configured_vision_extraction_total_timeout_seconds() -> int:
+    raw = os.environ.get("GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if not 1 <= value <= MAX_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS:
+        raise RuntimeError(
+            "GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS must be an integer from 1 through "
+            f"{MAX_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS}, not '{raw}'"
+        )
+    return value
+
+
+def _vision_observation_cache_get(key: tuple[int, str] | None) -> str | None:
+    if key is None or key[0] != _vision_observation_cache_generation:
+        return None
+    entry = _vision_observation_cache.get(key)
+    if entry is None:
+        return None
+    created_at, value = entry
+    ttl = _configured_vision_observation_cache_ttl_seconds()
+    if ttl == 0 or time.monotonic() - created_at > ttl:
+        _vision_observation_cache.pop(key, None)
+        return None
+    _vision_observation_cache.move_to_end(key)
+    return value
+
+
+def _vision_observation_cache_put(key: tuple[int, str] | None, value: str) -> None:
+    if (
+        key is None
+        or key[0] != _vision_observation_cache_generation
+        or _configured_vision_observation_cache_ttl_seconds() == 0
+    ):
+        return
+    _vision_observation_cache[key] = (time.monotonic(), value)
     _vision_observation_cache.move_to_end(key)
     while len(_vision_observation_cache) > VISION_OBSERVATION_CACHE_MAX_ENTRIES:
         _vision_observation_cache.popitem(last=False)
+
+
+def _clear_vision_observation_cache() -> None:
+    global _vision_observation_cache_generation
+    _vision_observation_cache_generation += 1
+    _vision_observation_cache.clear()
 
 
 def _configured_vision_fallback_max_images() -> int:
@@ -241,10 +381,19 @@ def _vision_fallback_policies() -> list[tuple[str, str, str | None]]:
 
 def _validate_vision_fallback_policy(*, log_policy: bool = True) -> None:
     """Fail startup/reload on invalid opt-ins and enforce locality boundaries."""
+    # Composites use the shared cache and extraction timeout even when no
+    # process-wide fallback is enabled, so validate these controls first.
+    cache_ttl = _configured_vision_observation_cache_ttl_seconds()
+    total_timeout = _configured_vision_extraction_total_timeout_seconds()
     policies = _vision_fallback_policies()
     if not policies:
         if log_policy:
-            log.info("vision fallback policy: disabled; image input to text-only models fails closed")
+            log.info(
+                "vision fallback policy: disabled; image input to text-only models fails closed "
+                "cache_ttl_seconds=%d total_timeout_seconds=%d",
+                cache_ttl,
+                total_timeout,
+            )
         return
 
     fallback_mode = _configured_vision_fallback_mode()
@@ -296,14 +445,18 @@ def _validate_vision_fallback_policy(*, log_policy: bool = True) -> None:
         cloud_egress = actual_locality == "cloud"
         message = (
             "vision fallback policy: enabled model=%s scope=%s providers=%s "
-            "cloud_egress=%s mode=%s max_images=%d"
+            "cloud_egress=%s mode=%s max_images=%d cache_ttl_seconds=%d total_timeout_seconds=%d"
         )
         scope = required_locality or "legacy-global"
         provider_list = ",".join(effective_providers)
+        args = (
+            fallback_model, scope, provider_list, str(cloud_egress).lower(), fallback_mode,
+            max_images, cache_ttl, total_timeout,
+        )
         if log_policy and cloud_egress:
-            log.warning(message, fallback_model, scope, provider_list, "true", fallback_mode, max_images)
+            log.warning(message, *args)
         elif log_policy:
-            log.info(message, fallback_model, scope, provider_list, "false", fallback_mode, max_images)
+            log.info(message, *args)
 
 
 def _session_affinity_id(request: Request) -> str:
@@ -1471,15 +1624,13 @@ def _replace_anthropic_images_with_extracted_text(
 
 
 def _inline_image_size(part: dict) -> int:
-    image_url = part.get("image_url")
-    url = image_url.get("url") if isinstance(image_url, dict) else image_url
-    if not isinstance(url, str) or not url.startswith("data:image/") or ";base64," not in url:
-        raise ValueError("Local composite vision accepts only inline data:image/...;base64 images")
-    encoded = url.split(";base64,", 1)[1]
     try:
-        return len(base64.b64decode(encoded, validate=True))
-    except (ValueError, TypeError) as exc:
+        image_bytes = _inline_image_bytes(part)
+    except ValueError as exc:
         raise ValueError("Local composite vision received malformed base64 image data") from exc
+    if image_bytes is None:
+        raise ValueError("Local composite vision accepts only inline data:image/...;base64 images")
+    return len(image_bytes)
 
 
 async def _await_client_bound_operation(request: Request, operation):
@@ -1508,6 +1659,51 @@ async def _await_client_bound_operation(request: Request, operation):
             await asyncio.gather(task, return_exceptions=True)
 
 
+class _VisionExtractionResponseTooLarge(Exception):
+    pass
+
+
+async def _post_vision_extraction_json(
+    request: Request,
+    client,
+    endpoint: str,
+    extraction_body: dict,
+    headers: dict,
+) -> tuple[int, dict]:
+    """POST one extraction request and bound the complete upstream response."""
+
+    async def operation() -> tuple[int, dict]:
+        if hasattr(client, "build_request") and hasattr(client, "send"):
+            upstream_request = client.build_request(
+                "POST", endpoint, json=extraction_body, headers=headers,
+            )
+            response = await client.send(upstream_request, stream=True)
+            raw = bytearray()
+            try:
+                async for chunk in response.aiter_bytes():
+                    if len(raw) + len(chunk) > VISION_EXTRACTION_UPSTREAM_RESPONSE_MAX_BYTES:
+                        raise _VisionExtractionResponseTooLarge
+                    raw.extend(chunk)
+            finally:
+                await response.aclose()
+            try:
+                data = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                data = {}
+            return response.status_code, data if isinstance(data, dict) else {}
+
+        # Narrow test-double compatibility path. Production httpx clients use
+        # the bounded streaming branch above.
+        response = await client.post(endpoint, json=extraction_body, headers=headers)
+        try:
+            data = response.json()
+        except Exception:  # noqa: BLE001
+            data = {}
+        return response.status_code, data if isinstance(data, dict) else {}
+
+    return await _await_client_bound_operation(request, operation)
+
+
 async def _extract_image_observations(
     request: Request,
     body: dict,
@@ -1516,8 +1712,11 @@ async def _extract_image_observations(
     error_factory=_error_openai,
     *,
     max_images: int = 1,
-    require_inline_images: bool = False,
 ) -> list[str] | JSONResponse:
+    # Capture before any await. A successful registry reload increments this
+    # generation, causing all writes from an in-flight old-registry extraction
+    # to be rejected even if the request resumes after the reload.
+    cache_generation = _vision_observation_cache_generation
     # Extraction is an explicit cross-model boundary. Send only image blocks,
     # never the surrounding conversation, tools, or user text. Extract each
     # image separately so observations remain aligned with its original place.
@@ -1535,15 +1734,21 @@ async def _extract_image_observations(
             "invalid_request_error",
             f"extract_then_answer accepts 1 through {max_images} images per request.",
         )
-    if require_inline_images:
-        try:
-            sizes = [_inline_image_size(part) for part in image_parts]
-        except ValueError as exc:
-            return error_factory(400, "invalid_request_error", str(exc))
-        if any(size > DEFAULT_COMPOSITE_IMAGE_MAX_BYTES for size in sizes):
-            return error_factory(413, "invalid_request_error", "A local composite image exceeds the per-image byte limit.")
-        if sum(sizes) > DEFAULT_COMPOSITE_IMAGE_TOTAL_MAX_BYTES:
-            return error_factory(413, "invalid_request_error", "Local composite images exceed the total byte limit.")
+    inline_sizes: list[int] = []
+    try:
+        for part in image_parts:
+            image_bytes = _inline_image_bytes(part)
+            if image_bytes is None:
+                raise ValueError(
+                    "extract_then_answer accepts only inline data:image/...;base64 images"
+                )
+            inline_sizes.append(len(image_bytes))
+    except ValueError as exc:
+        return error_factory(400, "invalid_request_error", str(exc))
+    if any(size > DEFAULT_VISION_FALLBACK_IMAGE_MAX_BYTES for size in inline_sizes):
+        return error_factory(413, "invalid_request_error", "A vision fallback image exceeds the per-image byte limit.")
+    if sum(inline_sizes) > DEFAULT_VISION_FALLBACK_IMAGE_TOTAL_MAX_BYTES:
+        return error_factory(413, "invalid_request_error", "Vision fallback images exceed the total byte limit.")
     if fallback_info.protocol == "anthropic":
         return error_factory(502, "api_error", f"Vision fallback model '{fallback_model}' does not support Chat Completions")
 
@@ -1560,12 +1765,22 @@ async def _extract_image_observations(
     endpoint = _upstream_endpoint(fallback_info, "/chat/completions")
     results: list[str] = []
     cache_hits = 0
+    total_chars = 0
+    deadline = time.monotonic() + _configured_vision_extraction_total_timeout_seconds()
     async with httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS) as client:
         for image_index, image_part in enumerate(image_parts, start=1):
-            cache_key = _vision_observation_cache_key(image_part, fallback_info.provider_model_id)
+            cache_key = _vision_observation_cache_key(
+                image_part,
+                fallback_model,
+                fallback_info,
+                generation=cache_generation,
+            )
             cached = _vision_observation_cache_get(cache_key)
             if cached is not None:
+                if total_chars + len(cached) > VISION_OBSERVATION_MAX_TOTAL_CHARS:
+                    return error_factory(502, "api_error", "Vision fallback observations exceed the total output limit.")
                 cache_hits += 1
+                total_chars += len(cached)
                 results.append(cached)
                 continue
             extraction_body = {
@@ -1582,30 +1797,35 @@ async def _extract_image_observations(
             _compress_fireworks_inline_images(extraction_body, fallback_info)
             _remap_max_tokens_for_provider(extraction_body, fallback_info.provider)
             start = time.time()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return error_factory(504, "api_error", "Vision fallback exceeded the total extraction timeout.")
             try:
-                resp = await _await_client_bound_operation(
-                    request,
-                    lambda: client.post(endpoint, json=extraction_body, headers=headers),
+                status_code, data = await asyncio.wait_for(
+                    _post_vision_extraction_json(
+                        request, client, endpoint, extraction_body, headers,
+                    ),
+                    timeout=remaining,
                 )
+            except TimeoutError:
+                return error_factory(504, "api_error", "Vision fallback exceeded the total extraction timeout.")
+            except _VisionExtractionResponseTooLarge:
+                return error_factory(502, "api_error", "Vision fallback response exceeds the byte limit.")
             except httpx.ConnectError:
                 return error_factory(502, "api_error", "Cannot connect to vision model provider")
             except Exception as exc:  # noqa: BLE001
                 return error_factory(502, "api_error", f"Vision fallback request failed: {type(exc).__name__}")
             latency_ms = int((time.time() - start) * 1000)
-            try:
-                data = resp.json()
-            except Exception:  # noqa: BLE001
-                data = {}
             usage = data.get("usage") if isinstance(data, dict) and isinstance(data.get("usage"), dict) else None
             _ledger_record(
                 "/internal/image-extract", "POST", fallback_model, fallback_info.provider,
-                fallback_info.provider_model_id, resp.status_code, latency_ms, False, usage,
+                fallback_info.provider_model_id, status_code, latency_ms, False, usage,
                 pricing_for(fallback_model), pricing_status_for(fallback_model),
             )
-            if resp.status_code >= 400:
+            if status_code >= 400:
                 return error_factory(
                     502, "api_error",
-                    f"Vision fallback provider returned HTTP {resp.status_code} for image {image_index}.",
+                    f"Vision fallback provider returned HTTP {status_code} for image {image_index}.",
                 )
             choice = (data.get("choices") or [{}])[0] if isinstance(data, dict) else {}
             finish_reason = choice.get("finish_reason") if isinstance(choice, dict) else None
@@ -1631,7 +1851,12 @@ async def _extract_image_observations(
                 result = ""
             if not result:
                 return error_factory(502, "api_error", f"Vision fallback returned empty observations for image {image_index}.")
+            if len(result) > VISION_OBSERVATION_MAX_CHARS_PER_IMAGE:
+                return error_factory(502, "api_error", f"Vision fallback observations exceed the per-image output limit for image {image_index}.")
+            if total_chars + len(result) > VISION_OBSERVATION_MAX_TOTAL_CHARS:
+                return error_factory(502, "api_error", "Vision fallback observations exceed the total output limit.")
             _vision_observation_cache_put(cache_key, result)
+            total_chars += len(result)
             results.append(result)
     if image_parts:
         log.info(
@@ -1714,7 +1939,6 @@ async def _apply_chat_vision_fallback(
                 if composite is not None
                 else _configured_vision_fallback_max_images()
             ),
-            require_inline_images=composite is not None,
         )
         if isinstance(observations, JSONResponse):
             return body, requested_model, info, observations
@@ -2670,8 +2894,10 @@ async def create_response(request: Request):
     if auth_error is not None:
         return auth_error
     try:
-        body = await request.json()
-    except Exception:
+        body = await _read_json_body_bounded(request)
+    except _RequestBodyTooLarge:
+        return _error_openai(413, "invalid_request_error", "Request body exceeds the byte limit")
+    except ValueError:
         return _error_openai(400, "invalid_request_error", "Invalid JSON body")
 
     profile_vision_body = responses_to_chat(body)
@@ -3044,8 +3270,13 @@ async def chat_completions(request: Request):
     if auth_error is not None:
         return auth_error
     try:
-        body = await request.json()
-    except Exception:
+        body = await _read_json_body_bounded(request)
+    except _RequestBodyTooLarge:
+        return JSONResponse(
+            status_code=413,
+            content={"error": {"message": "Request body exceeds the byte limit", "type": "invalid_request_error"}},
+        )
+    except ValueError:
         return JSONResponse(
             status_code=400,
             content={"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
@@ -3468,8 +3699,10 @@ async def messages(request: Request):
     if auth_error is not None:
         return auth_error
     try:
-        body = await request.json()
-    except Exception:
+        body = await _read_json_body_bounded(request)
+    except _RequestBodyTooLarge:
+        return _error(413, "invalid_request_error", "Request body exceeds the byte limit")
+    except ValueError:
         return _error(400, "invalid_request_error", "Invalid JSON body")
 
     profile_vision_body = anthropic_to_openai(body)

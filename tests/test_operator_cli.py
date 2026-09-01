@@ -21,6 +21,9 @@ def _run_env(home: Path, overrides: dict[str, str] | None = None) -> str:
         "GATEWAY_VISION_FALLBACK_LOCAL",
         "GATEWAY_VISION_FALLBACK_CLOUD",
         "GATEWAY_VISION_FALLBACK_MODE",
+        "GATEWAY_VISION_FALLBACK_MAX_IMAGES",
+        "GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS",
+        "GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS",
     ):
         env.pop(key, None)
     env["HOME"] = str(home)
@@ -99,11 +102,17 @@ def test_env_exposes_scoped_vision_fallback_configuration(tmp_path: Path) -> Non
             "GATEWAY_VISION_FALLBACK_LOCAL": "local-vision",
             "GATEWAY_VISION_FALLBACK_CLOUD": "cloud-vision",
             "GATEWAY_VISION_FALLBACK_MODE": "extract_then_answer",
+            "GATEWAY_VISION_FALLBACK_MAX_IMAGES": "12",
+            "GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS": "600",
+            "GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS": "1200",
         },
     )
     assert "GATEWAY_VISION_FALLBACK_LOCAL=local-vision" in output
     assert "GATEWAY_VISION_FALLBACK_CLOUD=cloud-vision" in output
     assert "GATEWAY_VISION_FALLBACK_MODE=extract_then_answer" in output
+    assert "GATEWAY_VISION_FALLBACK_MAX_IMAGES=12" in output
+    assert "GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS=600" in output
+    assert "GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS=1200" in output
 
 
 def test_explicit_empty_vision_setting_clears_persisted_plist_value(tmp_path: Path) -> None:
@@ -154,4 +163,7 @@ def test_install_and_post_pull_update_validate_before_atomic_plist_write() -> No
     assert "GATEWAY_VISION_FALLBACK_LOCAL" in write_plist
     assert "GATEWAY_VISION_FALLBACK_CLOUD" in write_plist
     assert "GATEWAY_VISION_FALLBACK_MODE" in write_plist
+    assert "GATEWAY_VISION_FALLBACK_MAX_IMAGES" in write_plist
+    assert "GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS" in write_plist
+    assert "GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS" in write_plist
     assert 'exec "$ROOT_DIR/bin/model-gateway" _update-after-pull' in update

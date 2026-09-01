@@ -985,7 +985,7 @@ def test_chat_completions_image_request_extracts_then_answers_with_opt_in_fallba
         assert fallback_model == "vision-fallback"
         assert fallback is fallback_info
         assert server_module._payload_has_image(body)
-        assert kwargs == {"max_images": 4, "require_inline_images": False}
+        assert kwargs == {"max_images": 4}
         return ["Visible: a concrete wall with a crack."]
 
     async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
@@ -1043,7 +1043,7 @@ def test_chat_completions_composite_defaults_to_scoped_local_extraction(client, 
     async def fake_extract(request, body, fallback_model, fallback, error_factory, **kwargs):
         assert fallback_model == "gemma-local"
         assert fallback is vision_info
-        assert kwargs == {"max_images": 4, "require_inline_images": True}
+        assert kwargs == {"max_images": 4}
         return ["Dense Gemma sees a terminal window."]
 
     async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
@@ -1316,7 +1316,7 @@ def test_chat_completions_image_request_extracts_when_mode_env_configured(client
         return None
 
     async def fake_extract(request, body, fallback_model, fallback, error_factory, **kwargs):
-        assert kwargs == {"max_images": 4, "require_inline_images": False}
+        assert kwargs == {"max_images": 4}
         return ["Visible: a red pixel."]
 
     async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
@@ -1357,7 +1357,7 @@ def test_chat_completions_image_request_extracts_multiple_images(client, monkeyp
         return None
 
     async def fake_extract(request, body, fallback_model, fallback, error_factory, **kwargs):
-        assert kwargs == {"max_images": 4, "require_inline_images": False}
+        assert kwargs == {"max_images": 4}
         return ["Visible: a red pixel.", "Visible: a blue square."]
 
     async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
@@ -1752,6 +1752,39 @@ def test_startup_rejects_invalid_vision_fallback_max_images(monkeypatch, raw):
         server_module._validate_vision_fallback_policy()
 
 
+@pytest.mark.parametrize(
+    ("variable", "raw"),
+    [
+        ("GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS", "-1"),
+        ("GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS", "86401"),
+        ("GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS", "many"),
+        ("GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS", "0"),
+        ("GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS", "3601"),
+        ("GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS", "many"),
+    ],
+)
+def test_startup_rejects_invalid_vision_fallback_resource_bounds(monkeypatch, variable, raw):
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
+    monkeypatch.setenv(variable, raw)
+    monkeypatch.setattr(
+        server_module, "resolve",
+        lambda model: pytest.fail("invalid resource bound must be rejected before resolving"),
+    )
+
+    with pytest.raises(RuntimeError, match=variable):
+        server_module._validate_vision_fallback_policy()
+
+
+def test_startup_validates_shared_extraction_controls_without_global_fallback(monkeypatch):
+    monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
+    monkeypatch.delenv("GATEWAY_VISION_FALLBACK_LOCAL", raising=False)
+    monkeypatch.delenv("GATEWAY_VISION_FALLBACK_CLOUD", raising=False)
+    monkeypatch.setenv("GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS", "invalid")
+
+    with pytest.raises(RuntimeError, match="GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS"):
+        server_module._validate_vision_fallback_policy()
+
+
 def test_startup_rejects_protocol_incompatible_vision_fallback(monkeypatch):
     fallback_info = _info("none", provider="anthropic", vision=True)
     fallback_info.protocol = "anthropic"
@@ -1982,7 +2015,7 @@ def test_multi_image_extraction_is_bounded_and_ordered(monkeypatch):
 
     result = asyncio.run(server_module._extract_image_observations(
         request, body, "gemma-local", info,
-        max_images=4, require_inline_images=True,
+        max_images=4,
     ))
 
     assert result == ["observation 1", "observation 2"]
@@ -2029,7 +2062,7 @@ def test_repeated_image_extraction_uses_the_observation_cache(monkeypatch):
 
     # Turn 1: both images extracted (2 upstream calls).
     first = asyncio.run(server_module._extract_image_observations(
-        request, copy.deepcopy(body), "gemma-local", info, max_images=4, require_inline_images=True,
+        request, copy.deepcopy(body), "gemma-local", info, max_images=4,
     ))
     assert first == ["observation 1", "observation 2"]
     assert len(calls) == 2
@@ -2040,7 +2073,7 @@ def test_repeated_image_extraction_uses_the_observation_cache(monkeypatch):
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,BQAD"}}
     )
     second = asyncio.run(server_module._extract_image_observations(
-        request, second_body, "gemma-local", info, max_images=4, require_inline_images=True,
+        request, second_body, "gemma-local", info, max_images=4,
     ))
     assert second == ["observation 1", "observation 2", "observation 3"]
     assert len(calls) == 3, "cached observations must not re-run upstream extraction"
@@ -2048,18 +2081,176 @@ def test_repeated_image_extraction_uses_the_observation_cache(monkeypatch):
     # A different extracting model misses the cache even for identical bytes.
     other_info = _info("", thinking="", provider="omlx", provider_model_id="other-upstream", vision=True)
     third = asyncio.run(server_module._extract_image_observations(
-        request, copy.deepcopy(body), "other-local", other_info, max_images=4, require_inline_images=True,
+        request, copy.deepcopy(body), "other-local", other_info, max_images=4,
     ))
     assert third == ["observation 4", "observation 5"]
     assert len(calls) == 5
 
     # Failed extractions must not be cached: the responses above always 200;
     # verify the cache only stores successful observations via the bound entries.
-    assert server_module._vision_observation_cache.get(
+    assert server_module._vision_observation_cache_get(
         server_module._vision_observation_cache_key(
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}, "gemma-upstream",
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            "gemma-local",
+            info,
         )
     ) == "observation 1"
+
+
+def test_request_json_reader_enforces_streaming_body_limit(monkeypatch):
+    class FakeRequest:
+        headers = {}
+
+        async def stream(self):
+            yield b'{"model":'
+            yield b'"too-large"}'
+
+    monkeypatch.setattr(server_module, "MODEL_GATEWAY_MAX_REQUEST_BODY_BYTES", 10)
+    with pytest.raises(server_module._RequestBodyTooLarge):
+        asyncio.run(server_module._read_json_body_bounded(FakeRequest()))
+
+
+class _StreamingExtractionResponse:
+    status_code = 200
+
+    def __init__(self, chunks):
+        self.chunks = chunks
+        self.closed = False
+
+    async def aiter_bytes(self):
+        for chunk in self.chunks:
+            yield chunk
+
+    async def aclose(self):
+        self.closed = True
+
+
+class _StreamingExtractionClient:
+    def __init__(self, response):
+        self.response = response
+
+    def build_request(self, *args, **kwargs):
+        return (args, kwargs)
+
+    async def send(self, request, stream=False):
+        assert stream is True
+        return self.response
+
+
+def test_vision_extraction_response_reader_enforces_streaming_byte_limit(monkeypatch):
+    response = _StreamingExtractionResponse([b'{"choices":', b'[{"message":{"content":"too large"}}]}'])
+    client = _StreamingExtractionClient(response)
+    monkeypatch.setattr(server_module, "VISION_EXTRACTION_UPSTREAM_RESPONSE_MAX_BYTES", 12)
+    request = SimpleNamespace(state=SimpleNamespace())
+
+    with pytest.raises(server_module._VisionExtractionResponseTooLarge):
+        asyncio.run(server_module._post_vision_extraction_json(
+            request, client, "http://up", {}, {},
+        ))
+    assert response.closed is True
+
+
+def test_vision_observation_cache_uses_inline_bytes_and_complete_extractor_identity():
+    inline = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQID"}}
+    same_bytes_different_mime = {
+        "type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AQID"},
+    }
+    remote = {"type": "image_url", "image_url": {"url": "https://example.test/mutable.png"}}
+    info = _info("", provider="omlx", provider_model_id="vision-upstream", vision=True)
+
+    key = server_module._vision_observation_cache_key(inline, "vision-local", info)
+    assert key != server_module._vision_observation_cache_key(
+        same_bytes_different_mime, "vision-local", info,
+    )
+    high_detail = copy.deepcopy(inline)
+    high_detail["image_url"]["detail"] = "high"
+    assert key != server_module._vision_observation_cache_key(
+        high_detail, "vision-local", info,
+    )
+    assert server_module._vision_observation_cache_key(remote, "vision-local", info) is None
+
+    changed_endpoint = copy.copy(info)
+    changed_endpoint.base_url = "http://different-upstream"
+    assert key != server_module._vision_observation_cache_key(
+        inline, "vision-local", changed_endpoint,
+    )
+    changed_instruction = copy.copy(info)
+    changed_instruction.system_instruction = "different extraction contract"
+    assert key != server_module._vision_observation_cache_key(
+        inline, "vision-local", changed_instruction,
+    )
+
+
+def test_vision_observation_cache_ttl_and_disable(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(server_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setenv("GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS", "10")
+    generation = server_module._vision_observation_cache_generation
+    key = (generation, "key")
+    server_module._vision_observation_cache_put(key, "observation")
+    assert server_module._vision_observation_cache_get(key) == "observation"
+    now[0] = 111.0
+    assert server_module._vision_observation_cache_get(key) is None
+
+    monkeypatch.setenv("GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS", "0")
+    disabled_key = (generation, "disabled")
+    server_module._vision_observation_cache_put(disabled_key, "observation")
+    assert server_module._vision_observation_cache_get(disabled_key) is None
+
+
+def test_vision_observation_cache_rejects_stale_generation_writes():
+    generation = server_module._vision_observation_cache_generation
+    stale_key = (generation, "stale")
+    server_module._clear_vision_observation_cache()
+    server_module._vision_observation_cache_put(stale_key, "old observation")
+    assert server_module._vision_observation_cache_get(stale_key) is None
+    assert not server_module._vision_observation_cache
+
+
+def test_inflight_old_generation_extraction_cannot_repopulate_cache_after_reload(monkeypatch):
+    async def scenario():
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {
+                    "choices": [{"finish_reason": "stop", "message": {"content": "old observation"}}],
+                    "usage": {},
+                }
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def post(self, endpoint, json, headers):
+                started.set()
+                await release.wait()
+                return FakeResponse()
+
+        monkeypatch.setattr(server_module.httpx, "AsyncClient", lambda **kwargs: FakeClient())
+        monkeypatch.setattr(server_module, "_ledger_record", lambda *args, **kwargs: None)
+        request = SimpleNamespace(state=SimpleNamespace())
+        info = _info("", provider="omlx", provider_model_id="vision-upstream", vision=True)
+        body = {"messages": [{"role": "user", "content": [{
+            "type": "image_url", "image_url": {"url": "data:image/png;base64,AQID"},
+        }]}]}
+
+        task = asyncio.create_task(server_module._extract_image_observations(
+            request, body, "vision-local", info, max_images=4,
+        ))
+        await started.wait()
+        server_module._clear_vision_observation_cache()
+        release.set()
+        assert await task == ["old observation"]
+        assert not server_module._vision_observation_cache
+
+    asyncio.run(scenario())
 
 
 def test_startup_accepts_vision_fallback_max_images_up_to_32(monkeypatch, caplog):
@@ -2074,7 +2265,7 @@ def test_startup_accepts_vision_fallback_max_images_up_to_32(monkeypatch, caplog
     assert "max_images=20" in caplog.text
 
 
-def test_local_composite_rejects_remote_images_before_upstream(monkeypatch):
+def test_all_extract_then_answer_modes_reject_remote_images_before_upstream(monkeypatch):
     class ForbiddenClient:
         def __init__(self, **kwargs):
             raise AssertionError("image validation must happen before creating a client")
@@ -2090,7 +2281,6 @@ def test_local_composite_rejects_remote_images_before_upstream(monkeypatch):
         "gemma-local",
         info,
         max_images=4,
-        require_inline_images=True,
     ))
 
     assert result.status_code == 400
@@ -2120,21 +2310,21 @@ def test_local_composite_rejects_invalid_image_batches_before_upstream(
 
     result = asyncio.run(server_module._extract_image_observations(
         request, body, "gemma-local", info,
-        max_images=max_images, require_inline_images=True,
+        max_images=max_images,
     ))
 
     assert result.status_code == expected_status
     assert message in result.body.decode()
 
 
-def test_local_composite_enforces_per_image_and_total_byte_limits(monkeypatch):
+def test_all_extraction_modes_enforce_inline_per_image_and_total_byte_limits(monkeypatch):
     class ForbiddenClient:
         def __init__(self, **kwargs):
             raise AssertionError("size validation must happen before creating a client")
 
     monkeypatch.setattr(server_module.httpx, "AsyncClient", ForbiddenClient)
-    monkeypatch.setattr(server_module, "DEFAULT_COMPOSITE_IMAGE_MAX_BYTES", 2)
-    monkeypatch.setattr(server_module, "DEFAULT_COMPOSITE_IMAGE_TOTAL_MAX_BYTES", 3)
+    monkeypatch.setattr(server_module, "DEFAULT_VISION_FALLBACK_IMAGE_MAX_BYTES", 2)
+    monkeypatch.setattr(server_module, "DEFAULT_VISION_FALLBACK_IMAGE_TOTAL_MAX_BYTES", 3)
     request = SimpleNamespace(state=SimpleNamespace())
     info = _info("", thinking="", provider="omlx", provider_model_id="gemma-upstream", vision=True)
 
@@ -2143,7 +2333,7 @@ def test_local_composite_enforces_per_image_and_total_byte_limits(monkeypatch):
         {"messages": [{"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQID"}},
         ]}]},
-        "gemma-local", info, max_images=4, require_inline_images=True,
+        "gemma-local", info, max_images=4,
     ))
     total = asyncio.run(server_module._extract_image_observations(
         request,
@@ -2151,7 +2341,7 @@ def test_local_composite_enforces_per_image_and_total_byte_limits(monkeypatch):
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQI="}},
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,AwQ="}},
         ]}]},
-        "gemma-local", info, max_images=4, require_inline_images=True,
+        "gemma-local", info, max_images=4,
     ))
 
     assert per_image.status_code == 413 and "per-image byte limit" in per_image.body.decode()
@@ -2196,7 +2386,7 @@ def test_local_composite_rejects_nonterminal_observations(monkeypatch, finish_re
         {"messages": [{"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
         ]}]},
-        "gemma-local", info, max_images=4, require_inline_images=True,
+        "gemma-local", info, max_images=4,
     ))
 
     assert calls == 1
@@ -2241,7 +2431,7 @@ def test_local_composite_rejects_nontext_observations(monkeypatch, content):
         {"messages": [{"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
         ]}]},
-        "gemma-local", info, max_images=4, require_inline_images=True,
+        "gemma-local", info, max_images=4,
     ))
 
     assert result.status_code == 502
@@ -2252,10 +2442,11 @@ def test_responses_input_image_translates_to_real_image_block():
     from src.responses import responses_to_chat
     result = responses_to_chat({"input": [{"type": "message", "role": "user", "content": [
         {"type": "input_text", "text": "inspect"},
-        {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+        {"type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "high"},
     ]}]})
     assert result["messages"][0]["content"][1] == {
-        "type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"},
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,AAAA", "detail": "high"},
     }
 
 
@@ -2322,7 +2513,7 @@ def test_responses_tool_output_preserves_images_for_gateway_staging():
             {"type": "input_text", "text": "screenshot"},
             {"type": "input_text", "text": {"page": 2}},
             {"type": "input_file", "filename": "report.pdf"},
-            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "low"},
         ],
     }]})
     tool = result["messages"][0]
@@ -2330,7 +2521,10 @@ def test_responses_tool_output_preserves_images_for_gateway_staging():
     assert tool["content"][0] == {"type": "text", "text": "screenshot"}
     assert tool["content"][1] == {"type": "text", "text": '{"page": 2}'}
     assert tool["content"][2] == {"type": "text", "text": "[file: report.pdf]"}
-    assert tool["content"][3]["image_url"]["url"] == "data:image/png;base64,AAAA"
+    assert tool["content"][3]["image_url"] == {
+        "url": "data:image/png;base64,AAAA",
+        "detail": "low",
+    }
     assert server_module._image_count(result) == 1
 
 

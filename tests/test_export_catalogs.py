@@ -245,6 +245,7 @@ def test_pooled_model_exported_with_effective_provider(tmp_path):
         "    context: 1000000\n"
         "    pi:\n"
         "      name: Fable via Databricks\n"
+        "      image_input: gateway-assisted\n"
         "  - name: gpt-5.5\n"
         "    pool: my-pool\n"
         "    alias: gpt\n"
@@ -259,7 +260,10 @@ def test_pooled_model_exported_with_effective_provider(tmp_path):
     assert fable["provider"] == "db-west"
     assert fable["protocol"] == "anthropic"
     assert fable["alias"] == "fable"
-    assert fable["pi"] == {"name": "Fable via Databricks"}
+    assert fable["pi"] == {
+        "name": "Fable via Databricks",
+        "image_input": "gateway-assisted",
+    }
     gpt = aliases["cloud:databricks-gpt-5-5"]
     # Protocol falls back to the provider config's protocol.
     assert gpt["protocol"] == "openai"

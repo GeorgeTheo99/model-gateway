@@ -94,6 +94,21 @@ if [ "${GATEWAY_VISION_FALLBACK_MODE+x}" = x ]; then
 else
   VISION_FALLBACK_MODE="$(installed_plist_env GATEWAY_VISION_FALLBACK_MODE)"
 fi
+if [ "${GATEWAY_VISION_FALLBACK_MAX_IMAGES+x}" = x ]; then
+  VISION_FALLBACK_MAX_IMAGES="$GATEWAY_VISION_FALLBACK_MAX_IMAGES"
+else
+  VISION_FALLBACK_MAX_IMAGES="$(installed_plist_env GATEWAY_VISION_FALLBACK_MAX_IMAGES)"
+fi
+if [ "${GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS+x}" = x ]; then
+  VISION_OBSERVATION_CACHE_TTL_SECONDS="$GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS"
+else
+  VISION_OBSERVATION_CACHE_TTL_SECONDS="$(installed_plist_env GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS)"
+fi
+if [ "${GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS+x}" = x ]; then
+  VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS="$GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS"
+else
+  VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS="$(installed_plist_env GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS)"
+fi
 UV_BIN="${UV_BIN:-$(command -v uv 2>/dev/null || true)}"
 
 # Colors (disabled when not a TTY).
@@ -366,7 +381,7 @@ write_plist() {
   ensure_private_dir "$(dirname "$LEDGER_PATH")"
   ensure_private_dir "$BACKUP_DIR"
   ensure_private_file "$LOG_FILE"
-  local plist plist_tmp e_label e_uv e_root e_host e_port e_config e_model_info e_model_info_source e_ledger e_vision_fallback e_vision_local e_vision_cloud e_vision_mode e_log_dir e_backup e_legacy_backups e_log
+  local plist plist_tmp e_label e_uv e_root e_host e_port e_config e_model_info e_model_info_source e_ledger e_vision_fallback e_vision_local e_vision_cloud e_vision_mode e_vision_max_images e_vision_cache_ttl e_vision_total_timeout e_log_dir e_backup e_legacy_backups e_log
   plist="$(plist_path)"
   plist_tmp="$(mktemp "$PLIST_DIR/.${LABEL}.plist.XXXXXX")"
   chmod 600 "$plist_tmp"
@@ -383,6 +398,9 @@ write_plist() {
   e_vision_local="$(xml_escape "$VISION_FALLBACK_LOCAL")"
   e_vision_cloud="$(xml_escape "$VISION_FALLBACK_CLOUD")"
   e_vision_mode="$(xml_escape "$VISION_FALLBACK_MODE")"
+  e_vision_max_images="$(xml_escape "$VISION_FALLBACK_MAX_IMAGES")"
+  e_vision_cache_ttl="$(xml_escape "$VISION_OBSERVATION_CACHE_TTL_SECONDS")"
+  e_vision_total_timeout="$(xml_escape "$VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS")"
   e_log_dir="$(xml_escape "$LOG_DIR")"
   e_backup="$(xml_escape "$BACKUP_DIR")"
   e_legacy_backups="$(xml_escape "$LEGACY_BACKUP_DIRS")"
@@ -407,6 +425,9 @@ write_plist() {
   <key>GATEWAY_VISION_FALLBACK_LOCAL</key><string>${e_vision_local}</string>
   <key>GATEWAY_VISION_FALLBACK_CLOUD</key><string>${e_vision_cloud}</string>
   <key>GATEWAY_VISION_FALLBACK_MODE</key><string>${e_vision_mode}</string>
+  <key>GATEWAY_VISION_FALLBACK_MAX_IMAGES</key><string>${e_vision_max_images}</string>
+  <key>GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS</key><string>${e_vision_cache_ttl}</string>
+  <key>GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS</key><string>${e_vision_total_timeout}</string>
   <key>MODEL_GATEWAY_LOG_DIR</key><string>${e_log_dir}</string>
   <key>MODEL_GATEWAY_BACKUP_DIR</key><string>${e_backup}</string>
   <key>MODEL_GATEWAY_LEGACY_BACKUP_DIRS</key><string>${e_legacy_backups}</string>
@@ -559,6 +580,9 @@ GATEWAY_VISION_FALLBACK=$VISION_FALLBACK
 GATEWAY_VISION_FALLBACK_LOCAL=$VISION_FALLBACK_LOCAL
 GATEWAY_VISION_FALLBACK_CLOUD=$VISION_FALLBACK_CLOUD
 GATEWAY_VISION_FALLBACK_MODE=$VISION_FALLBACK_MODE
+GATEWAY_VISION_FALLBACK_MAX_IMAGES=$VISION_FALLBACK_MAX_IMAGES
+GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS=$VISION_OBSERVATION_CACHE_TTL_SECONDS
+GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS=$VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS
 MODEL_GATEWAY_LOG_DIR=$LOG_DIR
 MODEL_GATEWAY_BACKUP_DIR=$BACKUP_DIR
 MODEL_GATEWAY_LEGACY_BACKUP_DIRS=$LEGACY_BACKUP_DIRS

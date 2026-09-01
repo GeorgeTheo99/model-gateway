@@ -117,7 +117,10 @@ def responses_to_chat(body: dict) -> dict:
                             # Preserve images as multimodal blocks; never turn them into prompt text.
                             url = part.get("image_url")
                             if url:
-                                chat_parts.append({"type": "image_url", "image_url": {"url": url}})
+                                image_url = {"url": url}
+                                if isinstance(part.get("detail"), str) and part["detail"]:
+                                    image_url["detail"] = part["detail"]
+                                chat_parts.append({"type": "image_url", "image_url": image_url})
                             elif part.get("file_id"):
                                 # Translated Chat paths cannot dereference OpenAI file IDs safely.
                                 # Preserve a sentinel so the endpoint can reject explicitly.
@@ -192,7 +195,10 @@ def responses_to_chat(body: dict) -> dict:
                         elif part_type in {"input_image", "image_url"}:
                             image_url = part.get("image_url")
                             if isinstance(image_url, str) and image_url:
-                                chat_parts.append({"type": "image_url", "image_url": {"url": image_url}})
+                                image_spec = {"url": image_url}
+                                if isinstance(part.get("detail"), str) and part["detail"]:
+                                    image_spec["detail"] = part["detail"]
+                                chat_parts.append({"type": "image_url", "image_url": image_spec})
                                 has_image = True
                             elif part.get("file_id"):
                                 chat_parts.append({"type": "unsupported_input_image_file", "file_id": part["file_id"]})

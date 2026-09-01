@@ -106,15 +106,27 @@ and returns bounded observations, then the originally requested text model
 answers. A caller can explicitly request `reroute`, or an operator can set
 `GATEWAY_VISION_FALLBACK_MODE=reroute`, to send the complete translated request
 to the fallback instead. The mode must be `reroute` or `extract_then_answer`.
-Because extraction is request-local and the gateway does not retain image
-state, a historical image that remains in a client's submitted conversation is
-extracted again on each later request; those later answers still come from the
-original text model. Extraction accepts up to 4 images per request by default;
-operators can adjust the limit with `GATEWAY_VISION_FALLBACK_MAX_IMAGES=<1-32>`
-(validated at startup with the other fallback policy checks). Successful
-observations are cached per process keyed on exact image bytes and the
-extracting model (bounded LRU, 256 entries), so the historical images that
-clients resend every turn are extracted once and then served from the cache.
+Only `extract_then_answer` keeps the originally requested text model as the
+answering model; `reroute` lets the fallback model answer the complete request.
+Extraction accepts only inline `data:image/...;base64` payloads so the gateway
+can enforce byte bounds without performing server-side URL fetches. It accepts
+up to 4 images per request by default; operators can adjust the limit with
+`GATEWAY_VISION_FALLBACK_MAX_IMAGES=<1-32>` (validated at startup with the other
+fallback policy checks). Inline images retain the existing 20 MB per-image and
+32 MB aggregate decoded-byte bounds in both composite and process-wide fallback
+modes. Gateway API request bodies are streamed into a bounded 64 MB buffer;
+vision-helper responses are streamed with a 1 MB cap before JSON parsing.
+Observation text is capped per image and per request, and the complete
+multi-image extraction is bounded by `GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS`
+(default 900 seconds, range 1-3600).
+
+Successful inline-image observations are cached per process in a 256-entry LRU,
+keyed by decoded image bytes, media/detail options, and the complete
+extractor/provider/prompt identity. Cache entries expire after
+`GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS` (default 3600 seconds, range
+0-86400; 0 disables caching), and a successful admin registry reload clears the
+cache. Pi/session history still owns the original image payloads; this cache
+holds only bounded observation text and does not provide durable image memory.
 
 The legacy `GATEWAY_VISION_FALLBACK=<native-vision-model>` remains supported for
 existing deployments and retains its historical default mode of `reroute`. It
@@ -179,3 +191,12 @@ exports:
 ```
 
 The gateway regenerates that generic alias file on startup. Render Pi-specific artifacts separately with `pi-shared/bin/pi-catalog`; generated launchers define `pi-restart model-gw`, which now delegates to the portable `model-gateway restart` command when available and falls back to `server-ci restart --model-gw` on the maintainer's dev-server install. Pi-owned generated artifacts should live under `~/.pi/` (for example, `~/.pi/generated/pi-launchers.zsh`), never under this repository or a model-gateway runtime directory.
+
+Pi removes image blocks before transport for models declared text-only. A route that deliberately relies on the validated process-wide fallback must therefore opt in through catalog metadata:
+
+```yaml
+pi:
+  image_input: gateway-assisted
+```
+
+The alias exporter carries this field through unchanged; `pi-shared/bin/pi-catalog` renders the route with image input enabled and labels it `assisted vision`. Use it only for direct routes whose locality-scoped fallback is guaranteed on that deployment. Native models continue to use `vision: true`, and explicit composites continue to advertise their own public vision capability.

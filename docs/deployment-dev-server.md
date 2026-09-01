@@ -72,6 +72,39 @@ Manual deploy:
 ~/ci/home-server/bin/server-ci deploy-model-gateway main
 ```
 
+### Promoting machine-local catalog changes
+
+`model-info.json` is intentionally Git-ignored and is not copied by the code deploy. When a reviewed change adds deployment-specific metadata such as `pi.image_input: gateway-assisted`, promote it separately and in this order:
+
+1. Deploy the tracked gateway and `pi-shared` code first, with both test suites passing.
+2. Validate the source catalog with `jq empty`, back up the current private runtime catalog, then copy through a mode-0600 temporary file in the runtime directory and rename it atomically:
+
+   ```bash
+   src=~/local_code/model-gateway/model-info.json
+   dst=~/srv/model-gateway/current/model-info.json
+   jq empty "$src"
+   backup_dir="$HOME/Library/Application Support/model-gateway/backups/config"
+   mkdir -p "$backup_dir" && chmod 700 "$backup_dir"
+   cp -p "$dst" "$backup_dir/model-info.manual.$(date -u +%Y%m%dT%H%M%SZ).json"
+   tmp="$(mktemp "${dst}.tmp.XXXXXX")"
+   install -m 600 "$src" "$tmp"
+   mv -f "$tmp" "$dst"
+   ```
+
+3. Restart `com.local.model-gateway`; startup validates the fallback policy and regenerates the shared alias export.
+4. Run `pi-regen` (or the equivalent explicit `pi-catalog` command), then verify source/runtime equality and the assisted-route counts:
+
+   ```bash
+   cmp "$src" "$dst"
+   jq '[to_entries[] | select(.value.pi.image_input == "gateway-assisted")] | length' \
+     ~/srv/model-gateway/shared/model-aliases.json
+   jq '[.providers[].models[] | select(.name | endswith("· assisted vision"))] | length' \
+     ~/.pi-omlx/agent/models.json
+   rg -c '\[assisted vision\]' ~/.pi/generated/pi-launchers.zsh
+   ```
+
+Do not treat a tracked-code deploy as activation proof: the live catalog, alias export, generated Pi models, and launcher labels must all be checked explicitly.
+
 ## oMLX companion service
 
 `com.local.omlx` runs `omlx serve` for local MLX models and is a routing

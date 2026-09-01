@@ -138,9 +138,10 @@ def _reload_registry_transactionally(provider_snapshot) -> str | None:
             snapshot_provider_registry()
             # Local import avoids the admin ↔ server module cycle at import time.
             from src.auth import validate_credential_separation
-            from src.server import _validate_vision_fallback_policy
+            from src.server import _clear_vision_observation_cache, _validate_vision_fallback_policy
             _validate_vision_fallback_policy()
             validate_credential_separation()
+            _clear_vision_observation_cache()
         except Exception as exc:  # noqa: BLE001 — malformed registries must roll back
             restore_provider_registry(provider_snapshot)
             return str(exc)
