@@ -802,13 +802,16 @@ def test_admin_workspace_pools_reports_runtime_routing_without_secrets(
     assert response.status_code == 200
     body = response.json()
     assert body["summary"] == {
-        "pools": 1, "workspaces": 2, "healthy": 0, "degraded": 1, "down": 0,
+        "pools": 1, "workspaces": 2, "standalone_providers": 0,
+        "healthy": 0, "degraded": 1, "down": 0,
     }
     pool = body["pools"][0]
     assert pool["active_member"] == "ws-standby"
     assert pool["models"] == ["pooled-model"]
     assert pool["members"][0]["issues"] == ["circuit_open"]
+    assert pool["members"][0]["role"] == "primary"
     assert pool["members"][0]["active"] is False
+    assert pool["members"][1]["role"] == "secondary"
     assert pool["members"][1]["active"] is True
     assert pool["members"][1]["auth_profile"] == "standby-profile"
     assert pool["members"][1]["credential_type"] == "oauth"
@@ -821,6 +824,67 @@ def test_admin_ui_contains_workspace_pool_view():
     assert 'data-tab="pools"' in html
     assert "/admin/api/workspace-pools" in html
     assert "model-gateway workspace repair" in html
+    assert "Standalone Endpoints" in html
+    assert "standaloneCards" in html
+    assert "<th>Failover</th>" in html
+
+
+def test_admin_workspace_pools_report_standalone_providers(
+    client_readonly, tmp_config, monkeypatch,
+):
+    config = {
+        "auth": {"admin_keys": ["admin"]},
+        "providers": {
+            "ws-primary": {
+                "base_url": "https://primary.cloud.databricks.com",
+                "api_key": "secret-primary-token",
+            },
+            "google": {
+                "base_url": "https://generativelanguage.googleapis.com",
+                "api_key": "secret-google-token",
+            },
+        },
+        "pools": {"default-pool": ["ws-primary"]},
+    }
+    import yaml
+    (tmp_config / "config.yaml").write_text(yaml.safe_dump(config, sort_keys=False))
+    (tmp_config / "model-info.json").write_text(json.dumps({"llm": [
+        {
+            "name": "pooled-model",
+            "provider": "ws-primary",
+            "pool": "default-pool",
+            "provider_model_id": "upstream-model",
+        },
+        {
+            "name": "direct-model",
+            "provider": "google",
+            "provider_model_id": "google-model",
+        },
+    ]}))
+    monkeypatch.setattr(circuit, "get_status", lambda: {})
+    providers.reload()
+
+    response = client_readonly.get(
+        "/admin/api/workspace-pools", headers={"Authorization": "Bearer admin"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["summary"]["standalone_providers"] == 1
+    assert [s["id"] for s in body["standalone_providers"]] == ["google"]
+    google = body["standalone_providers"][0]
+    assert google["models"] == ["direct-model"]
+    assert google["ready"] is True
+    assert "secret-google-token" not in response.text
+    assert "recent" in google
+
+    providers_response = client_readonly.get(
+        "/admin/api/providers", headers={"Authorization": "Bearer admin"},
+    )
+    rows = {p["id"]: p for p in providers_response.json()["providers"]}
+    assert rows["ws-primary"]["pool_memberships"] == [
+        {"pool": "default-pool", "position": 1},
+    ]
+    assert rows["google"]["pool_memberships"] == []
 
 
 def test_admin_reload_rejects_invalid_vision_fallback_and_restores_registry(

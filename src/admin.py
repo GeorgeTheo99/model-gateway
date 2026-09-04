@@ -19,6 +19,7 @@ from src.providers import (
     config_validation,
     model_status,
     provider_status,
+    standalone_provider_status,
     workspace_pool_status,
     registry_transaction as provider_registry_transaction,
     reload as reload_provider_registry,
@@ -79,21 +80,44 @@ async def admin_workspace_pools(request: Request):
     pools = workspace_pool_status()
     for pool in pools:
         for member in pool["members"]:
-            recent = ledger.recent(limit=100, provider=member["id"])
-            failures = [
-                row for row in recent
-                if row.get("error") or (row.get("status") is not None and row["status"] >= 400)
-            ]
-            rate_limits = sum(1 for row in recent if row.get("status") == 429)
-            member["recent"] = {
-                "requests": len(recent),
-                "failures": len(failures),
-                "rate_limits": rate_limits,
-                "last_status": recent[0].get("status") if recent else None,
-                "last_request_at": recent[0].get("ts") if recent else None,
-                "last_failure_status": failures[0].get("status") if failures else None,
-                "last_failure_at": failures[0].get("ts") if failures else None,
-            }
+            member["recent"] = _recent_activity(member["id"])
+    standalone = standalone_provider_status()
+    for provider in standalone:
+        provider["recent"] = _recent_activity(provider["id"])
+    states = {"healthy": 0, "degraded": 0, "down": 0}
+    workspace_ids = set()
+    for pool in pools:
+        states[pool["state"]] += 1
+        workspace_ids.update(member["id"] for member in pool["members"])
+    return {
+        "summary": {
+            "pools": len(pools),
+            "workspaces": len(workspace_ids),
+            "standalone_providers": len(standalone),
+            **states,
+        },
+        "pools": pools,
+        "standalone_providers": standalone,
+    }
+
+
+def _recent_activity(provider_id: str) -> dict:
+    """Bounded, redacted recent-request summary for a single provider."""
+    recent = ledger.recent(limit=100, provider=provider_id)
+    failures = [
+        row for row in recent
+        if row.get("error") or (row.get("status") is not None and row["status"] >= 400)
+    ]
+    rate_limits = sum(1 for row in recent if row.get("status") == 429)
+    return {
+        "requests": len(recent),
+        "failures": len(failures),
+        "rate_limits": rate_limits,
+        "last_status": recent[0].get("status") if recent else None,
+        "last_request_at": recent[0].get("ts") if recent else None,
+        "last_failure_status": failures[0].get("status") if failures else None,
+        "last_failure_at": failures[0].get("ts") if failures else None,
+    }
     states = {"healthy": 0, "degraded": 0, "down": 0}
     workspace_ids = set()
     for pool in pools:
@@ -831,6 +855,8 @@ _ADMIN_HTML = r"""
     .pill.bad { background: var(--bad-soft); border-color: color-mix(in oklab, var(--bad) 40%, var(--rule)); color: var(--bad); }
     .pill.bad .dot { background: var(--bad); }
     .pill.accent { background: var(--accent-soft); border-color: color-mix(in oklab, var(--accent) 40%, var(--rule)); color: var(--accent); }
+    .pill.accent .dot { background: var(--accent); }
+    .pill.muted { background: var(--rule-soft, rgba(127,127,127,.08)); border-color: var(--rule); color: var(--muted); }
     .id { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; }
     .ok-c { color: var(--ok); } .warn-c { color: var(--warn); } .bad-c { color: var(--bad); }
 
@@ -1053,7 +1079,7 @@ _ADMIN_HTML = r"""
           <div class="filterbar"><div class="field"><input id="providerFilter" type="search" placeholder="Filter providers" aria-label="Filter providers" /></div><span class="meta">config.yaml readiness</span></div>
         </div>
         <div class="scroll">
-          <table id="providers"><thead><tr><th>ID</th><th class="num">Models</th><th>Protocol</th><th>Base URL</th><th>Key</th><th>State</th><th>Issues</th><th></th><th class="chev"></th></tr></thead><tbody></tbody></table>
+          <table id="providers"><thead><tr><th>ID</th><th class="num">Models</th><th>Protocol</th><th>Base URL</th><th>Key</th><th>State</th><th>Issues</th><th>Failover</th><th></th><th class="chev"></th></tr></thead><tbody></tbody></table>
         </div>
         <details class="formset"><summary>Add or edit a provider</summary>
           <div class="form-body">
@@ -1087,9 +1113,12 @@ _ADMIN_HTML = r"""
           <div class="stat"><span class="label">Pools</span><span class="value" id="wpPools">—</span><span class="detail">configured routes</span></div>
           <div class="stat"><span class="label">Workspaces</span><span class="value" id="wpWorkspaces">—</span><span class="detail">unique members</span></div>
           <div class="stat"><span class="label">Healthy</span><span class="value" id="wpHealthy">—</span><span class="detail">all members ready</span></div>
+          <div class="stat"><span class="label">Standalone</span><span class="value" id="wpStandalone">—</span><span class="detail">no failover</span></div>
           <div class="stat"><span class="label">Attention</span><span class="value" id="wpAttention">—</span><span class="detail">degraded / down</span></div>
         </div>
         <div id="poolCards" class="pool-grid"></div>
+        <div class="sec-head" style="margin-top:22px;"><h2>Standalone Endpoints</h2><span class="meta" id="standaloneMeta">no pool failover</span></div>
+        <div id="standaloneCards" class="pool-grid"></div>
         <p class="hint">Health reflects local readiness plus live circuit state, not an on-demand upstream probe. Test and repair actions copy the transactional CLI command so authentication, endpoint coverage, smoke testing, restart verification, and rollback stay in one workflow.</p>
       </section>
 
@@ -1281,7 +1310,10 @@ _ADMIN_HTML = r"""
     document.getElementById('wpHealthy').className = 'value ' + (summary.healthy ? 'ok-c' : '');
     document.getElementById('wpAttention').textContent = fmtNum(attention);
     document.getElementById('wpAttention').className = 'value ' + (attention ? 'warn-c' : 'ok-c');
+    document.getElementById('wpStandalone').textContent = fmtNum(summary.standalone_providers||0);
+    const standalone = data.standalone_providers || [];
     document.getElementById('poolsMeta').textContent = pools.length ? 'ordered Databricks failover · runtime state' : 'no pools configured';
+    document.getElementById('standaloneMeta').textContent = standalone.length ? standalone.length + ' provider' + (standalone.length === 1 ? '' : 's') + ' outside every pool' : 'all providers covered by a pool';
 
     const routing = document.getElementById('routingHealth');
     routing.innerHTML = '<span class="route-label">Workspace routing</span>' + (pools.map(p => {
@@ -1296,6 +1328,7 @@ _ADMIN_HTML = r"""
         const issueKind = m.ready ? 'ok' : (m.configured ? 'warn' : 'bad');
         const issueLabel = m.ready ? 'ready' : ((m.issues||[]).join(', ') || 'unavailable');
         const active = m.active ? statePill('ok','active') : '';
+        const role = m.role === 'primary' ? statePill('accent','primary') : '<span class="pill muted"><span class="dot"></span>failover #'+escapeHtml(m.position)+'</span>';
         const recent = m.recent || {};
         const activity = fmtNum(recent.failures||0)+' failures / '+fmtNum(recent.requests||0);
         const circuit = m.circuit && m.circuit.is_open ? 'open' : 'closed';
@@ -1303,7 +1336,7 @@ _ADMIN_HTML = r"""
         const credential = (m.credential_type||'unknown')+' · '+(m.token_state||'unknown');
         const testCommand = 'model-gateway workspace test '+m.id;
         return '<div class="member-row">'
-          +'<div class="member-primary"><div class="member-name"><span class="small">'+escapeHtml(m.position)+'.</span>'+idPill(m.id)+active+statePill(issueKind,issueLabel)+'</div><div class="member-url" title="'+escapeHtml(m.base_url)+'">'+escapeHtml(m.base_url)+'</div></div>'
+          +'<div class="member-primary"><div class="member-name"><span class="small">'+escapeHtml(m.position)+'.</span>'+idPill(m.id)+role+active+statePill(issueKind,issueLabel)+'</div><div class="member-url" title="'+escapeHtml(m.base_url)+'">'+escapeHtml(m.base_url)+'</div></div>'
           +'<div class="member-facts">'
             +'<div class="member-fact"><span class="k">Auth / profile</span><span class="v" title="'+escapeHtml(credential+' / '+profile)+'">'+escapeHtml(credential)+' / '+escapeHtml(profile)+'</span></div>'
             +'<div class="member-fact"><span class="k">Circuit</span><span class="v">'+escapeHtml(circuit)+' · '+fmtNum((m.circuit||{}).consecutive_failures||0)+' failures</span></div>'
@@ -1315,6 +1348,26 @@ _ADMIN_HTML = r"""
       }).join('');
       return '<article class="pool-card"><div class="pool-head"><div class="pool-title"><h3>'+escapeHtml(p.id)+'</h3>'+poolStatePill(p.state)+'<span class="pool-route">active → <strong>'+route+'</strong> · '+fmtNum(p.ready_members)+'/'+fmtNum((p.members||[]).length)+' ready</span></div><button class="btn secondary" type="button" data-copy-command="model-gateway workspace repair">copy repair</button></div><div class="member-list">'+members+'</div><div class="pool-head"><span class="small">Catalog coverage</span><span>'+models+'</span></div></article>';
     }).join('') || '<div class="preset-card"><span class="muted">No workspace pools are configured.</span></div>';
+
+    document.getElementById('standaloneCards').innerHTML = standalone.map(s => {
+      const models = (s.models||[]).map(idPill).join(' ') || '<span class="muted">no catalog models bound to this provider</span>';
+      const issueKind = s.ready ? 'ok' : 'warn';
+      const issueLabel = s.ready ? 'ready' : ((s.issues||[]).join(', ') || 'unavailable');
+      const recent = s.recent || {};
+      const activity = fmtNum(recent.failures||0)+' failures / '+fmtNum(recent.requests||0);
+      const keyState = s.has_api_key ? '<span class="ok-c">present</span>' : '<span class="bad-c">missing</span>';
+      return '<article class="pool-card"><div class="pool-head"><div class="pool-title"><h3>'+escapeHtml(s.id)+'</h3><span class="pill muted"><span class="dot"></span>no failover</span>'+statePill(issueKind,issueLabel)+'<span class="pool-route">'+fmtNum(s.enabled_models||0)+' model'+(s.enabled_models === 1 ? '' : 's')+' · single endpoint</span></div></div>'
+        +'<div class="member-list"><div class="member-row">'
+          +'<div class="member-primary"><div class="member-name">'+idPill(s.id)+'</div><div class="member-url" title="'+escapeHtml(s.base_url||'')+'">'+escapeHtml(s.base_url || 'local runtime')+'</div></div>'
+          +'<div class="member-facts">'
+            +'<div class="member-fact"><span class="k">Protocol / key</span><span class="v">'+escapeHtml(s.protocol||'openai')+' · '+keyState+'</span></div>'
+            +'<div class="member-fact"><span class="k">Failover</span><span class="v">none — errors surface directly</span></div>'
+            +'<div class="member-fact"><span class="k">Recent 100</span><span class="v">'+escapeHtml(activity)+' · '+fmtNum(recent.rate_limits||0)+' rate limits</span></div>'
+            +'<div class="member-fact"><span class="k">Last request</span><span class="v" title="'+escapeHtml(fmtWhen(recent.last_request_at))+'">'+escapeHtml(fmtWhen(recent.last_request_at))+'</span></div>'
+          +'</div>'
+        +'</div></div>'
+        +'<div class="pool-head"><span class="small">Catalog coverage</span><span>'+models+'</span></div></article>';
+    }).join('') || '<div class="preset-card"><span class="muted">Every provider is a member of a workspace pool.</span></div>';
   }
 
   function renderHealth(status, providerRows, modelRows, validation){
@@ -1343,8 +1396,12 @@ _ADMIN_HTML = r"""
       const issues = (p.issues||[]).map(i => idPill(i)).join(' ') || '<span class="muted">—</span>';
       const state = ready ? statePill('ok','ready') : statePill('warn','config');
       const keyCell = p.has_api_key ? '<span class="ok-c">present</span>' : '<span class="bad-c">missing</span>';
-      return '<tr class="clickable-row" data-open-provider="'+escapeHtml(p.id)+'"><td>'+idPill(p.id)+'</td><td class="num">'+escapeHtml(p.enabled_models)+'</td><td>'+escapeHtml(p.protocol)+'</td><td class="id">'+escapeHtml(p.base_url)+'</td><td>'+keyCell+'</td><td>'+state+'</td><td>'+issues+'</td><td><button class="btn secondary" data-mgmt data-edit-provider="'+escapeHtml(p.id)+'">edit</button></td><td class="chev">›</td></tr>';
-    }).join('') || '<tr class="empty"><td colspan="9">No providers configured.</td></tr>';
+      const memberships = p.pool_memberships || [];
+      const failover = memberships.length
+        ? memberships.map(m => idPill(m.pool)+' <span class="muted">#'+escapeHtml(m.position)+'</span>').join(' ')
+        : '<span class="pill muted"><span class="dot"></span>standalone</span>';
+      return '<tr class="clickable-row" data-open-provider="'+escapeHtml(p.id)+'"><td>'+idPill(p.id)+'</td><td class="num">'+escapeHtml(p.enabled_models)+'</td><td>'+escapeHtml(p.protocol)+'</td><td class="id">'+escapeHtml(p.base_url)+'</td><td>'+keyCell+'</td><td>'+state+'</td><td>'+issues+'</td><td>'+failover+'</td><td><button class="btn secondary" data-mgmt data-edit-provider="'+escapeHtml(p.id)+'">edit</button></td><td class="chev">›</td></tr>';
+    }).join('') || '<tr class="empty"><td colspan="10">No providers configured.</td></tr>';
     applyFilter('providerFilter', '#providers');
   }
 

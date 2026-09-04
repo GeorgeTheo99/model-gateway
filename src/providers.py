@@ -1153,6 +1153,13 @@ def provider_status() -> list[dict]:
         if model.get("enabled"):
             model_counts[provider] = model_counts.get(provider, 0) + 1
 
+    pool_memberships: dict[str, list[dict]] = {}
+    for pool_id, members in _pools(config).items():
+        for position, member in enumerate(members, start=1):
+            pool_memberships.setdefault(_canonical_provider(member), []).append(
+                {"pool": pool_id, "position": position}
+            )
+
     provider_ids = sorted(set(model_counts) | {_canonical_provider(key) for key in configured})
     result = []
     for provider in provider_ids:
@@ -1178,6 +1185,7 @@ def provider_status() -> list[dict]:
             "has_api_key": has_api_key,
             "ready": not issues,
             "issues": issues,
+            "pool_memberships": pool_memberships.get(provider, []),
         })
     return result
 
@@ -1287,6 +1295,7 @@ def workspace_pool_status() -> list[dict]:
             members.append({
                 "id": member_id,
                 "position": position,
+                "role": "primary" if position == 1 else "secondary",
                 "configured": configured,
                 "ready": configured and not circuit_open,
                 "base_url": _safe_url(str(provider_config.get("base_url") or "")),
@@ -1326,6 +1335,48 @@ def workspace_pool_status() -> list[dict]:
             "ready_members": ready_count,
             "models": sorted(set(models_by_pool.get(pool_id, []))),
             "members": members,
+        })
+    return result
+
+
+@_registry_locked
+def standalone_provider_status() -> list[dict]:
+    """Return providers that sit outside every configured workspace pool.
+
+    Models routed to a standalone provider have no cross-workspace failover:
+    upstream errors surface directly to the client instead of rerouting to a
+    secondary member. Pool members never appear here even if they also serve
+    directly bound models; the Providers API exposes per-provider pool
+    memberships for that cross-reference.
+    """
+    config = _load_config()
+    pool_member_ids = {
+        _canonical_provider(member)
+        for members in _pools(config).values()
+        for member in members
+    }
+    models_by_provider: dict[str, list[str]] = {}
+    for model in effective_model_inventory():
+        if not model.get("enabled", True):
+            continue
+        provider = _canonical_provider(model.get("effective_provider") or model.get("provider", ""))
+        name = str(model.get("name") or model.get("id") or "").strip()
+        if provider and name:
+            models_by_provider.setdefault(provider, []).append(name)
+
+    result = []
+    for provider in provider_status():
+        if provider["id"] in pool_member_ids:
+            continue
+        result.append({
+            "id": provider["id"],
+            "enabled_models": provider["enabled_models"],
+            "models": sorted(set(models_by_provider.get(provider["id"], []))),
+            "base_url": provider["base_url"],
+            "protocol": provider["protocol"],
+            "has_api_key": provider["has_api_key"],
+            "ready": provider["ready"],
+            "issues": provider["issues"],
         })
     return result
 
