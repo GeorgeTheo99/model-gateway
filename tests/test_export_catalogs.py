@@ -535,3 +535,92 @@ def test_committed_fixture_catalog_renders(tmp_path):
     aliases = json.loads((tmp_path / "aliases.json").read_text())
     assert aliases["test-local-upstream"]["alias"] == "testlocal"
     assert aliases["test-local-upstream"]["omlx_id"] == "test-local-upstream"
+
+
+def _coverage_cfg(tmp_path: Path, providers_yaml: str, pools_yaml: str = "") -> Path:
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "providers:\n" + providers_yaml +
+        (("pools:\n" + pools_yaml) if pools_yaml else "") +
+        "models:\n"
+        "  - name: sonnet\n"
+        "    pool: p\n"
+        "    alias: sonnet\n"
+        "    provider_model_id: databricks-claude-sonnet-4-6\n"
+        "    protocol: anthropic\n"
+        "  - name: gpt\n"
+        "    pool: p\n"
+        "    alias: gpt\n"
+        "    provider_model_id: databricks-gpt-5-4\n"
+        "  - name: gemini\n"
+        "    pool: p\n"
+        "    alias: gemini\n"
+        "    provider_model_id: databricks-gemini-3-1-pro\n"
+        f"exports:\n  model_aliases: {tmp_path}/aliases.json\n"
+    )
+    return cfg
+
+
+def _aliases(tmp_path: Path, cfg: Path) -> dict:
+    mi = tmp_path / "model-info.json"
+    _write_model_info(mi, [])
+    r = _run(cfg, mi)
+    assert r.returncode == 0, r.stderr
+    return json.loads((tmp_path / "aliases.json").read_text())
+
+
+def test_export_omits_models_the_activated_workspace_does_not_serve(tmp_path):
+    cfg = _coverage_cfg(
+        tmp_path,
+        "  ws:\n    base_url: https://ws.example.com\n    api_key: k\n    protocol: openai\n"
+        "    endpoint_style: invocations\n"
+        "    available_model_ids: [databricks-claude-sonnet-4-6, databricks-gpt-5-4]\n"
+        "    coverage_checked_at: 2026-09-04T16:00:00Z\n",
+        "  p: [ws]\n",
+    )
+    aliases = _aliases(tmp_path, cfg)
+    assert set(aliases) == {"cloud:databricks-claude-sonnet-4-6", "cloud:databricks-gpt-5-4"}
+    assert "cloud:databricks-gemini-3-1-pro" not in aliases
+
+
+def test_export_keeps_all_models_when_coverage_unknown(tmp_path):
+    cfg = _coverage_cfg(
+        tmp_path,
+        "  ws:\n    base_url: https://ws.example.com\n    api_key: k\n    protocol: openai\n",
+        "  p: [ws]\n",
+    )
+    assert len(_aliases(tmp_path, cfg)) == 3
+
+
+def test_export_pool_member_with_endpoint_keeps_model_available(tmp_path):
+    cfg = _coverage_cfg(
+        tmp_path,
+        "  primary:\n    base_url: https://a.example.com\n    api_key: k\n    protocol: openai\n"
+        "    available_model_ids: [databricks-claude-sonnet-4-6]\n"
+        "  secondary:\n    base_url: https://b.example.com\n    api_key: k\n    protocol: openai\n"
+        "    available_model_ids: [databricks-gpt-5-4, databricks-gemini-3-1-pro]\n",
+        "  p: [primary, secondary]\n",
+    )
+    assert len(_aliases(tmp_path, cfg)) == 3
+
+
+def test_export_protocol_follows_invocations_provider_not_stale_model_override(tmp_path):
+    cfg = _coverage_cfg(
+        tmp_path,
+        "  ws:\n    base_url: https://ws.example.com\n    api_key: k\n    protocol: openai\n"
+        "    endpoint_style: invocations\n",
+        "  p: [ws]\n",
+    )
+    aliases = _aliases(tmp_path, cfg)
+    assert aliases["cloud:databricks-claude-sonnet-4-6"]["protocol"] == "openai"
+
+
+def test_export_protocol_keeps_model_override_on_ai_gateway_provider(tmp_path):
+    cfg = _coverage_cfg(
+        tmp_path,
+        "  gw:\n    base_url: https://1.ai-gateway.example.com\n    api_key: k\n    protocol: openai\n"
+        "    path_prefixes: {anthropic: anthropic/v1, openai: mlflow/v1}\n",
+        "  p: [gw]\n",
+    )
+    aliases = _aliases(tmp_path, cfg)
+    assert aliases["cloud:databricks-claude-sonnet-4-6"]["protocol"] == "anthropic"

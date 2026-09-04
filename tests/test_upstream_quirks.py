@@ -109,6 +109,66 @@ providers:
     assert _upstream_endpoint(info, "/messages") == info.base_url
 
 
+def test_invocations_style_ignores_model_native_protocol_override(tmp_config):
+    """A Claude entry carrying `protocol: anthropic` (from an AI-gateway
+    catalog) must resolve to the provider's OpenAI invocation protocol once the
+    provider is switched to direct invocations — otherwise the gateway sends a
+    native-Anthropic request (x-api-key, reasoning params, Anthropic stream
+    shape) to an OpenAI-compatible endpoint."""
+    _write_config(tmp_config, """
+providers:
+  my_workspace:
+    base_url: https://workspace.example.com
+    api_key: placeholder
+    protocol: openai
+    endpoint_style: invocations
+""")
+    _write_models(tmp_config, [
+        {"name": "claude", "provider": "my_workspace", "provider_model_id": "databricks-claude",
+         "protocol": "anthropic"},
+    ])
+    info = providers.resolve("claude")
+    assert info.protocol == "openai"
+    assert info.base_url.endswith("/serving-endpoints/databricks-claude/invocations")
+
+
+def test_invocations_style_honours_declared_native_protocols(tmp_config):
+    _write_config(tmp_config, """
+providers:
+  my_workspace:
+    base_url: https://workspace.example.com
+    api_key: placeholder
+    protocol: openai
+    endpoint_style: invocations
+    invocations_native_protocols: [anthropic]
+""")
+    _write_models(tmp_config, [
+        {"name": "claude", "provider": "my_workspace", "provider_model_id": "databricks-claude",
+         "protocol": "anthropic"},
+    ])
+    assert providers.resolve("claude").protocol == "anthropic"
+
+
+def test_gateway_style_keeps_model_protocol_override(tmp_config):
+    _write_config(tmp_config, """
+providers:
+  my_gateway:
+    base_url: https://gateway.example.com
+    api_key: placeholder
+    protocol: openai
+    path_prefixes:
+      anthropic: /anthropic/v1
+      openai: /mlflow/v1
+""")
+    _write_models(tmp_config, [
+        {"name": "claude", "provider": "my_gateway", "provider_model_id": "databricks-claude",
+         "protocol": "anthropic"},
+    ])
+    info = providers.resolve("claude")
+    assert info.protocol == "anthropic"
+    assert info.base_url == "https://gateway.example.com/anthropic/v1"
+
+
 def test_upstream_endpoint_default_suffix(tmp_config):
     info = SimpleNamespace(base_url="https://api.example.com/v1", endpoint_suffix=None)
     assert _upstream_endpoint(info, "/chat/completions") == "https://api.example.com/v1/chat/completions"

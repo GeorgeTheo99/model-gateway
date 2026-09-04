@@ -972,14 +972,29 @@ def resolve(model_id: str, provider_override: str | None = None) -> ProviderInfo
     if not provider_model_id:
         provider_model_id = entry.get("name", "") or model_id
 
+    endpoint_style = provider_config.get("endpoint_style", "")
     # Per-model protocol override (e.g. an AI-gateway provider that serves both
-    # Anthropic- and OpenAI-protocol models under one host).
+    # Anthropic- and OpenAI-protocol models under one host). Direct
+    # `/serving-endpoints/<id>/invocations` routes speak the provider's
+    # (OpenAI-compatible) protocol regardless of the model's native API, so a
+    # model-level override left over from an AI-gateway catalog must NOT flip
+    # an invocations provider to native Anthropic wire shape. A provider may
+    # opt in per protocol with `invocations_native_protocols: [anthropic]`.
     entry_protocol = entry.get("protocol")
     if entry_protocol:
-        protocol = entry_protocol
+        if endpoint_style != "invocations":
+            protocol = entry_protocol
+        else:
+            native = provider_config.get("invocations_native_protocols") or []
+            if isinstance(native, str):
+                native = [native]
+            if entry_protocol in native:
+                protocol = entry_protocol
+            elif entry_protocol != protocol:
+                log.debug("Model %r protocol %r ignored: provider %r uses %s invocations",
+                          model_id, entry_protocol, provider, protocol)
 
     endpoint_suffix: str | None = None
-    endpoint_style = provider_config.get("endpoint_style", "")
     if endpoint_style == "invocations":
         # base_url is a workspace host; each model has its own full invocation
         # URL: <base>/serving-endpoints/<provider_model_id>/invocations.

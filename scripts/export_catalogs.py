@@ -303,11 +303,53 @@ def _effective_provider(entry: dict, config: dict) -> str:
 
 
 def _effective_protocol(entry: dict, provider: str, config: dict) -> str:
-    """Request-shape protocol for a model: entry override, else provider config."""
-    if entry.get("protocol"):
-        return str(entry["protocol"])
+    """Upstream protocol for a model: entry override, else provider config.
+
+    Mirrors ``src.providers.resolve``: on a direct-invocations provider the
+    model-level override is ignored unless the provider lists that protocol in
+    ``invocations_native_protocols``.
+    """
     provider_config = (config.get("providers") or {}).get(provider) or {}
-    return str(provider_config.get("protocol") or "openai")
+    provider_protocol = str(provider_config.get("protocol") or "openai")
+    entry_protocol = entry.get("protocol")
+    if not entry_protocol:
+        return provider_protocol
+    if provider_config.get("endpoint_style") != "invocations":
+        return str(entry_protocol)
+    native = provider_config.get("invocations_native_protocols") or []
+    if isinstance(native, str):
+        native = [native]
+    return str(entry_protocol) if entry_protocol in native else provider_protocol
+
+
+def _model_available(entry: dict, provider: str, config: dict) -> bool:
+    """Does some usable member for this model actually serve its endpoint?
+
+    Providers that were activated through ``workspace add/replace`` record
+    ``available_model_ids`` (the provider_model_ids they were verified to
+    serve). A model is exported when its primary provider — or, for pooled
+    models, ANY pool member — either has no coverage record (unknown ⇒ trust
+    provider-level serveability) or lists the model's provider_model_id.
+    """
+    providers = config.get("providers")
+    if not isinstance(providers, dict) or not providers:
+        return True
+    pmid = str(entry.get("provider_model_id") or entry.get("name") or "")
+    candidates = [provider]
+    pool_name = entry.get("pool")
+    if pool_name:
+        members = (config.get("pools") or {}).get(str(pool_name)) or []
+        candidates = [str(m) for m in ([members] if isinstance(members, str) else members)] or candidates
+    for member in candidates:
+        member_config = providers.get(member) or {}
+        if member_config.get("enabled") is False:
+            continue
+        available = member_config.get("available_model_ids")
+        if available is None:
+            return True
+        if pmid in {str(a) for a in available}:
+            return True
+    return False
 
 
 def _provider_serveable(provider: str, config: dict, config_path: Path = DEFAULT_CONFIG) -> bool:
@@ -361,6 +403,8 @@ def render_model_aliases(
         provider = _effective_provider(entry, config)
         if not _provider_serveable(provider, config, config_path):
             continue  # this machine's gateway cannot route the model
+        if not _model_available(entry, provider, config):
+            continue  # the activated workspace(s) verifiably do not serve this endpoint
         is_cloud = provider not in ("omlx", "local") and bool(provider)
 
         if is_cloud:

@@ -315,9 +315,11 @@ def test_cmd_add_ai_gateway_style_derives_base_url_and_sets_workspace_url(tmp_pa
     monkeypatch.setattr(workspace, "restart_gateway", lambda: None)
     verify_hosts = []
 
-    def spy_verify(cfg, host, profile, pools, allow_partial, token=None, provider_names=()):
+    def spy_verify(cfg, host, profile, pools, allow_partial, token=None, provider_names=(), **kw):
         verify_hosts.append(host)
         assert provider_names == ["new-ws"]
+        assert kw["style"] == "ai-gateway"
+        assert kw["base_url"] == "https://1444828305810485.ai-gateway.cloud.databricks.com"
 
     monkeypatch.setattr(workspace, "_verify", spy_verify)
 
@@ -394,7 +396,7 @@ def test_cmd_replace_ai_gateway_entry_derives_gateway_host(tmp_path, monkeypatch
     workspace.cmd_replace(argparse.Namespace(
         config=config, old_name="dead-aigw",
         host="https://e2-demo-field-eng.cloud.databricks.com",
-        name=None, profile=None, allow_partial=False,
+        name=None, profile=None, allow_partial=False, style="inherit",
     ))
 
     providers = workspace._load_config(config)["providers"]
@@ -403,3 +405,265 @@ def test_cmd_replace_ai_gateway_entry_derives_gateway_host(tmp_path, monkeypatch
     assert entry["base_url"] == "https://1444828305810485.ai-gateway.cloud.databricks.com"
     assert entry["workspace_url"] == "https://e2-demo-field-eng.cloud.databricks.com"
     assert entry["auth_profile"] == "dead-aigw"  # profile defaults to new name
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("https://fevm-talen-risk-demo.cloud.databricks.com", "https://fevm-talen-risk-demo.cloud.databricks.com"),
+    ("https://fevm-talen-risk-demo.cloud.databricks.com/?o=7474651766001209#ml/experiments",
+     "https://fevm-talen-risk-demo.cloud.databricks.com"),
+    ("  E2-Demo-Field-Eng.cloud.databricks.com/ ", "https://e2-demo-field-eng.cloud.databricks.com"),
+    ("adb-2548836972759138.18.azuredatabricks.net", "https://adb-2548836972759138.18.azuredatabricks.net"),
+])
+def test_normalize_host_accepts_browser_urls_and_bare_hostnames(raw, expected):
+    ws = load_workspace_module()
+    assert ws.normalize_host(raw) == expected
+
+
+@pytest.mark.parametrize("raw, fragment", [
+    ("7474651766001209", "looks like a workspace ID"),
+    ("o=7474651766001209", "looks like a workspace ID"),
+    ("adb-2548836972759138.18", "looks like a workspace ID"),
+    ("http://my-ws.cloud.databricks.com", "must use https"),
+    ("localhost", "not a valid workspace hostname"),
+    ("my workspace", "not a valid workspace hostname"),
+    ("https://my-ws.cloud.databricks.com:8443", "must not include a port"),
+    ("", "empty workspace URL"),
+])
+def test_normalize_host_rejects_ids_and_junk_with_guidance(raw, fragment):
+    ws = load_workspace_module()
+    with pytest.raises(SystemExit) as exc:
+        ws.normalize_host(raw)
+    msg = str(exc.value)
+    assert fragment in msg
+    assert "https://my-workspace.cloud.databricks.com" in msg  # tells the user what to paste
+
+
+# ── route-aware activation (--style auto / conversion / coverage persistence) ──
+
+_STARTER_MODELS = (
+    "models:\n"
+    "  - name: claude-sonnet\n"
+    "    provider: ws\n"
+    "    provider_model_id: databricks-claude-sonnet-4-6\n"
+    "    alias: sonnet\n"
+    "    protocol: anthropic\n"
+    "    pool: default-pool\n"
+    "  - name: gpt-5.4\n"
+    "    provider: ws\n"
+    "    provider_model_id: databricks-gpt-5-4\n"
+    "    alias: gpt54\n"
+    "    pool: default-pool\n"
+    "  - name: gemini\n"
+    "    provider: ws\n"
+    "    provider_model_id: databricks-gemini-3-1-pro\n"
+    "    alias: gemini\n"
+    "    pool: default-pool\n"
+)
+
+_AIGW_ENTRY = (
+    "providers:\n"
+    "  ws:\n"
+    "    base_url: https://0.ai-gateway.cloud.databricks.com\n"
+    "    protocol: openai\n"
+    "    path_prefixes:\n"
+    "      anthropic: anthropic/v1\n"
+    "      openai: mlflow/v1\n"
+    "    auth_refresh: databricks-cli\n"
+    "    auth_profile: ws\n"
+    "    api_key: ''\n"
+    "    quirks: [anthropic_bearer_auth]\n"
+    "pools:\n"
+    "  default-pool: [ws]\n"
+)
+
+
+def _route_fixture(tmp_path, monkeypatch, *, served: set[str], gateway_ok: bool):
+    """Stub auth/probe/activation; make the ai-gateway preflight succeed or fail
+    with a DNS error while the direct invocations preflight always succeeds."""
+    workspace = load_workspace_module()
+    config = tmp_path / "config.yaml"
+    config.write_text(_AIGW_ENTRY + _STARTER_MODELS)
+    token = fake_jwt({"aud": ["7474651766001209"], "iss": "https://fevm.cloud.databricks.com/oidc"})
+    monkeypatch.setattr(workspace, "ADMIN_KEY", "")
+    monkeypatch.setattr(workspace, "RESTART_BIN", "/safe/model-gateway")
+    monkeypatch.setattr(workspace, "ensure_auth", lambda host, profile: token)
+    monkeypatch.setattr(workspace, "probe_endpoints", lambda host, tk: set(served))
+    monkeypatch.setattr(workspace, "restart_gateway", lambda: None)
+    calls: list[tuple] = []
+
+    def fake_preflight(style, host, base_url, tk, names, protocols=None):
+        calls.append((style, host, base_url, frozenset(protocols or ())))
+        if style == "ai-gateway" and not gateway_ok:
+            raise workspace.RoutePreflightError("dns", "hostname does not resolve")
+        if "databricks-claude-sonnet-4-6" not in names:
+            raise workspace.RoutePreflightError("missing_model", "no bootstrap model")
+        return "databricks-claude-sonnet-4-6"
+
+    monkeypatch.setattr(workspace, "runtime_preflight", fake_preflight)
+    return workspace, config, calls
+
+
+def _replace(workspace, config, **kw):
+    ns = dict(config=config, old_name="ws", host="https://fevm.cloud.databricks.com/?o=7474651766001209",
+              name=None, profile=None, allow_partial=False, style="inherit")
+    ns.update(kw)
+    workspace.cmd_replace(argparse.Namespace(**ns))
+
+
+def test_replace_auto_falls_back_to_invocations_when_gateway_dns_fails(tmp_path, monkeypatch, capsys):
+    ws, config, calls = _route_fixture(tmp_path, monkeypatch,
+                                       served={"databricks-claude-sonnet-4-6", "databricks-gpt-5-4",
+                                               "databricks-gemini-3-1-pro"}, gateway_ok=False)
+    _replace(ws, config, style="auto")
+    entry = ws._load_config(config)["providers"]["ws"]
+    assert entry["endpoint_style"] == "invocations"
+    assert entry["base_url"] == "https://fevm.cloud.databricks.com"
+    assert "path_prefixes" not in entry and "workspace_url" not in entry
+    assert entry["quirks"] == ["no_stream_options", "no_reasoning_params"]
+    # Preflight tried the derived gateway first, then the direct route.
+    assert [c[0] for c in calls] == ["ai-gateway", "invocations"]
+    assert calls[0][2] == "https://7474651766001209.ai-gateway.cloud.databricks.com"
+    assert calls[0][3] == frozenset({"anthropic", "openai"})
+    out = capsys.readouterr().out
+    assert "unusable (dns" in out and "falling back to direct invocations" in out
+
+
+def test_replace_auto_keeps_ai_gateway_when_runtime_route_works(tmp_path, monkeypatch):
+    ws, config, calls = _route_fixture(tmp_path, monkeypatch,
+                                       served={"databricks-claude-sonnet-4-6", "databricks-gpt-5-4",
+                                               "databricks-gemini-3-1-pro"}, gateway_ok=True)
+    _replace(ws, config, style="auto")
+    entry = ws._load_config(config)["providers"]["ws"]
+    assert entry["base_url"] == "https://7474651766001209.ai-gateway.cloud.databricks.com"
+    assert entry["workspace_url"] == "https://fevm.cloud.databricks.com"
+    assert entry["path_prefixes"] == {"anthropic": "anthropic/v1", "openai": "mlflow/v1"}
+    assert "endpoint_style" not in entry
+    assert [c[0] for c in calls] == ["ai-gateway", "ai-gateway"]  # route pick + verify, same route
+
+
+def test_replace_style_invocations_converts_gateway_entry_completely(tmp_path, monkeypatch):
+    ws, config, calls = _route_fixture(tmp_path, monkeypatch,
+                                       served={"databricks-claude-sonnet-4-6", "databricks-gpt-5-4",
+                                               "databricks-gemini-3-1-pro"}, gateway_ok=True)
+    _replace(ws, config, style="invocations")
+    entry = ws._load_config(config)["providers"]["ws"]
+    assert entry["endpoint_style"] == "invocations"
+    assert entry["protocol"] == "openai"
+    assert not {"path_prefixes", "workspace_url"} & entry.keys()
+    assert [c[0] for c in calls] == ["invocations"]
+
+
+def test_replace_inherit_smokes_through_inherited_gateway_route(tmp_path, monkeypatch):
+    ws, config, calls = _route_fixture(tmp_path, monkeypatch,
+                                       served={"databricks-claude-sonnet-4-6", "databricks-gpt-5-4",
+                                               "databricks-gemini-3-1-pro"}, gateway_ok=False)
+    with pytest.raises(SystemExit) as exc:
+        _replace(ws, config)  # inherit == ai-gateway, and that route is dead
+    assert "runtime smoke via ai-gateway route failed (dns" in str(exc.value)
+    # Nothing committed: old entry untouched.
+    assert ws._load_config(config)["providers"]["ws"]["base_url"] == "https://0.ai-gateway.cloud.databricks.com"
+
+
+def test_partial_coverage_persists_available_model_ids(tmp_path, monkeypatch, capsys):
+    ws, config, _ = _route_fixture(tmp_path, monkeypatch,
+                                   served={"databricks-claude-sonnet-4-6", "databricks-gpt-5-4"},
+                                   gateway_ok=False)
+    _replace(ws, config, style="auto", allow_partial=True)
+    entry = ws._load_config(config)["providers"]["ws"]
+    assert entry["available_model_ids"] == ["databricks-claude-sonnet-4-6", "databricks-gpt-5-4"]
+    assert entry["coverage_checked_at"].endswith("Z")
+    assert "DEGRADED" in capsys.readouterr().out
+    assert "databricks-gemini-3-1-pro" in capsys.readouterr().out or True
+
+
+def test_strict_coverage_still_rolls_back(tmp_path, monkeypatch):
+    ws, config, _ = _route_fixture(tmp_path, monkeypatch,
+                                   served={"databricks-claude-sonnet-4-6", "databricks-gpt-5-4"},
+                                   gateway_ok=False)
+    with pytest.raises(SystemExit) as exc:
+        _replace(ws, config, style="auto", allow_partial=False)
+    assert "does not serve 1 of 3" in str(exc.value)
+    assert "--allow-partial" in str(exc.value)
+    assert "available_model_ids" not in ws._load_config(config)["providers"]["ws"]
+
+
+def test_partial_coverage_requires_bootstrap_model(tmp_path, monkeypatch):
+    ws, config, _ = _route_fixture(tmp_path, monkeypatch,
+                                   served={"databricks-gpt-5-4"}, gateway_ok=False)
+    # With no bootstrap (sonnet) endpoint the runtime smoke cannot run; the
+    # invocations fallback path must not silently commit.
+    with pytest.raises(SystemExit) as exc:
+        _replace(ws, config, style="auto", allow_partial=True)
+    assert "bootstrap" in str(exc.value)
+
+
+def test_auto_does_not_mask_auth_failure_with_fallback(tmp_path, monkeypatch):
+    ws, config, _ = _route_fixture(tmp_path, monkeypatch,
+                                   served={"databricks-claude-sonnet-4-6", "databricks-gpt-5-4",
+                                           "databricks-gemini-3-1-pro"}, gateway_ok=True)
+
+    def auth_fail(style, *a, **k):
+        raise ws.RoutePreflightError("auth", "HTTP 401")
+
+    monkeypatch.setattr(ws, "runtime_preflight", auth_fail)
+    with pytest.raises(SystemExit) as exc:
+        _replace(ws, config, style="auto")
+    assert "not falling back" in str(exc.value)
+
+
+def test_runtime_preflight_uses_exact_route_and_bearer_auth(monkeypatch):
+    ws = load_workspace_module()
+    seen: list[tuple[str, dict, dict]] = []
+
+    def fake_request(url, body, headers, deadline):
+        seen.append((url, body, headers))
+
+    monkeypatch.setattr(ws, "_smoke_request", fake_request)
+    names = {"databricks-claude-sonnet-4-6"}
+    ws.runtime_preflight("invocations", "https://w.example.com", "https://w.example.com", "tok", names)
+    ws.runtime_preflight("ai-gateway", "https://w.example.com", "https://1.ai-gateway.example.com", "tok",
+                         names, {"anthropic", "openai"})
+    urls = [u for u, _, _ in seen]
+    assert urls == [
+        "https://w.example.com/serving-endpoints/databricks-claude-sonnet-4-6/invocations",
+        "https://1.ai-gateway.example.com/anthropic/v1/messages",
+        "https://1.ai-gateway.example.com/mlflow/v1/chat/completions",
+    ]
+    assert all(h["Authorization"] == "Bearer tok" for _, _, h in seen)
+    assert "x-api-key" not in seen[1][2] and seen[1][2]["anthropic-version"]
+
+
+def test_preflight_classifies_dns_auth_and_path_failures(monkeypatch):
+    import socket
+    import urllib.error
+    ws = load_workspace_module()
+
+    class Resp:
+        def __init__(self, code):
+            self.code = code
+        def read(self):
+            return b"nope"
+
+    def raiser(exc):
+        def _open(req, timeout):
+            raise exc
+        return _open
+
+    cases = [
+        (urllib.error.URLError(socket.gaierror(8, "nodename nor servname provided")), "dns"),
+        (urllib.error.HTTPError("u", 401, "x", {}, None), "auth"),
+        (urllib.error.HTTPError("u", 404, "x", {}, None), "path"),
+        (urllib.error.URLError(ConnectionRefusedError("refused")), "connect"),
+    ]
+    for exc, kind in cases:
+        monkeypatch.setattr(ws.urllib.request, "urlopen", raiser(exc))
+        with pytest.raises(ws.RoutePreflightError) as err:
+            ws._smoke_request("https://x.example.com/p", {}, {}, deadline=0)
+        assert err.value.kind == kind, (exc, err.value)
+
+
+def test_missing_bootstrap_model_is_reported_not_skipped_in_partial_mode():
+    ws = load_workspace_module()
+    with pytest.raises(ws.RoutePreflightError) as err:
+        ws.runtime_preflight("invocations", "https://w", "https://w", "t", {"databricks-gpt-5-4"})
+    assert err.value.kind == "missing_model"

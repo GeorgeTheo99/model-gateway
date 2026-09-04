@@ -7,8 +7,9 @@ Commands:
     model-gateway workspace test <name>
     model-gateway workspace add <name> --host <url> [--pools p1,p2]
                                 [--position N] [--profile <cli-profile>]
-                                [--style invocations|ai-gateway] [--allow-partial]
+                                [--style invocations|ai-gateway|auto] [--allow-partial]
     model-gateway workspace replace <old-name> --host <url> [--name <new-name>]
+                                      [--style inherit|invocations|ai-gateway|auto]
                                       [--allow-partial]
     model-gateway workspace remove <name>
 
@@ -17,14 +18,24 @@ activation fails, the previous config is restored and activated automatically:
   1. auth   — databricks CLI profile (browser SSO if refresh token is dead)
   2. probe  — GET /api/2.0/serving-endpoints reachability
   3. cover  — every pool model's provider_model_id exists on the workspace
-  4. smoke  — one real completion per protocol used by affected models
+  4. smoke  — one real completion through the EXACT route the gateway will
+              use (derived AI Gateway host + path prefix, or the direct
+              /serving-endpoints/<id>/invocations URL) — not a proxy for it
   5. commit — write config.yaml (backup first), then restart+verify through
               the operator CLI or use the authenticated admin reload API
 
 `replace` gives the new workspace the old one's pool positions, then removes
 the old entry. `remove` refuses to empty a pool. `test` runs steps 1-4 only.
 
-Accepted --host shapes: https://host, https://host/?o=123, bare host.
+Accepted --host shapes: https://host, https://host/?o=123, bare host. A bare
+workspace ID (e.g. 7474651766001209) is rejected with instructions to paste
+the browser URL instead.
+
+--style auto probes the derived AI Gateway route with a real completion and
+falls back to direct invocations when that host/path is unusable (DNS, TLS,
+404, protocol); the chosen style and the reason are printed. --allow-partial
+records which catalog models the workspace actually serves
+(``available_model_ids``) so exported launchers omit the rest.
 For --style ai-gateway, pass the WORKSPACE URL (e.g. https://e2-demo-field-eng
 .cloud.databricks.com); the routed <org-id>.ai-gateway.cloud.databricks.com
 base_url is derived from the workspace token's aud claim. An explicit
@@ -39,7 +50,10 @@ import base64
 import copy
 import os
 import json
+import re
 import shutil
+import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -66,17 +80,40 @@ def _fail(msg: str) -> "SystemExit":
     return SystemExit(f"workspace: ERROR: {msg}")
 
 
+WORKSPACE_URL_HELP = (
+    "Expected the full workspace URL copied from your browser, e.g. "
+    "https://my-workspace.cloud.databricks.com or "
+    "https://adb-1234567890123456.7.azuredatabricks.net "
+    "(a '?o=<id>' suffix and any path are fine and are stripped)."
+)
+
+
 def normalize_host(raw: str) -> str:
-    """Normalize a pasted workspace URL to a bare https origin."""
+    """Normalize a pasted workspace URL to a bare https origin.
+
+    Accepts a browser URL (with ``?o=`` query, path, trailing slash) or a bare
+    hostname. Rejects a bare workspace/org ID (e.g. ``7474651766001209``), an
+    ``adb-`` prefix without a domain, ``http://`` and anything that is not a
+    dotted DNS hostname, and says exactly what to paste instead.
+    """
     raw = raw.strip()
     if not raw:
-        raise _fail("empty workspace URL")
+        raise _fail(f"empty workspace URL. {WORKSPACE_URL_HELP}")
+    if re.fullmatch(r"(o=)?\d{6,}", raw) or re.fullmatch(r"adb-\d+(\.\d+)?", raw):
+        raise _fail(
+            f"{raw!r} looks like a workspace ID, not a workspace URL. {WORKSPACE_URL_HELP}"
+        )
     if "://" not in raw:
         raw = f"https://{raw}"
     parts = urllib.parse.urlsplit(raw)
-    if parts.scheme != "https" or not parts.netloc:
-        raise _fail(f"not a valid https workspace URL: {raw!r}")
-    return f"https://{parts.netloc}"
+    host = parts.hostname or ""
+    if parts.scheme != "https":
+        raise _fail(f"workspace URL must use https, got {parts.scheme!r}. {WORKSPACE_URL_HELP}")
+    if not host or "." not in host or not re.fullmatch(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+", host.lower()):
+        raise _fail(f"not a valid workspace hostname: {host or raw!r}. {WORKSPACE_URL_HELP}")
+    if parts.port:
+        raise _fail(f"workspace URL must not include a port: {raw!r}. {WORKSPACE_URL_HELP}")
+    return f"https://{host.lower()}"
 
 
 def _load_config(path: Path) -> dict:
@@ -210,56 +247,156 @@ def _affected_models(config: dict, pool_names: list[str], provider_names: list[s
 
 
 def check_coverage(config: dict, pool_names: list[str], endpoint_names: set[str], allow_partial: bool,
-                   provider_names: list[str] = ()) -> None:
+                   provider_names: list[str] = ()) -> list[str] | None:
+    """Print per-model coverage; return the sorted provider_model_ids this
+    workspace serves. Fails unless every affected model is served or
+    ``allow_partial`` is set (then the missing ones are listed as degraded)."""
     models = _affected_models(config, pool_names, provider_names)
     if not models:
         print("  coverage: no models bound to these pools/providers — skipped")
-        return
-    missing = []
+        return None
+    missing, available = [], []
     print("  coverage:")
     for m in models:
         pmid = m.get("provider_model_id", m.get("name"))
         ok = pmid in endpoint_names
         print(f"    {'✓' if ok else '✗'} {m.get('alias') or m.get('name'):10s} {pmid}")
-        if not ok:
-            missing.append(pmid)
-    if missing and not allow_partial:
-        raise _fail(
-            f"workspace does not serve {len(missing)} pool model(s): {', '.join(missing)}. "
-            "Re-run with --allow-partial to accept degraded coverage."
-        )
+        (available if ok else missing).append(pmid)
+    if missing:
+        if not allow_partial:
+            raise _fail(
+                f"workspace does not serve {len(missing)} of {len(models)} model(s): {', '.join(missing)}. "
+                "Re-run with --allow-partial to accept degraded coverage (those models will be "
+                "left out of the exported catalogs)."
+            )
+        print(f"  coverage: DEGRADED — {len(missing)} model(s) not served here and will be omitted "
+              f"from catalogs: {', '.join(missing)}")
+    return sorted(set(available))
 
 
-def smoke_test(host: str, token: str, endpoint_names: set[str]) -> None:
-    """One tiny real completion against a known FMAPI endpoint on the workspace."""
-    candidates = [n for n in ("databricks-claude-sonnet-4-6", "databricks-gpt-5-4-mini", "databricks-gpt-5-5")
-                  if n in endpoint_names]
-    if not candidates:
-        print("  smoke: no known FMAPI endpoint available — skipped")
+def _model_protocols(config: dict, pool_names: list[str], provider_names: list[str] = ()) -> set[str]:
+    """Wire protocols the affected models use on an AI-gateway route."""
+    return {str(m.get("protocol") or "openai") for m in _affected_models(config, pool_names, provider_names)}
+
+
+def _stamp_coverage(entry: dict, available: list[str] | None) -> None:
+    """Persist which catalog models the workspace serves (no secrets). ``None``
+    means coverage was not checked (no bound models); drop stale values."""
+    entry.pop("available_model_ids", None)
+    entry.pop("coverage_checked_at", None)
+    if available is None:
         return
-    name = candidates[0]
-    body = json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: OK"}],
-                       "max_tokens": 16}).encode()
-    req = urllib.request.Request(
-        f"{host}/serving-endpoints/{name}/invocations",
-        data=body, method="POST",
-        headers={"Authorization": f"Bearer {token}", "content-type": "application/json"},
-    )
-    deadline = time.time() + 120
+    entry["available_model_ids"] = list(available)
+    entry["coverage_checked_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+SMOKE_CANDIDATES = ("databricks-claude-sonnet-4-6", "databricks-gpt-5-4-mini", "databricks-gpt-5-5")
+
+AI_GATEWAY_PATH_PREFIXES = {"anthropic": "anthropic/v1", "openai": "mlflow/v1"}
+
+
+class RoutePreflightError(Exception):
+    """A runtime data-plane probe failed; ``kind`` classifies the failure."""
+
+    def __init__(self, kind: str, detail: str):
+        super().__init__(f"{kind}: {detail}")
+        self.kind = kind
+        self.detail = detail
+
+
+def _classify_url_error(exc: urllib.error.URLError) -> tuple[str, str]:
+    reason = exc.reason
+    if isinstance(reason, socket.gaierror) or "nodename nor servname" in str(reason) \
+            or "Name or service not known" in str(reason) or "[Errno 8]" in str(reason):
+        return "dns", f"hostname does not resolve ({reason})"
+    if isinstance(reason, ssl.SSLError) or "SSL" in str(reason).upper():
+        return "tls", str(reason)
+    return "connect", str(reason)
+
+
+def _smoke_request(url: str, body: dict, headers: dict, deadline: float) -> None:
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
+                                 headers={"content-type": "application/json", **headers})
     while True:
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 json.loads(resp.read())
-                print(f"  smoke: OK ({name})")
                 return
         except urllib.error.HTTPError as exc:
+            snippet = exc.read()[:150]
             if exc.code == 429 and time.time() < deadline:
                 print("  smoke: 429, retrying in 15s…")
                 time.sleep(15)
                 continue
-            raise _fail(f"smoke completion failed on {name}: HTTP {exc.code} {exc.read()[:150]!r}")
+            if exc.code in (401, 403):
+                raise RoutePreflightError("auth", f"HTTP {exc.code} {snippet!r}")
+            if exc.code == 404:
+                raise RoutePreflightError("path", f"HTTP 404 (path/model not served here) {snippet!r}")
+            if exc.code == 429:
+                raise RoutePreflightError("rate_limited", "HTTP 429 persisted for 120s")
+            raise RoutePreflightError("http", f"HTTP {exc.code} {snippet!r}")
         except urllib.error.URLError as exc:
-            raise _fail(f"smoke completion failed on {name}: {exc}")
+            kind, detail = _classify_url_error(exc)
+            raise RoutePreflightError(kind, detail)
+        except socket.timeout:
+            raise RoutePreflightError("connect", "timed out")
+
+
+def runtime_preflight(style: str, workspace_host: str, base_url: str, token: str,
+                      endpoint_names: set[str], protocols: set[str] | None = None) -> str:
+    """One real completion through the EXACT route the gateway will use.
+
+    ``style`` is ``invocations`` (POST <workspace>/serving-endpoints/<id>/invocations,
+    bearer auth, OpenAI body) or ``ai-gateway`` (POST <gateway>/<prefix>/... per
+    protocol with bearer auth). Returns the endpoint name used. Raises
+    RoutePreflightError with a classified ``kind`` (dns/tls/connect/auth/path/
+    rate_limited/http/missing_model) so callers can decide whether to fall back.
+    """
+    candidates = [n for n in SMOKE_CANDIDATES if n in endpoint_names]
+    if not candidates:
+        raise RoutePreflightError("missing_model",
+                                  f"none of the bootstrap models {', '.join(SMOKE_CANDIDATES)} is served")
+    name = candidates[0]
+    deadline = time.time() + 120
+    headers = {"Authorization": f"Bearer {token}"}
+    openai_body = {"messages": [{"role": "user", "content": "Reply with exactly: OK"}], "max_tokens": 16}
+    if style == "invocations":
+        _smoke_request(f"{workspace_host}/serving-endpoints/{name}/invocations", openai_body, headers, deadline)
+        return name
+    if style != "ai-gateway":
+        raise ValueError(f"unknown route style {style!r}")
+    for protocol in sorted(protocols or {"openai"}):
+        prefix = AI_GATEWAY_PATH_PREFIXES[protocol]
+        if protocol == "anthropic":
+            url = f"{base_url}/{prefix}/messages"
+            body = {"model": name, **openai_body}
+            _smoke_request(url, body, {**headers, "anthropic-version": "2023-06-01"}, deadline)
+        else:
+            url = f"{base_url}/{prefix}/chat/completions"
+            _smoke_request(url, {"model": name, **openai_body}, headers, deadline)
+    return name
+
+
+def smoke_test(host: str, token: str, endpoint_names: set[str], *, style: str = "invocations",
+               base_url: str | None = None, protocols: set[str] | None = None,
+               require_bootstrap: bool = False) -> None:
+    """Runtime smoke through the committed route; SystemExit on failure.
+
+    ``require_bootstrap`` (set for partial-coverage activations) turns "no
+    bootstrap model to smoke" into a failure: degraded coverage is only
+    acceptable when at least one known model provably works end to end.
+    """
+    try:
+        name = runtime_preflight(style, host, base_url or host, token, endpoint_names, protocols)
+    except RoutePreflightError as exc:
+        if exc.kind == "missing_model":
+            if require_bootstrap:
+                raise _fail(f"partial coverage refused: {exc.detail}; a bootstrap model must exist "
+                            "and answer through the runtime route")
+            print(f"  smoke: skipped — {exc.detail}")
+            return
+        raise _fail(f"runtime smoke via {style} route failed ({exc.kind}): {exc.detail}")
+    print(f"  smoke: OK ({name} via {style})")
 
 
 def _config_target(path: Path) -> Path:
@@ -452,11 +589,72 @@ def cmd_list(args) -> None:
 
 
 def _verify(config: dict, host: str, profile: str, pool_names: list[str], allow_partial: bool,
-            token: str | None = None, provider_names: list[str] = ()) -> None:
+            token: str | None = None, provider_names: list[str] = (), *,
+            style: str = "invocations", base_url: str | None = None) -> list[str] | None:
+    """Control-plane (auth + endpoint coverage) then data-plane (one completion
+    through the exact committed route). Returns the served provider_model_ids."""
     token = token or ensure_auth(host, profile)
     endpoint_names = probe_endpoints(host, token)
-    check_coverage(config, pool_names, endpoint_names, allow_partial, provider_names)
-    smoke_test(host, token, endpoint_names)
+    available = check_coverage(config, pool_names, endpoint_names, allow_partial, provider_names)
+    protocols = _model_protocols(config, pool_names, provider_names) if style == "ai-gateway" else None
+    smoke_test(host, token, endpoint_names, style=style, base_url=base_url, protocols=protocols,
+               require_bootstrap=allow_partial)
+    return available
+
+
+def _entry_style(entry: dict) -> str:
+    if entry.get("endpoint_style") == "invocations":
+        return "invocations"
+    return "ai-gateway" if isinstance(entry.get("path_prefixes"), dict) else "invocations"
+
+
+def _resolve_route(style: str, host: str, profile: str, config: dict, pool_names: list[str],
+                   provider_names: list[str]) -> tuple[str, str, str, str]:
+    """Pick the concrete route for ``style`` (invocations|ai-gateway|auto).
+
+    Returns (final_style, workspace_host, base_url, token). ``auto`` tries the
+    derived AI Gateway host with a real data-plane probe first and falls back
+    to direct invocations when that route is unusable (DNS, TLS, connect, path
+    or protocol failures); auth failures are NOT masked by fallback.
+    """
+    if style == "invocations":
+        return "invocations", host, host, ensure_auth(host, profile)
+    verify_host, base_url, token = _resolve_ai_gateway_host(host, profile)
+    if style == "ai-gateway":
+        print(f"  ai-gateway: {base_url} (workspace {verify_host})")
+        return "ai-gateway", verify_host, base_url, token
+    # auto
+    endpoint_names = probe_endpoints(verify_host, token)
+    protocols = _model_protocols(config, pool_names, provider_names)
+    try:
+        used = runtime_preflight("ai-gateway", verify_host, base_url, token, endpoint_names, protocols)
+        print(f"  route: ai-gateway {base_url} OK ({used})")
+        return "ai-gateway", verify_host, base_url, token
+    except RoutePreflightError as exc:
+        if exc.kind == "auth":
+            raise _fail(f"AI Gateway route rejected the workspace credential ({exc.detail}); not falling back")
+        print(f"  route: ai-gateway {base_url} unusable ({exc.kind}: {exc.detail})")
+        print(f"  route: falling back to direct invocations on {verify_host}")
+        return "invocations", verify_host, verify_host, token
+
+
+def _provider_entry(style: str, base_url: str, token: str, profile: str, workspace_host: str,
+                    inherit: dict | None = None) -> dict:
+    """Build a complete provider entry for ``style``, dropping fields that
+    belong to the other style so a converted entry has no stale routing."""
+    entry = dict(inherit or {})
+    for k in ("endpoint_style", "path_prefixes", "workspace_url", "quirks", "protocol"):
+        entry.pop(k, None)
+    entry.update({"base_url": base_url, "api_key": token, "protocol": "openai",
+                  "auth_refresh": "databricks-cli", "auth_profile": profile})
+    if style == "invocations":
+        entry["endpoint_style"] = "invocations"
+        entry["quirks"] = ["no_stream_options", "no_reasoning_params"]
+    else:
+        entry["path_prefixes"] = dict(AI_GATEWAY_PATH_PREFIXES)
+        entry["quirks"] = ["anthropic_bearer_auth"]
+        entry["workspace_url"] = workspace_host
+    return entry
 
 
 def cmd_test(args) -> None:
@@ -479,7 +677,10 @@ def cmd_test(args) -> None:
             raise _fail(f"workspace {args.name!r} has no api_key configured")
     endpoint_names = probe_endpoints(host, token)
     check_coverage(config, pools, endpoint_names, allow_partial=True, provider_names=[args.name])
-    smoke_test(host, token, endpoint_names)
+    style = _entry_style(entry)
+    protocols = _model_protocols(config, pools, [args.name]) if style == "ai-gateway" else None
+    smoke_test(host, token, endpoint_names, style=style, base_url=str(entry.get("base_url", "")),
+               protocols=protocols)
     print("workspace test: PASSED")
 
 
@@ -502,45 +703,22 @@ def cmd_add(args) -> None:
     pool_names = [p.strip() for p in (args.pools or "").split(",") if p.strip()]
     config = _load_config(args.config)
 
-    # ai-gateway style: --host may be the workspace URL (recommended) or the
-    # <org-id>.ai-gateway hostname. Auth and probes always go through the
-    # workspace REST API; only base_url is the gateway hostname.
-    verify_host = base_url = host
-    token = None
-    if args.style != "invocations":
-        verify_host, base_url, token = _resolve_ai_gateway_host(host, profile)
-        print(f"  ai-gateway: {base_url} (workspace {verify_host})")
-
-    print(f"Adding workspace {args.name!r} ({verify_host}) to pools: {', '.join(pool_names) or 'none'}")
-    # Verify against a config copy that already contains the new pool layout so
-    # coverage checks the models this workspace WILL serve.
     staged = copy.deepcopy(config)
     _insert_into_pools(staged, args.name, pool_names, args.position)
-    _verify(staged, verify_host, profile, pool_names, args.allow_partial, token=token,
-            provider_names=[args.name])
+    style, verify_host, base_url, token = _resolve_route(
+        args.style, host, profile, staged, pool_names, [args.name])
+    print(f"Adding workspace {args.name!r} ({verify_host}, {style}) to pools: {', '.join(pool_names) or 'none'}")
+    available = _verify(staged, verify_host, profile, pool_names, args.allow_partial, token=token,
+                        provider_names=[args.name], style=style, base_url=base_url)
 
     providers = _providers_section(config)
-    if token is None:
-        token = ensure_auth(host, profile)  # cheap: token is cached by the CLI
-    entry = {
-        "base_url": base_url,
-        "api_key": token,
-        "protocol": "openai",
-        "endpoint_style": "invocations",
-        "auth_refresh": "databricks-cli",
-        "auth_profile": profile,
-        "quirks": ["no_stream_options", "no_reasoning_params"],
-    }
-    if args.style != "invocations":
-        entry.pop("endpoint_style")
-        entry["path_prefixes"] = {"anthropic": "anthropic/v1", "openai": "mlflow/v1"}
-        entry["quirks"] = ["anthropic_bearer_auth"]
-        entry["workspace_url"] = verify_host
-    providers[args.name] = {k: v for k, v in entry.items() if v is not None}
+    entry = _provider_entry(style, base_url, token, profile, verify_host)
+    _stamp_coverage(entry, available)
+    providers[args.name] = entry
     _insert_into_pools(config, args.name, pool_names, args.position)
 
     _commit_and_activate(args.config, config)
-    print(f"workspace add: DONE — {args.name} is live")
+    print(f"workspace add: DONE — {args.name} is live via {style}")
 
 
 def cmd_replace(args) -> None:
@@ -556,30 +734,22 @@ def cmd_replace(args) -> None:
 
     pools = _pools_section(config)
     affected = [p for p, members in pools.items() if args.old_name in (members or [])]
-    print(f"Replacing workspace {args.old_name!r} with {new_name!r} ({host}) in pools: {', '.join(affected) or 'none'}")
 
-    # Inherit the old entry's style. ai-gateway entries (path_prefixes, no
-    # invocations endpoint_style) need the same host derivation as `add`.
-    ai_gw = isinstance(old.get("path_prefixes"), dict) and old.get("endpoint_style") != "invocations"
-    verify_host = base_url = host
-    token = None
-    if ai_gw:
-        verify_host, base_url, token = _resolve_ai_gateway_host(host, profile)
-        print(f"  ai-gateway: {base_url} (workspace {verify_host})")
+    requested = getattr(args, "style", "inherit") or "inherit"
+    style = _entry_style(old) if requested == "inherit" else requested
 
     staged = copy.deepcopy(config)
     for pool in affected:  # stage: swap in place, keep position
         members = staged["pools"][pool]
         members[members.index(args.old_name)] = new_name
-    _verify(staged, verify_host, profile, affected, args.allow_partial, token=token,
-            provider_names=[new_name])
+    style, verify_host, base_url, token = _resolve_route(style, host, profile, staged, affected, [new_name])
+    print(f"Replacing workspace {args.old_name!r} with {new_name!r} ({verify_host}, {style}) "
+          f"in pools: {', '.join(affected) or 'none'}")
+    available = _verify(staged, verify_host, profile, affected, args.allow_partial, token=token,
+                        provider_names=[new_name], style=style, base_url=base_url)
 
-    if token is None:
-        token = ensure_auth(host, profile)
-    entry = {k: v for k, v in old.items()}  # inherit style/quirks from the old entry
-    entry.update({"base_url": base_url, "api_key": token, "auth_refresh": "databricks-cli", "auth_profile": profile})
-    if ai_gw:
-        entry["workspace_url"] = verify_host
+    entry = _provider_entry(style, base_url, token, profile, verify_host, inherit=old)
+    _stamp_coverage(entry, available)
     providers[new_name] = entry
     if new_name != args.old_name:
         providers.pop(args.old_name, None)
@@ -588,7 +758,7 @@ def cmd_replace(args) -> None:
         members[members.index(args.old_name)] = new_name
 
     _commit_and_activate(args.config, config)
-    print(f"workspace replace: DONE — {new_name} took over {args.old_name}'s pool positions")
+    print(f"workspace replace: DONE — {new_name} took over {args.old_name}'s pool positions via {style}")
 
 
 def cmd_repair(args) -> None:
@@ -622,7 +792,7 @@ def cmd_repair(args) -> None:
                 continue
             ns = argparse.Namespace(
                 config=args.config, old_name=name, host=reply,
-                name=None, profile=None, allow_partial=True,
+                name=None, profile=None, allow_partial=True, style="inherit",
             )
             cmd_replace(ns)
             broken.remove(name)
@@ -676,7 +846,9 @@ def main() -> None:
     p.add_argument("--pools", default="")
     p.add_argument("--position", type=int, default=None)
     p.add_argument("--profile", default=None)
-    p.add_argument("--style", choices=["invocations", "ai-gateway"], default="invocations")
+    p.add_argument("--style", choices=["invocations", "ai-gateway", "auto"], default="invocations",
+                   help="route style; auto = try the derived AI Gateway route with a real "
+                        "completion, fall back to direct invocations if it is unusable")
     p.add_argument("--allow-partial", action="store_true")
 
     p = sub.add_parser("replace")
@@ -684,6 +856,8 @@ def main() -> None:
     p.add_argument("--host", required=True)
     p.add_argument("--name", default=None)
     p.add_argument("--profile", default=None)
+    p.add_argument("--style", choices=["inherit", "invocations", "ai-gateway", "auto"], default="inherit",
+                   help="route style for the replacement (default: inherit the old entry's style)")
     p.add_argument("--allow-partial", action="store_true")
 
     p = sub.add_parser("remove")

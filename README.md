@@ -101,6 +101,17 @@ and restore the prior configuration if activation fails. Run
 `<org-id>.ai-gateway.cloud.databricks.com` base URL is derived from the
 workspace token (an explicit gateway hostname is still accepted).
 
+`--host` must be the workspace URL from your browser (`https://…databricks.com`,
+`?o=` and paths are stripped); a bare workspace ID is rejected with guidance.
+The smoke test runs through the **exact runtime route** that will be committed.
+`--style auto` (on `add` and `replace`) tries the derived AI Gateway route with
+a real completion and falls back to direct `/serving-endpoints/…/invocations`
+when that host/path is unusable, printing the reason. `--allow-partial`
+accepts a workspace that lacks some catalog models, but only when a bootstrap
+model answers through the runtime route; the served IDs are recorded on the
+provider as `available_model_ids`, and `scripts/export_catalogs.py` omits the
+rest so downstream launchers (`pi-list`) never advertise dead models.
+
 ## Configuration
 
 Two layers (see `config/config.yaml.example` and `docs/`):
