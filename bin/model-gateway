@@ -676,14 +676,14 @@ cmd_onboard() {
 }
 
 cmd_workspace() {
-  [ $# -ge 1 ] || die "usage: model-gateway workspace {list|repair|test|add|replace|remove} [options]"
+  [ $# -ge 1 ] || die "usage: model-gateway workspace {list|repair|test|add|replace|remove|normalize} [options]"
   check_prereqs
   local requested_help=0 arg
   for arg in "$@"; do
     case "$arg" in -h|--help) requested_help=1 ;; esac
   done
   case "$1" in
-    list|test) ;;
+    list|test|normalize) ;;
     repair|add|replace|remove)
       [ "$requested_help" = 1 ] || ensure_runtime_paths_safe "workspace management"
       ;;

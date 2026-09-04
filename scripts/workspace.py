@@ -12,6 +12,7 @@ Commands:
                                       [--style inherit|invocations|ai-gateway|auto]
                                       [--allow-partial]
     model-gateway workspace remove <name>
+    model-gateway workspace normalize <pasted-url>   # validate; print https origin
 
 `add`/`replace` are idempotent and verify BEFORE committing config. If gateway
 activation fails, the previous config is restored and activated automatically:
@@ -835,6 +836,9 @@ def main() -> None:
     sub.add_parser("list")
     sub.add_parser("repair")
 
+    p = sub.add_parser("normalize", help="validate a pasted workspace URL and print its https origin")
+    p.add_argument("url")
+
     p = sub.add_parser("test")
     p.add_argument("name")
 
@@ -865,7 +869,8 @@ def main() -> None:
 
     args = parser.parse_args()
     {"list": cmd_list, "repair": cmd_repair, "test": cmd_test, "add": cmd_add,
-     "replace": cmd_replace, "remove": cmd_remove}[args.command](args)
+     "replace": cmd_replace, "remove": cmd_remove,
+     "normalize": lambda a: print(normalize_host(a.url))}[args.command](args)
 
 
 if __name__ == "__main__":

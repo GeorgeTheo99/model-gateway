@@ -6,6 +6,7 @@ import importlib.util
 import json
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -667,3 +668,12 @@ def test_missing_bootstrap_model_is_reported_not_skipped_in_partial_mode():
     with pytest.raises(ws.RoutePreflightError) as err:
         ws.runtime_preflight("invocations", "https://w", "https://w", "t", {"databricks-gpt-5-4"})
     assert err.value.kind == "missing_model"
+
+
+def test_normalize_subcommand_for_shell_callers(tmp_path):
+    ok = subprocess.run([sys.executable, str(SCRIPT), "normalize", "my-ws.cloud.databricks.com/?o=1#x"],
+                        capture_output=True, text=True)
+    assert ok.returncode == 0 and ok.stdout.strip() == "https://my-ws.cloud.databricks.com"
+    bad = subprocess.run([sys.executable, str(SCRIPT), "normalize", "7474651766001209"],
+                         capture_output=True, text=True)
+    assert bad.returncode != 0 and "looks like a workspace ID" in bad.stderr
