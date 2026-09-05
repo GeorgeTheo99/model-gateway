@@ -422,6 +422,11 @@ def _validate_vision_fallback_policy(*, log_policy: bool = True) -> None:
                     f"{variable} model '{fallback_model}' is not vision-capable "
                     f"on provider '{provider_label}'"
                 )
+            if getattr(fallback_info, "api_style", "") == "open_responses":
+                raise RuntimeError(
+                    f"{variable} model '{fallback_model}' is Responses-only "
+                    f"on provider '{provider_label}'; vision fallback requires Chat Completions"
+                )
             if fallback_info.protocol != "openai":
                 raise RuntimeError(
                     f"{variable} model '{fallback_model}' must use an "
@@ -3191,6 +3196,9 @@ async def _handle_openai_responses_passthrough(endpoint: str, body: dict, header
             return _error_openai(502, "api_error", "Cannot connect to OpenAI API")
         except Exception as e:
             return _error_openai(502, "api_error", f"OpenAI error: {e}")
+
+    if resp.status_code != 200:
+        return upstream_error_openai(resp, resp.text, "OpenAI")
 
     try:
         content = resp.json()

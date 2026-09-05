@@ -96,10 +96,12 @@ GATEWAY_VISION_FALLBACK_CLOUD=<native-cloud-vision-model>
 A text-only local route can use only the local helper, and a text-only cloud
 route can use only the cloud helper. If its matching variable is empty, that
 route fails closed. Source or fallback pools that mix local oMLX and cloud
-providers are rejected. Each fallback must be a native vision model using an
-OpenAI-compatible protocol; the gateway validates every configured pool
+providers are rejected. Each fallback must be a native vision model supporting
+OpenAI-compatible Chat Completions; the gateway validates every configured pool
 candidate at startup, on admin reload, and again before each fallback request.
-Cloud helper use is explicit cloud egress and is logged as such.
+Responses-only models (`api_style: open_responses`, such as Astra) cannot be
+fallback helpers in either mode. They still accept native image requests through
+`/v1/responses`. Cloud helper use is explicit cloud egress and is logged as such.
 
 Scoped fallbacks default to `extract_then_answer`: the helper receives the image
 and returns bounded observations, then the originally requested text model

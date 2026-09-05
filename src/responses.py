@@ -98,7 +98,9 @@ def responses_to_chat(body: dict) -> dict:
                 messages.append({"role": "user", "content": item})
                 continue
 
-            item_type = item.get("type", "")
+            # EasyInputMessage permits omitting type. Treat role-bearing
+            # items as messages so vision inspection also sees their images.
+            item_type = item.get("type", "message" if "role" in item else "")
 
             if item_type == "message":
                 role = item.get("role", "user")

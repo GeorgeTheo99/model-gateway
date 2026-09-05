@@ -1006,7 +1006,12 @@ def resolve(model_id: str, provider_override: str | None = None) -> ProviderInfo
         # endpoint instead of a per-model invocations URL. Pool members swap
         # cleanly because every member resolves to the same-shaped URL
         # (endpoint_suffix "").
-        base_url = base_url.rstrip("/") + "/serving-endpoints/open-responses"
+        # Explicit configs may use the workspace root; Databricks environment
+        # configuration already includes /serving-endpoints. Accept both.
+        base_url = (
+            base_url.rstrip("/").removesuffix("/serving-endpoints")
+            + "/serving-endpoints/open-responses"
+        )
         endpoint_suffix = ""
     elif endpoint_style == "invocations":
         # base_url is a workspace host; each model has its own full invocation
