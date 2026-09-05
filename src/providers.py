@@ -92,6 +92,11 @@ class ProviderInfo:
     # ("/chat/completions" or "/messages"). "" => base_url is already a complete
     # invocation URL (e.g. endpoint_style: invocations providers).
     endpoint_suffix: str | None = None
+    # Gateway request style for this model: "" (default: protocol-native
+    # chat/messages), or "open_responses" for models served through the
+    # workspace-wide Open Responses endpoint (/serving-endpoints/open-responses)
+    # because the upstream rejects function tools on chat/completions.
+    api_style: str = ""
     # Provider quirk flags from config (e.g. "no_stream_options",
     # "no_reasoning_params"). Generic mechanism; which providers need which
     # quirks is runtime config, not code.
@@ -994,8 +999,16 @@ def resolve(model_id: str, provider_override: str | None = None) -> ProviderInfo
                 log.debug("Model %r protocol %r ignored: provider %r uses %s invocations",
                           model_id, entry_protocol, provider, protocol)
 
+    api_style = (entry.get("api_style") or "").strip().lower()
     endpoint_suffix: str | None = None
-    if endpoint_style == "invocations":
+    if api_style == "open_responses":
+        # Responses-only model: route to the workspace-wide Open Responses
+        # endpoint instead of a per-model invocations URL. Pool members swap
+        # cleanly because every member resolves to the same-shaped URL
+        # (endpoint_suffix "").
+        base_url = base_url.rstrip("/") + "/serving-endpoints/open-responses"
+        endpoint_suffix = ""
+    elif endpoint_style == "invocations":
         # base_url is a workspace host; each model has its own full invocation
         # URL: <base>/serving-endpoints/<provider_model_id>/invocations.
         base_url = base_url.rstrip("/") + f"/serving-endpoints/{provider_model_id}/invocations"
@@ -1026,6 +1039,7 @@ def resolve(model_id: str, provider_override: str | None = None) -> ProviderInfo
         base_url=base_url,
         api_key=api_key,
         provider_model_id=provider_model_id,
+        api_style=api_style,
         protocol=protocol,
         endpoint_suffix=endpoint_suffix,
         quirks=frozenset(quirks_set),

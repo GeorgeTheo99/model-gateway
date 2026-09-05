@@ -519,6 +519,15 @@ def _error_openai(status: int, error_type: str, message: str) -> JSONResponse:
     )
 
 
+def _responses_only_error_message(model: str, route: str = "/v1/responses") -> str:
+    """Client-facing error for models the gateway serves via Responses only."""
+    return (
+        f"Model '{model}' is served through the OpenAI Responses API only; "
+        f"send requests to POST {route}. Its upstream model rejects function "
+        "tools on the Chat Completions API."
+    )
+
+
 def _model_error_message(model: str) -> str:
     availability = model_availability(model)
     if availability.get("reason") == "model_not_found":
@@ -1992,7 +2001,11 @@ def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat") -> bool:
         req.pop("reasoning", None)
         req["reasoning_effort"] = "none"
         return False
-    if target_api != "messages" and "no_reasoning_params" in quirks:
+    if target_api == "chat" and "no_reasoning_params" in quirks:
+        # Chat-completions upstream only. Responses-native passthrough
+        # (target "responses") and Anthropic Messages keep their reasoning
+        # controls: models routed via the Open Responses endpoint (e.g.
+        # gpt-6-astra) reason natively and reject having the params stripped.
         _strip_reasoning_controls(req)
         req.pop("reasoning", None)
         return bool(enabled)
@@ -2030,7 +2043,12 @@ def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat") -> bool:
 
     if target_api == "responses" or fmt == "openai-responses":
         if enabled:
-            forwarded = "low" if effort == "minimal" else ("xhigh" if effort == "max" else effort)
+            if getattr(info, "api_style", "") == "open_responses":
+                # Responses-native gateway models pass canonical levels through
+                # verbatim (minimal maps to the lowest upstream effort).
+                forwarded = "low" if effort == "minimal" else effort
+            else:
+                forwarded = "low" if effort == "minimal" else ("xhigh" if effort == "max" else effort)
             req["reasoning"] = {"effort": forwarded}
         elif effort == "off":
             req["reasoning"] = {"effort": "none"}
@@ -2977,16 +2995,18 @@ async def create_response(request: Request):
             chat_body=vision_chat if vision_extracted else None,
         )
 
-    # OpenAI models support Responses natively. Do not translate Codex's
-    # Responses+tools requests to Chat Completions: GPT-5.4 rejects function
-    # tools with reasoning_effort on /chat/completions.
-    if info.provider == "openai" and not vision_changed:
+    # OpenAI models support Responses natively. Models with api_style
+    # "open_responses" (Databricks workspace Open Responses endpoint, e.g.
+    # gpt-6-astra) take the same native path: their upstream rejects function
+    # tools with reasoning on /chat/completions, so do not translate
+    # Responses+tools requests down to Chat Completions.
+    if (info.provider == "openai" or getattr(info, "api_style", "") == "open_responses") and not vision_changed:
         body["model"] = info.provider_model_id
         _apply_gateway_reasoning(body, info, target_api="responses")
         request.state.api_key = info.api_key
         fwd = _forward_headers(request, provider=info.provider)
         endpoint = _upstream_endpoint(info, "/responses")
-        log.info("Responses %s -> openai native (stream=%s)", model, is_stream)
+        log.info("Responses %s -> %s native (stream=%s)", model, info.provider, is_stream)
         return await _handle_openai_responses_passthrough(endpoint, body, fwd, is_stream, provider=info.provider, request=request)
 
     # Translate Responses → Chat Completions
@@ -3121,7 +3141,9 @@ async def _handle_openai_responses_passthrough(endpoint: str, body: dict, header
     if is_stream:
         client = httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS)
         try:
-            resp = await _retry_send_stream(
+            # Pool-aware send: astra-pool style workspace failover (and any
+            # configured model fallback) engage through request.state.pool_ctx.
+            resp = await _retry_send_stream_with_model_fallback(
                 client, endpoint, json=body, headers=headers,
                 provider=provider, request=request,
             )
@@ -3160,7 +3182,8 @@ async def _handle_openai_responses_passthrough(endpoint: str, body: dict, header
 
     async with httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS) as client:
         try:
-            resp = await _retry_post(
+            # Pool-aware send: workspace failover via request.state.pool_ctx.
+            resp = await _retry_post_with_model_fallback(
                 client, endpoint, json=body, headers=headers,
                 provider=provider, request=request,
             )
@@ -3306,6 +3329,14 @@ async def chat_completions(request: Request):
         return JSONResponse(
             status_code=404,
             content={"error": {"message": _model_error_message(model), "type": "invalid_request_error"}},
+        )
+    if getattr(info, "api_style", "") == "open_responses":
+        # Responses-only model: its upstream (workspace Open Responses endpoint)
+        # rejects function tools on chat/completions, so the gateway serves it
+        # exclusively through the native Responses passthrough.
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": _responses_only_error_message(model, "/v1/responses"), "type": "invalid_request_error"}},
         )
     thinking_error = _thinking_validation_response(body, info, _error_openai)
     if thinking_error is not None:
@@ -3731,6 +3762,8 @@ async def messages(request: Request):
             return forwarded
     if not info:
         return _error(404, "invalid_request_error", _model_error_message(model))
+    if getattr(info, "api_style", "") == "open_responses":
+        return _error(400, "invalid_request_error", _responses_only_error_message(model, "/v1/responses"))
     thinking_error = _thinking_validation_response(body, info, _error)
     if thinking_error is not None:
         return thinking_error

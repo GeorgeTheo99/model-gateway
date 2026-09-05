@@ -152,6 +152,7 @@ _ALIAS_FIELDS = (
     "chat_template_kwargs",
     "vision",
     "format",
+    "api_style",
     "context",
     "max_output_tokens",
     "omlx_id",
