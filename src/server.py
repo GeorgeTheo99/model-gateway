@@ -1391,7 +1391,9 @@ def _infer_thinking_format(info, target_api: str) -> str:
         return explicit
     provider = getattr(info, "provider", "")
     model_id = (getattr(info, "provider_model_id", "") or "").lower()
-    if provider == "anthropic":
+    # Native Messages routes can live behind arbitrarily named proxy providers.
+    # Use the resolved wire protocol, not just the provider's display name.
+    if getattr(info, "protocol", "") == "anthropic" or provider == "anthropic":
         return "anthropic"
     if provider == "openrouter":
         return "openrouter"
