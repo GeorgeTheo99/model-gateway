@@ -40,6 +40,28 @@ def test_explicit_thinking_format_still_takes_precedence(explicit):
     assert server._infer_thinking_format(info, "messages") == explicit
 
 
+@pytest.mark.parametrize("protocol,expected_params", [
+    ("anthropic", ["thinking"]),
+    ("openai", ["reasoning_effort"]),
+])
+def test_model_discovery_reflects_protocol_reasoning(monkeypatch, protocol, expected_params):
+    entry = {
+        "id": "sonnet", "name": "sonnet", "provider": "workspace-proxy",
+        "provider_model_id": "databricks-claude-sonnet-4-6",
+        "protocol": protocol, "thinking": "optional", "max_output_tokens": 4096,
+    }
+    monkeypatch.setattr(server, "list_available_models", lambda: [entry])
+    monkeypatch.setattr(server, "list_routable_models", lambda: [entry])
+    client = TestClient(server.app)
+    for endpoint in ["/v1/models", "/v1/debug/thinking"]:
+        response = client.get(endpoint)
+        assert response.status_code == 200
+        data = response.json()
+        row = data["data"][0] if endpoint == "/v1/models" else data["models"][0]
+        assert row["thinking_format"] == protocol
+        assert row["forwarded_params"] == expected_params
+
+
 @pytest.mark.parametrize("stream", [False, True], ids=["sync", "stream"])
 @pytest.mark.parametrize("controls,expected_thinking", [
     ({}, None),

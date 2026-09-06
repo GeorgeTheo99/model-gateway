@@ -2205,6 +2205,7 @@ def _probe_forwarded_params(entry: dict, levels: tuple[str, ...]) -> set[str]:
         return set()
     info = SimpleNamespace(
         provider=entry.get("provider", ""),
+        protocol=entry.get("protocol", ""),
         provider_model_id=entry.get("provider_model_id", entry.get("name", "")),
         thinking=entry.get("thinking", ""),
         thinking_levels=levels,
@@ -2230,6 +2231,7 @@ def _thinking_capabilities(entry: dict) -> dict:
     forwarded = _probe_forwarded_params(normalized, levels)
     info = SimpleNamespace(
         provider=normalized.get("provider", ""),
+        protocol=normalized.get("protocol", ""),
         provider_model_id=normalized.get("provider_model_id", normalized.get("name", "")),
         thinking_format=normalized.get("thinking_format", ""),
     )
