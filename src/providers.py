@@ -1215,6 +1215,7 @@ def provider_status() -> list[dict]:
             "configured": bool(explicit_config or _provider_defaults(provider) or env_config),
             "enabled_models": model_count,
             "base_url": base_url,
+            "base_url_redacted": base_url != provider_config.get("base_url", ""),
             "protocol": provider_config.get("protocol", "openai") if provider_config else "openai",
             "has_api_key": has_api_key,
             "ready": not issues,
@@ -1229,9 +1230,33 @@ def model_status() -> list[dict]:
     """Return the shared effective inventory in the admin API shape."""
     ready = {p["id"]: p["ready"] for p in provider_status()}
     configured = _configured_provider_ids() | {"omlx"}
+    fallback_map = _load_config().get("model_fallbacks") or {}
+    if not isinstance(fallback_map, dict):
+        fallback_map = {}
     result = []
     for model in effective_model_inventory():
         provider = _canonical_provider(model.get("effective_provider") or model.get("provider", ""))
+        declared_providers = [
+            _canonical_provider(member) for member in model.get("declared_providers", [])
+        ]
+        localities = {"local" if member == "omlx" else "cloud" for member in declared_providers}
+        raw_composite = model.get("composite")
+        composite = None
+        if isinstance(raw_composite, dict):
+            composite = {
+                key: raw_composite[key]
+                for key in ("text_model", "vision_model")
+                if isinstance(raw_composite.get(key), str)
+            }
+            mode = raw_composite.get("image_handling") or "extract_then_answer"
+            composite["image_handling"] = mode if isinstance(mode, str) and mode in {"extract_then_answer", "reroute"} else None
+        # Composite branches are separate routes; the wrapper's provider pool
+        # cannot establish their locality or their upstream fallback target.
+        locality = None if raw_composite is not None else (
+            next(iter(localities)) if len(localities) == 1 else "mixed" if localities else None
+        )
+        provider_model_id = model.get("provider_model_id") or model.get("omlx_id") or model.get("name", "")
+        fallback = fallback_map.get(provider_model_id) if raw_composite is None else None
         result.append({
             "id": model.get("id"),
             "name": model.get("name", ""),
@@ -1239,11 +1264,19 @@ def model_status() -> list[dict]:
             "routable_ids": model.get("routable_ids", []),
             "provider": provider,
             "configured_provider": _canonical_provider(model.get("provider", "")),
+            "declared_providers": declared_providers,
+            "pool": model.get("pool") if isinstance(model.get("pool"), str) else "",
+            "desc": model.get("desc") if isinstance(model.get("desc"), str) else "",
+            "tools": model.get("tools") if isinstance(model.get("tools"), bool) else None,
+            "locality": locality,
+            "composite": composite,
+            # model_fallbacks is keyed by upstream ID, not logical name/alias.
+            "fallback_model": fallback if isinstance(fallback, str) and fallback else None,
             "candidate_providers": [
                 _canonical_provider(candidate)
                 for candidate in model.get("candidate_providers", [])
             ],
-            "provider_model_id": model.get("provider_model_id") or model.get("omlx_id") or model.get("name", ""),
+            "provider_model_id": provider_model_id,
             "omlx_id": model.get("omlx_id", ""),
             "provider_configured": provider in configured,
             "provider_ready": ready.get(provider, False),

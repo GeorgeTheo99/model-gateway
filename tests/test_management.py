@@ -821,12 +821,13 @@ def test_admin_workspace_pools_reports_runtime_routing_without_secrets(
 
 def test_admin_ui_contains_workspace_pool_view():
     html = TestClient(app).get("/admin").text
-    assert 'data-tab="pools"' in html
+    assert 'data-tab="connections"' in html
     assert "/admin/api/workspace-pools" in html
     assert "model-gateway workspace repair" in html
-    assert "Standalone Endpoints" in html
-    assert "standaloneCards" in html
-    assert "<th>Failover</th>" in html
+    assert "Routing groups (workspace pools)" in html
+    assert 'id="workspaceList"' in html
+    assert "Copy repair-all command" in html
+    assert 'id="standaloneCards"' not in html
 
 
 def test_admin_workspace_pools_report_standalone_providers(
