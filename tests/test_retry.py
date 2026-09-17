@@ -114,9 +114,10 @@ def test_retry_post_401_refreshes_token_and_retries(fast_retries, clean_circuit,
     provider = clean_circuit("retry-prov-b")
     calls = []
 
-    async def fake_refresh(prov: str, *, force: bool = False) -> str | None:
+    async def fake_refresh(prov: str, *, force: bool = False, allow_login: bool = True) -> str | None:
         assert prov == provider
         assert force is True
+        assert allow_login is True
         return "eyJnew"
 
     # src.upstream binds refresh_oauth_token by value at import; patch both.
@@ -148,8 +149,9 @@ def test_retry_post_preflight_refreshes_near_expiry_token(fast_retries, clean_ci
     provider = clean_circuit("retry-prov-preflight")
     calls = []
 
-    async def fake_ensure(prov: str) -> str | None:
+    async def fake_ensure(prov: str, *, allow_login: bool = True) -> str | None:
         assert prov == provider
+        assert allow_login is True
         return "eyJfresh"
 
     monkeypatch.setattr(upstream, "ensure_fresh_oauth_token", fake_ensure)

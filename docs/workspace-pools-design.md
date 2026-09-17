@@ -127,16 +127,21 @@ Per request, in `resolve()` + `upstream.py`:
 1. Take the pool's workspace list, skip any workspace whose circuit is OPEN
    (circuit breaker becomes **per-workspace**, which it effectively already is
    since circuits key on provider name).
-2. Send to the first healthy workspace. Existing retry ladder applies
-   (5xx x3, 429 x6 with backoff, transport x4), plus 401/403 → oauth-cli
-   refresh for that workspace.
+2. Send to the first healthy workspace. If another resolvable member remains,
+   use one attempt with no backoff/circuit wait and a maximum 5-second connect
+   timeout. Permit one immediate retry after a cached CLI OAuth refresh, but
+   do not start browser SSO or wait for another request's refresh. The final
+   member (or a single-workspace route) retains the existing retry ladder:
+   transient HTTP x3, 429 x6, transport x4, with backoff/recovery waits.
+   Read/write timeouts remain unchanged; this is not a total request deadline.
 3. Workspace-level failover triggers — move to the next pool member — on:
-   - retry ladder exhausted with 429/5xx (today this falls through to
-     `model_fallbacks`; pool comes first now),
+   - first transient HTTP failure (408/409/425/429/500/502/503/504),
    - 404 model-not-found (endpoint deleted on that workspace),
    - DNS/TLS/connect errors (workspace deleted → NXDOMAIN routes here),
    - 401/403 *after* a failed refresh attempt,
-   - circuit already OPEN (skip without sending).
+   - circuit already OPEN (skip without sending while a backup remains).
+   Successful streams are not replayed mid-stream. Terminal streaming errors
+   return their buffered response without an extra POST to reopen it.
 4. Only after **all** pool members fail: consult `fallback_model` /
    `model_fallbacks` (different model, e.g. gpt-5.5 → gpt-5.4, resolved
    through its own pool).
@@ -153,9 +158,11 @@ Failovers are logged + counted in the ledger (`failover_from`,
 - `auth: oauth-cli` → generalize today's `refresh_oauth_token()`:
   preflight (<5 min JWT validity) + reactive on 401/403, using
   `databricks auth token --profile <auth_profile>`, persisting back to
-  config.yaml. If the CLI cache is broken, the gateway launches
-  `databricks auth login` once per cooldown window, retries token minting,
-  and then continues the original request with the fresh token.
+  config.yaml. If the CLI cache is broken and no pool backup remains, the
+  gateway may launch `databricks auth login` once per cooldown window, retry
+  token minting, and continue the original request with the fresh token.
+  Requests with a backup use cached CLI auth only; a token command can still
+  take up to 30 seconds.
 - `auth: pat` → static; validation warns if the PAT fails a probe.
 - Browser SSO can still be disabled per provider with `auth_login: false`
   for headless deployments; local Pi desktop deployments leave it enabled so

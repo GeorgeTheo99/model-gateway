@@ -33,7 +33,8 @@ translation between them.
 - **Unified model catalog** — logical model names, aliases, capability
   metadata (context, vision, reasoning levels), and pricing in one registry.
 - **Reliability** — per-provider retries, circuit breakers, provider pools,
-  and model-level fallback routes.
+  and model-level fallback routes. Pools try a backup on the first transient
+  failure, reserving backoff/recovery waits for the last workspace.
 - **Admin dashboard** — health, provider/model inventory, Databricks workspace
   pool routing, usage and cost, and gated write controls at `/admin`.
 - **Transactional onboarding** — `model-gateway onboard` discovers upstream
@@ -92,6 +93,27 @@ model-gateway workspace test <name>             # auth, coverage, smoke test
 model-gateway workspace repair                  # repair dead OAuth/workspaces
 ```
 
+**Add Databricks workspaces through the CLI**, on the gateway host. The admin
+UI at `/admin#connections` shows routing groups and workspace diagnostics;
+its generic **Add a connection** form does not configure Databricks OAuth or
+workspace-pool membership.
+
+```bash
+model-gateway workspace list  # find the existing pool names
+model-gateway workspace add backup-workspace \
+  --host https://<workspace-host> \
+  --profile <databricks-cli-profile> \
+  --pools <existing-pool-a>,<existing-pool-b> \
+  --style auto
+model-gateway workspace test backup-workspace
+```
+
+Omitting `--position` appends the workspace as a backup. Supply `--pools`:
+without it, the workspace is registered but is not added to any routing pool.
+This registers an existing Databricks workspace; it does not provision one.
+Authentication may open browser SSO, and validation makes small real inference
+requests. The command activates the change, so it can restart the gateway.
+
 Mutating Databricks workspace commands are similarly available as
 `workspace add`, `workspace replace`, and `workspace remove`. They verify the
 candidate before writing `config.yaml`, restart and health-check the gateway,
@@ -111,6 +133,22 @@ accepts a workspace that lacks some catalog models, but only when a bootstrap
 model answers through the runtime route; the served IDs are recorded on the
 provider as `available_model_ids`, and `scripts/export_catalogs.py` omits the
 rest so downstream launchers (`pi-list`) never advertise dead models.
+
+### Failover timing
+
+When another configured, resolvable pool member remains, streaming and
+non-streaming requests move to it on the first transient HTTP/transport
+failure, missing endpoint (404), or auth rejection after one cached-token
+refresh attempt. They do not wait through same-workspace backoff, an open
+circuit's recovery, browser SSO, or another in-progress OAuth refresh.
+Connection setup is capped at 5 seconds on these attempts (an already-shorter
+timeout is respected). The last member—and single-workspace routes—retain
+the normal retry/recovery policy.
+
+This is **not a total request deadline**: cached-token CLI calls can take up
+to 30 seconds, and existing read/write timeouts are preserved for large prompts
+and slow reasoning. A successful stream is never replayed on a backup after
+it has started. Model-level fallback remains after workspace failover.
 
 ## Configuration
 

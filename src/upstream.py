@@ -26,7 +26,7 @@ from src.circuit import (
     record_success,
     wait_for_recovery,
 )
-from src.model_fallback import SATURATION_STATUSES, fallback_after_error
+from src.model_fallback import fallback_after_error
 from src.providers import ensure_fresh_oauth_token, refresh_oauth_token
 
 log = logging.getLogger("model-gateway")
@@ -40,6 +40,7 @@ _RETRY_429_MAX_DELAY = 60.0  # seconds
 _RETRY_429_ATTEMPTS = 6  # rate limits get more patience
 _RETRY_TRANSPORT_ATTEMPTS = 4
 _RETRY_TRANSPORT_MAX_DELAY = 15.0  # seconds
+_POOL_CONNECT_TIMEOUT = 5.0  # try a backup promptly if a workspace cannot connect
 
 
 async def _raise_if_disconnected(request: Request | None) -> None:
@@ -131,11 +132,13 @@ def _apply_refreshed_token(headers: dict, token: str, request: Request | None) -
     return headers
 
 
-async def _preflight_oauth_token(provider: str, headers: dict, request: Request | None) -> dict:
-    """Refresh nearly-expired OAuth tokens before the upstream request."""
+async def _preflight_oauth_token(
+    provider: str, headers: dict, request: Request | None, *, fast_failover: bool = False,
+) -> dict:
+    """Refresh nearly-expired tokens, without browser SSO when a backup exists."""
     if not provider:
         return headers
-    token = await ensure_fresh_oauth_token(provider)
+    token = await ensure_fresh_oauth_token(provider, allow_login=not fast_failover)
     if not token:
         return headers
     log.warning("Preflight refreshed OAuth token for provider %r", provider)
@@ -158,20 +161,35 @@ def _max_attempts_for_status(status_code: int) -> int:
     return _RETRY_MAX
 
 
+def _pool_timeout(client: httpx.AsyncClient) -> httpx.Timeout:
+    """Cap connection setup only; preserve slow reasoning/stream read budgets."""
+    timeout = httpx.Timeout(client.timeout)
+    timeout.connect = (
+        min(timeout.connect, _POOL_CONNECT_TIMEOUT)
+        if timeout.connect is not None else _POOL_CONNECT_TIMEOUT
+    )
+    return timeout
+
+
 async def _retry_post(
     client: httpx.AsyncClient, endpoint: str, *, json: dict, headers: dict,
     provider: str = "",
     request: Request | None = None,
+    fast_failover: bool = False,
 ) -> httpx.Response:
     """POST with exponential backoff + circuit breaker.
 
     If the provider's circuit is open, waits for recovery (up to 3 min)
     instead of sending requests into a known-down endpoint. This keeps
     errors inside the gateway so the coding harness never sees them.
+    With a pool backup, skip recovery waits and same-workspace backoff retries.
+    A cached OAuth refresh still gets one immediate authenticated retry.
     """
     circuit = _circuit_key(provider)
     probe_request = False
     if circuit and is_tripped(circuit):
+        if fast_failover:
+            raise httpx.ConnectError(f"Provider {circuit} unavailable (circuit open)")
         log.info("circuit[%s]: POST waiting for recovery", circuit)
         recovered = await wait_for_recovery(circuit)
         if not recovered:
@@ -179,19 +197,23 @@ async def _retry_post(
             raise httpx.ConnectError(f"Provider {circuit} unavailable (circuit open)")
         probe_request = is_tripped(circuit)
 
-    max_attempts = _RETRY_MAX
+    max_attempts = 1 if fast_failover else _RETRY_MAX
     attempt = 0
     auth_retried = False
-    headers = await _preflight_oauth_token(provider, headers, request)
+    headers = await _preflight_oauth_token(provider, headers, request, fast_failover=fast_failover)
     while attempt < max_attempts:
         await _raise_if_disconnected(request)
         try:
-            resp = await client.post(endpoint, json=json, headers=headers)
+            resp = await client.post(
+                endpoint, json=json, headers=headers,
+                timeout=_pool_timeout(client) if fast_failover else client.timeout,
+            )
         except Exception as exc:
             if circuit and probe_request:
                 probe_done(circuit, success=False)
                 probe_request = False
-            max_attempts = max(max_attempts, _RETRY_TRANSPORT_ATTEMPTS)
+            if not fast_failover:
+                max_attempts = max(max_attempts, _RETRY_TRANSPORT_ATTEMPTS)
             if not _is_retryable_exception(exc) or attempt == max_attempts - 1:
                 if circuit:
                     record_failure(circuit, 0, f"transport: {type(exc).__name__}")
@@ -210,7 +232,9 @@ async def _retry_post(
         if _is_auth_status(resp.status_code) and not auth_retried and provider:
             auth_retried = True
             await resp.aread()
-            token = await refresh_oauth_token(provider, force=True)
+            token = await refresh_oauth_token(
+                provider, force=True, allow_login=not fast_failover,
+            )
             if token:
                 headers = _apply_refreshed_token(headers, token, request)
                 log.warning(
@@ -232,7 +256,8 @@ async def _retry_post(
                     record_success(circuit)
             return resp
 
-        max_attempts = max(max_attempts, _max_attempts_for_status(resp.status_code))
+        if not fast_failover:
+            max_attempts = max(max_attempts, _max_attempts_for_status(resp.status_code))
         await resp.aread()
 
         if circuit and probe_request:
@@ -264,15 +289,19 @@ async def _retry_send_stream(
     client: httpx.AsyncClient, endpoint: str, *, json: dict, headers: dict,
     provider: str = "",
     request: Request | None = None,
+    fast_failover: bool = False,
 ) -> httpx.Response:
     """Streaming POST with exponential backoff + circuit breaker.
 
-    Returns an open streaming response — caller must close it.
-    Same circuit breaker semantics as _retry_post.
+    Success returns an open stream — caller must close it. Terminal errors
+    return the buffered response, never a duplicate POST just to reopen it.
+    Same circuit breaker and fast-failover semantics as _retry_post.
     """
     circuit = _circuit_key(provider)
     probe_request = False
     if circuit and is_tripped(circuit):
+        if fast_failover:
+            raise httpx.ConnectError(f"Provider {circuit} unavailable (circuit open)")
         log.info("circuit[%s]: stream waiting for recovery", circuit)
         recovered = await wait_for_recovery(circuit)
         if not recovered:
@@ -280,22 +309,26 @@ async def _retry_send_stream(
             raise httpx.ConnectError(f"Provider {circuit} unavailable (circuit open)")
         probe_request = is_tripped(circuit)
 
-    max_attempts = _RETRY_MAX
+    max_attempts = 1 if fast_failover else _RETRY_MAX
     attempt = 0
     auth_retried = False
-    headers = await _preflight_oauth_token(provider, headers, request)
+    headers = await _preflight_oauth_token(provider, headers, request, fast_failover=fast_failover)
     while attempt < max_attempts:
         await _raise_if_disconnected(request)
         try:
             resp = await client.send(
-                client.build_request("POST", endpoint, json=json, headers=headers),
+                client.build_request(
+                    "POST", endpoint, json=json, headers=headers,
+                    timeout=_pool_timeout(client) if fast_failover else client.timeout,
+                ),
                 stream=True,
             )
         except Exception as exc:
             if circuit and probe_request:
                 probe_done(circuit, success=False)
                 probe_request = False
-            max_attempts = max(max_attempts, _RETRY_TRANSPORT_ATTEMPTS)
+            if not fast_failover:
+                max_attempts = max(max_attempts, _RETRY_TRANSPORT_ATTEMPTS)
             if not _is_retryable_exception(exc) or attempt == max_attempts - 1:
                 if circuit:
                     record_failure(circuit, 0, f"transport: {type(exc).__name__}")
@@ -315,7 +348,9 @@ async def _retry_send_stream(
             auth_retried = True
             await resp.aread()
             await resp.aclose()
-            token = await refresh_oauth_token(provider, force=True)
+            token = await refresh_oauth_token(
+                provider, force=True, allow_login=not fast_failover,
+            )
             if token:
                 headers = _apply_refreshed_token(headers, token, request)
                 log.warning(
@@ -327,10 +362,6 @@ async def _retry_send_stream(
             if circuit and probe_request:
                 probe_done(circuit, success=_probe_succeeded(resp.status_code))
                 probe_request = False
-            resp = await client.send(
-                client.build_request("POST", endpoint, json=json, headers=headers),
-                stream=True,
-            )
             return resp
 
         if not _is_retryable_status(resp.status_code):
@@ -342,7 +373,8 @@ async def _retry_send_stream(
                     record_success(circuit)
             return resp
 
-        max_attempts = max(max_attempts, _max_attempts_for_status(resp.status_code))
+        if not fast_failover:
+            max_attempts = max(max_attempts, _max_attempts_for_status(resp.status_code))
         await resp.aread()
         await resp.aclose()
 
@@ -354,18 +386,6 @@ async def _retry_send_stream(
             record_failure(circuit, resp.status_code, "")
 
         if attempt == max_attempts - 1:
-            # Need a fresh stream response to return
-            resp = await client.send(
-                client.build_request("POST", endpoint, json=json, headers=headers),
-                stream=True,
-            )
-            if circuit and probe_request:
-                probe_done(circuit, success=_probe_succeeded(resp.status_code))
-                probe_request = False
-            if circuit and _is_circuit_breaker_status(resp.status_code):
-                record_failure(circuit, resp.status_code, "")
-            elif circuit and not _is_retryable_status(resp.status_code):
-                record_success(circuit)
             return resp
 
         # If circuit just tripped, wait for recovery instead of blind retry
@@ -373,10 +393,6 @@ async def _retry_send_stream(
             log.info("circuit[%s]: tripped mid-retry (stream), waiting for recovery", circuit)
             recovered = await wait_for_recovery(circuit)
             if not recovered:
-                resp = await client.send(
-                    client.build_request("POST", endpoint, json=json, headers=headers),
-                    stream=True,
-                )
                 return resp
             probe_request = is_tripped(circuit)
 
@@ -417,9 +433,7 @@ def _fallback_endpoint(endpoint: str, requested_model: str, fallback_model: str)
 
 def _pool_eligible_status(status_code: int) -> bool:
     """Statuses that justify trying the next workspace in the pool."""
-    if status_code in SATURATION_STATUSES:
-        return True
-    return status_code in (401, 403, 404)
+    return _is_retryable_status(status_code) or status_code in (401, 403, 404)
 
 
 def _rewire_for_provider(
@@ -490,55 +504,64 @@ async def _send_with_pool(
 ) -> httpx.Response:
     """Run one send (post or stream-open) with ordered workspace-pool failover.
 
-    Transport exceptions and pool-eligible statuses (429/5xx exhausted, 404,
-    401/403 after refresh) advance to the next pool member. The last
-    response/exception is returned/raised when every member fails.
+    While another resolvable member remains, try each workspace once (plus
+    one cached-token auth retry), without backoff or circuit-recovery waits.
+    Only the last member retains the normal retry/recovery budget. Successful
+    streams are handed off to the caller and are never replayed mid-stream.
     """
-    candidates = _pool_failover_candidates(pool)
-    try:
-        resp = await send(
-            client, endpoint, json=json, headers=headers, provider=provider, request=request,
-        )
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        if not candidates:
-            raise
-        resp = None
-
-    if resp is not None and (not candidates or not _pool_eligible_status(resp.status_code)):
-        return resp
-
     from src.providers import resolve  # runtime import: avoid cycle
-    for candidate in candidates:
-        info = resolve(pool.model_key, provider_override=candidate)
-        if info is None:
-            continue
-        if resp is not None:
-            await resp.aread()
-            await resp.aclose()
-        cand_endpoint, cand_headers = _rewire_for_provider(pool, endpoint, headers, info)
-        log.warning(
-            "pool-failover: %s → workspace %r after failure on %r",
-            pool.model_key, candidate, provider,
-        )
-        try:
-            resp = await send(
-                client, cand_endpoint, json=json, headers=cand_headers,
-                provider=candidate, request=request,
+
+    candidates = [provider, *_pool_failover_candidates(pool)]
+    resp = None
+    last_error = None
+    previous = provider
+    try:
+        for index, candidate in enumerate(candidates):
+            await _raise_if_disconnected(request)
+            cand_endpoint, cand_headers = endpoint, headers
+            if index:
+                # Resolve just in time: a concurrent OAuth refresh/config reload
+                # may have changed this workspace while the primary was running.
+                info = resolve(pool.model_key, provider_override=candidate)
+                if info is None:
+                    continue
+                cand_endpoint, cand_headers = _rewire_for_provider(pool, endpoint, headers, info)
+                if resp is not None:
+                    # No need to drain an error body on a discarded route.
+                    await resp.aclose()
+                    resp = None
+                log.warning(
+                    "pool-failover: %s → workspace %r after failure on %r",
+                    pool.model_key, candidate, previous,
+                )
+            has_backup = any(
+                resolve(pool.model_key, provider_override=backup) is not None
+                for backup in candidates[index + 1:]
             )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            if candidate == candidates[-1]:
+            previous = candidate
+            try:
+                resp = await send(
+                    client, cand_endpoint, json=json, headers=cand_headers,
+                    provider=candidate, request=request, fast_failover=has_backup,
+                )
+            except asyncio.CancelledError:
                 raise
-            resp = None
-            continue
-        if not _pool_eligible_status(resp.status_code):
-            return resp
-    if resp is None:  # every candidate raised; surface a connect error
-        raise httpx.ConnectError(f"all pool workspaces failed for {pool.model_key}")
-    return resp
+            except Exception as exc:
+                if not has_backup or not _is_retryable_exception(exc):
+                    raise
+                last_error = exc
+                continue
+            if not has_backup or not _pool_eligible_status(resp.status_code):
+                result, resp = resp, None  # transfer ownership to the caller
+                return result
+        # All remaining backups may have disappeared during an in-flight send.
+        if resp is not None:
+            result, resp = resp, None
+            return result
+        raise last_error
+    finally:
+        if resp is not None:
+            await resp.aclose()
 
 
 async def _retry_post_with_model_fallback(
