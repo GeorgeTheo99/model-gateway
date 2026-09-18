@@ -127,25 +127,30 @@ Per request, in `resolve()` + `upstream.py`:
 1. Take the pool's workspace list, skip any workspace whose circuit is OPEN
    (circuit breaker becomes **per-workspace**, which it effectively already is
    since circuits key on provider name).
-2. Send to the first healthy workspace. If another resolvable member remains,
-   use one attempt with no backoff/circuit wait and a maximum 5-second connect
-   timeout. Permit one immediate retry after a cached CLI OAuth refresh, but
-   do not start browser SSO or wait for another request's refresh. The final
-   member (or a single-workspace route) retains the existing retry ladder:
-   transient HTTP x3, 429 x6, transport x4, with backoff/recovery waits.
+2. Send to the first healthy workspace. If another resolvable, closed-circuit
+   member with matching declared protocol/API style remains, use one attempt
+   with no backoff/circuit wait and a maximum 5-second connect timeout. Permit
+   one immediate retry after a cached CLI OAuth refresh, but do not start
+   browser SSO or wait for another request's refresh. The last healthy member
+   (or a single-workspace route) retains the existing retry ladder: transient
+   HTTP x3, 429 x6, transport x4. Only afterward may an open-circuit member be
+   tried as a last resort. Known-tripped backups do not remove healthy retries.
    Read/write timeouts remain unchanged; this is not a total request deadline.
 3. Workspace-level failover triggers — move to the next pool member — on:
    - first transient HTTP failure (408/409/425/429/500/502/503/504),
    - 404 model-not-found (endpoint deleted on that workspace),
    - DNS/TLS/connect errors (workspace deleted → NXDOMAIN routes here),
    - 401/403 *after* a failed refresh attempt,
-   - circuit already OPEN (skip without sending while a backup remains).
-   Successful streams are not replayed mid-stream. Terminal streaming errors
-   return their buffered response without an extra POST to reopen it.
-4. Only after **all** pool members fail: consult `fallback_model` /
-   `model_fallbacks` (different model, e.g. gpt-5.5 → gpt-5.4, resolved
-   through its own pool).
-5. Sticky preference (optional, phase 2): remember "workspace X is serving
+   - circuit already OPEN (skip without sending while a healthy compatible backup remains).
+   Successful streams are not replayed mid-stream. Discarded streaming error
+   bodies are not drained; terminal errors are buffered without an extra POST.
+   Unread responses are closed on handoff or interrupted authentication/body reads.
+4. Incompatible declared protocols/API styles are skipped rather than receiving
+   a payload prepared for another wire format. Pool failover rewrites URLs and
+   credentials only; model capabilities and provider quirks must remain compatible.
+5. After eligible pool members fail: retain the existing `fallback_model` /
+   `model_fallbacks` behavior (different model, e.g. gpt-5.5 → gpt-5.4).
+6. Sticky preference (optional, phase 2): remember "workspace X is serving
    model M" for N minutes after a failover so every request doesn't re-probe
    the dead primary; the circuit breaker's probe loop already gives us most
    of this for free.
@@ -158,10 +163,10 @@ Failovers are logged + counted in the ledger (`failover_from`,
 - `auth: oauth-cli` → generalize today's `refresh_oauth_token()`:
   preflight (<5 min JWT validity) + reactive on 401/403, using
   `databricks auth token --profile <auth_profile>`, persisting back to
-  config.yaml. If the CLI cache is broken and no pool backup remains, the
+  config.yaml. If the CLI cache is broken and no healthy compatible backup remains, the
   gateway may launch `databricks auth login` once per cooldown window, retry
   token minting, and continue the original request with the fresh token.
-  Requests with a backup use cached CLI auth only; a token command can still
+  Requests with a healthy compatible backup use cached CLI auth only; a token command can still
   take up to 30 seconds.
 - `auth: pat` → static; validation warns if the PAT fails a probe.
 - Browser SSO can still be disabled per provider with `auth_login: false`

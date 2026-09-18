@@ -346,19 +346,30 @@ async def _retry_send_stream(
 
         if _is_auth_status(resp.status_code) and not auth_retried and provider:
             auth_retried = True
-            await resp.aread()
-            await resp.aclose()
-            token = await refresh_oauth_token(
-                provider, force=True, allow_login=not fast_failover,
-            )
+            if not fast_failover:
+                try:
+                    await resp.aread()
+                finally:
+                    await resp.aclose()
+            try:
+                token = await refresh_oauth_token(
+                    provider, force=True, allow_login=not fast_failover,
+                )
+            except BaseException:
+                # This response has not reached the pool owner yet. Cancellation
+                # or a refresh failure must not leak its open connection.
+                await resp.aclose()
+                raise
             if token:
+                await resp.aclose()
                 headers = _apply_refreshed_token(headers, token, request)
                 log.warning(
                     "Upstream %d on stream — refreshed OAuth token for %r, retrying",
                     resp.status_code, provider,
                 )
                 continue  # immediate retry with fresh credentials, no attempt charge
-            # No fresh token available — return a non-streamed error response as-is.
+            # With a backup, leave the body unread for the pool owner to close
+            # on handoff (or return to the caller if every backup disappears).
             if circuit and probe_request:
                 probe_done(circuit, success=_probe_succeeded(resp.status_code))
                 probe_request = False
@@ -375,8 +386,12 @@ async def _retry_send_stream(
 
         if not fast_failover:
             max_attempts = max(max_attempts, _max_attempts_for_status(resp.status_code))
-        await resp.aread()
-        await resp.aclose()
+            try:
+                await resp.aread()
+            finally:
+                await resp.aclose()
+        # Fast attempts return an unread error to the pool owner. Draining it
+        # here could spend the full read budget before trying a healthy backup.
 
         if circuit and probe_request:
             probe_done(circuit, success=_probe_succeeded(resp.status_code))
@@ -407,15 +422,16 @@ async def _retry_send_stream(
 class PoolContext:
     """Workspace-pool failover context for a single upstream request.
 
-    Pool members must be protocol-compatible for the routed model (same body
-    and response shape, same header style, same endpoint suffix relative to
-    base_url) — config guarantees this by pooling only like-kind workspace
-    entries. Failover then reduces to swapping base_url + credentials.
+    Captures the protocol/API style used to prepare the outbound body. Pool
+    failover can swap URL and credentials, but cannot translate that body;
+    members with incompatible declared wire formats are therefore skipped.
     """
     model_key: str          # any routable id for the model (used to re-resolve)
     provider: str           # provider the request was originally resolved to
     base_url: str           # that provider's resolved base_url (prefix of endpoint)
     api_key: str            # that provider's credential as sent in headers
+    protocol: str = "openai"
+    api_style: str = ""
 
 
 def _fallback_endpoint(endpoint: str, requested_model: str, fallback_model: str) -> str:
@@ -452,7 +468,7 @@ def _rewire_for_provider(
         # Path-prefix member: reuse the original suffix, or derive the
         # protocol default when the original was a complete invocation URL.
         cand_suffix = original_suffix or (
-            "/messages" if "anthropic-version" in headers else "/chat/completions"
+            "/messages" if pool.protocol == "anthropic" else "/chat/completions"
         )
     new_endpoint = f"{info.base_url}{cand_suffix}"
     new_headers = dict(headers)
@@ -483,9 +499,9 @@ def _pool_failover_candidates(pool: PoolContext | None) -> list[str]:
         return []
     from src.providers import pool_candidates  # runtime import: avoid cycle
     candidates = [c for c in pool_candidates(pool.model_key) if c != pool.provider]
-    # Prefer members whose circuit is closed; a known-down workspace would
-    # block the failover on its recovery wait. Keep tripped members as a
-    # last resort (their probe may succeed) rather than dropping them.
+    # Known-down members remain a last resort, but must not remove the last
+    # healthy member's normal retry budget. Recovery waits happen only after
+    # those healthy attempts have been exhausted.
     healthy = [c for c in candidates if not is_tripped(c)]
     tripped = [c for c in candidates if is_tripped(c)]
     return healthy + tripped
@@ -504,12 +520,21 @@ async def _send_with_pool(
 ) -> httpx.Response:
     """Run one send (post or stream-open) with ordered workspace-pool failover.
 
-    While another resolvable member remains, try each workspace once (plus
-    one cached-token auth retry), without backoff or circuit-recovery waits.
-    Only the last member retains the normal retry/recovery budget. Successful
-    streams are handed off to the caller and are never replayed mid-stream.
+    While another healthy, wire-compatible member remains, try each workspace
+    once (plus one cached-token auth retry), without backoff/recovery waits.
+    The last healthy member retains its normal retries before any last-resort
+    open-circuit probes. Successful streams are never replayed mid-stream.
     """
     from src.providers import resolve  # runtime import: avoid cycle
+
+    def candidate_info(candidate):
+        if pool is None:
+            return None
+        info = resolve(pool.model_key, provider_override=candidate)
+        if info is not None and (info.protocol, info.api_style) != (pool.protocol, pool.api_style):
+            log.warning("pool-failover: skipping incompatible wire format for %s on %r", pool.model_key, candidate)
+            return None
+        return info
 
     candidates = [provider, *_pool_failover_candidates(pool)]
     resp = None
@@ -522,7 +547,7 @@ async def _send_with_pool(
             if index:
                 # Resolve just in time: a concurrent OAuth refresh/config reload
                 # may have changed this workspace while the primary was running.
-                info = resolve(pool.model_key, provider_override=candidate)
+                info = candidate_info(candidate)
                 if info is None:
                     continue
                 cand_endpoint, cand_headers = _rewire_for_provider(pool, endpoint, headers, info)
@@ -534,15 +559,17 @@ async def _send_with_pool(
                     "pool-failover: %s → workspace %r after failure on %r",
                     pool.model_key, candidate, previous,
                 )
-            has_backup = any(
-                resolve(pool.model_key, provider_override=backup) is not None
-                for backup in candidates[index + 1:]
-            )
+            backups = [backup for backup in candidates[index + 1:]
+                       if candidate_info(backup) is not None]
+            has_backup = bool(backups)
+            # A resolvable but tripped workspace is a last resort, not a
+            # reason to take retry attempts away from this healthy member.
+            fast_failover = any(not is_tripped(backup) for backup in backups)
             previous = candidate
             try:
                 resp = await send(
                     client, cand_endpoint, json=json, headers=cand_headers,
-                    provider=candidate, request=request, fast_failover=has_backup,
+                    provider=candidate, request=request, fast_failover=fast_failover,
                 )
             except asyncio.CancelledError:
                 raise
@@ -586,7 +613,10 @@ async def _retry_post_with_model_fallback(
 
     body_text = ""
     if resp.status_code != 200:
-        body = await resp.aread()
+        try:
+            body = await resp.aread()
+        finally:
+            await resp.aclose()
         body_text = body.decode(errors="replace")
 
     if request is not None and getattr(request.state, "disable_model_fallback", False):
@@ -630,7 +660,10 @@ async def _retry_send_stream_with_model_fallback(
 
     body_text = ""
     if resp.status_code != 200:
-        body = await resp.aread()
+        try:
+            body = await resp.aread()
+        finally:
+            await resp.aclose()
         body_text = body.decode(errors="replace")
 
     if request is not None and getattr(request.state, "disable_model_fallback", False):

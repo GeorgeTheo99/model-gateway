@@ -31,6 +31,7 @@ POOLED_CONFIG = {
             "api_key": "key-b",
             "protocol": "openai",
             "endpoint_style": "invocations",
+            "invocations_native_protocols": ["anthropic"],
         },
     },
     "pools": {
@@ -163,6 +164,7 @@ def _pool_ctx() -> upstream.PoolContext:
         provider="ws-a",
         base_url="https://a.example.com/anthropic/v1",
         api_key="key-a",
+        protocol="anthropic",
     )
 
 
@@ -535,6 +537,108 @@ def test_pool_auth_uses_cached_refresh_without_browser_sso(
         assert preflights == [("ws-a", False), ("ws-b", True)]
 
 
+@pytest.mark.parametrize("status", [429, 500])
+def test_last_healthy_member_keeps_retries_when_old_primary_is_tripped(
+    pooled_registry, clean_circuits, pool_send, monkeypatch, status,
+):
+    for _ in range(circuit.TRIP_THRESHOLD):
+        circuit.record_failure("ws-a", 503, "down")
+    info = providers.resolve("pooled-model")
+    assert info.provider == "ws-b"
+    monkeypatch.setattr(upstream, "_compute_retry_delay", lambda response, attempt: 0)
+
+    async def unexpected_recovery(*args, **kwargs):
+        pytest.fail("a tripped old primary must not steal the last healthy member's retries")
+
+    monkeypatch.setattr(upstream, "wait_for_recovery", unexpected_recovery)
+    hosts = []
+
+    def handler(req):
+        hosts.append(req.url.host)
+        assert req.url.host == "b.example.com"
+        return httpx.Response(status if len(hosts) == 1 else 200, text="response")
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            response = await pool_send(
+                client, info.base_url,
+                json={"model": info.provider_model_id}, headers={"Authorization": "Bearer key-b"},
+                provider=info.provider,
+                pool=upstream.PoolContext("pooled-model", info.provider, info.base_url, info.api_key,
+                                          protocol=info.protocol, api_style=info.api_style),
+            )
+            assert response.status_code == 200
+            await response.aclose()
+
+    asyncio.run(run())
+    assert hosts == ["b.example.com", "b.example.com"]
+
+
+def test_tripped_member_is_only_probed_after_last_healthy_retries(
+    pooled_registry, clean_circuits, pool_send, monkeypatch,
+):
+    for _ in range(circuit.TRIP_THRESHOLD):
+        circuit.record_failure("ws-a", 503, "down")
+    info = providers.resolve("pooled-model")
+    assert info.provider == "ws-b"
+    monkeypatch.setattr(upstream, "_compute_retry_delay", lambda response, attempt: 0)
+    hosts = []
+    recoveries = []
+
+    async def recovered(provider):
+        recoveries.append(provider)
+        assert hosts == ["b.example.com"] * upstream._RETRY_429_ATTEMPTS
+        return True
+
+    monkeypatch.setattr(upstream, "wait_for_recovery", recovered)
+
+    def handler(req):
+        hosts.append(req.url.host)
+        return httpx.Response(429 if req.url.host == "b.example.com" else 200, text="response")
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            response = await pool_send(
+                client, info.base_url,
+                json={"model": info.provider_model_id}, headers={"Authorization": "Bearer key-b"},
+                provider=info.provider,
+                pool=upstream.PoolContext("pooled-model", info.provider, info.base_url, info.api_key,
+                                          protocol=info.protocol, api_style=info.api_style),
+            )
+            assert response.status_code == 200
+            await response.aclose()
+
+    asyncio.run(run())
+    assert hosts == ["b.example.com"] * upstream._RETRY_429_ATTEMPTS + ["a.example.com"]
+    assert recoveries == ["ws-a"]
+    assert not circuit.is_tripped("ws-a")
+
+
+def test_incompatible_backup_does_not_receive_body_or_remove_primary_retries(
+    pooled_registry, clean_circuits, pool_send, monkeypatch,
+):
+    config = copy.deepcopy(POOLED_CONFIG)
+    config["workspaces"]["ws-b"].pop("invocations_native_protocols")
+    monkeypatch.setattr(providers, "_config", config)
+    assert providers.resolve("pooled-model", provider_override="ws-b").protocol == "openai"
+    monkeypatch.setattr(upstream, "_compute_retry_delay", lambda response, attempt: 0)
+    hosts = []
+
+    def handler(req):
+        hosts.append(req.url.host)
+        assert req.url.host == "a.example.com", "Anthropic body must not go to an OpenAI-only backup"
+        return httpx.Response(429, text="busy")
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            response = await _send_pool(pool_send, client)
+            assert response.status_code == 429
+            await response.aclose()
+
+    asyncio.run(run())
+    assert hosts == ["a.example.com"] * upstream._RETRY_429_ATTEMPTS
+
+
 def test_pool_final_member_keeps_retries(
     pooled_registry, clean_circuits, pool_send, monkeypatch,
 ):
@@ -630,8 +734,9 @@ def test_pool_resolves_backup_credentials_after_primary_finishes(
 
 
 @pytest.mark.parametrize("failure", [503, httpx.ConnectError])
+@pytest.mark.parametrize("change", ["disable", "protocol", "api_style"])
 def test_pool_preserves_failure_if_backup_disappears(
-    pooled_registry, clean_circuits, no_retry_waits, pool_send, monkeypatch, failure,
+    pooled_registry, clean_circuits, no_retry_waits, pool_send, monkeypatch, failure, change,
 ):
     config = copy.deepcopy(POOLED_CONFIG)
     monkeypatch.setattr(providers, "_config", config)
@@ -639,7 +744,15 @@ def test_pool_preserves_failure_if_backup_disappears(
 
     def handler(req):
         hosts.append(req.url.host)
-        config["workspaces"]["ws-b"]["enabled"] = False
+        if change == "disable":
+            config["workspaces"]["ws-b"]["enabled"] = False
+        elif change == "protocol":
+            config["workspaces"]["ws-b"].pop("invocations_native_protocols")
+        else:
+            config["models"][0]["api_style"] = "open_responses"
+            # Model entries are cached separately from provider credentials;
+            # emulate the registry invalidation performed by a config reload.
+            monkeypatch.setattr(providers, "_models", None)
         if failure == 503:
             return httpx.Response(503, text="original error")
         raise failure("original error", request=req)
@@ -660,8 +773,9 @@ def test_pool_preserves_failure_if_backup_disappears(
 
 
 @pytest.mark.parametrize("disconnect", [False, True])
+@pytest.mark.parametrize("status", [401, 403, 404, 408, 409, 425, 429, 500, 502, 503, 504])
 def test_pool_closes_lazy_error_stream_on_handoff_or_disconnect(
-    pooled_registry, clean_circuits, disconnect,
+    pooled_registry, clean_circuits, disconnect, status,
 ):
     hosts = []
 
@@ -676,7 +790,7 @@ def test_pool_closes_lazy_error_stream_on_handoff_or_disconnect(
             self.closed = True
 
     stream = ErrorStream()
-    error = httpx.Response(404, stream=stream)
+    error = httpx.Response(status, stream=stream)
 
     class DownstreamRequest:
         state = SimpleNamespace()
@@ -710,6 +824,165 @@ def test_pool_closes_lazy_error_stream_on_handoff_or_disconnect(
         assert hosts == ["a.example.com", "b.example.com"]
     assert stream.closed
     assert error.is_closed
+
+
+@pytest.mark.parametrize("error", [asyncio.CancelledError, RuntimeError])
+def test_pool_closes_auth_response_if_refresh_is_interrupted(
+    pooled_registry, clean_circuits, monkeypatch, error,
+):
+    hosts = []
+
+    class ErrorStream(httpx.AsyncByteStream):
+        closed = False
+
+        async def __aiter__(self):
+            pytest.fail("auth failover must not drain the rejected response")
+            yield b"unused"
+
+        async def aclose(self):
+            self.closed = True
+
+    stream = ErrorStream()
+
+    async def refresh(*args, **kwargs):
+        raise error("refresh interrupted")
+
+    monkeypatch.setattr(upstream, "refresh_oauth_token", refresh)
+
+    def handler(req):
+        hosts.append(req.url.host)
+        return httpx.Response(401, stream=stream)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            await _send_pool(upstream._retry_send_stream_with_model_fallback, client)
+
+    with pytest.raises(error, match="refresh interrupted"):
+        asyncio.run(run())
+    assert hosts == ["a.example.com"]
+    assert stream.closed
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_pool_cached_auth_retry_closes_without_reading_error_body(
+    pooled_registry, clean_circuits, monkeypatch, status,
+):
+    hosts = []
+
+    class ErrorStream(httpx.AsyncByteStream):
+        closed = False
+
+        async def __aiter__(self):
+            pytest.fail("cached-auth retry must not drain the rejected response")
+            yield b"unused"
+
+        async def aclose(self):
+            self.closed = True
+
+    stream = ErrorStream()
+
+    async def refresh(provider, *, force, allow_login):
+        assert provider == "ws-a" and force and not allow_login
+        return "fresh-key"
+
+    monkeypatch.setattr(upstream, "refresh_oauth_token", refresh)
+
+    def handler(req):
+        hosts.append(req.url.host)
+        if len(hosts) == 1:
+            return httpx.Response(status, stream=stream)
+        assert stream.closed
+        assert req.headers["authorization"] == "Bearer fresh-key"
+        return httpx.Response(200, text="ok")
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            response = await _send_pool(upstream._retry_send_stream_with_model_fallback, client)
+            assert await response.aread() == b"ok"
+            await response.aclose()
+
+    asyncio.run(run())
+    assert hosts == ["a.example.com", "a.example.com"]
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 429, 503])
+def test_pool_can_return_unread_error_if_backup_disappears(
+    pooled_registry, clean_circuits, monkeypatch, status,
+):
+    config = copy.deepcopy(POOLED_CONFIG)
+    monkeypatch.setattr(providers, "_config", config)
+    hosts = []
+
+    class ErrorStream(httpx.AsyncByteStream):
+        closed = False
+
+        async def __aiter__(self):
+            yield b"original upstream error"
+
+        async def aclose(self):
+            self.closed = True
+
+    stream = ErrorStream()
+
+    def handler(req):
+        hosts.append(req.url.host)
+        config["workspaces"]["ws-b"]["enabled"] = False
+        return httpx.Response(status, stream=stream)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            response = await _send_pool(upstream._retry_send_stream_with_model_fallback, client)
+            assert response.status_code == status
+            assert await response.aread() == b"original upstream error"
+            await response.aclose()
+
+    asyncio.run(run())
+    assert hosts == ["a.example.com"]
+    assert stream.closed
+
+
+@pytest.mark.parametrize("error", [httpx.ReadError, asyncio.CancelledError])
+@pytest.mark.parametrize("status", [404, 503])
+def test_terminal_error_body_failure_closes_response(
+    pooled_registry, clean_circuits, error, status,
+):
+    class ErrorStream(httpx.AsyncByteStream):
+        closed = False
+
+        async def __aiter__(self):
+            raise error("body interrupted")
+            yield b"unused"
+
+        async def aclose(self):
+            self.closed = True
+
+    stream = ErrorStream()
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda req: httpx.Response(status, stream=stream),
+        )) as client:
+            await upstream._retry_send_stream_with_model_fallback(
+                client, "https://a.example.com/anthropic/v1/messages",
+                json={"model": "databricks-pooled-model"},
+                headers={"Authorization": "Bearer key-a"}, provider="ws-a",
+            )
+
+    with pytest.raises(error, match="body interrupted"):
+        asyncio.run(run())
+    assert stream.closed
+
+
+@pytest.mark.parametrize("protocol,api_style", [("anthropic", ""), ("openai", "open_responses")])
+def test_pool_context_captures_prepared_wire_format(protocol, api_style):
+    from src import server
+
+    info = providers.ProviderInfo("ws-a", "https://a.example.com", "fixture-key", "fixture-model",
+                                  protocol=protocol, api_style=api_style)
+    request = SimpleNamespace(state=SimpleNamespace())
+    server._set_ledger_ctx(request, "fixture-model", info)
+    assert request.state.pool_ctx.protocol == protocol
+    assert request.state.pool_ctx.api_style == api_style
 
 
 def test_pool_never_replays_a_started_stream(pooled_registry, clean_circuits):

@@ -34,7 +34,8 @@ translation between them.
   metadata (context, vision, reasoning levels), and pricing in one registry.
 - **Reliability** — per-provider retries, circuit breakers, provider pools,
   and model-level fallback routes. Pools try a backup on the first transient
-  failure, reserving backoff/recovery waits for the last workspace.
+  failure, reserving normal retries for the last healthy workspace before
+  last-resort circuit-recovery probes.
 - **Admin dashboard** — health, provider/model inventory, Databricks workspace
   pool routing, usage and cost, and gated write controls at `/admin`.
 - **Transactional onboarding** — `model-gateway onboard` discovers upstream
@@ -136,19 +137,27 @@ rest so downstream launchers (`pi-list`) never advertise dead models.
 
 ### Failover timing
 
-When another configured, resolvable pool member remains, streaming and
-non-streaming requests move to it on the first transient HTTP/transport
-failure, missing endpoint (404), or auth rejection after one cached-token
-refresh attempt. They do not wait through same-workspace backoff, an open
-circuit's recovery, browser SSO, or another in-progress OAuth refresh.
-Connection setup is capped at 5 seconds on these attempts (an already-shorter
-timeout is respected). The last member—and single-workspace routes—retain
-the normal retry/recovery policy.
+When another configured, resolvable pool member with a closed circuit and
+compatible declared protocol/API style remains, streaming and non-streaming
+requests move to it on the first transient HTTP/transport failure, missing
+endpoint (404), or auth rejection after one cached-token refresh attempt.
+They do not wait through same-workspace backoff, an open circuit's recovery,
+browser SSO, or another in-progress OAuth refresh. Connection setup is capped
+at 5 seconds on these attempts (an already-shorter timeout is respected).
+The last healthy member retains its normal retries before any last-resort
+open-circuit probes; single-workspace routes retain their original policy.
+
+Failover swaps URL/credentials, not request-body formats. For example, an
+OpenAI-only invocations endpoint is skipped for a prepared native Anthropic
+request. Pool members still need compatible model capabilities and provider
+quirks; automatic cross-protocol body translation is not part of pool failover.
+Discarded streaming error responses are closed without draining their bodies.
 
 This is **not a total request deadline**: cached-token CLI calls can take up
 to 30 seconds, and existing read/write timeouts are preserved for large prompts
-and slow reasoning. A successful stream is never replayed on a backup after
-it has started. Model-level fallback remains after workspace failover.
+and slow reasoning. Non-streaming HTTP calls still buffer the upstream response.
+A successful stream is never replayed on a backup after it has started.
+Model-level fallback remains after workspace failover.
 
 ## Configuration
 
