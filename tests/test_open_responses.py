@@ -167,6 +167,7 @@ def test_pool_failover_on_404_targets_member_open_responses_url(
                     provider="ws-e2",
                     base_url="https://e2.example.com/serving-endpoints/open-responses",
                     api_key="key-e2",
+                    api_style="open_responses",
                 ),
             )
 

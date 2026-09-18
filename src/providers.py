@@ -566,7 +566,9 @@ def _persist_api_key(
                 return False
 
 
-async def refresh_oauth_token(provider: str, *, force: bool = False) -> str | None:
+async def refresh_oauth_token(
+    provider: str, *, force: bool = False, allow_login: bool = True,
+) -> str | None:
     """Refresh an expired OAuth token via an external CLI token cache.
 
     Opt-in per provider with config.yaml::
@@ -580,7 +582,9 @@ async def refresh_oauth_token(provider: str, *, force: bool = False) -> str | No
     (e.g. a short-lived OAuth JWT expired). If the CLI token cache itself is
     broken, the gateway runs ``databricks auth login`` once per cooldown window,
     then retries token minting. Providers without ``auth_refresh`` are
-    untouched. Returns the new token if one was obtained, else None.
+    untouched. ``allow_login=False`` limits this to cached CLI authentication
+    so requests with a backup workspace never wait for browser SSO.
+    Returns the new token if one was obtained, else None.
     """
     config = _load_config()
     found = _find_provider_entry(config, provider)
@@ -595,7 +599,17 @@ async def refresh_oauth_token(provider: str, *, force: bool = False) -> str | No
         return None
 
     lock = _token_refresh_locks.setdefault(provider, asyncio.Lock())
-    async with lock:
+    if allow_login:
+        await lock.acquire()
+    else:
+        # No suspension is allowed: locked() alone misses FIFO handoff to a
+        # queued owner, whose refresh may be waiting for browser SSO.
+        try:
+            async with asyncio.timeout(0):
+                await lock.acquire()
+        except TimeoutError:
+            return None
+    try:
         # Re-read after acquiring the async refresh lease. Admin reloads replace
         # the registry while an earlier caller may be waiting here.
         latest_found = _find_provider_entry(_load_config(), provider)
@@ -638,7 +652,7 @@ async def refresh_oauth_token(provider: str, *, force: bool = False) -> str | No
             log.error("OAuth token refresh for %r failed: %s", provider, exc)
             return None
 
-        if returncode != 0 and entry.get("auth_login", True) is not False:
+        if returncode != 0 and allow_login and entry.get("auth_login", True) is not False:
             log.error(
                 "OAuth token refresh for %r failed (exit %d): %s",
                 provider, returncode, stderr.decode(errors="replace")[:300],
@@ -704,9 +718,13 @@ async def refresh_oauth_token(provider: str, *, force: bool = False) -> str | No
             return latest if latest and latest != current else None
         log.warning("Refreshed expired OAuth token for provider %r via CLI token cache", provider)
         return token
+    finally:
+        lock.release()
 
 
-async def ensure_fresh_oauth_token(provider: str, *, min_valid_seconds: int = 300) -> str | None:
+async def ensure_fresh_oauth_token(
+    provider: str, *, min_valid_seconds: int = 300, allow_login: bool = True,
+) -> str | None:
     """Refresh a configured OAuth JWT before it expires.
 
     PAT-backed providers and opaque API keys are left untouched. This is a
@@ -726,7 +744,7 @@ async def ensure_fresh_oauth_token(provider: str, *, min_valid_seconds: int = 30
     exp = _jwt_expiry_epoch(current)
     if exp is None or exp - time.time() > min_valid_seconds:
         return None
-    return await refresh_oauth_token(provider, force=True)
+    return await refresh_oauth_token(provider, force=True, allow_login=allow_login)
 
 
 def _configured_pool_members(entry: dict, config: dict) -> list[str]:

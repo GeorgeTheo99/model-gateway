@@ -26,7 +26,7 @@ from src.circuit import (
     record_success,
     wait_for_recovery,
 )
-from src.model_fallback import SATURATION_STATUSES, fallback_after_error
+from src.model_fallback import fallback_after_error
 from src.providers import ensure_fresh_oauth_token, refresh_oauth_token
 
 log = logging.getLogger("model-gateway")
@@ -40,6 +40,7 @@ _RETRY_429_MAX_DELAY = 60.0  # seconds
 _RETRY_429_ATTEMPTS = 6  # rate limits get more patience
 _RETRY_TRANSPORT_ATTEMPTS = 4
 _RETRY_TRANSPORT_MAX_DELAY = 15.0  # seconds
+_POOL_CONNECT_TIMEOUT = 5.0  # try a backup promptly if a workspace cannot connect
 
 
 async def _raise_if_disconnected(request: Request | None) -> None:
@@ -131,11 +132,13 @@ def _apply_refreshed_token(headers: dict, token: str, request: Request | None) -
     return headers
 
 
-async def _preflight_oauth_token(provider: str, headers: dict, request: Request | None) -> dict:
-    """Refresh nearly-expired OAuth tokens before the upstream request."""
+async def _preflight_oauth_token(
+    provider: str, headers: dict, request: Request | None, *, fast_failover: bool = False,
+) -> dict:
+    """Refresh nearly-expired tokens, without browser SSO when a backup exists."""
     if not provider:
         return headers
-    token = await ensure_fresh_oauth_token(provider)
+    token = await ensure_fresh_oauth_token(provider, allow_login=not fast_failover)
     if not token:
         return headers
     log.warning("Preflight refreshed OAuth token for provider %r", provider)
@@ -158,248 +161,299 @@ def _max_attempts_for_status(status_code: int) -> int:
     return _RETRY_MAX
 
 
+def _pool_timeout(client: httpx.AsyncClient) -> httpx.Timeout:
+    """Cap connection setup only; preserve slow reasoning/stream read budgets."""
+    timeout = httpx.Timeout(client.timeout)
+    timeout.connect = (
+        min(timeout.connect, _POOL_CONNECT_TIMEOUT)
+        if timeout.connect is not None else _POOL_CONNECT_TIMEOUT
+    )
+    return timeout
+
+
 async def _retry_post(
     client: httpx.AsyncClient, endpoint: str, *, json: dict, headers: dict,
     provider: str = "",
     request: Request | None = None,
+    fast_failover: bool = False,
 ) -> httpx.Response:
     """POST with exponential backoff + circuit breaker.
 
     If the provider's circuit is open, waits for recovery (up to 3 min)
     instead of sending requests into a known-down endpoint. This keeps
     errors inside the gateway so the coding harness never sees them.
+    With a pool backup, skip recovery waits and same-workspace backoff retries.
+    A cached OAuth refresh still gets one immediate authenticated retry.
     """
     circuit = _circuit_key(provider)
     probe_request = False
     if circuit and is_tripped(circuit):
+        if fast_failover:
+            raise httpx.ConnectError(f"Provider {circuit} unavailable (circuit open)")
         log.info("circuit[%s]: POST waiting for recovery", circuit)
         recovered = await wait_for_recovery(circuit)
         if not recovered:
             record_failure(circuit, 502, "circuit breaker timeout")
             raise httpx.ConnectError(f"Provider {circuit} unavailable (circuit open)")
         probe_request = is_tripped(circuit)
+    try:
 
-    max_attempts = _RETRY_MAX
-    attempt = 0
-    auth_retried = False
-    headers = await _preflight_oauth_token(provider, headers, request)
-    while attempt < max_attempts:
-        await _raise_if_disconnected(request)
-        try:
-            resp = await client.post(endpoint, json=json, headers=headers)
-        except Exception as exc:
-            if circuit and probe_request:
-                probe_done(circuit, success=False)
-                probe_request = False
-            max_attempts = max(max_attempts, _RETRY_TRANSPORT_ATTEMPTS)
-            if not _is_retryable_exception(exc) or attempt == max_attempts - 1:
+        max_attempts = 1 if fast_failover else _RETRY_MAX
+        attempt = 0
+        auth_retried = False
+        headers = await _preflight_oauth_token(provider, headers, request, fast_failover=fast_failover)
+        while attempt < max_attempts:
+            await _raise_if_disconnected(request)
+            try:
+                resp = await client.post(
+                    endpoint, json=json, headers=headers,
+                    timeout=_pool_timeout(client) if fast_failover else client.timeout,
+                )
+            except Exception as exc:
+                if circuit and probe_request:
+                    probe_done(circuit, success=False)
+                    probe_request = False
+                if not fast_failover:
+                    max_attempts = max(max_attempts, _RETRY_TRANSPORT_ATTEMPTS)
+                if not _is_retryable_exception(exc) or attempt == max_attempts - 1:
+                    if circuit:
+                        record_failure(circuit, 0, f"transport: {type(exc).__name__}")
+                    raise
                 if circuit:
                     record_failure(circuit, 0, f"transport: {type(exc).__name__}")
-                raise
-            if circuit:
-                record_failure(circuit, 0, f"transport: {type(exc).__name__}")
-            delay = _compute_transport_retry_delay(attempt)
-            log.warning(
-                "Transient upstream transport error %s on POST (attempt %d/%d), retrying in %.1fs",
-                type(exc).__name__, attempt + 1, max_attempts, delay,
-            )
-            await _sleep_or_disconnect(delay, request)
-            attempt += 1
-            continue
-
-        if _is_auth_status(resp.status_code) and not auth_retried and provider:
-            auth_retried = True
-            await resp.aread()
-            token = await refresh_oauth_token(provider, force=True)
-            if token:
-                headers = _apply_refreshed_token(headers, token, request)
+                delay = _compute_transport_retry_delay(attempt)
                 log.warning(
-                    "Upstream %d on POST — refreshed OAuth token for %r, retrying",
-                    resp.status_code, provider,
+                    "Transient upstream transport error %s on POST (attempt %d/%d), retrying in %.1fs",
+                    type(exc).__name__, attempt + 1, max_attempts, delay,
                 )
-                continue  # immediate retry with fresh credentials, no attempt charge
+                await _sleep_or_disconnect(delay, request)
+                attempt += 1
+                continue
+
+            if _is_auth_status(resp.status_code) and not auth_retried and provider:
+                auth_retried = True
+                await resp.aread()
+                token = await refresh_oauth_token(
+                    provider, force=True, allow_login=not fast_failover,
+                )
+                if token:
+                    headers = _apply_refreshed_token(headers, token, request)
+                    log.warning(
+                        "Upstream %d on POST — refreshed OAuth token for %r, retrying",
+                        resp.status_code, provider,
+                    )
+                    continue  # immediate retry with fresh credentials, no attempt charge
+                if circuit and probe_request:
+                    probe_done(circuit, success=_probe_succeeded(resp.status_code))
+                    probe_request = False
+                return resp
+
+            if not _is_retryable_status(resp.status_code):
+                if circuit:
+                    if probe_request:
+                        probe_done(circuit, success=True)
+                        probe_request = False
+                    else:
+                        record_success(circuit)
+                return resp
+
+            if not fast_failover:
+                max_attempts = max(max_attempts, _max_attempts_for_status(resp.status_code))
+            await resp.aread()
+
             if circuit and probe_request:
                 probe_done(circuit, success=_probe_succeeded(resp.status_code))
                 probe_request = False
-            return resp
 
-        if not _is_retryable_status(resp.status_code):
-            if circuit:
-                if probe_request:
-                    probe_done(circuit, success=True)
-                    probe_request = False
-                else:
-                    record_success(circuit)
-            return resp
+            if circuit and _is_circuit_breaker_status(resp.status_code):
+                record_failure(circuit, resp.status_code, resp.text[:200])
 
-        max_attempts = max(max_attempts, _max_attempts_for_status(resp.status_code))
-        await resp.aread()
-
-        if circuit and probe_request:
-            probe_done(circuit, success=_probe_succeeded(resp.status_code))
-            probe_request = False
-
-        if circuit and _is_circuit_breaker_status(resp.status_code):
-            record_failure(circuit, resp.status_code, resp.text[:200])
-
-        if attempt == max_attempts - 1:
-            return resp
-
-        # If circuit just tripped, wait for recovery instead of blind retry
-        if circuit and is_tripped(circuit):
-            log.info("circuit[%s]: tripped mid-retry (POST), waiting for recovery", circuit)
-            recovered = await wait_for_recovery(circuit)
-            if not recovered:
+            if attempt == max_attempts - 1:
                 return resp
-            probe_request = is_tripped(circuit)
 
-        delay = _compute_retry_delay(resp, attempt)
-        log.warning("Transient upstream status %d on POST (attempt %d/%d), retrying in %.1fs", resp.status_code, attempt + 1, max_attempts, delay)
-        await _sleep_or_disconnect(delay, request)
-        attempt += 1
-    return resp  # unreachable, but satisfies type checkers
+            # If circuit just tripped, wait for recovery instead of blind retry
+            if circuit and is_tripped(circuit):
+                log.info("circuit[%s]: tripped mid-retry (POST), waiting for recovery", circuit)
+                recovered = await wait_for_recovery(circuit)
+                if not recovered:
+                    return resp
+                probe_request = is_tripped(circuit)
+
+            delay = _compute_retry_delay(resp, attempt)
+            log.warning("Transient upstream status %d on POST (attempt %d/%d), retrying in %.1fs", resp.status_code, attempt + 1, max_attempts, delay)
+            await _sleep_or_disconnect(delay, request)
+            attempt += 1
+        return resp  # unreachable, but satisfies type checkers
+    finally:
+        # Exception-safe probe ownership: any exit that still holds an
+        # in-flight recovery probe (body-read, OAuth-refresh, disconnect,
+        # or cancellation paths that never reached a probe_done) releases
+        # it as a failed probe so circuit ownership cannot leak past
+        # this request and block other waiters on probe_in_progress.
+        if circuit and probe_request:
+            probe_done(circuit, success=False)
+
+
 
 
 async def _retry_send_stream(
     client: httpx.AsyncClient, endpoint: str, *, json: dict, headers: dict,
     provider: str = "",
     request: Request | None = None,
+    fast_failover: bool = False,
 ) -> httpx.Response:
     """Streaming POST with exponential backoff + circuit breaker.
 
-    Returns an open streaming response — caller must close it.
-    Same circuit breaker semantics as _retry_post.
+    Success returns an open stream — caller must close it. Terminal errors
+    return the buffered response, never a duplicate POST just to reopen it.
+    Same circuit breaker and fast-failover semantics as _retry_post.
     """
     circuit = _circuit_key(provider)
     probe_request = False
     if circuit and is_tripped(circuit):
+        if fast_failover:
+            raise httpx.ConnectError(f"Provider {circuit} unavailable (circuit open)")
         log.info("circuit[%s]: stream waiting for recovery", circuit)
         recovered = await wait_for_recovery(circuit)
         if not recovered:
             record_failure(circuit, 502, "circuit breaker timeout")
             raise httpx.ConnectError(f"Provider {circuit} unavailable (circuit open)")
         probe_request = is_tripped(circuit)
+    try:
 
-    max_attempts = _RETRY_MAX
-    attempt = 0
-    auth_retried = False
-    headers = await _preflight_oauth_token(provider, headers, request)
-    while attempt < max_attempts:
-        await _raise_if_disconnected(request)
-        try:
-            resp = await client.send(
-                client.build_request("POST", endpoint, json=json, headers=headers),
-                stream=True,
-            )
-        except Exception as exc:
-            if circuit and probe_request:
-                probe_done(circuit, success=False)
-                probe_request = False
-            max_attempts = max(max_attempts, _RETRY_TRANSPORT_ATTEMPTS)
-            if not _is_retryable_exception(exc) or attempt == max_attempts - 1:
-                if circuit:
-                    record_failure(circuit, 0, f"transport: {type(exc).__name__}")
-                raise
-            if circuit:
-                record_failure(circuit, 0, f"transport: {type(exc).__name__}")
-            delay = _compute_transport_retry_delay(attempt)
-            log.warning(
-                "Transient upstream transport error %s on stream (attempt %d/%d), retrying in %.1fs",
-                type(exc).__name__, attempt + 1, max_attempts, delay,
-            )
-            await _sleep_or_disconnect(delay, request)
-            attempt += 1
-            continue
-
-        if _is_auth_status(resp.status_code) and not auth_retried and provider:
-            auth_retried = True
-            await resp.aread()
-            await resp.aclose()
-            token = await refresh_oauth_token(provider, force=True)
-            if token:
-                headers = _apply_refreshed_token(headers, token, request)
-                log.warning(
-                    "Upstream %d on stream — refreshed OAuth token for %r, retrying",
-                    resp.status_code, provider,
-                )
-                continue  # immediate retry with fresh credentials, no attempt charge
-            # No fresh token available — return a non-streamed error response as-is.
-            if circuit and probe_request:
-                probe_done(circuit, success=_probe_succeeded(resp.status_code))
-                probe_request = False
-            resp = await client.send(
-                client.build_request("POST", endpoint, json=json, headers=headers),
-                stream=True,
-            )
-            return resp
-
-        if not _is_retryable_status(resp.status_code):
-            if circuit:
-                if probe_request:
-                    probe_done(circuit, success=True)
-                    probe_request = False
-                else:
-                    record_success(circuit)
-            return resp
-
-        max_attempts = max(max_attempts, _max_attempts_for_status(resp.status_code))
-        await resp.aread()
-        await resp.aclose()
-
-        if circuit and probe_request:
-            probe_done(circuit, success=_probe_succeeded(resp.status_code))
-            probe_request = False
-
-        if circuit and _is_circuit_breaker_status(resp.status_code):
-            record_failure(circuit, resp.status_code, "")
-
-        if attempt == max_attempts - 1:
-            # Need a fresh stream response to return
-            resp = await client.send(
-                client.build_request("POST", endpoint, json=json, headers=headers),
-                stream=True,
-            )
-            if circuit and probe_request:
-                probe_done(circuit, success=_probe_succeeded(resp.status_code))
-                probe_request = False
-            if circuit and _is_circuit_breaker_status(resp.status_code):
-                record_failure(circuit, resp.status_code, "")
-            elif circuit and not _is_retryable_status(resp.status_code):
-                record_success(circuit)
-            return resp
-
-        # If circuit just tripped, wait for recovery instead of blind retry
-        if circuit and is_tripped(circuit):
-            log.info("circuit[%s]: tripped mid-retry (stream), waiting for recovery", circuit)
-            recovered = await wait_for_recovery(circuit)
-            if not recovered:
+        max_attempts = 1 if fast_failover else _RETRY_MAX
+        attempt = 0
+        auth_retried = False
+        headers = await _preflight_oauth_token(provider, headers, request, fast_failover=fast_failover)
+        while attempt < max_attempts:
+            await _raise_if_disconnected(request)
+            try:
                 resp = await client.send(
-                    client.build_request("POST", endpoint, json=json, headers=headers),
+                    client.build_request(
+                        "POST", endpoint, json=json, headers=headers,
+                        timeout=_pool_timeout(client) if fast_failover else client.timeout,
+                    ),
                     stream=True,
                 )
-                return resp
-            probe_request = is_tripped(circuit)
+            except Exception as exc:
+                if circuit and probe_request:
+                    probe_done(circuit, success=False)
+                    probe_request = False
+                if not fast_failover:
+                    max_attempts = max(max_attempts, _RETRY_TRANSPORT_ATTEMPTS)
+                if not _is_retryable_exception(exc) or attempt == max_attempts - 1:
+                    if circuit:
+                        record_failure(circuit, 0, f"transport: {type(exc).__name__}")
+                    raise
+                if circuit:
+                    record_failure(circuit, 0, f"transport: {type(exc).__name__}")
+                delay = _compute_transport_retry_delay(attempt)
+                log.warning(
+                    "Transient upstream transport error %s on stream (attempt %d/%d), retrying in %.1fs",
+                    type(exc).__name__, attempt + 1, max_attempts, delay,
+                )
+                await _sleep_or_disconnect(delay, request)
+                attempt += 1
+                continue
 
-        delay = _compute_retry_delay(resp, attempt)
-        log.warning("Transient upstream status %d on stream (attempt %d/%d), retrying in %.1fs", resp.status_code, attempt + 1, max_attempts, delay)
-        await _sleep_or_disconnect(delay, request)
-        attempt += 1
-    return resp  # unreachable
+            if _is_auth_status(resp.status_code) and not auth_retried and provider:
+                auth_retried = True
+                if not fast_failover:
+                    try:
+                        await resp.aread()
+                    finally:
+                        await resp.aclose()
+                try:
+                    token = await refresh_oauth_token(
+                        provider, force=True, allow_login=not fast_failover,
+                    )
+                except BaseException:
+                    # This response has not reached the pool owner yet. Cancellation
+                    # or a refresh failure must not leak its open connection.
+                    await resp.aclose()
+                    raise
+                if token:
+                    await resp.aclose()
+                    headers = _apply_refreshed_token(headers, token, request)
+                    log.warning(
+                        "Upstream %d on stream — refreshed OAuth token for %r, retrying",
+                        resp.status_code, provider,
+                    )
+                    continue  # immediate retry with fresh credentials, no attempt charge
+                # With a backup, leave the body unread for the pool owner to close
+                # on handoff (or return to the caller if every backup disappears).
+                if circuit and probe_request:
+                    probe_done(circuit, success=_probe_succeeded(resp.status_code))
+                    probe_request = False
+                return resp
+
+            if not _is_retryable_status(resp.status_code):
+                if circuit:
+                    if probe_request:
+                        probe_done(circuit, success=True)
+                        probe_request = False
+                    else:
+                        record_success(circuit)
+                return resp
+
+            if not fast_failover:
+                max_attempts = max(max_attempts, _max_attempts_for_status(resp.status_code))
+                try:
+                    await resp.aread()
+                finally:
+                    await resp.aclose()
+            # Fast attempts return an unread error to the pool owner. Draining it
+            # here could spend the full read budget before trying a healthy backup.
+
+            if circuit and probe_request:
+                probe_done(circuit, success=_probe_succeeded(resp.status_code))
+                probe_request = False
+
+            if circuit and _is_circuit_breaker_status(resp.status_code):
+                record_failure(circuit, resp.status_code, "")
+
+            if attempt == max_attempts - 1:
+                return resp
+
+            # If circuit just tripped, wait for recovery instead of blind retry
+            if circuit and is_tripped(circuit):
+                log.info("circuit[%s]: tripped mid-retry (stream), waiting for recovery", circuit)
+                recovered = await wait_for_recovery(circuit)
+                if not recovered:
+                    return resp
+                probe_request = is_tripped(circuit)
+
+            delay = _compute_retry_delay(resp, attempt)
+            log.warning("Transient upstream status %d on stream (attempt %d/%d), retrying in %.1fs", resp.status_code, attempt + 1, max_attempts, delay)
+            await _sleep_or_disconnect(delay, request)
+            attempt += 1
+        return resp  # unreachable
+    finally:
+        # Exception-safe probe ownership: any exit that still holds an
+        # in-flight recovery probe (body-read, OAuth-refresh, disconnect,
+        # or cancellation paths that never reached a probe_done) releases
+        # it as a failed probe so circuit ownership cannot leak past
+        # this request and block other waiters on probe_in_progress.
+        if circuit and probe_request:
+            probe_done(circuit, success=False)
+
+
 
 
 @dataclass
 class PoolContext:
     """Workspace-pool failover context for a single upstream request.
 
-    Pool members must be protocol-compatible for the routed model (same body
-    and response shape, same header style, same endpoint suffix relative to
-    base_url) — config guarantees this by pooling only like-kind workspace
-    entries. Failover then reduces to swapping base_url + credentials.
+    Captures the protocol/API style used to prepare the outbound body. Pool
+    failover can swap URL and credentials, but cannot translate that body;
+    members with incompatible declared wire formats are therefore skipped.
     """
     model_key: str          # any routable id for the model (used to re-resolve)
     provider: str           # provider the request was originally resolved to
     base_url: str           # that provider's resolved base_url (prefix of endpoint)
     api_key: str            # that provider's credential as sent in headers
+    protocol: str = "openai"
+    api_style: str = ""
 
 
 def _fallback_endpoint(endpoint: str, requested_model: str, fallback_model: str) -> str:
@@ -417,29 +471,62 @@ def _fallback_endpoint(endpoint: str, requested_model: str, fallback_model: str)
 
 def _pool_eligible_status(status_code: int) -> bool:
     """Statuses that justify trying the next workspace in the pool."""
-    if status_code in SATURATION_STATUSES:
-        return True
-    return status_code in (401, 403, 404)
+    return _is_retryable_status(status_code) or status_code in (401, 403, 404)
 
 
 def _rewire_for_provider(
     pool: PoolContext, endpoint: str, headers: dict, info,
-) -> tuple[str, dict]:
+) -> tuple[str, dict] | None:
     """Rebuild endpoint + auth headers for another pool member.
 
+    The destination URL is derived from the CANDIDATE's resolved routing with
+    the same rules as initial routing — never from a guess about the prepared
+    operation. Returns ``None`` when the candidate cannot serve the prepared
+    request, so callers exclude it before counting it as a usable backup.
+
     Handles kind differences between pool members: ``endpoint_style:
-    invocations`` members resolve to a complete URL (suffix ""), while
-    path-prefix members need the protocol suffix appended. All pooled
-    members are Databricks workspaces, which accept Bearer auth everywhere.
+    invocations`` and ``api_style: open_responses`` members resolve to a
+    complete URL (suffix ""), while path-prefix members need the operation
+    suffix. All pooled members are Databricks workspaces, which accept Bearer
+    auth everywhere.
     """
     original_suffix = endpoint[len(pool.base_url):] if endpoint.startswith(pool.base_url) else ""
     cand_suffix = getattr(info, "endpoint_suffix", None)
     if cand_suffix is None:
-        # Path-prefix member: reuse the original suffix, or derive the
-        # protocol default when the original was a complete invocation URL.
-        cand_suffix = original_suffix or (
-            "/messages" if "anthropic-version" in headers else "/chat/completions"
-        )
+        # Path-prefix member: rebuild the operation suffix the way the
+        # original route did. The wire-format guard already ensured the
+        # candidate speaks the same protocol/API style as the source.
+        if original_suffix:
+            # The source was itself a path-prefix member, so its suffix IS
+            # the prepared operation (chat/messages/responses) and applies
+            # to this candidate unchanged.
+            cand_suffix = original_suffix
+        elif pool.api_style == "open_responses":
+            # The source was a complete Open Responses URL. Path-prefix
+            # members expose chat/messages prefixes only and cannot serve a
+            # Responses operation; skip rather than guess a chat URL.
+            log.warning(
+                "pool-failover: %r cannot serve the prepared Responses operation",
+                getattr(info, "provider", "?"),
+            )
+            return None
+        else:
+            if not endpoint.startswith(pool.base_url):
+                # The endpoint is outside the source provider's base URL, so
+                # its kind cannot be classified (neither a prepared operation
+                # suffix nor a complete invocation URL). Refuse rather than
+                # guess a chat URL onto an unrelated destination.
+                log.warning(
+                    "pool-failover: endpoint %r is outside source base %r; cannot infer the prepared operation",
+                    endpoint, pool.base_url,
+                )
+                return None
+            # The source was a complete invocation URL (suffix ""): map the
+            # prepared operation by wire protocol, mirroring the suffix
+            # defaults of initial routing. invocations endpoints speak
+            # OpenAI chat (or native Anthropic when the workspace opts in),
+            # so the protocol default is exact.
+            cand_suffix = "/messages" if pool.protocol == "anthropic" else "/chat/completions"
     new_endpoint = f"{info.base_url}{cand_suffix}"
     new_headers = dict(headers)
     # Databricks accepts Bearer on both AI-gateway and invocations endpoints.
@@ -469,9 +556,9 @@ def _pool_failover_candidates(pool: PoolContext | None) -> list[str]:
         return []
     from src.providers import pool_candidates  # runtime import: avoid cycle
     candidates = [c for c in pool_candidates(pool.model_key) if c != pool.provider]
-    # Prefer members whose circuit is closed; a known-down workspace would
-    # block the failover on its recovery wait. Keep tripped members as a
-    # last resort (their probe may succeed) rather than dropping them.
+    # Known-down members remain a last resort, but must not remove the last
+    # healthy member's normal retry budget. Recovery waits happen only after
+    # those healthy attempts have been exhausted.
     healthy = [c for c in candidates if not is_tripped(c)]
     tripped = [c for c in candidates if is_tripped(c)]
     return healthy + tripped
@@ -490,55 +577,88 @@ async def _send_with_pool(
 ) -> httpx.Response:
     """Run one send (post or stream-open) with ordered workspace-pool failover.
 
-    Transport exceptions and pool-eligible statuses (429/5xx exhausted, 404,
-    401/403 after refresh) advance to the next pool member. The last
-    response/exception is returned/raised when every member fails.
+    While another healthy, wire-compatible member remains, try each workspace
+    once (plus one cached-token auth retry), without backoff/recovery waits.
+    The last healthy member retains its normal retries before any last-resort
+    open-circuit probes. Successful streams are never replayed mid-stream.
     """
-    candidates = _pool_failover_candidates(pool)
-    try:
-        resp = await send(
-            client, endpoint, json=json, headers=headers, provider=provider, request=request,
-        )
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        if not candidates:
-            raise
-        resp = None
-
-    if resp is not None and (not candidates or not _pool_eligible_status(resp.status_code)):
-        return resp
-
     from src.providers import resolve  # runtime import: avoid cycle
-    for candidate in candidates:
+
+    def candidate_route(candidate):
+        """Resolve a backup member to (info, endpoint, headers), or None.
+
+        A member is excluded up front — before it can count as a healthy
+        backup or strip retries from the last healthy member — when it
+        cannot serve the PREPARED request: incompatible wire format, or a
+        destination URL that cannot be constructed for the prepared
+        operation.
+        """
+        if pool is None:
+            return None
         info = resolve(pool.model_key, provider_override=candidate)
         if info is None:
-            continue
-        if resp is not None:
-            await resp.aread()
-            await resp.aclose()
-        cand_endpoint, cand_headers = _rewire_for_provider(pool, endpoint, headers, info)
-        log.warning(
-            "pool-failover: %s → workspace %r after failure on %r",
-            pool.model_key, candidate, provider,
-        )
-        try:
-            resp = await send(
-                client, cand_endpoint, json=json, headers=cand_headers,
-                provider=candidate, request=request,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            if candidate == candidates[-1]:
+            return None
+        if (info.protocol, info.api_style) != (pool.protocol, pool.api_style):
+            log.warning("pool-failover: skipping incompatible wire format for %s on %r", pool.model_key, candidate)
+            return None
+        wired = _rewire_for_provider(pool, endpoint, headers, info)
+        if wired is None:
+            return None
+        return info, *wired
+
+    candidates = [provider, *_pool_failover_candidates(pool)]
+    resp = None
+    last_error = None
+    previous = provider
+    try:
+        for index, candidate in enumerate(candidates):
+            await _raise_if_disconnected(request)
+            cand_endpoint, cand_headers = endpoint, headers
+            if index:
+                # Resolve just in time: a concurrent OAuth refresh/config reload
+                # may have changed this workspace while the primary was running.
+                route = candidate_route(candidate)
+                if route is None:
+                    continue
+                _, cand_endpoint, cand_headers = route
+                if resp is not None:
+                    # No need to drain an error body on a discarded route.
+                    await resp.aclose()
+                    resp = None
+                log.warning(
+                    "pool-failover: %s → workspace %r after failure on %r",
+                    pool.model_key, candidate, previous,
+                )
+            backups = [backup for backup in candidates[index + 1:]
+                       if candidate_route(backup) is not None]
+            has_backup = bool(backups)
+            # A resolvable but tripped workspace is a last resort, not a
+            # reason to take retry attempts away from this healthy member.
+            fast_failover = any(not is_tripped(backup) for backup in backups)
+            previous = candidate
+            try:
+                resp = await send(
+                    client, cand_endpoint, json=json, headers=cand_headers,
+                    provider=candidate, request=request, fast_failover=fast_failover,
+                )
+            except asyncio.CancelledError:
                 raise
-            resp = None
-            continue
-        if not _pool_eligible_status(resp.status_code):
-            return resp
-    if resp is None:  # every candidate raised; surface a connect error
-        raise httpx.ConnectError(f"all pool workspaces failed for {pool.model_key}")
-    return resp
+            except Exception as exc:
+                if not has_backup or not _is_retryable_exception(exc):
+                    raise
+                last_error = exc
+                continue
+            if not has_backup or not _pool_eligible_status(resp.status_code):
+                result, resp = resp, None  # transfer ownership to the caller
+                return result
+        # All remaining backups may have disappeared during an in-flight send.
+        if resp is not None:
+            result, resp = resp, None
+            return result
+        raise last_error
+    finally:
+        if resp is not None:
+            await resp.aclose()
 
 
 async def _retry_post_with_model_fallback(
@@ -563,7 +683,10 @@ async def _retry_post_with_model_fallback(
 
     body_text = ""
     if resp.status_code != 200:
-        body = await resp.aread()
+        try:
+            body = await resp.aread()
+        finally:
+            await resp.aclose()
         body_text = body.decode(errors="replace")
 
     if request is not None and getattr(request.state, "disable_model_fallback", False):
@@ -607,7 +730,10 @@ async def _retry_send_stream_with_model_fallback(
 
     body_text = ""
     if resp.status_code != 200:
-        body = await resp.aread()
+        try:
+            body = await resp.aread()
+        finally:
+            await resp.aclose()
         body_text = body.decode(errors="replace")
 
     if request is not None and getattr(request.state, "disable_model_fallback", False):

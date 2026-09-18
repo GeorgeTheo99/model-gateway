@@ -898,14 +898,16 @@ def test_stale_oauth_refresh_cannot_overwrite_admin_provider_update(
     assert "eyJstale" not in (tmp_config / "config.yaml").read_text()
 
 
-def test_refresh_oauth_token_respects_auth_login_false(tmp_config, monkeypatch):
-    _write_config(tmp_config, """providers:
+@pytest.mark.parametrize("allow_login", [True, False])
+def test_refresh_oauth_token_respects_auth_login_false(tmp_config, monkeypatch, allow_login):
+    # Either the provider setting or the per-request flag can prohibit SSO.
+    _write_config(tmp_config, f"""providers:
   ws:
     base_url: https://workspace.example.com
     api_key: eyJold
     auth_refresh: databricks-cli
     auth_profile: ws-profile
-    auth_login: false
+    auth_login: {str(not allow_login).lower()}
 """)
     providers._last_token_refresh_attempt.clear()
     providers._last_auth_login_attempt.clear()
@@ -924,10 +926,81 @@ def test_refresh_oauth_token_respects_auth_login_false(tmp_config, monkeypatch):
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
 
-    token = asyncio.run(providers.refresh_oauth_token("ws", force=True))
+    token = asyncio.run(providers.refresh_oauth_token("ws", force=True, allow_login=allow_login))
 
     assert token is None
     assert calls == [("databricks", "auth", "token", "--profile", "ws-profile")]
+
+
+def test_pool_oauth_refresh_does_not_wait_for_another_login(tmp_config, monkeypatch):
+    _write_config(tmp_config, """providers:
+  ws:
+    base_url: https://workspace.example.com
+    api_key: eyJold
+    auth_refresh: databricks-cli
+""")
+    lock = asyncio.Lock()
+    monkeypatch.setitem(providers._token_refresh_locks, "ws", lock)
+
+    async def run():
+        async with lock:
+            return await asyncio.wait_for(
+                providers.refresh_oauth_token("ws", force=True, allow_login=False), timeout=0.1,
+            )
+
+    assert asyncio.run(run()) is None
+
+
+def test_pool_oauth_refresh_does_not_queue_during_lock_handoff(tmp_config, monkeypatch):
+    _write_config(tmp_config, """providers:
+  ws:
+    base_url: https://workspace.example.com
+    api_key: eyJold
+    auth_refresh: databricks-cli
+""")
+    lock = asyncio.Lock()
+    monkeypatch.setitem(providers._token_refresh_locks, "ws", lock)
+
+    async def run():
+        release_owner = asyncio.Event()
+
+        async def queued_owner():
+            async with lock:
+                await release_owner.wait()
+
+        await lock.acquire()
+        owner = asyncio.create_task(queued_owner())
+        await asyncio.sleep(0)  # owner queues behind the initial lease
+        lock.release()
+        assert not lock.locked()  # but the queued owner has priority
+        try:
+            async with asyncio.timeout(0.1):
+                return await providers.refresh_oauth_token("ws", force=True, allow_login=False)
+        finally:
+            release_owner.set()
+            await owner
+            assert not lock.locked()
+
+    assert asyncio.run(run()) is None
+
+
+def test_pool_oauth_preflight_disallows_browser_login(tmp_config, monkeypatch):
+    _write_config(tmp_config, """providers:
+  ws:
+    base_url: https://workspace.example.com
+    api_key: eyJold
+    auth_refresh: databricks-cli
+""")
+    monkeypatch.setattr(providers, "_jwt_expiry_epoch", lambda token: 1)
+    calls = []
+
+    async def refresh(provider, *, force, allow_login):
+        calls.append((provider, force, allow_login))
+        return "eyJfresh"
+
+    monkeypatch.setattr(providers, "refresh_oauth_token", refresh)
+    assert asyncio.run(providers.ensure_fresh_oauth_token("ws", allow_login=False)) == "eyJfresh"
+    assert calls == [("ws", True, False)]
 
 
 def test_jwt_expiry_epoch_parses_exp():
