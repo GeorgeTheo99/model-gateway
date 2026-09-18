@@ -1167,6 +1167,23 @@ def test_rewire_preserves_custom_source_suffix_for_prefix_candidate():
     assert headers["Authorization"] == "Bearer key-c"
 
 
+def test_rewire_refuses_endpoint_outside_source_base():
+    pool = upstream.PoolContext(
+        model_key="m", provider="ws-a",
+        base_url="https://a.example.com/api", api_key="key-a", protocol="openai",
+    )
+    cand = SimpleNamespace(
+        base_url="https://c.example.com/mlflow/v1", api_key="key-c",
+        endpoint_suffix=None, provider="ws-c",
+    )
+    # An endpoint that is not under the source base URL cannot be classified
+    # as a prepared operation or a complete invocation URL: refuse it.
+    assert upstream._rewire_for_provider(
+        pool, "https://elsewhere.example.com/v1/chat",
+        {"Authorization": "Bearer key-a"}, cand,
+    ) is None
+
+
 def test_unroutable_backup_is_excluded_and_primary_keeps_retries(
     pooled_registry, clean_circuits, monkeypatch,
 ):
@@ -1205,20 +1222,61 @@ def _trip(provider):
     assert circuit.is_tripped(provider)
 
 
-@pytest.mark.parametrize("error", [asyncio.CancelledError, RuntimeError])
-def test_probe_released_when_auth_refresh_interrupted(
-    pooled_registry, clean_circuits, monkeypatch, error,
-):
-    info = providers.resolve("solo-model")
-    assert info.provider == "ws-b"
-    _trip("ws-b")
+def _acquiring_recovery(monkeypatch):
+    """Patch wait_for_recovery with a stub that MIRRORS real ownership handoff.
+
+    The real waiter claims the probe via circuit.should_probe() (setting
+    probe_in_progress) before returning True. Tests that skip this step
+    assert nothing — the release path would run on an unowned probe.
+    """
+    monkeypatch.setattr(circuit, "PROBE_INTERVAL", 0.0)
 
     async def recovered(provider):
+        assert provider == "ws-b"
+        assert circuit.should_probe(provider), "recovery must hand probe ownership to this request"
+        assert circuit._get(provider).probe_in_progress is True
         return True
 
     monkeypatch.setattr(upstream, "wait_for_recovery", recovered)
 
+
+def _probe_spy(monkeypatch):
+    """Record every probe_done release seen by src.upstream."""
+    releases = []
+    real_probe_done = upstream.probe_done
+
+    def spy(provider, success):
+        releases.append((provider, success))
+        real_probe_done(provider, success)
+
+    monkeypatch.setattr(upstream, "probe_done", spy)
+    return releases
+
+
+async def _solo_send(handler, send):
+    info = providers.resolve("solo-model")
+    assert info.provider == "ws-b"
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await send(
+            client, info.base_url,
+            json={"model": info.provider_model_id},
+            headers={"Authorization": "Bearer key-b"},
+            provider="ws-b",
+        )
+
+
+@pytest.mark.parametrize("send", [upstream._retry_post, upstream._retry_send_stream],
+                         ids=["post", "stream"])
+@pytest.mark.parametrize("error", [asyncio.CancelledError, RuntimeError])
+def test_probe_released_when_auth_refresh_interrupted(
+    pooled_registry, clean_circuits, monkeypatch, error, send,
+):
+    _trip("ws-b")
+    _acquiring_recovery(monkeypatch)
+    releases = _probe_spy(monkeypatch)
+
     async def refresh(*args, **kwargs):
+        assert circuit._get("ws-b").probe_in_progress is True, "probe must be owned at the failure point"
         raise error("refresh interrupted")
 
     monkeypatch.setattr(upstream, "refresh_oauth_token", refresh)
@@ -1226,34 +1284,25 @@ def test_probe_released_when_auth_refresh_interrupted(
     def handler(req):
         return httpx.Response(401, text="expired")
 
-    async def run():
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            await upstream._retry_send_stream(
-                client, info.base_url,
-                json={"model": info.provider_model_id},
-                headers={"Authorization": "Bearer key-b"},
-                provider="ws-b",
-            )
-
     with pytest.raises(error, match="refresh interrupted"):
-        asyncio.run(run())
-    # The in-flight recovery probe was released as failed, not leaked.
+        asyncio.run(_solo_send(handler, send))
+    # Exactly one release, as a failed probe: ownership cannot leak.
+    assert releases == [("ws-b", False)]
     assert circuit._get("ws-b").probe_in_progress is False
     assert circuit.is_tripped("ws-b")
 
 
+@pytest.mark.parametrize("send", [upstream._retry_post, upstream._retry_send_stream],
+                         ids=["post", "stream"])
 def test_probe_released_when_preflight_refresh_interrupted(
-    pooled_registry, clean_circuits, monkeypatch,
+    pooled_registry, clean_circuits, monkeypatch, send,
 ):
-    info = providers.resolve("solo-model")
     _trip("ws-b")
-
-    async def recovered(provider):
-        return True
-
-    monkeypatch.setattr(upstream, "wait_for_recovery", recovered)
+    _acquiring_recovery(monkeypatch)
+    releases = _probe_spy(monkeypatch)
 
     async def preflight(*args, **kwargs):
+        assert circuit._get("ws-b").probe_in_progress is True
         raise asyncio.CancelledError()
 
     monkeypatch.setattr(upstream, "_preflight_oauth_token", preflight)
@@ -1261,17 +1310,9 @@ def test_probe_released_when_preflight_refresh_interrupted(
     def handler(req):
         return httpx.Response(200, json={"ok": True})
 
-    async def run():
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            await upstream._retry_send_stream(
-                client, info.base_url,
-                json={"model": info.provider_model_id},
-                headers={"Authorization": "Bearer key-b"},
-                provider="ws-b",
-            )
-
     with pytest.raises(asyncio.CancelledError):
-        asyncio.run(run())
+        asyncio.run(_solo_send(handler, send))
+    assert releases == [("ws-b", False)]
     assert circuit._get("ws-b").probe_in_progress is False
     assert circuit.is_tripped("ws-b")
 
@@ -1279,13 +1320,9 @@ def test_probe_released_when_preflight_refresh_interrupted(
 def test_probe_released_when_error_body_read_fails(
     pooled_registry, clean_circuits, monkeypatch,
 ):
-    info = providers.resolve("solo-model")
     _trip("ws-b")
-
-    async def recovered(provider):
-        return True
-
-    monkeypatch.setattr(upstream, "wait_for_recovery", recovered)
+    _acquiring_recovery(monkeypatch)
+    releases = _probe_spy(monkeypatch)
 
     class ExplodingStream(httpx.AsyncByteStream):
         async def __aiter__(self):
@@ -1298,16 +1335,8 @@ def test_probe_released_when_error_body_read_fails(
     def handler(req):
         return httpx.Response(503, stream=ExplodingStream())
 
-    async def run():
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            await upstream._retry_send_stream(
-                client, info.base_url,
-                json={"model": info.provider_model_id},
-                headers={"Authorization": "Bearer key-b"},
-                provider="ws-b",
-            )
-
     with pytest.raises(RuntimeError, match="read boom"):
-        asyncio.run(run())
+        asyncio.run(_solo_send(handler, upstream._retry_send_stream))
+    assert releases == [("ws-b", False)]
     assert circuit._get("ws-b").probe_in_progress is False
     assert circuit.is_tripped("ws-b")

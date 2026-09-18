@@ -511,6 +511,16 @@ def _rewire_for_provider(
             )
             return None
         else:
+            if not endpoint.startswith(pool.base_url):
+                # The endpoint is outside the source provider's base URL, so
+                # its kind cannot be classified (neither a prepared operation
+                # suffix nor a complete invocation URL). Refuse rather than
+                # guess a chat URL onto an unrelated destination.
+                log.warning(
+                    "pool-failover: endpoint %r is outside source base %r; cannot infer the prepared operation",
+                    endpoint, pool.base_url,
+                )
+                return None
             # The source was a complete invocation URL (suffix ""): map the
             # prepared operation by wire protocol, mirroring the suffix
             # defaults of initial routing. invocations endpoints speak
