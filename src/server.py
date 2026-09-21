@@ -37,6 +37,7 @@ from src.upstream import (
     _retry_send_stream_with_model_fallback,
 )
 from src.reasoning import reasoning_alias_text
+from src.request_options import upstream_auth_headers, normalize_token_limit
 from src.responses import chat_to_responses, responses_result_events, responses_to_chat, translate_responses_stream
 from src.signature_cache import store_from_extra_content
 from src.streaming import _flatten_list_content, translate_stream
@@ -486,22 +487,9 @@ def _forward_headers(request: Request, protocol: str = "openai", provider: str =
     Includes Authorization and x-session-affinity for Fireworks prompt caching.
     Uses x-api-key + anthropic-version for Anthropic native API.
     """
-    if protocol == "anthropic":
-        headers = {
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }
-        # Some Anthropic-protocol upstreams (e.g. AI gateways fronting Claude)
-        # require Bearer auth instead of x-api-key. Config quirk: anthropic_bearer_auth.
-        if "anthropic_bearer_auth" in provider_quirks(provider):
-            headers["Authorization"] = f"Bearer {request.state.api_key}"
-        else:
-            headers["x-api-key"] = request.state.api_key
-        return headers
-    headers = {
-        "Authorization": f"Bearer {request.state.api_key}",
-    }
-    if provider == "fireworks":
+    quirks = provider_quirks(provider) if protocol == "anthropic" else ()
+    headers = upstream_auth_headers(request.state.api_key, protocol, quirks)
+    if protocol != "anthropic" and provider == "fireworks":
         headers["x-session-affinity"] = _session_affinity_id(request)
     return headers
 
@@ -861,16 +849,7 @@ def _apply_openai_request_quirks(req: dict, info) -> str | None:
         req.pop("reasoning", None)
         req["reasoning_effort"] = "max"
 
-    if "use_max_completion_tokens" in quirks:
-        value = req.get("max_completion_tokens")
-        if value is None:
-            value = req.get("max_tokens")
-        if value is None:
-            value = req.get("max_output_tokens")
-        for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
-            req.pop(key, None)
-        if value is not None:
-            req["max_completion_tokens"] = value
+    normalize_token_limit(req, quirks)
 
     if "drop_fixed_sampling_fields" in quirks:
         for key in ("temperature", "top_p", "n", "presence_penalty", "frequency_penalty"):

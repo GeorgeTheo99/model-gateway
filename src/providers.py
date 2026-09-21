@@ -933,6 +933,43 @@ def pool_candidates(model_id: str) -> list[str]:
 
 
 @_registry_locked
+def preview_pool_member(
+    config: dict, config_path: Path, model_info_path: Path, pool: str, member: str,
+) -> list[ProviderInfo]:
+    """Resolve a staged pool addition using runtime rules, without publishing it.
+
+    The registry lock hides the temporary snapshot from concurrent readers;
+    even failed previews restore the original caches and path configuration.
+    No auth refresh, network calls, or config writes occur here.
+    """
+    global _config, _models, CONFIG_PATH, MODEL_INFO_PATH
+    saved = _config, _models, CONFIG_PATH, MODEL_INFO_PATH
+    try:
+        _config, _models = config, None
+        CONFIG_PATH, MODEL_INFO_PATH = config_path.resolve(), model_info_path.resolve()
+        entries = {id(entry): entry for entry in _load_models().values()}
+        routes = []
+        for entry in entries.values():
+            if entry.get("pool") != pool or not _is_model_enabled(entry.get("name")):
+                continue
+            name = entry["name"]
+            candidate = resolve(name, provider_override=member)
+            if candidate is None or candidate.composite is not None:
+                raise ValueError(f"{name}: workspace {member!r} is not routable")
+            for existing in _configured_pool_members(entry, config):
+                info = resolve(name, provider_override=existing)
+                if info is None or (info.protocol, info.api_style) != (candidate.protocol, candidate.api_style):
+                    raise ValueError(f"{name}: incompatible wire format between {existing!r} and {member!r}")
+            coverage = _effective_provider_config(config, member).get("available_model_ids")
+            if coverage is not None and candidate.provider_model_id not in coverage:
+                raise ValueError(f"{name}: excluded by {member!r} available_model_ids; revalidate workspace coverage first")
+            routes.append(candidate)
+        return routes
+    finally:
+        _config, _models, CONFIG_PATH, MODEL_INFO_PATH = saved
+
+
+@_registry_locked
 def resolve(model_id: str, provider_override: str | None = None) -> ProviderInfo | None:
     """Resolve a model name/alias/id to provider info.
 

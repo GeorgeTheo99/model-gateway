@@ -115,6 +115,32 @@ This registers an existing Databricks workspace; it does not provision one.
 Authentication may open browser SSO, and validation makes small real inference
 requests. The command activates the change, so it can restart the gateway.
 
+For a workspace **already registered** in the gateway, attach it without
+recreating or overwriting its connection settings:
+
+```bash
+model-gateway workspace pool add-member fable-pool dogfood --dry-run
+model-gateway workspace pool add-member fable-pool dogfood
+```
+
+This appends one backup to an existing nonempty pool; repeating it is a no-op.
+It uses the live gateway's model catalog and routing rules, rejects disabled or
+wire-incompatible members, and tests **every enabled pool model** through the
+candidate's configured route. Missing models or failed probes leave config
+unchanged. Provider settings and other pools are preserved. `--dry-run` still
+performs authentication and small billable inference probes, but never writes
+config or restarts the gateway. Existing OAuth profile/host selection and
+`auth_login: false` are respected. Unset shell provider routing/credential
+overrides before using this command: preflight must validate the saved
+connection, not unrelated credentials inherited by an interactive shell.
+
+An admin **read** key (`auth.admin_keys` or `MODEL_GATEWAY_ADMIN_KEY`) is required
+to verify the gateway's config identity and live pool order/readiness. The CLI
+uses restart activation even when admin API writes are disabled. Activation or
+live-verification failure restores the backup and reactivates the previous
+config, unless a concurrent edit makes automatic rollback unsafe. Concurrent
+config edits during preflight cause the command to abort without writing.
+
 Mutating Databricks workspace commands are similarly available as
 `workspace add`, `workspace replace`, and `workspace remove`. They verify the
 candidate before writing `config.yaml`, restart and health-check the gateway,

@@ -12,6 +12,7 @@ Commands:
                                       [--style inherit|invocations|ai-gateway|auto]
                                       [--allow-partial]
     model-gateway workspace remove <name>
+    model-gateway workspace pool add-member <pool> <name> [--dry-run]
     model-gateway workspace normalize <pasted-url>   # validate; print https origin
 
 `add`/`replace` are idempotent and verify BEFORE committing config. If gateway
@@ -65,6 +66,12 @@ import urllib.request
 from pathlib import Path
 
 import yaml
+
+# The operator wrapper invokes this file directly, not as a Python module.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from src.config_lock import config_write_lock
+from src.catalog import canonical_provider
+from src.request_options import upstream_auth_headers, normalize_token_limit
 
 HOME = Path.home()
 # Same resolution as the gateway: MODEL_GATEWAY_CONFIG env, else checkout-local.
@@ -140,19 +147,22 @@ def _databricks(*args: str, timeout: int = 60) -> subprocess.CompletedProcess:
     return subprocess.run([cli, *args], capture_output=True, text=True, timeout=timeout)
 
 
-def ensure_auth(host: str, profile: str) -> str:
-    """Return a fresh access token for the workspace, running SSO if needed."""
-    proc = _databricks("auth", "token", "--profile", profile)
+def ensure_auth(host: str, profile: str, *, allow_login: bool = True) -> str:
+    """Mint using the configured profile or host, respecting browser-login policy."""
+    selector = ["--profile", profile] if profile else ["--host", host]
+    proc = _databricks("auth", "token", *selector)
     if proc.returncode != 0:
-        print(f"  auth: profile {profile!r} has no valid token — launching browser SSO for {host}")
+        if not allow_login:
+            raise _fail("cached OAuth authentication failed and auth_login is disabled")
+        print(f"  auth: no valid token — launching browser SSO for {host}")
         login = subprocess.run(
             [shutil.which("databricks") or "/opt/homebrew/bin/databricks",
-             "auth", "login", "--host", host, "--profile", profile],
+             "auth", "login", "--host", host, *(["--profile", profile] if profile else [])],
             timeout=300,
         )
         if login.returncode != 0:
             raise _fail(f"browser SSO login failed for {host} (profile {profile})")
-        proc = _databricks("auth", "token", "--profile", profile)
+        proc = _databricks("auth", "token", *selector)
         if proc.returncode != 0:
             raise _fail(f"still cannot mint a token for profile {profile}: {proc.stderr[:200]}")
     token = json.loads(proc.stdout).get("access_token", "")
@@ -315,14 +325,13 @@ def _classify_url_error(exc: urllib.error.URLError) -> tuple[str, str]:
     return "connect", str(reason)
 
 
-def _smoke_request(url: str, body: dict, headers: dict, deadline: float) -> None:
+def _smoke_request(url: str, body: dict, headers: dict, deadline: float) -> dict:
     req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
                                  headers={"content-type": "application/json", **headers})
     while True:
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
-                json.loads(resp.read())
-                return
+                return json.loads(resp.read())
         except urllib.error.HTTPError as exc:
             snippet = exc.read()[:150]
             if exc.code == 429 and time.time() < deadline:
@@ -539,23 +548,33 @@ def activate_gateway() -> None:
         reload_gateway()
 
 
-def _commit_and_activate(path: Path, config: dict) -> None:
-    """Commit verified config, activate it, and roll back on activation failure."""
-    backup = _backup(path)
-    _write_config(path, config)
+def _commit_and_activate(path: Path, config: dict, *, expected_bytes: bytes | None = None,
+                         verify=None) -> None:
+    """Commit, activate and optionally verify; never clobber concurrent edits."""
+    with config_write_lock(path):
+        if expected_bytes is not None and path.read_bytes() != expected_bytes:
+            raise _fail("config changed during validation; retry against the current config")
+        backup = _backup(path)
+        _write_config(path, config)
+        committed = path.read_bytes()
     print(f"  commit: {_config_target(path)}")
     try:
         activate_gateway()
-    except Exception as activation_error:
+        if verify is not None:
+            verify()
+    except (Exception, SystemExit) as activation_error:
         print(f"  activation: FAILED — {activation_error}")
         print(f"  rollback: restoring {backup.name}")
         try:
-            _restore_backup(path, backup)
+            with config_write_lock(path):
+                if path.read_bytes() != committed:
+                    raise RuntimeError("config changed after commit; refusing to overwrite concurrent changes")
+                _restore_backup(path, backup)
             activate_gateway()
         except Exception as rollback_error:
             raise _fail(
                 "activation failed and rollback could not be activated; "
-                f"config was restored from {backup}, but the gateway needs manual recovery: "
+                f"backup is at {backup}; the gateway needs manual recovery: "
                 f"{rollback_error}"
             ) from rollback_error
         raise _fail(
@@ -824,6 +843,134 @@ def cmd_remove(args) -> None:
     print(f"workspace remove: DONE — {args.name} removed")
 
 
+def _pool_admin_key(config: dict) -> str:
+    keys = (config.get("auth") or {}).get("admin_keys") or []
+    if isinstance(keys, str):
+        keys = [key.strip() for key in keys.split(",") if key.strip()]
+    key = ADMIN_KEY or next(iter(keys), "")
+    if not key:
+        raise _fail("pool management requires an admin read key (MODEL_GATEWAY_ADMIN_KEY or auth.admin_keys)")
+    return key
+
+
+def _pool_runtime_status(path: Path, key: str) -> dict:
+    status = _get_json(f"{GATEWAY_URL}/admin/api/status", key)
+    if status.get("status") != "ok" or Path(status.get("config_path", "")).resolve() != path.resolve():
+        raise _fail("gateway is not serving the selected config; check MODEL_GATEWAY_CONFIG and MODEL_GATEWAY_URL")
+    if not status.get("model_info_path"):
+        raise _fail("gateway did not report its model catalog path")
+    return status
+
+
+def _verify_live_pool(path: Path, key: str, pool: str, members: list[str]) -> None:
+    _pool_runtime_status(path, key)
+    data = _get_json(f"{GATEWAY_URL}/admin/api/workspace-pools", key)
+    live = next((p for p in data.get("pools", []) if p.get("id") == pool), {})
+    rows = live.get("members", [])
+    expected = [canonical_provider(member) for member in members]
+    if [row.get("id") for row in rows] != expected or not rows or not rows[-1].get("ready"):
+        raise RuntimeError(f"live pool {pool!r} did not activate the expected member order/readiness")
+    print(f"  live pool: {' → '.join(members)}")
+
+
+def _smoke_pool_routes(routes, token: str, *, auth_quirks=()) -> None:
+    """Probe each model using the router's resolved URL and wire format."""
+    for route in routes:
+        headers = upstream_auth_headers(token, route.protocol, auth_quirks)
+        body = {"model": route.provider_model_id, "max_tokens": 16,
+                "messages": [{"role": "user", "content": "Reply OK"}]}
+        if route.api_style == "open_responses":
+            url = route.base_url
+            body = {"model": route.provider_model_id, "input": "Reply OK", "max_output_tokens": 16}
+        elif route.protocol in {"openai", "anthropic"}:
+            suffix = route.endpoint_suffix
+            if suffix is None:
+                suffix = "/messages" if route.protocol == "anthropic" else "/chat/completions"
+            url = route.base_url.rstrip("/") + suffix
+            if route.protocol == "openai":
+                normalize_token_limit(body, route.quirks)
+                if "force_reasoning_effort_max" in route.quirks:
+                    body["reasoning_effort"] = "max"
+        else:
+            raise _fail(f"unsupported smoke protocol {route.protocol!r}")
+        try:
+            result = _smoke_request(url, body, headers, time.time() + 120)
+            response_field = ("output" if route.api_style == "open_responses" else
+                              "content" if route.protocol == "anthropic" else "choices")
+            if not isinstance(result, dict) or result.get("error") or not result.get(response_field):
+                raise _fail(f"{route.provider_model_id} smoke returned no {response_field}")
+        except RoutePreflightError as exc:
+            raise _fail(f"{route.provider_model_id} smoke failed ({exc.kind}): {exc.detail}") from exc
+        print(f"  smoke: OK ({route.provider_model_id})")
+
+
+def cmd_pool_add_member(args) -> None:
+    """Attach a registered workspace without rebuilding its provider entry."""
+    from src.providers import _find_provider_location, _provider_env_prefix, preview_pool_member
+
+    original = args.config.read_bytes()
+    config = yaml.safe_load(original) or {}
+    pools = config.get("pools") or {}
+    members = pools.get(args.pool)
+    if not isinstance(members, list) or not members:
+        raise _fail(f"unknown or empty pool {args.pool!r}; use workspace list")
+    member = canonical_provider(args.name)
+    found = _find_provider_location(config, member)
+    if found is None:
+        raise _fail(f"unknown workspace {args.name!r}; register it with workspace add first")
+    entry = found[2]
+    if member in {canonical_provider(name) for name in members}:
+        print(f"workspace pool add-member: no change — {args.name!r} already belongs to {args.pool!r}")
+        return
+    if entry.get("enabled") is False:
+        raise _fail(f"workspace {args.name!r} is disabled")
+    # The interactive shell need not share the launchd service's environment.
+    # Do not validate with unrelated shell credentials/URLs and publish config
+    # that the service would interpret differently.
+    for candidate in {member, *(canonical_provider(name) for name in members)}:
+        prefix = _provider_env_prefix(candidate)
+        variables = [f"{prefix}_{suffix}" for suffix in ("BASE_URL", "API_KEY", "PROTOCOL", "ENABLED")]
+        if candidate == "databricks":
+            variables += ["DATABRICKS_HOST", "DATABRICKS_TOKEN", "DATABRICKS_SERVING_BASE_URL"]
+        if any(variable in os.environ for variable in variables):
+            raise _fail(f"workspace {candidate!r} has shell routing/credential overrides; "
+                        "unset DATABRICKS_* / MODEL_GATEWAY_PROVIDER_* overrides before pool management")
+    if not args.dry_run:
+        _require_activation_path()
+    key = _pool_admin_key(config)
+    status = _pool_runtime_status(args.config, key)
+    if not args.dry_run and not RESTART_BIN and not status.get("writes_enabled"):
+        raise _fail("admin writes are disabled; run through model-gateway workspace for restart activation")
+    staged = copy.deepcopy(config)
+    staged["pools"][args.pool].append(member)
+    try:
+        routes = preview_pool_member(staged, args.config, Path(status["model_info_path"]), args.pool, member)
+    except ValueError as exc:
+        raise _fail(str(exc)) from exc
+    if not routes:
+        raise _fail(f"pool {args.pool!r} has no enabled models to validate")
+    host = normalize_host(str(entry.get("workspace_url") or entry.get("base_url", "")))
+    token = (ensure_auth(host, entry.get("auth_profile") or "", allow_login=entry.get("auth_login") is not False)
+             if entry.get("auth_refresh") == "databricks-cli" else routes[0].api_key)
+    endpoints = probe_endpoints(host, token)
+    missing = sorted({route.provider_model_id for route in routes} - endpoints)
+    if missing:
+        raise _fail(f"workspace does not serve pool models: {', '.join(missing)}")
+    print(f"  planned pool: {' → '.join(staged['pools'][args.pool])}")
+    auth_quirks = entry.get("quirks") or []
+    if isinstance(auth_quirks, str):
+        auth_quirks = [quirk.strip() for quirk in auth_quirks.split(",") if quirk.strip()]
+    _smoke_pool_routes(routes, token, auth_quirks=auth_quirks)
+    if args.dry_run:
+        print("workspace pool add-member: dry run PASSED — no config write or restart")
+        return
+    _commit_and_activate(
+        args.config, staged, expected_bytes=original,
+        verify=lambda: _verify_live_pool(args.config, key, args.pool, staged["pools"][args.pool]),
+    )
+    print(f"workspace pool add-member: DONE — {args.name} is live in {args.pool}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="model-gateway workspace",
@@ -867,9 +1014,16 @@ def main() -> None:
     p = sub.add_parser("remove")
     p.add_argument("name")
 
+    p = sub.add_parser("pool", help="manage existing workspace pool membership")
+    pool_commands = p.add_subparsers(dest="pool_command", required=True)
+    p = pool_commands.add_parser("add-member", help="validate and append an existing workspace")
+    p.add_argument("pool")
+    p.add_argument("name")
+    p.add_argument("--dry-run", action="store_true", help="run auth/model probes without writing or restarting")
+
     args = parser.parse_args()
     {"list": cmd_list, "repair": cmd_repair, "test": cmd_test, "add": cmd_add,
-     "replace": cmd_replace, "remove": cmd_remove,
+     "replace": cmd_replace, "remove": cmd_remove, "pool": cmd_pool_add_member,
      "normalize": lambda a: print(normalize_host(a.url))}[args.command](args)
 
 

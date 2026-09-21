@@ -676,7 +676,7 @@ cmd_onboard() {
 }
 
 cmd_workspace() {
-  [ $# -ge 1 ] || die "usage: model-gateway workspace {list|repair|test|add|replace|remove|normalize} [options]"
+  [ $# -ge 1 ] || die "usage: model-gateway workspace {list|repair|test|add|replace|remove|pool|normalize} [options]"
   check_prereqs
   local requested_help=0 arg
   for arg in "$@"; do
@@ -684,7 +684,7 @@ cmd_workspace() {
   done
   case "$1" in
     list|test|normalize) ;;
-    repair|add|replace|remove)
+    repair|add|replace|remove|pool)
       [ "$requested_help" = 1 ] || ensure_runtime_paths_safe "workspace management"
       ;;
     -h|--help) ;;
