@@ -222,6 +222,7 @@ multi-tenant isolation; run the gateway on loopback or behind a trusted proxy.
 | Doc | Contents |
 |---|---|
 | `docs/deployment.md` | Deployment layout and operations |
+| `docs/unity-gateway.md` | Unity Gateway model-service routing and migration checks |
 | `docs/deployment-auth.md` | Inbound auth configuration |
 | `docs/provider-onboarding.md` | Provider/model onboarding flow |
 | `docs/workspace-pools-design.md` | Databricks workspace pools and operations |

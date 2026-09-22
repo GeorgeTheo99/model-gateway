@@ -93,9 +93,9 @@ class ProviderInfo:
     # invocation URL (e.g. endpoint_style: invocations providers).
     endpoint_suffix: str | None = None
     # Gateway request style for this model: "" (default: protocol-native
-    # chat/messages), or "open_responses" for models served through the
-    # workspace-wide Open Responses endpoint (/serving-endpoints/open-responses)
-    # because the upstream rejects function tools on chat/completions.
+    # chat/messages), or "open_responses" for Responses-only models. Providers
+    # with path_prefixes use the responses prefix (or openai prefix); legacy
+    # workspace providers use /serving-endpoints/open-responses.
     api_style: str = ""
     # Provider quirk flags from config (e.g. "no_stream_options",
     # "no_reasoning_params"). Generic mechanism; which providers need which
@@ -1057,16 +1057,23 @@ def resolve(model_id: str, provider_override: str | None = None) -> ProviderInfo
     api_style = (entry.get("api_style") or "").strip().lower()
     endpoint_suffix: str | None = None
     if api_style == "open_responses":
-        # Responses-only model: route to the workspace-wide Open Responses
-        # endpoint instead of a per-model invocations URL. Pool members swap
-        # cleanly because every member resolves to the same-shaped URL
-        # (endpoint_suffix "").
-        # Explicit configs may use the workspace root; Databricks environment
-        # configuration already includes /serving-endpoints. Accept both.
-        base_url = (
-            base_url.rstrip("/").removesuffix("/serving-endpoints")
-            + "/serving-endpoints/open-responses"
-        )
+        # Unity Gateway exposes native Responses separately from unified Chat:
+        # path_prefixes: {openai: mlflow/v1, responses: openai/v1}.
+        # A unified Responses provider can use its openai prefix for both.
+        path_prefixes = provider_config.get("path_prefixes") or {}
+        prefix = (
+            path_prefixes.get("responses") or path_prefixes.get("openai")
+        ) if isinstance(path_prefixes, dict) else None
+        if prefix:
+            base_url = base_url.rstrip("/") + "/" + str(prefix).strip("/") + "/responses"
+        else:
+            # Preserve explicit legacy workspace routing for other installs.
+            base_url = (
+                base_url.rstrip("/").removesuffix("/serving-endpoints")
+                + "/serving-endpoints/open-responses"
+            )
+        # A complete URL keeps native passthrough and pool failover from
+        # appending an operation twice or falling back to the legacy path.
         endpoint_suffix = ""
     elif endpoint_style == "invocations":
         # base_url is a workspace host; each model has its own full invocation

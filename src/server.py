@@ -679,7 +679,10 @@ ADAPTIVE_THINKING_ANTHROPIC_MODELS = {
 
 
 def _uses_adaptive_anthropic_thinking(provider_model_id: str) -> bool:
-    return provider_model_id in ADAPTIVE_THINKING_ANTHROPIC_MODELS
+    # Databricks names its built-in models as Unity services or legacy serving
+    # endpoints. Do not strip arbitrary catalog/schema prefixes from custom IDs.
+    model = provider_model_id.removeprefix("system.ai.").removeprefix("databricks-")
+    return model in ADAPTIVE_THINKING_ANTHROPIC_MODELS
 
 
 def _legacy_anthropic_budget_effort(budget: int | None) -> str:

@@ -384,13 +384,17 @@ def test_dispatch_reuses_the_single_validated_reasoning_control(monkeypatch):
     assert calls == 1
 
 
-def test_adaptive_anthropic_legacy_budget_preserves_prior_effort_inference():
+@pytest.mark.parametrize("model_id", [
+    "claude-opus-5", "databricks-claude-opus-5", "system.ai.claude-opus-5",
+    "system.ai.claude-opus-4-7", "system.ai.claude-opus-4-8",
+])
+def test_adaptive_anthropic_legacy_budget_preserves_prior_effort_inference(model_id):
     info = _info(
         "anthropic",
         thinking="optional",
         thinking_levels=("off", "low", "medium", "high", "xhigh", "max"),
         provider="anthropic",
-        provider_model_id="claude-opus-5",
+        provider_model_id=model_id,
     )
     body = {
         "messages": [],
@@ -453,6 +457,23 @@ def test_adaptive_anthropic_opus_ids_match_provider_model_ids():
     assert server_module._uses_adaptive_anthropic_thinking("claude-opus-5") is True
     assert server_module._uses_adaptive_anthropic_thinking("claude-opus-4-7") is True
     assert server_module._uses_adaptive_anthropic_thinking("claude-opus-4-8") is True
+
+
+@pytest.mark.parametrize("model_id", [
+    "system.ai.claude-opus-5", "system.ai.claude-opus-4-7", "system.ai.claude-opus-4-8",
+])
+def test_unity_native_adaptive_thinking_preserved(model_id):
+    info = _info("anthropic", provider_model_id=model_id, thinking="optional")
+    body = {"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}
+    server_module._normalize_anthropic_adaptive_thinking(body, info)
+    assert _apply_gateway_reasoning(body, info, target_api="messages") is True
+    assert body["thinking"] == {"type": "adaptive"}
+    assert body["output_config"] == {"effort": "high"}
+
+
+@pytest.mark.parametrize("model_id", ["system.ai.claude-sonnet-4-6", "custom.ai.claude-opus-5"])
+def test_unity_adaptive_detection_does_not_match_other_models(model_id):
+    assert server_module._uses_adaptive_anthropic_thinking(model_id) is False
 
 
 def test_unknown_or_overridden_unsupported_level_is_never_silently_dropped():
