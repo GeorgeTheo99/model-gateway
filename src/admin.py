@@ -9,7 +9,7 @@ import sys
 import time
 from pathlib import Path
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
@@ -51,6 +51,7 @@ async def admin_status(request: Request):
         "model_info_path": str(MODEL_INFO_PATH),
         "config_path": str(config_io.CONFIG_PATH),
         "writes_enabled": mode.writes_enabled,
+        "capabilities": {"create_only_model_registration": True},
         "auth": {
             "client_auth_enabled": mode.client_auth_enabled,
             "admin_auth_enabled": mode.admin_auth_enabled,
@@ -191,13 +192,15 @@ def _reload_registry_transactionally(provider_snapshot) -> str | None:
         return None
 
 
-def _apply_registry_mutation(mutate, extra_paths=None):
-    """Run one locked admin file mutation and publish it only after validation.
+def _apply_registry_mutation(mutate, extra_paths=None, *, precondition=None):
+    """Check preconditions and mutate under one lock, publishing after validation.
 
     ``extra_paths`` is an optional callable, evaluated under the lock, naming
     additional files (such as a provider key file) the mutation may write.
     """
     with config_write_lock(config_io.CONFIG_PATH):
+        if precondition is not None:
+            precondition()
         provider_snapshot = snapshot_provider_registry()
         file_snapshot = config_io.snapshot_writable_files(extra_paths() if extra_paths else ())
         try:
@@ -630,6 +633,26 @@ async def admin_preview_model(model_name: str, request: Request):
     }
 
 
+def _require_model_absent(model_name: str, body: dict) -> None:
+    """Reject identifier collisions using fresh files under the mutation lock."""
+    from src.catalog import entry_routable_ids
+
+    candidate = {key: body.get(key) for key in ("alias", "provider_model_id", "omlx_id")}
+    candidate["name"] = model_name.strip()
+    candidate_ids = set(entry_routable_ids(candidate))
+    # Inspect both sources before catalog merging can hide a canonical name or
+    # alias. Do not use the process-local registry cache: another writer may
+    # have changed the files while this request was waiting for the lock.
+    entries = [
+        *config_io.load_model_info().get("llm", []),
+        *config_io.load_config_full().get("models", []),
+    ]
+    for entry in entries:
+        if candidate_ids.intersection(entry_routable_ids(entry)):
+            raise HTTPException(status_code=412, detail="Model identifier already exists")
+
+
+@router.put("/admin/api/models/{model_name}")
 @router.post("/admin/api/models/{model_name}")
 async def admin_upsert_model(model_name: str, request: Request):
     """Create or update a model entry in model-info.json.
@@ -638,13 +661,26 @@ async def admin_upsert_model(model_name: str, request: Request):
     alias, context, max_output_tokens, thinking, thinking_levels, thinking_format, vision,
     system_instruction, pricing, pricing_status, desc, enabled.
     Writes the live catalog and optional machine-local mirror; reloads registry.
+    If-None-Match: * requires all candidate identifiers to be unused (412 on
+    collision). Other If-None-Match values are unsupported (400); omission is upsert
+    only for POST. PUT always requires create-only preconditions so older gateways
+    lacking this method fail closed rather than ignoring an unknown header.
     """
     require_admin_auth(request)
     require_admin_writes()
+    preconditions = request.headers.getlist("if-none-match")
+    if request.method == "PUT" and not preconditions:
+        return _bad_request("PUT model registration requires If-None-Match: *", status=428)
+    if request.method == "PUT" and "if-match" in request.headers:
+        return _bad_request("If-Match is not supported for create-only model registration")
+    if preconditions and (len(preconditions) != 1 or preconditions[0].strip(" \t") != "*"):
+        return _bad_request("Only If-None-Match: * is supported")
     try:
         body = await request.json()
     except Exception:
         return _bad_request("Invalid JSON body")
+    if not isinstance(body, dict):
+        return _bad_request("Model configuration must be an object")
     def mutate_model():
         result = config_io.upsert_model(model_name, **body)
         if "enabled" in body:
@@ -657,7 +693,10 @@ async def admin_upsert_model(model_name: str, request: Request):
         return result
 
     try:
-        result, reload_error = _apply_registry_mutation(mutate_model)
+        result, reload_error = _apply_registry_mutation(
+            mutate_model,
+            precondition=(lambda: _require_model_absent(model_name, body)) if preconditions else None,
+        )
     except ValueError as exc:
         return _bad_request(str(exc))
     if reload_error is not None:

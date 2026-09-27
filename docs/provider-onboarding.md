@@ -4,6 +4,36 @@ OpenAI-compatible providers and replacement models can be added with a
 secret-free YAML profile instead of hand-editing runtime files. Profiles may be
 written by hand or generated as reviewable drafts.
 
+## Create-only admin model registration
+
+Importers can discover support through authenticated `GET /admin/api/status`:
+`"capabilities": {"create_only_model_registration": true}`. This advertises
+support, not permission; admin authentication and the existing admin write gate
+still apply.
+
+Send `If-None-Match: *` with the existing JSON body to
+`PUT /admin/api/models/{name}` for atomic create-only registration. PUT is a
+separate method so older gateways fail with 405 instead of ignoring the header:
+
+- Success returns the existing **200** response, including `name`, `entry`,
+  `written_to`, and `reloaded: true` (plus `enabled` when supplied).
+- **412 Precondition Failed** means an identifier is already reserved. The
+  trimmed URL name and supplied alias/upstream IDs are checked against canonical
+  names, aliases, upstream IDs, and alternate IDs in both the catalog and config
+  overlay, including disabled entries. No config/catalog/mirror write or
+  registry reload occurs on a failed precondition.
+- Unsupported `If-None-Match` values (including ETags, lists, empty values, and
+  repeated headers) return **400** without mutation. Surrounding HTTP whitespace
+  around a single `*` is accepted.
+- Omitting the header on PUT returns **428 Precondition Required**. PUT does not
+  support `If-Match` updates.
+- POST retains legacy **upsert** behavior without a header, and also supports
+  the create-only header for compatibility with conditional POST clients.
+
+The check reads current files while holding the same configuration lock as the
+write, so concurrent competing creates cannot overwrite each other. Preview is
+advisory, not a reservation; importers must send the header on the final PUT.
+
 ## Generate a draft
 
 For a simple OpenAI-compatible provider, start with only the provider, HTTPS

@@ -4,6 +4,8 @@ import json
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -1373,6 +1375,176 @@ def test_admin_upsert_model_endpoint(client):
     assert resp.json()["name"] == "new-model"
     # Catalog now contains the model (resolve also needs provider config).
     assert "new-model" in providers._load_models()
+
+
+def test_create_only_status_capability_is_authenticated(client_readonly):
+    assert client_readonly.get("/admin/api/status").status_code == 401
+    response = client_readonly.get("/admin/api/status", headers={"Authorization": "Bearer admin"})
+    assert response.status_code == 200
+    assert response.json()["capabilities"]["create_only_model_registration"] is True
+    assert response.json()["writes_enabled"] is False
+
+
+def test_create_only_put_requires_precondition_and_preserves_existing_model(client):
+    headers = {"Authorization": "Bearer admin"}
+    payload = {"provider": "anthropic", "provider_model_id": "put-upstream"}
+    assert client.put("/admin/api/models/put-model", headers=headers, json=payload).status_code == 428
+    for invalid in ([], "not-an-object", 1):
+        response = client.put("/admin/api/models/put-model", headers={**headers, "If-None-Match": "*"}, json=invalid)
+        assert response.status_code == 400
+    response = client.put("/admin/api/models/put-model", headers={**headers, "If-None-Match": "*", "If-Match": '"ignored"'}, json=payload)
+    assert response.status_code == 400
+    response = client.put("/admin/api/models/put-model", headers={**headers, "If-None-Match": "*"}, json=payload)
+    assert response.status_code == 200
+    before = config_io.MODEL_INFO_PATH.read_bytes()
+    response = client.put("/admin/api/models/put-model", headers={**headers, "If-None-Match": "*"},
+                          json={**payload, "provider_model_id": "replacement"})
+    assert response.status_code == 412
+    assert config_io.MODEL_INFO_PATH.read_bytes() == before
+
+
+def test_create_only_model_success_then_legacy_upsert(client):
+    headers = {"Authorization": "Bearer admin", "If-None-Match": " \t* "}
+    payload = {"provider": "anthropic", "provider_model_id": "new-upstream", "enabled": False}
+    response = client.post("/admin/api/models/%20new-model%20", headers=headers, json=payload)
+    assert response.status_code == 200
+    assert response.json()["name"] == "new-model"
+    assert response.json()["reloaded"] is True
+    assert response.json()["enabled"] is False
+    assert config_io.load_config_full()["model_overrides"]["new-model"] == {"enabled": False}
+    assert providers._load_models()["new-model"]["provider_model_id"] == "new-upstream"
+
+    # Omitting the precondition still updates the same normalized canonical name.
+    payload.update(provider_model_id="replacement-upstream", enabled=True)
+    response = client.post(
+        "/admin/api/models/%20new-model%20",
+        headers={"Authorization": "Bearer admin"}, json=payload,
+    )
+    assert response.status_code == 200
+    assert providers.resolve("new-model").provider_model_id == "replacement-upstream"
+    assert len([e for e in config_io.load_model_info()["llm"] if e["name"] == "new-model"]) == 1
+
+
+@pytest.mark.parametrize("target,fields,overlay", [
+    ("claude-test", {}, False),
+    ("%20claude-test%20", {}, False),
+    ("existing-alias", {}, False),
+    ("claude-test-1", {}, False),
+    ("alternate-id", {}, False),
+    ("new-model", {"alias": "existing-alias"}, False),
+    ("new-model", {"alias": "claude-test"}, False),
+    ("new-model", {"provider_model_id": "claude-test-1"}, False),
+    ("new-model", {"omlx_id": "alternate-id"}, False),
+    ("overlay-model", {}, True),
+    ("overlay-alias", {}, True),
+])
+def test_create_only_preserves_existing_identifiers_without_writes_or_reload(
+    client, tmp_config, monkeypatch, target, fields, overlay,
+):
+    # Prime the registry, then change disk without a reload to simulate another
+    # process's completed write. The precondition must not trust cached state.
+    cached_models = providers._load_models()
+    doc = config_io.load_model_info()
+    doc["llm"][0].update(alias="existing-alias", alternate_ids=["alternate-id"])
+    config_io.MODEL_INFO_PATH.write_text(json.dumps(doc))
+    with config_io.CONFIG_PATH.open("a") as handle:
+        handle.write("model_overrides:\n  claude-test:\n    enabled: false\n")
+    if overlay:
+        with config_io.CONFIG_PATH.open("a") as handle:
+            handle.write("models:\n  - name: overlay-model\n    alias: overlay-alias\n"
+                         "    provider: anthropic\n    provider_model_id: overlay-upstream\n")
+    mirror = tmp_config / "mirror.json"
+    mirror.write_text(json.dumps(doc))
+    monkeypatch.setattr(config_io, "MODEL_INFO_SOURCE_PATH", mirror)
+    paths = [config_io.CONFIG_PATH, config_io.MODEL_INFO_PATH, mirror]
+    before = [(p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino) for p in paths]
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Failed preconditions must not write, restore, or reload")
+
+    monkeypatch.setattr(config_io, "_atomic_write", unexpected)
+    monkeypatch.setattr(config_io, "_backup", unexpected)
+    monkeypatch.setattr(admin, "_reload_registry_transactionally", unexpected)
+    monkeypatch.setattr(admin, "restore_provider_registry", unexpected)
+    payload = {"provider": "anthropic", "provider_model_id": "new-upstream", "enabled": False, **fields}
+    response = client.post(
+        f"/admin/api/models/{target}",
+        headers={"Authorization": "Bearer admin", "If-None-Match": "*"}, json=payload,
+    )
+    assert response.status_code == 412
+    assert [(p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino) for p in paths] == before
+    assert providers._load_models() is cached_models
+
+
+@pytest.mark.parametrize("values", [
+    [""], ['"etag"'], ['W/"etag"'], ['"*"'], ["*, *"], ["*", "*"], ["*", '"etag"'],
+])
+def test_create_only_rejects_unsupported_preconditions(client, monkeypatch, values):
+    def unexpected(*args, **kwargs):
+        pytest.fail("Unsupported preconditions must not start a mutation")
+
+    monkeypatch.setattr(admin, "_apply_registry_mutation", unexpected)
+    response = client.post(
+        "/admin/api/models/new-model",
+        headers=[("Authorization", "Bearer admin"), *[("If-None-Match", v) for v in values]],
+        json={"provider": "anthropic", "provider_model_id": "new-upstream"},
+    )
+    assert response.status_code == 400
+
+
+@pytest.mark.parametrize("precondition", ["*", '"unsupported"'])
+def test_create_only_keeps_auth_and_write_gates(client_readonly, monkeypatch, precondition):
+    monkeypatch.setenv("MODEL_GATEWAY_CLIENT_KEYS", "consumer-key")
+    payload = {"provider": "anthropic", "provider_model_id": "new-upstream"}
+    for key in (None, "wrong", "consumer-key", "admin"):
+        headers = {"If-None-Match": precondition}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        response = client_readonly.post("/admin/api/models/new-model", headers=headers, json=payload)
+        assert response.status_code == (403 if key == "admin" else 401)
+    assert not any(e["name"] == "new-model" for e in config_io.load_model_info()["llm"])
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT"])
+@pytest.mark.parametrize("shared_alias", [False, True])
+def test_create_only_competing_api_requests_have_one_winner(client, monkeypatch, shared_alias, method):
+    # Separate TestClients give concurrent requests independent event loops.
+    # Rendezvous immediately before the real lock so an outside-lock existence
+    # check would let both requests through and fail this test deterministically.
+    barrier = threading.Barrier(2)
+    real_lock = admin.config_write_lock
+
+    @contextmanager
+    def competing_lock(path):
+        barrier.wait(timeout=5)
+        with real_lock(path):
+            yield
+
+    monkeypatch.setattr(admin, "config_write_lock", competing_lock)
+
+    def create(index):
+        competing_client = TestClient(app)
+        name = f"competing-model-{index}" if shared_alias else "competing-model"
+        return competing_client.request(
+            method, f"/admin/api/models/{name}",
+            headers={"Authorization": "Bearer admin", "If-None-Match": "*"},
+            json={"provider": "anthropic", "provider_model_id": f"upstream-{index}",
+                  "alias": "shared-alias" if shared_alias else f"alias-{index}", "enabled": bool(index)},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(create, index) for index in range(2)]
+        responses = [future.result(timeout=10) for future in futures]
+    assert sorted(r.status_code for r in responses) == [200, 412]
+    winner = next(index for index, response in enumerate(responses) if response.status_code == 200)
+    entries = [e for e in config_io.load_model_info()["llm"] if e["name"].startswith("competing-model")]
+    assert len(entries) == 1
+    name = f"competing-model-{winner}" if shared_alias else "competing-model"
+    assert entries[0]["name"] == name
+    assert entries[0]["provider_model_id"] == f"upstream-{winner}"
+    assert entries[0]["alias"] == ("shared-alias" if shared_alias else f"alias-{winner}")
+    assert config_io.load_config_full()["model_overrides"] == {name: {"enabled": bool(winner)}}
+    assert providers._load_models()[name]["provider_model_id"] == f"upstream-{winner}"
 
 
 def test_admin_upsert_model_applies_enabled_checkbox(client):
