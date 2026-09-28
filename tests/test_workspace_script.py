@@ -336,7 +336,9 @@ def test_cmd_add_ai_gateway_style_derives_base_url_and_sets_workspace_url(tmp_pa
     assert entry["base_url"] == "https://1444828305810485.ai-gateway.cloud.databricks.com"
     assert entry["workspace_url"] == "https://e2-demo-field-eng.cloud.databricks.com"
     assert entry["api_key"] == token
-    assert entry["path_prefixes"] == {"anthropic": "anthropic/v1", "openai": "mlflow/v1"}
+    assert entry["path_prefixes"] == {
+        "anthropic": "anthropic/v1", "openai": "mlflow/v1", "responses": "openai/v1",
+    }
     assert entry["quirks"] == ["anthropic_bearer_auth"]
     assert entry.get("endpoint_style") is None
     assert workspace._load_config(config)["pools"]["default-pool"] == ["new-ws"]
@@ -537,7 +539,9 @@ def test_replace_auto_keeps_ai_gateway_when_runtime_route_works(tmp_path, monkey
     entry = ws._load_config(config)["providers"]["ws"]
     assert entry["base_url"] == "https://7474651766001209.ai-gateway.cloud.databricks.com"
     assert entry["workspace_url"] == "https://fevm.cloud.databricks.com"
-    assert entry["path_prefixes"] == {"anthropic": "anthropic/v1", "openai": "mlflow/v1"}
+    assert entry["path_prefixes"] == {
+        "anthropic": "anthropic/v1", "openai": "mlflow/v1", "responses": "openai/v1",
+    }
     assert "endpoint_style" not in entry
     assert [c[0] for c in calls] == ["ai-gateway", "ai-gateway"]  # route pick + verify, same route
 

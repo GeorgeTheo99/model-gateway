@@ -673,6 +673,7 @@ async def _forward_imported_if_known(request: Request, path: str, body: dict) ->
 ADAPTIVE_THINKING_ANTHROPIC_MODELS = {
     "claude-fable-5",
     "claude-opus-5",
+    "claude-opus-5-5",
     "claude-opus-4-7",
     "claude-opus-4-8",
 }

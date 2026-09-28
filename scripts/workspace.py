@@ -303,7 +303,11 @@ def _stamp_coverage(entry: dict, available: list[str] | None) -> None:
 
 SMOKE_CANDIDATES = ("databricks-claude-sonnet-4-6", "databricks-gpt-5-4-mini", "databricks-gpt-5-5")
 
-AI_GATEWAY_PATH_PREFIXES = {"anthropic": "anthropic/v1", "openai": "mlflow/v1"}
+AI_GATEWAY_PATH_PREFIXES = {
+    "anthropic": "anthropic/v1",
+    "openai": "mlflow/v1",
+    "responses": "openai/v1",
+}
 
 
 class RoutePreflightError(Exception):
