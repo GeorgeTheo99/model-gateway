@@ -689,8 +689,10 @@ cmd_secrets() {
   done
   check_prereqs
   [ "$dry_run" = 1 ] || ensure_runtime_paths_safe "secret migration"
-  local rc=0
-  MODEL_GATEWAY_BACKUP_DIR="$BACKUP_DIR" \
+  # Keep the pre-migration config backup with the running service's backups.
+  local rc=0 backup_dir
+  backup_dir="$(plist_env_value "$(plist_path)" MODEL_GATEWAY_BACKUP_DIR || true)"
+  MODEL_GATEWAY_BACKUP_DIR="${backup_dir:-$BACKUP_DIR}" \
   MODEL_GATEWAY_MODEL_INFO="$MODEL_INFO_PATH" \
   MODEL_GATEWAY_MODEL_INFO_SOURCE="$MODEL_INFO_SOURCE_PATH" \
     "$UV_BIN" run --project "$ROOT_DIR" python "$ROOT_DIR/scripts/migrate_api_keys.py" \
