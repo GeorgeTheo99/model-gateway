@@ -12,6 +12,9 @@ Commands:
                                       [--style inherit|invocations|ai-gateway|auto]
                                       [--allow-partial]
     model-gateway workspace remove <name>
+    model-gateway workspace pool add-member <pool> <name> [--dry-run]
+    model-gateway workspace pool create <pool> --members a,b[,c] --model <id>
+                                          [--model <id> ...] [--dry-run]
     model-gateway workspace normalize <pasted-url>   # validate; print https origin
 
 `add`/`replace` are idempotent and verify BEFORE committing config. If gateway
@@ -27,6 +30,10 @@ activation fails, the previous config is restored and activated automatically:
 
 `replace` gives the new workspace the old one's pool positions, then removes
 the old entry. `remove` refuses to empty a pool. `test` runs steps 1-4 only.
+`pool create` builds a new ordered pool from registered workspaces and binds
+models to it; every member must keep each model's upstream id and wire format,
+coverage accepts legacy serving endpoints or Unity model services, and each
+member is smoked through its exact route before the config is committed.
 
 Accepted --host shapes: https://host, https://host/?o=123, bare host. A bare
 workspace ID (e.g. 7474651766001209) is rejected with instructions to paste
@@ -66,10 +73,14 @@ from pathlib import Path
 
 import yaml
 
+# The operator wrapper invokes this file directly, not as a Python module.
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from src.catalog import canonical_provider  # noqa: E402
+from src.config_lock import config_write_lock  # noqa: E402
+from src.request_options import normalize_token_limit, upstream_auth_headers  # noqa: E402
 from src.secret_files import read_api_key_file  # noqa: E402
 
 HOME = Path.home()
@@ -165,19 +176,22 @@ def _databricks(*args: str, timeout: int = 60) -> subprocess.CompletedProcess:
     return subprocess.run([cli, *args], capture_output=True, text=True, timeout=timeout)
 
 
-def ensure_auth(host: str, profile: str) -> str:
-    """Return a fresh access token for the workspace, running SSO if needed."""
-    proc = _databricks("auth", "token", "--profile", profile)
+def ensure_auth(host: str, profile: str, *, allow_login: bool = True) -> str:
+    """Mint using the configured profile or host, respecting browser-login policy."""
+    selector = ["--profile", profile] if profile else ["--host", host]
+    proc = _databricks("auth", "token", *selector)
     if proc.returncode != 0:
-        print(f"  auth: profile {profile!r} has no valid token — launching browser SSO for {host}")
+        if not allow_login:
+            raise _fail("cached OAuth authentication failed and auth_login is disabled")
+        print(f"  auth: no valid token — launching browser SSO for {host}")
         login = subprocess.run(
             [shutil.which("databricks") or "/opt/homebrew/bin/databricks",
-             "auth", "login", "--host", host, "--profile", profile],
+             "auth", "login", "--host", host, *(["--profile", profile] if profile else [])],
             timeout=300,
         )
         if login.returncode != 0:
             raise _fail(f"browser SSO login failed for {host} (profile {profile})")
-        proc = _databricks("auth", "token", "--profile", profile)
+        proc = _databricks("auth", "token", *selector)
         if proc.returncode != 0:
             raise _fail(f"still cannot mint a token for profile {profile}: {proc.stderr[:200]}")
     token = json.loads(proc.stdout).get("access_token", "")
@@ -261,6 +275,42 @@ def probe_endpoints(host: str, token: str) -> set[str]:
     return names
 
 
+def probe_model_services(host: str, token: str) -> set[str]:
+    """Unity Catalog model-service names (e.g. ``system.ai.claude-opus-5-5``).
+
+    Unity Gateway models are not listed by the legacy serving-endpoints API.
+    Workspaces without the API (or without access) report none rather than
+    failing: coverage then falls back to the legacy listing alone.
+    """
+    names: set[str] = set()
+    page, seen = "", set()
+    while True:
+        query = urllib.parse.urlencode({"parent": "schemas/system.ai", **({"page_token": page} if page else {})})
+        try:
+            data = _get_json(f"{host}/api/2.1/unity-catalog/model-services?{query}", token)
+        except (OSError, ValueError) as exc:  # URLError/HTTPError/timeouts are OSErrors
+            print(f"  probe: Unity model services unavailable ({exc})")
+            return names
+        if not isinstance(data, dict):
+            return names
+        for service in data.get("model_services") or []:
+            name = str(service.get("name") or "") if isinstance(service, dict) else ""
+            if name:
+                names.add(name.removeprefix("model-services/"))
+        page = data.get("next_page_token") or ""
+        if not page or page in seen:
+            return names
+        seen.add(page)
+
+
+def _served_model_ids(host: str, token: str, wanted: set[str]) -> set[str]:
+    """Which wanted provider_model_ids the workspace serves (legacy or Unity)."""
+    served = probe_endpoints(host, token) & wanted
+    if wanted - served:
+        served |= probe_model_services(host, token) & wanted
+    return served
+
+
 def _affected_models(config: dict, pool_names: list[str], provider_names: list[str] = ()) -> list[dict]:
     """Models served by the given pools OR bound directly to the given providers."""
     models = []
@@ -318,7 +368,11 @@ def _stamp_coverage(entry: dict, available: list[str] | None) -> None:
 
 SMOKE_CANDIDATES = ("databricks-claude-sonnet-4-6", "databricks-gpt-5-4-mini", "databricks-gpt-5-5")
 
-AI_GATEWAY_PATH_PREFIXES = {"anthropic": "anthropic/v1", "openai": "mlflow/v1"}
+AI_GATEWAY_PATH_PREFIXES = {
+    "anthropic": "anthropic/v1",
+    "openai": "mlflow/v1",
+    "responses": "openai/v1",
+}
 
 
 class RoutePreflightError(Exception):
@@ -340,14 +394,13 @@ def _classify_url_error(exc: urllib.error.URLError) -> tuple[str, str]:
     return "connect", str(reason)
 
 
-def _smoke_request(url: str, body: dict, headers: dict, deadline: float) -> None:
+def _smoke_request(url: str, body: dict, headers: dict, deadline: float) -> dict:
     req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
                                  headers={"content-type": "application/json", **headers})
     while True:
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
-                json.loads(resp.read())
-                return
+                return json.loads(resp.read())
         except urllib.error.HTTPError as exc:
             snippet = exc.read()[:150]
             if exc.code == 429 and time.time() < deadline:
@@ -433,9 +486,19 @@ def _config_target(path: Path) -> Path:
 def _backup(path: Path) -> Path:
     """Create a collision-safe, owner-only backup of secret-bearing config."""
     path = _config_target(path)
-    backup = path.with_name(path.name + f".bak-{time.strftime('%Y%m%d-%H%M%S')}")
+    stamp = path.name + f".bak-{time.strftime('%Y%m%d-%H%M%S')}"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(backup, flags, 0o600)
+    # Two commits within one second (e.g. back-to-back pool edits) must not
+    # collide; O_EXCL still guarantees an existing backup is never reused.
+    for attempt in range(100):
+        backup = path.with_name(stamp if attempt == 0 else f"{stamp}-{attempt}")
+        try:
+            fd = os.open(backup, flags, 0o600)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise FileExistsError(f"too many config backups named {stamp}*")
     try:
         os.fchmod(fd, 0o600)
         with path.open("rb") as source, os.fdopen(fd, "wb") as target:
@@ -564,23 +627,33 @@ def activate_gateway() -> None:
         reload_gateway()
 
 
-def _commit_and_activate(path: Path, config: dict) -> None:
-    """Commit verified config, activate it, and roll back on activation failure."""
-    backup = _backup(path)
-    _write_config(path, config)
+def _commit_and_activate(path: Path, config: dict, *, expected_bytes: bytes | None = None,
+                         verify=None) -> None:
+    """Commit, activate and optionally verify; never clobber concurrent edits."""
+    with config_write_lock(path):
+        if expected_bytes is not None and path.read_bytes() != expected_bytes:
+            raise _fail("config changed during validation; retry against the current config")
+        backup = _backup(path)
+        _write_config(path, config)
+        committed = path.read_bytes()
     print(f"  commit: {_config_target(path)}")
     try:
         activate_gateway()
-    except Exception as activation_error:
+        if verify is not None:
+            verify()
+    except (Exception, SystemExit) as activation_error:
         print(f"  activation: FAILED — {activation_error}")
         print(f"  rollback: restoring {backup.name}")
         try:
-            _restore_backup(path, backup)
+            with config_write_lock(path):
+                if path.read_bytes() != committed:
+                    raise RuntimeError("config changed after commit; refusing to overwrite concurrent changes")
+                _restore_backup(path, backup)
             activate_gateway()
         except Exception as rollback_error:
             raise _fail(
                 "activation failed and rollback could not be activated; "
-                f"config was restored from {backup}, but the gateway needs manual recovery: "
+                f"backup is at {backup}; the gateway needs manual recovery: "
                 f"{rollback_error}"
             ) from rollback_error
         raise _fail(
@@ -849,6 +922,270 @@ def cmd_remove(args) -> None:
     print(f"workspace remove: DONE — {args.name} removed")
 
 
+def _pool_admin_key(config: dict) -> str:
+    keys = (config.get("auth") or {}).get("admin_keys") or []
+    if isinstance(keys, str):
+        keys = [key.strip() for key in keys.split(",") if key.strip()]
+    key = ADMIN_KEY or next(iter(keys), "")
+    if not key:
+        raise _fail("pool management requires an admin read key (MODEL_GATEWAY_ADMIN_KEY or auth.admin_keys)")
+    return key
+
+
+def _pool_runtime_status(path: Path, key: str) -> dict:
+    status = _get_json(f"{GATEWAY_URL}/admin/api/status", key)
+    if status.get("status") != "ok" or Path(status.get("config_path", "")).resolve() != path.resolve():
+        raise _fail("gateway is not serving the selected config; check MODEL_GATEWAY_CONFIG and MODEL_GATEWAY_URL")
+    if not status.get("model_info_path"):
+        raise _fail("gateway did not report its model catalog path")
+    return status
+
+
+def _verify_live_pool(path: Path, key: str, pool: str, members: list[str], models: list[str] = ()) -> None:
+    _pool_runtime_status(path, key)
+    data = _get_json(f"{GATEWAY_URL}/admin/api/workspace-pools", key)
+    live = next((p for p in data.get("pools", []) if p.get("id") == pool), {})
+    rows = live.get("members", [])
+    expected = [canonical_provider(member) for member in members]
+    if [row.get("id") for row in rows] != expected or not rows or not rows[-1].get("ready"):
+        raise RuntimeError(f"live pool {pool!r} did not activate the expected member order/readiness")
+    missing = sorted(set(models) - set(live.get("models") or []))
+    if missing:
+        raise RuntimeError(f"live pool {pool!r} is not serving model(s): {', '.join(missing)}")
+    print(f"  live pool: {' → '.join(members)}")
+
+
+def _reject_shell_overrides(members) -> None:
+    """Validate the saved connections, not credentials inherited by this shell.
+
+    The interactive shell need not share the launchd service's environment;
+    probing with overrides could publish config the service interprets
+    differently.
+    """
+    from src.providers import _provider_env_prefix
+
+    for candidate in members:
+        prefix = _provider_env_prefix(candidate)
+        variables = [f"{prefix}_{suffix}" for suffix in ("BASE_URL", "API_KEY", "PROTOCOL", "ENABLED")]
+        if candidate == "databricks":
+            variables += ["DATABRICKS_HOST", "DATABRICKS_TOKEN", "DATABRICKS_SERVING_BASE_URL"]
+        if any(variable in os.environ for variable in variables):
+            raise _fail(f"workspace {candidate!r} has shell routing/credential overrides; "
+                        "unset DATABRICKS_* / MODEL_GATEWAY_PROVIDER_* overrides before pool management")
+
+
+def _probe_member(entry: dict, routes) -> None:
+    """Authenticate a registered member, check coverage, and smoke its routes."""
+    host = normalize_host(str(entry.get("workspace_url") or entry.get("base_url", "")))
+    token = (ensure_auth(host, entry.get("auth_profile") or "", allow_login=entry.get("auth_login") is not False)
+             if entry.get("auth_refresh") == "databricks-cli" else routes[0].api_key)
+    wanted = {route.provider_model_id for route in routes}
+    missing = sorted(wanted - _served_model_ids(host, token, wanted))
+    if missing:
+        raise _fail(f"workspace does not serve pool models: {', '.join(missing)}")
+    auth_quirks = entry.get("quirks") or []
+    if isinstance(auth_quirks, str):
+        auth_quirks = [quirk.strip() for quirk in auth_quirks.split(",") if quirk.strip()]
+    _smoke_pool_routes(routes, token, auth_quirks=auth_quirks)
+
+
+def _smoke_pool_routes(routes, token: str, *, auth_quirks=()) -> None:
+    """Probe each model using the router's resolved URL and wire format."""
+    for route in routes:
+        headers = upstream_auth_headers(token, route.protocol, auth_quirks)
+        body = {"model": route.provider_model_id, "max_tokens": 16,
+                "messages": [{"role": "user", "content": "Reply OK"}]}
+        if route.api_style == "open_responses":
+            url = route.base_url
+            body = {"model": route.provider_model_id, "input": "Reply OK", "max_output_tokens": 16}
+        elif route.protocol in {"openai", "anthropic"}:
+            suffix = route.endpoint_suffix
+            if suffix is None:
+                suffix = "/messages" if route.protocol == "anthropic" else "/chat/completions"
+            url = route.base_url.rstrip("/") + suffix
+            if route.protocol == "openai":
+                normalize_token_limit(body, route.quirks)
+                if "force_reasoning_effort_max" in route.quirks:
+                    body["reasoning_effort"] = "max"
+        else:
+            raise _fail(f"unsupported smoke protocol {route.protocol!r}")
+        try:
+            result = _smoke_request(url, body, headers, time.time() + 120)
+            response_field = ("output" if route.api_style == "open_responses" else
+                              "content" if route.protocol == "anthropic" else "choices")
+            if not isinstance(result, dict) or result.get("error") or not result.get(response_field):
+                raise _fail(f"{route.provider_model_id} smoke returned no {response_field}")
+        except RoutePreflightError as exc:
+            raise _fail(f"{route.provider_model_id} smoke failed ({exc.kind}): {exc.detail}") from exc
+        print(f"  smoke: OK ({route.provider_model_id})")
+
+
+def cmd_pool_add_member(args) -> None:
+    """Attach a registered workspace without rebuilding its provider entry."""
+    from src.providers import _find_provider_location, preview_pool_member
+
+    original = args.config.read_bytes()
+    config = yaml.safe_load(original) or {}
+    pools = config.get("pools") or {}
+    members = pools.get(args.pool)
+    if not isinstance(members, list) or not members:
+        raise _fail(f"unknown or empty pool {args.pool!r}; use workspace list")
+    member = canonical_provider(args.name)
+    found = _find_provider_location(config, member)
+    if found is None:
+        raise _fail(f"unknown workspace {args.name!r}; register it with workspace add first")
+    entry = found[2]
+    if member in {canonical_provider(name) for name in members}:
+        print(f"workspace pool add-member: no change — {args.name!r} already belongs to {args.pool!r}")
+        return
+    if entry.get("enabled") is False:
+        raise _fail(f"workspace {args.name!r} is disabled")
+    _reject_shell_overrides({member, *(canonical_provider(name) for name in members)})
+    if not args.dry_run:
+        _require_activation_path()
+    key = _pool_admin_key(config)
+    status = _pool_runtime_status(args.config, key)
+    if not args.dry_run and not RESTART_BIN and not status.get("writes_enabled"):
+        raise _fail("admin writes are disabled; run through model-gateway workspace for restart activation")
+    staged = copy.deepcopy(config)
+    staged["pools"][args.pool].append(member)
+    try:
+        routes = preview_pool_member(staged, args.config, Path(status["model_info_path"]), args.pool, member)
+    except ValueError as exc:
+        raise _fail(str(exc)) from exc
+    if not routes:
+        raise _fail(f"pool {args.pool!r} has no enabled models to validate")
+    print(f"  planned pool: {' → '.join(staged['pools'][args.pool])}")
+    _probe_member(entry, routes)
+    if args.dry_run:
+        print("workspace pool add-member: dry run PASSED — no config write or restart")
+        return
+    _commit_and_activate(
+        args.config, staged, expected_bytes=original,
+        verify=lambda: _verify_live_pool(args.config, key, args.pool, staged["pools"][args.pool]),
+    )
+    print(f"workspace pool add-member: DONE — {args.name} is live in {args.pool}")
+
+
+def _bind_model(config: dict, catalog_path: Path, model_id: str, pool: str, primary: str) -> str:
+    """Point one model at ``pool`` in the config overlay; return its name.
+
+    Only routing fields change. A catalog-only model gains a minimal overlay
+    entry that inherits every capability from ``model-info.json``.
+    """
+    from src.catalog import entry_routable_ids, load_catalog_entries
+
+    if not isinstance(config.get("models"), list):
+        config["models"] = []
+    overlay = config["models"]
+    # Resolve against the merged catalog first: a minimal overlay entry does not
+    # repeat the alias/upstream id it inherits, so matching the raw overlay alone
+    # would append a duplicate entry on every re-run.
+    try:
+        merged = next((m for m in load_catalog_entries(catalog_path, overlay=overlay)
+                       if model_id in entry_routable_ids(m)), None)
+    except ValueError as exc:
+        raise _fail(f"invalid model catalog: {exc}") from exc
+    if merged is None:
+        raise _fail(f"unknown model {model_id!r}; use a catalog name, alias or upstream id")
+    ids = set(entry_routable_ids(merged))
+    entry = next((m for m in overlay if isinstance(m, dict) and ids & set(entry_routable_ids(m))), None)
+    if entry is None:
+        entry = {"name": merged["name"]}
+        overlay.append(entry)
+    current = entry.get("pool")
+    if current and current != pool:
+        raise _fail(f"model {model_id!r} already uses pool {current!r}; manage that pool instead")
+    entry["provider"] = primary
+    entry["pool"] = pool
+    return str(entry["name"])
+
+
+def cmd_pool_create(args) -> None:
+    """Create an ordered pool from registered workspaces and bind models to it.
+
+    Models keep their upstream id and wire format: every member must resolve
+    to the same protocol/API style as the model's current route, so active
+    client sessions remain compatible after activation. Re-running with an
+    already-applied pool/binding is a no-op.
+    """
+    from src.providers import (_find_provider_location, preview_model_enabled, preview_model_route,
+                               preview_pool_member)
+
+    original = args.config.read_bytes()
+    config = yaml.safe_load(original) or {}
+    raw = [name.strip() for name in args.members.split(",") if name.strip()]
+    members = [canonical_provider(name) for name in raw]
+    if len(members) < 2:
+        raise _fail("a failover pool needs at least two --members")
+    if len(set(members)) != len(members):
+        raise _fail("--members must not repeat a workspace")
+    entries = {}
+    for name, member in zip(raw, members):
+        found = _find_provider_location(config, member)
+        if found is None:
+            raise _fail(f"unknown workspace {name!r}; register it with workspace add first")
+        if found[2].get("enabled") is False:
+            raise _fail(f"workspace {name!r} is disabled")
+        entries[member] = found[2]
+    existing = (config.get("pools") if isinstance(config.get("pools"), dict) else {}).get(args.pool)
+    if existing is not None and [canonical_provider(m) for m in existing or []] != members:
+        raise _fail(f"pool {args.pool!r} already exists with different members; use workspace pool add-member")
+    _reject_shell_overrides(members)
+    if not args.dry_run:
+        _require_activation_path()
+    key = _pool_admin_key(config)
+    status = _pool_runtime_status(args.config, key)
+    catalog_path = Path(status["model_info_path"])
+
+    staged = copy.deepcopy(config)
+    if staged.get("pools") is None:
+        staged["pools"] = {}
+    elif not isinstance(staged["pools"], dict):
+        raise _fail("config 'pools' must be a mapping of pool name to member list")
+    staged["pools"][args.pool] = existing if existing is not None else list(members)
+    names = list(dict.fromkeys(_bind_model(staged, catalog_path, model, args.pool, members[0])
+                               for model in args.model))
+    disabled = [name for name in names if not preview_model_enabled(staged, args.config, catalog_path, name)]
+    if disabled:
+        raise _fail(f"model(s) disabled by runtime model_overrides: {', '.join(disabled)}")
+    if staged == config:
+        print(f"workspace pool create: no change — {args.pool!r} already serves {', '.join(names)}")
+        return
+    if not args.dry_run and not RESTART_BIN and not status.get("writes_enabled"):
+        raise _fail("admin writes are disabled; run through model-gateway workspace for restart activation")
+    for model in names:
+        before = preview_model_route(config, args.config, catalog_path, model)
+        for member in members:
+            after = preview_model_route(staged, args.config, catalog_path, model, provider_override=member)
+            if after is None:
+                raise _fail(f"{model}: workspace {member!r} is not routable")
+            if before is None:
+                continue
+            if (after.protocol, after.api_style) != (before.protocol, before.api_style):
+                raise _fail(
+                    f"{model}: {member!r} speaks {after.protocol}/{after.api_style or 'default'} but the "
+                    f"current route speaks {before.protocol}/{before.api_style or 'default'}; register a "
+                    "compatible route (workspace add --style ...) so active sessions keep working")
+            # The upstream id is preserved by construction: _bind_model changes
+            # only the model's provider/pool routing fields.
+    print(f"  planned pool: {args.pool}: {' → '.join(members)} (models: {', '.join(names)})")
+    for member in members:
+        try:
+            routes = preview_pool_member(staged, args.config, catalog_path, args.pool, member)
+        except ValueError as exc:
+            raise _fail(str(exc)) from exc
+        print(f"  member {member}:")
+        _probe_member(entries[member], routes)
+    if args.dry_run:
+        print("workspace pool create: dry run PASSED — no config write or restart")
+        return
+    _commit_and_activate(
+        args.config, staged, expected_bytes=original,
+        verify=lambda: _verify_live_pool(args.config, key, args.pool, members, names),
+    )
+    print(f"workspace pool create: DONE — {', '.join(names)} now fail over across {args.pool}")
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="model-gateway workspace",
@@ -892,9 +1229,24 @@ def main() -> None:
     p = sub.add_parser("remove")
     p.add_argument("name")
 
+    p = sub.add_parser("pool", help="manage existing workspace pool membership")
+    pool_commands = p.add_subparsers(dest="pool_command", required=True)
+    p = pool_commands.add_parser("add-member", help="validate and append an existing workspace")
+    p.add_argument("pool")
+    p.add_argument("name")
+    p.add_argument("--dry-run", action="store_true", help="run auth/model probes without writing or restarting")
+    p = pool_commands.add_parser("create", help="create an ordered pool and bind models to it")
+    p.add_argument("pool")
+    p.add_argument("--members", required=True, help="comma-separated registered workspaces, primary first")
+    p.add_argument("--model", action="append", required=True,
+                   help="model name, alias or upstream id to bind (repeatable)")
+    p.add_argument("--dry-run", action="store_true", help="run auth/model probes without writing or restarting")
+
     args = parser.parse_args()
+    pool_commands_map = {"add-member": cmd_pool_add_member, "create": cmd_pool_create}
     {"list": cmd_list, "repair": cmd_repair, "test": cmd_test, "add": cmd_add,
      "replace": cmd_replace, "remove": cmd_remove,
+     "pool": lambda a: pool_commands_map[a.pool_command](a),
      "normalize": lambda a: print(normalize_host(a.url))}[args.command](args)
 
 

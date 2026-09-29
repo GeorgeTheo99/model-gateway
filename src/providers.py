@@ -93,9 +93,9 @@ class ProviderInfo:
     # invocation URL (e.g. endpoint_style: invocations providers).
     endpoint_suffix: str | None = None
     # Gateway request style for this model: "" (default: protocol-native
-    # chat/messages), or "open_responses" for models served through the
-    # workspace-wide Open Responses endpoint (/serving-endpoints/open-responses)
-    # because the upstream rejects function tools on chat/completions.
+    # chat/messages), or "open_responses" for Responses-only models. Providers
+    # with path_prefixes use the responses prefix (or openai prefix); legacy
+    # workspace providers use /serving-endpoints/open-responses.
     api_style: str = ""
     # Provider quirk flags from config (e.g. "no_stream_options",
     # "no_reasoning_params"). Generic mechanism; which providers need which
@@ -932,6 +932,69 @@ def pool_candidates(model_id: str) -> list[str]:
     return _configured_pool_members(entry, _load_config())
 
 
+@contextmanager
+def _preview_snapshot(config: dict, config_path: Path, model_info_path: Path):
+    """Temporarily route against a staged config; always restore the registry.
+
+    Callers hold the registry lock, which hides the snapshot from concurrent
+    readers. No auth refresh, network calls, or config writes occur here.
+    """
+    global _config, _models, CONFIG_PATH, MODEL_INFO_PATH
+    saved = _config, _models, CONFIG_PATH, MODEL_INFO_PATH
+    try:
+        _config, _models = config, None
+        CONFIG_PATH, MODEL_INFO_PATH = config_path.resolve(), model_info_path.resolve()
+        yield
+    finally:
+        _config, _models, CONFIG_PATH, MODEL_INFO_PATH = saved
+
+
+@_registry_locked
+def preview_model_route(
+    config: dict, config_path: Path, model_info_path: Path, model_id: str,
+    provider_override: str | None = None,
+) -> ProviderInfo | None:
+    """Resolve a model route against a config snapshot, without publishing it."""
+    with _preview_snapshot(config, config_path, model_info_path):
+        return resolve(model_id, provider_override=provider_override)
+
+
+@_registry_locked
+def preview_model_enabled(config: dict, config_path: Path, model_info_path: Path, name: str) -> bool:
+    """Whether runtime ``model_overrides`` in a config snapshot enable ``name``."""
+    with _preview_snapshot(config, config_path, model_info_path):
+        return _is_model_enabled(name)
+
+
+@_registry_locked
+def preview_pool_member(
+    config: dict, config_path: Path, model_info_path: Path, pool: str, member: str,
+) -> list[ProviderInfo]:
+    """Resolve a staged pool addition using runtime rules, without publishing it.
+
+    Even failed previews restore the original caches and path configuration.
+    """
+    with _preview_snapshot(config, config_path, model_info_path):
+        entries = {id(entry): entry for entry in _load_models().values()}
+        routes = []
+        for entry in entries.values():
+            if entry.get("pool") != pool or not _is_model_enabled(entry.get("name")):
+                continue
+            name = entry["name"]
+            candidate = resolve(name, provider_override=member)
+            if candidate is None or candidate.composite is not None:
+                raise ValueError(f"{name}: workspace {member!r} is not routable")
+            for existing in _configured_pool_members(entry, config):
+                info = resolve(name, provider_override=existing)
+                if info is None or (info.protocol, info.api_style) != (candidate.protocol, candidate.api_style):
+                    raise ValueError(f"{name}: incompatible wire format between {existing!r} and {member!r}")
+            coverage = _effective_provider_config(config, member).get("available_model_ids")
+            if coverage is not None and candidate.provider_model_id not in coverage:
+                raise ValueError(f"{name}: excluded by {member!r} available_model_ids; revalidate workspace coverage first")
+            routes.append(candidate)
+        return routes
+
+
 @_registry_locked
 def resolve(model_id: str, provider_override: str | None = None) -> ProviderInfo | None:
     """Resolve a model name/alias/id to provider info.
@@ -1020,16 +1083,23 @@ def resolve(model_id: str, provider_override: str | None = None) -> ProviderInfo
     api_style = (entry.get("api_style") or "").strip().lower()
     endpoint_suffix: str | None = None
     if api_style == "open_responses":
-        # Responses-only model: route to the workspace-wide Open Responses
-        # endpoint instead of a per-model invocations URL. Pool members swap
-        # cleanly because every member resolves to the same-shaped URL
-        # (endpoint_suffix "").
-        # Explicit configs may use the workspace root; Databricks environment
-        # configuration already includes /serving-endpoints. Accept both.
-        base_url = (
-            base_url.rstrip("/").removesuffix("/serving-endpoints")
-            + "/serving-endpoints/open-responses"
-        )
+        # Unity Gateway exposes native Responses separately from unified Chat:
+        # path_prefixes: {openai: mlflow/v1, responses: openai/v1}.
+        # A unified Responses provider can use its openai prefix for both.
+        path_prefixes = provider_config.get("path_prefixes") or {}
+        prefix = (
+            path_prefixes.get("responses") or path_prefixes.get("openai")
+        ) if isinstance(path_prefixes, dict) else None
+        if prefix:
+            base_url = base_url.rstrip("/") + "/" + str(prefix).strip("/") + "/responses"
+        else:
+            # Preserve explicit legacy workspace routing for other installs.
+            base_url = (
+                base_url.rstrip("/").removesuffix("/serving-endpoints")
+                + "/serving-endpoints/open-responses"
+            )
+        # A complete URL keeps native passthrough and pool failover from
+        # appending an operation twice or falling back to the legacy path.
         endpoint_suffix = ""
     elif endpoint_style == "invocations":
         # base_url is a workspace host; each model has its own full invocation

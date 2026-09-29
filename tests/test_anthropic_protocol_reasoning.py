@@ -105,3 +105,60 @@ def test_messages_proxy_forwards_only_native_reasoning(monkeypatch, stream, cont
     assert response.status_code == 200
     assert response.json() == {"ok": True}
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("model_id", [
+    "claude-opus-5-5", "databricks-claude-opus-5-5",
+    "system.ai.claude-opus-5-5", "system.ai.databricks-claude-opus-5-5",
+])
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
+@pytest.mark.parametrize("stream", [False, True], ids=["sync", "stream"])
+def test_opus55_preserves_adaptive_effort_and_tools(monkeypatch, model_id, effort, stream):
+    info = _native_info(
+        provider_model_id=model_id, thinking="always",
+        thinking_levels=("low", "medium", "high", "xhigh", "max"),
+    )
+    monkeypatch.setattr(server, "resolve", lambda model: info if model == "opus55" else None)
+    tools = [{"name": "lookup", "description": "Look up a value", "input_schema": {"type": "object"}}]
+    calls = []
+
+    async def capture(endpoint, body, headers, **kwargs):
+        calls.append(copy.deepcopy(body))
+        assert body["model"] == model_id
+        assert body["stream"] is stream
+        assert body["tools"] == tools
+        assert body["thinking"] == {"type": "adaptive"}
+        assert body["output_config"] == {"effort": effort}
+        assert "temperature" not in body
+        assert "reasoning_effort" not in body
+        return server.JSONResponse(content={"ok": True})
+
+    handler = "_passthrough_anthropic_stream" if stream else "_passthrough_anthropic_sync"
+    monkeypatch.setattr(server, handler, capture)
+    response = TestClient(server.app).post("/v1/messages", json={
+        "model": "opus55", "messages": [{"role": "user", "content": "Reply OK"}],
+        "max_tokens": 4096, "stream": stream, "tools": tools, "temperature": 0,
+        "thinking": {"type": "adaptive"}, "output_config": {"effort": effort},
+    })
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("effort", ["off", "minimal"])
+def test_opus55_rejects_unsupported_thinking_levels(monkeypatch, effort):
+    info = _native_info(
+        provider_model_id="databricks-claude-opus-5-5", thinking="always",
+        thinking_levels=("low", "medium", "high", "xhigh", "max"),
+    )
+    monkeypatch.setattr(server, "resolve", lambda model: info if model == "opus55" else None)
+
+    async def unexpected_upstream(*args, **kwargs):
+        pytest.fail("unsupported thinking levels must be rejected before inference")
+
+    monkeypatch.setattr(server, "_passthrough_anthropic_sync", unexpected_upstream)
+    response = TestClient(server.app).post("/v1/messages", json={
+        "model": "opus55", "messages": [{"role": "user", "content": "Reply OK"}],
+        "max_tokens": 4096, "reasoning_effort": effort,
+    })
+    assert response.status_code == 400

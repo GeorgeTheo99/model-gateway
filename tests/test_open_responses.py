@@ -99,6 +99,31 @@ def test_resolve_builds_open_responses_url(open_responses_registry, suffix):
     assert info.provider_model_id == "databricks-gpt-6-astra"
 
 
+@pytest.mark.parametrize("base,prefixes,expected", [
+    ("https://workspace.example.com/ai-gateway", {"openai": "mlflow/v1", "responses": "openai/v1"},
+     "https://workspace.example.com/ai-gateway/openai/v1/responses"),
+    ("https://workspace.example.com/ai-gateway/", {"openai": "/mlflow/v1/", "responses": "/openai/v1/"},
+     "https://workspace.example.com/ai-gateway/openai/v1/responses"),
+    ("https://gateway.example.com", {"openai": "mlflow/v1"},
+     "https://gateway.example.com/mlflow/v1/responses"),
+])
+def test_resolve_gateway_responses_prefix(open_responses_registry, base, prefixes, expected):
+    provider = open_responses_registry["providers"]["ws-e2"]
+    provider.update(base_url=base, path_prefixes=prefixes)
+    provider.pop("endpoint_style")
+    model = open_responses_registry["models"][0]
+    model.update(provider_model_id="system.ai.gpt-6-astra",
+                 alternate_ids=["databricks-gpt-6-astra"])
+
+    for model_id in ("astra", "gpt-6-astra", "databricks-gpt-6-astra", "system.ai.gpt-6-astra"):
+        info = providers.resolve(model_id)
+        assert info.base_url == expected
+        assert info.endpoint_suffix == ""
+        assert info.provider_model_id == "system.ai.gpt-6-astra"
+        assert server._upstream_endpoint(info, "/responses") == expected
+    assert providers.resolve("plain").base_url == base.rstrip("/") + "/mlflow/v1"
+
+
 @pytest.mark.parametrize("variable,suffix", [
     ("DATABRICKS_HOST", ""),
     ("DATABRICKS_HOST", "/"),
@@ -138,8 +163,9 @@ def test_pool_rewire_targets_open_responses_on_every_member(open_responses_regis
     assert west_info.endpoint_suffix == ""
 
 
+@pytest.mark.parametrize("gateway_members", [(), ("ws-west",), ("ws-e2", "ws-west")])
 def test_pool_failover_on_404_targets_member_open_responses_url(
-    open_responses_registry, monkeypatch
+    open_responses_registry, monkeypatch, gateway_members
 ):
     """A dead primary fails over to the next member's open-responses URL."""
     monkeypatch.setattr(upstream, "_RETRY_MAX", 1)
@@ -147,10 +173,19 @@ def test_pool_failover_on_404_targets_member_open_responses_url(
     monkeypatch.setattr(upstream, "_RETRY_MAX_DELAY", 0)
     monkeypatch.setattr(upstream, "_RETRY_TRANSPORT_ATTEMPTS", 1)
     monkeypatch.setattr(upstream, "_RETRY_TRANSPORT_MAX_DELAY", 0)
+    for member in gateway_members:
+        provider = open_responses_registry["providers"][member]
+        provider.pop("endpoint_style")
+        provider["path_prefixes"] = {"openai": "ai-gateway/mlflow/v1", "responses": "ai-gateway/openai/v1"}
+    primary = providers.resolve("astra", provider_override="ws-e2")
+    secondary = providers.resolve("astra", provider_override="ws-west")
     seen = []
 
     def handler(req: httpx.Request) -> httpx.Response:
         seen.append(str(req.url))
+        assert req.headers["authorization"] == (
+            "Bearer key-e2" if req.url.host == "e2.example.com" else "Bearer key-west"
+        )
         if req.url.host == "e2.example.com":
             return httpx.Response(404, text='{"message": "endpoint not found"}')
         return httpx.Response(200, json={"ok": True, "host": req.url.host})
@@ -158,14 +193,14 @@ def test_pool_failover_on_404_targets_member_open_responses_url(
     async def run():
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             return await upstream._retry_post_with_model_fallback(
-                client, "https://e2.example.com/serving-endpoints/open-responses",
+                client, primary.base_url,
                 json={"model": "databricks-gpt-6-astra"},
                 headers={"Authorization": "Bearer key-e2"},
                 provider="ws-e2",
                 pool=PoolContext(
                     model_key="astra",
                     provider="ws-e2",
-                    base_url="https://e2.example.com/serving-endpoints/open-responses",
+                    base_url=primary.base_url,
                     api_key="key-e2",
                     api_style="open_responses",
                 ),
@@ -173,10 +208,10 @@ def test_pool_failover_on_404_targets_member_open_responses_url(
 
     resp = asyncio.run(run())
     assert resp.status_code == 200
-    assert seen == [
-        "https://e2.example.com/serving-endpoints/open-responses",
-        "https://west.example.com/serving-endpoints/open-responses",
-    ]
+    assert seen == [primary.base_url, secondary.base_url]
+    if len(gateway_members) == 2:
+        assert all("/ai-gateway/openai/v1/responses" in url for url in seen)
+        assert not any("/serving-endpoints/" in url for url in seen)
 
 
 def test_plain_chat_model_unaffected(open_responses_registry):

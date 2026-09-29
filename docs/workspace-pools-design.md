@@ -342,8 +342,11 @@ If a routed workspace is deleted *right now*:
 - **Phase 2 (implemented):** workspace pools + per-workspace circuit/failover in
   `upstream.py`/`providers.py` (~ the existing `model_fallback` retry-wrapper
   pattern, applied one level up).
-- **Phase 3:** `model-gateway workspace add/remove/test/repair` is implemented;
-  quarantine and the admin-UI pool panel remain.
+- **Phase 3:** `model-gateway workspace add/remove/test/repair` is implemented,
+  as are `workspace pool add-member` and `workspace pool create` (new ordered
+  pool + model binding that preserves the model's upstream ID and wire format,
+  with legacy or Unity model-service coverage); quarantine and the admin-UI
+  pool panel remain.
 
 ## Open questions
 
