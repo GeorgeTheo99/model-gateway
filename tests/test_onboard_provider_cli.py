@@ -28,6 +28,47 @@ def test_operator_cli_resolves_its_installed_symlink(tmp_path):
     assert f"ROOT_DIR={SCRIPT.parents[1]}" in result.stdout
 
 
+def test_reload_verification_authenticates_with_the_service_client_key_file(monkeypatch, tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump({"auth": {"client_keys": ["config-key"]}}))
+    key_file = tmp_path / "client.key"
+    key_file.write_text("\nfile-key\n")
+    key_file.chmod(0o600)
+    monkeypatch.setenv("MODEL_GATEWAY_CLIENT_KEYS", "  ")
+    monkeypatch.setenv("MODEL_GATEWAY_CLIENT_KEYS_FILE", str(key_file))
+    assert CLI._client_headers(config) == {"Authorization": "Bearer file-key"}
+
+    monkeypatch.setenv("MODEL_GATEWAY_CLIENT_KEYS", "env-key")
+    assert CLI._client_headers(config) == {"Authorization": "Bearer env-key"}
+
+    monkeypatch.delenv("MODEL_GATEWAY_CLIENT_KEYS")
+    monkeypatch.setenv("MODEL_GATEWAY_CLIENT_KEYS_FILE", "")
+    assert CLI._client_headers(config) == {"Authorization": "Bearer config-key"}
+
+    config.write_text(yaml.safe_dump({"auth": {"client_keys": []}}))
+    assert CLI._client_headers(config) == {}
+
+
+@pytest.mark.parametrize("problem", ["world-readable", "symlink", "empty", "missing"])
+def test_reload_verification_rejects_a_key_file_the_service_would_reject(monkeypatch, tmp_path, problem):
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump({"auth": {"client_keys": ["config-key"]}}))
+    real_file = tmp_path / "real.key"
+    real_file.write_text("" if problem == "empty" else "file-key\n")
+    real_file.chmod(0o644 if problem == "world-readable" else 0o600)
+    key_file = real_file
+    if problem == "symlink":
+        key_file = tmp_path / "client.key"
+        key_file.symlink_to(real_file)
+    elif problem == "missing":
+        key_file = tmp_path / "absent.key"
+    monkeypatch.delenv("MODEL_GATEWAY_CLIENT_KEYS", raising=False)
+    monkeypatch.setenv("MODEL_GATEWAY_CLIENT_KEYS_FILE", str(key_file))
+    with pytest.raises(OnboardingError, match="client key file is unreadable or invalid"):
+        CLI._service_reloader("com.local.model-gateway-test", "http://127.0.0.1:1/health",
+                              config_path=config, model_info_path=tmp_path / "model-info.json")
+
+
 def test_reload_verification_allows_retired_name_retained_as_compatibility_id(monkeypatch, tmp_path):
     calls = []
 

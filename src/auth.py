@@ -136,6 +136,11 @@ def _key_file_values(env_name: str) -> tuple[set[str], bool]:
     return keys, bool(keys)
 
 
+def client_key_file_values() -> tuple[set[str], bool]:
+    """Legacy client keys from MODEL_GATEWAY_CLIENT_KEYS_FILE, read with the service's file checks."""
+    return _key_file_values("MODEL_GATEWAY_CLIENT_KEYS_FILE")
+
+
 def _client_auth_configured() -> bool:
     global _client_auth_required_latched
     configured = bool(

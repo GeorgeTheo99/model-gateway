@@ -34,8 +34,7 @@ precedence over config):
    auth:
      admin_keys:
        - "<admin-key>"
-     client_keys:
-       - "cloud"
+     client_keys: []  # migration-only shared keys; prefer consumer_credentials
    ```
 
    Each field accepts a list or a single comma-separated string. Reloaded on
@@ -45,9 +44,12 @@ precedence over config):
    (comma-separated), which override/extend config. Useful for ad-hoc overrides
    without editing the file.
 
-The launchd plist (`com.local.model-gateway`) only sets `MODEL_GATEWAY_*` path env vars;
-auth env vars are intentionally not wired into the plist template in `server-ci`
-`install-launchagents` to avoid committing secrets.
+The launchd plist (`com.local.model-gateway`) only sets `MODEL_GATEWAY_*` path env vars,
+including `MODEL_GATEWAY_CLIENT_KEYS_FILE` (a private file of newline-separated
+legacy client keys that must stay readable and non-empty while configured); key
+values are intentionally not wired into the plist template in `server-ci`
+`install-launchagents` to avoid committing secrets. `model-gateway onboard`
+passes the same key source to its post-reload `/v1` verification.
 
 ## Consumer profile credentials
 

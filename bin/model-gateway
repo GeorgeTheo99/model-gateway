@@ -697,7 +697,11 @@ cmd_onboard() {
   if [ -n "$MODEL_INFO_SOURCE_PATH" ]; then
     cmd+=(--model-info-source "$MODEL_INFO_SOURCE_PATH")
   fi
-  "${cmd[@]}"
+  # Post-reload /v1 verification must authenticate like the running service;
+  # an operator-exported key (e.g. a consumer token) still wins.
+  MODEL_GATEWAY_CLIENT_KEYS="${MODEL_GATEWAY_CLIENT_KEYS:-$(installed_plist_env MODEL_GATEWAY_CLIENT_KEYS)}" \
+  MODEL_GATEWAY_CLIENT_KEYS_FILE="$(installed_plist_env MODEL_GATEWAY_CLIENT_KEYS_FILE)" \
+    "${cmd[@]}"
   if [ "$generate" = 1 ] && [ "$apply" = 0 ]; then
     ok "onboarding draft generated; review it before applying"
   elif [ "$dry_run" = 0 ]; then

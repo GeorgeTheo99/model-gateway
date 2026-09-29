@@ -393,3 +393,38 @@ def test_bundle_import_restores_when_terminated_after_files_are_written(tmp_path
     assert (target / "config.yaml").read_text() == "auth:\n  client_keys: [client-token]\nproviders: {}\n"
     assert not (target / "model-info.json").exists()
     assert not list(backups.glob("bundle-rollback.*"))
+
+
+def test_onboard_passes_the_service_client_key_source_to_reload_verification(tmp_path: Path) -> None:
+    import plistlib
+
+    real = Path(os.path.realpath(tmp_path))
+    key_file = real / "client.key"
+    plist_dir = real / "LaunchAgents"
+    plist_dir.mkdir()
+    label = "com.local.model-gateway-test-does-not-exist"
+    (plist_dir / f"{label}.plist").write_bytes(plistlib.dumps({
+        "Label": label,
+        "EnvironmentVariables": {"MODEL_GATEWAY_CLIENT_KEYS_FILE": str(key_file)},
+    }))
+    captured = real / "captured.env"
+    fake_uv = real / "uv"
+    fake_uv.write_text(
+        '#!/bin/sh\nprintf "keys=%s\\nfile=%s\\n" "${MODEL_GATEWAY_CLIENT_KEYS-unset}" '
+        f'"$MODEL_GATEWAY_CLIENT_KEYS_FILE" > "{captured}"\n'
+    )
+    fake_uv.chmod(0o700)
+    env = {key: value for key, value in os.environ.items() if not key.startswith(("MODEL_GATEWAY_", "GATEWAY_VISION"))}
+    env.update({"HOME": str(real), "UV_BIN": str(fake_uv), "MODEL_GATEWAY_LAUNCHD_LABEL": label,
+                "MODEL_GATEWAY_PLIST_DIR": str(plist_dir), "MODEL_GATEWAY_CONFIG": str(real / "config.yaml"),
+                "MODEL_GATEWAY_MODEL_INFO": str(real / "model-info.json")})
+    result = subprocess.run([str(SCRIPT), "onboard", "example", "--dry-run"],
+                            capture_output=True, text=True, env=env, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert captured.read_text() == f"keys=\nfile={key_file}\n"
+
+    env["MODEL_GATEWAY_CLIENT_KEYS"] = "operator-token"
+    result = subprocess.run([str(SCRIPT), "onboard", "example", "--dry-run"],
+                            capture_output=True, text=True, env=env, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert captured.read_text() == f"keys=operator-token\nfile={key_file}\n"

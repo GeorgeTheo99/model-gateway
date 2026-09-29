@@ -21,6 +21,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from src.auth import client_key_file_values  # noqa: E402
 from src.catalog import entry_routable_ids  # noqa: E402
 from src.onboarding import (  # noqa: E402
     OnboardingError,
@@ -145,7 +146,13 @@ def _launchd_pid(target: str) -> int | None:
 
 def _client_headers(config_path: Path) -> dict[str, str]:
     config = yaml.safe_load(config_path.read_text()) or {}
-    keys = os.environ.get("MODEL_GATEWAY_CLIENT_KEYS") or (config.get("auth") or {}).get("client_keys") or []
+    keys = os.environ.get("MODEL_GATEWAY_CLIENT_KEYS", "").strip()
+    if not keys:
+        file_keys, valid = client_key_file_values()
+        if not valid:
+            raise OnboardingError("configured client key file is unreadable or invalid")
+        keys = ",".join(sorted(file_keys))
+    keys = keys or (config.get("auth") or {}).get("client_keys") or []
     if isinstance(keys, str):
         keys = [part.strip() for part in keys.split(",") if part.strip()]
     return {"Authorization": f"Bearer {keys[0]}"} if keys else {}
@@ -160,6 +167,9 @@ def _service_reloader(
     expected_models: set[str] | None = None,
     absent_models: set[str] | None = None,
 ):
+    # Resolve credentials before any config write or restart so a bad key source fails early.
+    headers = _client_headers(config_path)
+
     def reload_and_verify() -> None:
         target = f"gui/{os.getuid()}/{label}"
         previous_pid = _launchd_pid(target)
@@ -167,7 +177,6 @@ def _service_reloader(
         deadline = time.monotonic() + 30
         last_error = "service did not become healthy"
         models_url = health_url.rsplit("/health", 1)[0] + "/v1/models"
-        headers = _client_headers(config_path)
         while time.monotonic() < deadline:
             try:
                 current_pid = _launchd_pid(target)
