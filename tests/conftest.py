@@ -43,6 +43,8 @@ def _isolate_runtime_config(tmp_path, monkeypatch):
     monkeypatch.setenv("MODEL_GATEWAY_BACKUP_DIR", str(tmp_path / "config-backups"))
     # Provider key writes must never touch ~/.config/model-gateway/secrets.
     monkeypatch.setenv("MODEL_GATEWAY_SECRET_DIR", str(tmp_path / "secrets"))
+    # Startup writes the consumer discovery file; never touch the real one.
+    monkeypatch.setenv("MODEL_GATEWAY_ENDPOINT_FILE", str(tmp_path / "endpoint.json"))
     monkeypatch.setenv("MODEL_GATEWAY_LEGACY_BACKUP_DIRS", str(tmp_path / "logs" / "config-backups"))
     from src import config_io
     monkeypatch.setattr(config_io, "log_dir", tmp_path / "logs")

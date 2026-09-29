@@ -33,4 +33,4 @@ def test_portable_launchagent_uses_private_log_and_backup_contract():
     assert "ensure_log_backup_separation" in script
     assert 'chmod 600 "$plist"' in script
     assert "$HOME/.claude" not in script
-    assert "~/srv/model-gateway/shared/model-aliases.json" in script
+    assert "model_aliases: ~/Library/Application Support/model-gateway/model-aliases.json" in script

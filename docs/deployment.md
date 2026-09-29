@@ -30,6 +30,8 @@ model-gateway logs -f
 model-gateway restart
 model-gateway update      # git pull --ff-only + uv sync + restart + verify
 model-gateway env
+model-gateway consumer add|list|revoke   # see "Connecting consumers"
+model-gateway bundle export|import       # see "Moving to another machine"
 ```
 
 Portable defaults are env-overridable. During `install`, the resolved bind host and port are persisted in the owner-only `~/Library/Application Support/model-gateway/install.env`; later `update`, `restart`, `status`, and fresh shell sessions recover that assignment before falling back to the legacy defaults. Updates re-exec the newly pulled operator script before rewriting the LaunchAgent, so future installer changes use the current resolution logic. An explicit environment value still takes precedence when intentionally re-running `install`.
@@ -58,6 +60,95 @@ URLs can contain temporary capabilities; structured usage remains available in
 the ledger.
 
 After install, edit `config/config.yaml` to add auth and provider connections; provider keys go in mode-0600 `api_key_file`s (see [provider onboarding](provider-onboarding.md#where-provider-keys-are-stored)). A fresh generated config intentionally has `providers: {}`, so catalog entries remain unavailable until providers are configured. If you deliberately expose the gateway beyond loopback (`MODEL_GATEWAY_HOST=0.0.0.0`), configure `auth.client_keys` and firewall rules first.
+
+## Connecting consumers
+
+Each project connects with its own consumer credential and finds the gateway
+through a discovery file, so nothing hardcodes a port or home directory.
+
+```bash
+model-gateway consumer add myai --role runtime --allow-direct-models
+model-gateway consumer add myai --role deployer   # registers profile snapshots
+model-gateway consumer list                       # ids, permissions, key status; never values
+model-gateway consumer revoke myai-deployer       # removes the entry and deletes its key file
+```
+
+- `add` creates credential `<consumer>-<role>` with a generated mode-`0600`
+  key file at `<config dir>/secrets/consumers/<id>.key` (directory `0700`).
+  `runtime` grants `profiles:read` + `profiles:invoke`; `deployer` grants
+  `profiles:read` + `profiles:write`. The namespace defaults to the consumer
+  id (`--namespace` is repeatable). Re-running an identical `add` is a no-op;
+  an existing valid key file at the default path is adopted, not replaced, and
+  a missing one is regenerated.
+- The first credential on a gateway with no `client_keys` switches `/v1` from
+  open to key-protected; `add` prints a warning when that happens.
+- `revoke` deletes only the managed `secrets/consumers/<id>.key` file (a key
+  file elsewhere is kept), and refuses to remove the last `/v1` credential,
+  because that would reopen `/v1` without authentication.
+- `add`/`revoke` back up and validate `config.yaml` (rolling back on any
+  credential overlap), then restart the gateway. They require the installed
+  LaunchAgent to be loaded and to target the same config.
+
+On every start and `/admin/api/reload` the gateway writes the owner-only
+discovery file `~/Library/Application Support/model-gateway/endpoint.json`
+(`MODEL_GATEWAY_ENDPOINT_FILE` overrides the path; an empty value disables it):
+
+```json
+{
+  "version": 1,
+  "service": "model-gateway",
+  "base_url": "http://127.0.0.1:9111/v1",
+  "health_url": "http://127.0.0.1:9111/health",
+  "port": 9111,
+  "model_aliases": "/Users/me/Library/Application Support/model-gateway/model-aliases.json",
+  "client_key_file": null,
+  "consumers": {
+    "myai-runtime": {
+      "consumer": "myai", "namespaces": ["myai"],
+      "permissions": ["profiles:read", "profiles:invoke"],
+      "allow_direct_models": true,
+      "key_file": "/Users/me/.../secrets/consumers/myai-runtime.key"
+    }
+  }
+}
+```
+
+It contains paths only, never key values. Consumers should resolve their
+settings in this order: explicit environment variable, then `endpoint.json`,
+then their built-in default.
+
+## Moving to another machine
+
+A bundle carries providers, the catalog, and registered profiles without any
+secrets:
+
+```bash
+model-gateway bundle export --out ~/gateway-bundle.tar.gz   # on the source machine
+./install.sh                                                # on the new machine
+model-gateway bundle import ~/gateway-bundle.tar.gz --dry-run
+model-gateway bundle import ~/gateway-bundle.tar.gz          # add --force to replace existing content
+```
+
+- Export keeps only the content sections (`providers`, `workspaces`, `pools`,
+  `models`, `model_overrides`, `model_fallbacks`), strips every inline
+  `api_key` and auth-like `default_headers`, and rewrites home-directory paths
+  as `~/...`. Provider `api_key_file`
+  references are kept, so import lists the key files the new machine still
+  needs (add them with `model-gateway onboard` or the admin UI).
+- Machine-layout sections (`auth`, `federation`, `exports`, `profiles`) always
+  stay with the target machine. Recreate consumer credentials there with
+  `model-gateway consumer add`.
+- Import refuses to replace existing providers, models, or profiles without
+  `--force`, backs up every file it writes, and validates like an admin
+  reload (catalog, vision policy, credentials) before restarting. If the
+  restarted gateway fails its health check, the previous files are restored
+  and the gateway is restarted on them.
+- Bundles are trusted input: an imported provider's `base_url` receives the
+  key in its `api_key_file` on this machine. `--dry-run` lists every
+  `provider_endpoints` URL and key-file pair for review.
+- Imported profile snapshots bind to the source machine's routes. If the new
+  machine's providers differ, invocation fails closed (`409`) until the
+  consumer re-registers its manifest.
 
 The installer refuses to overwrite/stop/remove an existing `com.local.model-gateway` plist whose `WorkingDirectory` points somewhere else (for example a CI-managed runtime checkout). Use `model-gateway install --force` or `MODEL_GATEWAY_FORCE=1` only when you intentionally want this clone to adopt that LaunchAgent label.
 
@@ -159,7 +250,8 @@ security, discovery, and forwarding contract.
 merge the router uses (`model-info.json` + the `config.yaml` `models:` overlay,
 overlay wins on id clash):
 
-- `exports.model_aliases` → `~/srv/model-gateway/shared/model-aliases.json`, the **public
+- `exports.model_aliases` → for example
+  `~/Library/Application Support/model-gateway/model-aliases.json`, the **public
   contract** consumed by Pi-side renderers (`pi-shared/bin/pi-catalog`) and any
   other tool that needs the model catalog.
 
@@ -167,8 +259,11 @@ Pi-specific artifacts (Pi `models.json` and `pi-launchers.zsh`) are NO LONGER
 rendered by the gateway — they live in `pi-shared/bin/pi-catalog`, which reads
 the alias file. The gateway stays generic (no Pi config-schema knowledge).
 
-Exports are **opt-in** via the gitignored `config.yaml`. Machines that don't
-need an alias file omit the `exports:` section and the generator is a no-op.
+Exports are configured in the gitignored `config.yaml`. A config created by
+`model-gateway install` enables `exports.model_aliases` at
+`~/Library/Application Support/model-gateway/model-aliases.json`, and
+`endpoint.json` publishes that path to consumers. Machines that don't need an
+alias file remove the `exports:` section and the generator is a no-op.
 Generation runs on gateway start (`src/server.py` lifespan) and on
 `/admin/api/reload`; drift is checked with `scripts/export_catalogs.py --check`.
 
@@ -185,11 +280,12 @@ or compatibility symlink.
 
 ## Pi launcher integration
 
-For Pi users, configure an alias export in `config/config.yaml` when desired:
+Fresh installs already export the alias catalog (see above); an existing
+config can add it explicitly:
 
 ```yaml
 exports:
-  model_aliases: ~/srv/model-gateway/shared/model-aliases.json
+  model_aliases: ~/Library/Application Support/model-gateway/model-aliases.json
 ```
 
 The gateway regenerates that generic alias file on startup. Render Pi-specific artifacts separately with `pi-shared/bin/pi-catalog`; generated launchers define `pi-restart model-gw`, which now delegates to the portable `model-gateway restart` command when available and falls back to `server-ci restart --model-gw` on the maintainer's dev-server install. Pi-owned generated artifacts should live under `~/.pi/` (for example, `~/.pi/generated/pi-launchers.zsh`), never under this repository or a model-gateway runtime directory.

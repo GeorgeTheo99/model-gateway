@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import secrets
 import shutil
 import stat
 import time
@@ -629,6 +630,225 @@ def migrate_inline_api_keys(*, dry_run: bool = False) -> list[dict]:
         restore_writable_files(snapshot)
         raise
     return summary
+
+
+# ── consumer credentials (auth.consumer_credentials) ────────────────────────
+
+# Roles map onto the profile permissions in docs/consumer-profiles.md.
+CONSUMER_ROLES = {
+    "runtime": ["profiles:read", "profiles:invoke"],
+    "deployer": ["profiles:read", "profiles:write"],
+}
+
+
+def consumer_key_path(credential_id: str) -> Path:
+    """Default key file for a consumer credential, beside the live config."""
+    from src.auth import _PRINCIPAL_ID_RE
+
+    if not _PRINCIPAL_ID_RE.fullmatch(credential_id or ""):
+        raise ValueError("consumer credential id is invalid")
+    return _resolve_target(CONFIG_PATH).parent / "secrets" / "consumers" / f"{credential_id}.key"
+
+
+def _consumer_entries(config: dict) -> list:
+    auth = config.setdefault("auth", {})
+    if not isinstance(auth, dict):
+        raise ValueError("auth configuration must be an object")
+    entries = auth.setdefault("consumer_credentials", [])
+    if not isinstance(entries, list) or any(not isinstance(item, dict) for item in entries):
+        raise ValueError("auth.consumer_credentials must be a list of objects")
+    return entries
+
+
+def _consumer_key_status(entry: dict) -> str:
+    from src.auth import _read_consumer_key_file
+
+    if "key" in entry:
+        return "inline"
+    try:
+        _read_consumer_key_file(entry.get("key_file"))
+    except FileNotFoundError:
+        return "missing"
+    except (OSError, UnicodeError, ValueError):
+        return "invalid"
+    return "ok"
+
+
+def _consumer_summary(entry: dict) -> dict:
+    """Non-secret view of one credential entry."""
+    return {
+        "id": entry.get("id"),
+        "consumer": entry.get("consumer"),
+        "namespaces": list(entry.get("namespaces") or []),
+        "permissions": list(entry.get("permissions") or []),
+        "allow_direct_models": bool(entry.get("allow_direct_models", False)),
+        "key_file": entry.get("key_file"),
+        "key_status": _consumer_key_status(entry),
+    }
+
+
+def list_consumer_credentials() -> list[dict]:
+    """Return every consumer credential without key values."""
+    return [_consumer_summary(entry) for entry in _consumer_entries(load_config_full())]
+
+
+def _validate_auth_after_write(snapshot: dict[Path, str | None], *, keep_client_auth: bool = False) -> None:
+    """Reload the written config and roll every file back if auth rejects it.
+
+    ``keep_client_auth`` also refuses a write that leaves ``/v1`` with no
+    client or consumer credential, which would reopen it without auth.
+    """
+    from src import auth, providers
+
+    providers.reload()
+    try:
+        consumers, clients, _admins = auth.validate_credential_separation()
+        if keep_client_auth and not consumers and not clients:
+            raise ValueError("refusing to remove the last /v1 credential; add another client or consumer key first")
+    except Exception:
+        restore_writable_files(snapshot)
+        raise
+    finally:
+        providers.reload()
+
+
+@_write_transaction
+def add_consumer_credential(
+    consumer: str,
+    role: str,
+    *,
+    namespaces: list[str] | None = None,
+    allow_direct_models: bool = False,
+) -> dict:
+    """Create credential ``<consumer>-<role>`` with a generated mode-0600 key file.
+
+    Idempotent: an identical existing entry is reported unchanged, and an
+    existing key file at the default path is adopted rather than replaced. An
+    identical entry whose default key file is missing gets a new key.
+    Returns the non-secret summary plus ``status`` (``created``/``repaired``/
+    ``unchanged``) and ``enables_client_auth`` when ``/v1`` was open before.
+    """
+    from src.auth import _PRINCIPAL_ID_RE, _read_consumer_key_file
+
+    if role not in CONSUMER_ROLES:
+        raise ValueError(f"role must be one of: {', '.join(CONSUMER_ROLES)}")
+    if not isinstance(consumer, str) or not _PRINCIPAL_ID_RE.fullmatch(consumer):
+        raise ValueError("consumer must be 1-32 lowercase letters, digits, or hyphens")
+    credential_id = f"{consumer}-{role}"
+    target = consumer_key_path(credential_id)
+    namespaces = list(namespaces or [consumer])
+    if len(set(namespaces)) != len(namespaces) or any(
+        not isinstance(value, str) or not _PRINCIPAL_ID_RE.fullmatch(value) for value in namespaces
+    ):
+        raise ValueError("namespaces must be unique 1-32 character lowercase ids")
+    desired = {
+        "id": credential_id,
+        "consumer": consumer,
+        "key_file": str(target),
+        "namespaces": namespaces,
+        "permissions": list(CONSUMER_ROLES[role]),
+        "allow_direct_models": bool(allow_direct_models),
+    }
+
+    config = load_config_full()
+    entries = _consumer_entries(config)
+    existing = next((entry for entry in entries if entry.get("id") == credential_id), None)
+    if existing is not None:
+        comparable = {key: existing.get(key) for key in desired if key != "key_file"}
+        comparable["allow_direct_models"] = bool(existing.get("allow_direct_models", False))
+        if comparable != {key: value for key, value in desired.items() if key != "key_file"}:
+            raise ValueError(
+                f"consumer credential {credential_id!r} already exists with different settings; revoke it first"
+            )
+        summary = _consumer_summary(existing)
+        if summary["key_status"] == "ok":
+            return {**summary, "status": "unchanged", "enables_client_auth": False}
+        if summary["key_status"] != "missing" or "key_file" not in existing or (
+            resolve_api_key_file(existing["key_file"], CONFIG_PATH) != target
+        ):
+            raise ValueError(
+                f"consumer credential {credential_id!r} has an unusable key file ({summary['key_status']}); "
+                "fix its permissions or revoke and re-add it"
+            )
+        if target.is_symlink():
+            raise ValueError(f"refusing symlink consumer key target: {target}")
+        snapshot = snapshot_writable_files([target])
+        write_api_key_file(target, secrets.token_hex(32))
+        _validate_auth_after_write(snapshot)
+        return {**_consumer_summary(existing), "status": "repaired", "enables_client_auth": False}
+
+    from src import auth, providers
+
+    try:
+        providers.reload()
+        consumers_before, clients_before, _admins = auth.validate_credential_separation()
+        enables_client_auth = not consumers_before and not clients_before
+    except Exception:  # noqa: BLE001 — a broken config is reported by the post-write check
+        enables_client_auth = False
+
+    if target.is_symlink():
+        raise ValueError(f"refusing symlink consumer key target: {target}")
+    _check_key_file_target(config, f"consumer {credential_id}", target)
+    for entry in entries:
+        if "key_file" in entry and resolve_api_key_file(entry["key_file"], CONFIG_PATH) == target:
+            raise ValueError(f"consumer key file {target} is already used by {entry.get('id')!r}")
+
+    snapshot = snapshot_writable_files([target])
+    try:
+        if target.exists():
+            _read_consumer_key_file(str(target))  # adopt only a valid private key file
+        else:
+            write_api_key_file(target, secrets.token_hex(32))
+        entries.append(desired)
+        _backup(CONFIG_PATH)
+        _atomic_write(CONFIG_PATH, yaml.safe_dump(config, sort_keys=False, default_flow_style=False))
+    except Exception:
+        restore_writable_files(snapshot)
+        raise
+    _validate_auth_after_write(snapshot)
+    return {**_consumer_summary(desired), "status": "created", "enables_client_auth": enables_client_auth}
+
+
+@_write_transaction
+def revoke_consumer_credential(credential_id: str) -> dict:
+    """Remove a consumer credential entry and delete its managed key file.
+
+    Only the default ``secrets/consumers/<id>.key`` file is deleted; a key file
+    elsewhere, still referenced, or a symlink is kept. The config is rewritten
+    first, so a failed delete leaves an unused orphan file and a warning.
+    """
+    config = load_config_full()
+    entries = _consumer_entries(config)
+    index = next((i for i, entry in enumerate(entries) if entry.get("id") == credential_id), None)
+    if index is None:
+        raise KeyError(f"consumer credential {credential_id!r} not found")
+    entry = entries.pop(index)
+    summary = _consumer_summary(entry)
+
+    snapshot = snapshot_writable_files()
+    _backup(CONFIG_PATH)
+    _atomic_write(CONFIG_PATH, yaml.safe_dump(config, sort_keys=False, default_flow_style=False))
+    _validate_auth_after_write(snapshot, keep_client_auth=True)
+
+    summary["key_file_deleted"] = False
+    raw = entry.get("key_file")
+    if raw:
+        intended = Path(str(raw)).expanduser()
+        if not intended.is_absolute():
+            intended = _resolve_target(CONFIG_PATH).parent / intended
+        target = resolve_api_key_file(raw, CONFIG_PATH)
+        managed = intended == consumer_key_path(credential_id) and not intended.is_symlink()
+        still_used = any(
+            "key_file" in other and resolve_api_key_file(other["key_file"], CONFIG_PATH) == target
+            for other in entries
+        ) or any(path == target for _owner, path in _key_file_owners(config))
+        if managed and not still_used and intended.is_file():
+            try:
+                intended.unlink()
+                summary["key_file_deleted"] = True
+            except OSError as exc:
+                summary["warning"] = f"could not delete key file: {exc.strerror or exc}"
+    return {**summary, "status": "revoked"}
 
 
 # ── model config (model-info.json) ──────────────────────────────────────────

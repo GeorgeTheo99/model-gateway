@@ -17,6 +17,8 @@
 #   model-gateway onboard generate [options]     discover metadata and save a draft profile
 #   model-gateway workspace COMMAND [options]    manage Databricks workspace pools
 #   model-gateway secrets migrate [--dry-run]    move inline provider keys to 0600 key files
+#   model-gateway consumer add|list|revoke       manage consumer credentials (0600 key files)
+#   model-gateway bundle export|import           move config/catalog/profiles (no secrets)
 #   model-gateway env                            print resolved config
 set -euo pipefail
 umask 077
@@ -221,9 +223,11 @@ auth:
 
 providers: {}
 
-# Optional downstream alias export consumed by pi-shared/bin/pi-catalog:
-# exports:
-#   model_aliases: ~/srv/model-gateway/shared/model-aliases.json
+# Downstream alias catalog consumed by pi-shared/bin/pi-catalog. The gateway
+# re-renders it at startup and on reload; consumers find this path in
+# ~/Library/Application Support/model-gateway/endpoint.json.
+exports:
+  model_aliases: ~/Library/Application Support/model-gateway/model-aliases.json
 EOF
   chmod 600 "$CONFIG_PATH"
   warn "Created empty config at $CONFIG_PATH; add provider secrets/auth before expecting models to route"
@@ -355,9 +359,13 @@ ensure_log_backup_separation() {
 }
 
 ensure_runtime_paths_safe() {
-  local action="${1:-operation}"
+  local action="${1:-operation}" allow_unloaded="${2:-}"
   ensure_label_safe "$action"
-  service_loaded || die "refusing $action: launchd service is not loaded: $LABEL"
+  if [ "$allow_unloaded" = allow-unloaded ]; then
+    [ -f "$(plist_path)" ] || die "refusing $action: missing LaunchAgent plist: $(plist_path)"
+  else
+    service_loaded || die "refusing $action: launchd service is not loaded: $LABEL"
+  fi
   local plist actual expected key value
   plist="$(plist_path)"
   for key in MODEL_GATEWAY_CONFIG MODEL_GATEWAY_MODEL_INFO MODEL_GATEWAY_MODEL_INFO_SOURCE; do
@@ -588,6 +596,7 @@ GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS=$VISION_EXTRACTION_TOTAL_TIMEOUT
 MODEL_GATEWAY_LOG_DIR=$LOG_DIR
 MODEL_GATEWAY_BACKUP_DIR=$BACKUP_DIR
 MODEL_GATEWAY_LEGACY_BACKUP_DIRS=$LEGACY_BACKUP_DIRS
+MODEL_GATEWAY_ENDPOINT_FILE=${MODEL_GATEWAY_ENDPOINT_FILE-$HOME/Library/Application Support/model-gateway/endpoint.json}
 HEALTH_URL=$(health_url)
 EOF
 }
@@ -707,6 +716,129 @@ cmd_secrets() {
   fi
 }
 
+# Run a Python operator helper with the running service's environment, so
+# validation sees the same client keys, backup dir, and vision policy.
+run_service_python() {
+  local script="$1" backup_dir
+  shift
+  backup_dir="$(installed_plist_env MODEL_GATEWAY_BACKUP_DIR)"
+  MODEL_GATEWAY_BACKUP_DIR="${backup_dir:-$BACKUP_DIR}" \
+  MODEL_GATEWAY_CLIENT_KEYS="$(installed_plist_env MODEL_GATEWAY_CLIENT_KEYS)" \
+  MODEL_GATEWAY_CLIENT_KEYS_FILE="$(installed_plist_env MODEL_GATEWAY_CLIENT_KEYS_FILE)" \
+  MODEL_GATEWAY_ADMIN_KEY="$(installed_plist_env MODEL_GATEWAY_ADMIN_KEY)" \
+  MODEL_GATEWAY_PROFILE_REGISTRY="$(installed_plist_env MODEL_GATEWAY_PROFILE_REGISTRY)" \
+  MODEL_GATEWAY_MODEL_INFO="$MODEL_INFO_PATH" \
+  MODEL_GATEWAY_MODEL_INFO_SOURCE="$MODEL_INFO_SOURCE_PATH" \
+  GATEWAY_VISION_FALLBACK="$VISION_FALLBACK" \
+  GATEWAY_VISION_FALLBACK_LOCAL="$VISION_FALLBACK_LOCAL" \
+  GATEWAY_VISION_FALLBACK_CLOUD="$VISION_FALLBACK_CLOUD" \
+  GATEWAY_VISION_FALLBACK_MODE="$VISION_FALLBACK_MODE" \
+  GATEWAY_VISION_FALLBACK_MAX_IMAGES="$VISION_FALLBACK_MAX_IMAGES" \
+  GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS="$VISION_OBSERVATION_CACHE_TTL_SECONDS" \
+  GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS="$VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS" \
+    "$UV_BIN" run --project "$ROOT_DIR" python "$ROOT_DIR/scripts/$script" --config "$CONFIG_PATH" "$@"
+}
+
+cmd_consumer() {
+  local usage="usage: model-gateway consumer {add CONSUMER --role runtime|deployer [--namespace NS] [--allow-direct-models] | list [--json] | revoke CREDENTIAL_ID}"
+  [ $# -ge 1 ] || die "$usage"
+  local mutate=0 arg rc=0
+  case "$1" in
+    list) ;;
+    add|revoke) mutate=1 ;;
+    -h|--help|help) shift; set -- --help ;;
+    *) die "$usage" ;;
+  esac
+  for arg in "$@"; do
+    case "$arg" in -h|--help) mutate=0 ;; esac
+  done
+  check_prereqs
+  [ "$mutate" = 0 ] || ensure_runtime_paths_safe "consumer management"
+  run_service_python consumers.py "$@" || rc=$?
+  # Exit 3: nothing changed, so the running gateway needs no restart.
+  [ "$rc" = 3 ] && return 0
+  [ "$rc" = 0 ] || exit "$rc"
+  if [ "$mutate" = 1 ]; then
+    restart_service
+    verify || die "gateway did not come back after the consumer change; check 'model-gateway logs'"
+    ok "consumer credentials updated; gateway restarted"
+  fi
+}
+
+# EXIT/INT/TERM trap for the whole import: any failure, die, or interrupt
+# restores the pre-import files once the helper has saved them, and restarts
+# the gateway only if it was already restarted on the imported files.
+BUNDLE_ROLLBACK=""
+BUNDLE_RESTARTED=0
+bundle_restore_on_exit() {
+  local rc=$?
+  trap - EXIT INT TERM
+  [ "$rc" != 0 ] || rc=1
+  if [ -s "$BUNDLE_ROLLBACK" ]; then
+    warn "bundle import did not complete; restoring the previous files"
+    if run_service_python bundle.py restore-rollback "$BUNDLE_ROLLBACK"; then
+      if [ "$BUNDLE_RESTARTED" = 1 ]; then
+        ( restart_service && verify ) || warn "gateway still unhealthy after restoring; check 'model-gateway logs'"
+      fi
+    else
+      warn "restore failed; previous files are saved in $BUNDLE_ROLLBACK"
+      warn "recover with: model-gateway bundle restore-rollback $BUNDLE_ROLLBACK"
+    fi
+  else
+    # The helper saves nothing before refusing a bundle, so nothing changed.
+    rm -f "$BUNDLE_ROLLBACK"
+  fi
+  exit "$rc"
+}
+
+cmd_bundle() {
+  local usage="usage: model-gateway bundle {export [--out FILE] | import FILE [--force] [--dry-run] | restore-rollback FILE}"
+  [ $# -ge 1 ] || die "$usage"
+  local mutate=0 arg rc=0 backup_dir
+  case "$1" in
+    export) ;;
+    import|restore-rollback) mutate=1 ;;
+    -h|--help|help) shift; set -- --help ;;
+    *) die "$usage" ;;
+  esac
+  for arg in "$@"; do
+    case "$arg" in -h|--help|--dry-run) mutate=0 ;; esac
+  done
+  check_prereqs
+  if [ "$mutate" = 0 ]; then
+    run_service_python bundle.py "$@" || rc=$?
+    # Exit 3: dry run, nothing written.
+    [ "$rc" = 3 ] && return 0
+    [ "$rc" = 0 ] && return 0
+    exit "$rc"
+  fi
+  if [ "$1" = restore-rollback ]; then
+    # Recovery must work after a failed bootstrap left the service unloaded.
+    ensure_runtime_paths_safe "bundle restore" allow-unloaded
+    run_service_python bundle.py "$@"
+    restart_service
+    verify || die "gateway unhealthy after restoring; check 'model-gateway logs'"
+    ok "previous gateway files restored; gateway restarted"
+    return 0
+  fi
+  ensure_runtime_paths_safe "bundle import"
+  # Keep the pre-import contents with the private config backups so a
+  # gateway that will not start on the imported files can be restored.
+  backup_dir="$(installed_plist_env MODEL_GATEWAY_BACKUP_DIR)"
+  backup_dir="${backup_dir:-$BACKUP_DIR}"
+  ensure_private_dir "$backup_dir"
+  BUNDLE_ROLLBACK="$(mktemp "$backup_dir/bundle-rollback.XXXXXX")"
+  BUNDLE_RESTARTED=0
+  trap bundle_restore_on_exit EXIT INT TERM
+  run_service_python bundle.py "$@" --rollback-file "$BUNDLE_ROLLBACK" || exit $?
+  BUNDLE_RESTARTED=1
+  restart_service
+  verify || die "gateway did not start on the imported bundle"
+  trap - EXIT INT TERM
+  rm -f "$BUNDLE_ROLLBACK"
+  ok "bundle imported; gateway restarted"
+}
+
 cmd_workspace() {
   [ $# -ge 1 ] || die "usage: model-gateway workspace {list|repair|test|add|replace|remove|normalize} [options]"
   check_prereqs
@@ -755,6 +887,8 @@ main() {
     onboard) shift; cmd_onboard "$@" ;;
     workspace) shift; cmd_workspace "$@" ;;
     secrets) shift; cmd_secrets "$@" ;;
+    consumer) shift; cmd_consumer "$@" ;;
+    bundle) shift; cmd_bundle "$@" ;;
     env) cmd_env ;;
     -h|--help|help) usage ;;
     *) die "unknown command: $1" ;;

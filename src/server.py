@@ -41,7 +41,7 @@ from src.responses import chat_to_responses, responses_result_events, responses_
 from src.signature_cache import store_from_extra_content
 from src.streaming import _flatten_list_content, translate_stream
 from src.translator import anthropic_to_openai, anthropic_to_openai_chat, openai_chat_to_anthropic, openai_to_anthropic
-from src import catalog, config_io, federation, ledger, profiles, providers
+from src import catalog, config_io, discovery, federation, ledger, profiles, providers
 from src.usage import (
     anthropic_usage_to_openai_chat as convert_anthropic_usage_to_openai_chat,
     anthropic_usage_to_responses,
@@ -120,6 +120,7 @@ async def _lifespan(_app: FastAPI):
     # call scripts/export_catalogs.py themselves.
     from src.admin import _regenerate_catalogs
     log.info("catalog exports: %s", await _regenerate_catalogs())
+    discovery.refresh()
     await federation.start()
     try:
         yield

@@ -27,7 +27,7 @@ from src.providers import (
     routable_ids,
     snapshot_registry as snapshot_provider_registry,
 )
-from src import config_io, federation, ledger
+from src import config_io, discovery, federation, ledger
 
 router = APIRouter()
 _STARTED_AT = time.time()
@@ -232,6 +232,7 @@ async def admin_reload(request: Request):
             return _bad_request(f"Provider registry reload rejected: {reload_error}")
     federation_status = await federation.reconfigure(config=federation_config)
     catalogs = await _regenerate_catalogs()
+    discovery.refresh()
     return {
         "status": "ok",
         "message": "provider registry and federation reloaded",
