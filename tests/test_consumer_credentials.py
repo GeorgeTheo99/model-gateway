@@ -254,3 +254,28 @@ def test_cli_exit_codes_and_output_never_print_keys(tmp_path):
     assert missing.returncode == 2 and "not found" in missing.stderr
     outputs = [added, listed, conflict, revoked, missing]
     assert all(token not in result.stdout + result.stderr for result in outputs)
+
+
+def test_cli_manager_role_requires_and_lists_provider_allowlist(tmp_path):
+    real = Path(os.path.realpath(tmp_path))
+    config = real / "config.yaml"
+    config.write_text("auth:\n  client_keys: [client-token]\nproviders: {}\n")
+    config.chmod(0o600)
+    env = {key: value for key, value in os.environ.items() if not key.startswith("MODEL_GATEWAY_CLIENT_KEYS")}
+    env["MODEL_GATEWAY_BACKUP_DIR"] = str(real / "backups")
+
+    def run(*args):
+        return subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "consumers.py"), "--config", str(config), *args],
+            env=env, capture_output=True, text=True, timeout=60,
+        )
+
+    missing = run("add", "ha", "--role", "manager")
+    assert missing.returncode == 2 and "providers allowlist" in missing.stderr
+    stray = run("add", "ha", "--role", "runtime", "--provider", "fireworks")
+    assert stray.returncode == 2 and "only to the manager role" in stray.stderr
+    added = run("add", "ha", "--role", "manager", "--provider", "fireworks")
+    assert added.returncode == 0, added.stderr
+    assert "providers=fireworks" in run("list").stdout
+    (entry,) = yaml.safe_load(config.read_text())["auth"]["consumer_credentials"]
+    assert entry["id"] == "ha-manager" and entry["providers"] == ["fireworks"]

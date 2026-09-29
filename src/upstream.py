@@ -15,6 +15,7 @@ import logging
 import random
 import time
 from dataclasses import dataclass
+from urllib.parse import quote
 
 import httpx
 from fastapi import Request
@@ -463,9 +464,10 @@ def _fallback_endpoint(endpoint: str, requested_model: str, fallback_model: str)
     (/serving-endpoints/<model>/invocations), so switching json["model"]
     alone would keep hitting the failed primary endpoint.
     """
+    # Match the one-segment encoding used when the endpoint was built.
     return endpoint.replace(
-        f"/serving-endpoints/{requested_model}/",
-        f"/serving-endpoints/{fallback_model}/",
+        f"/serving-endpoints/{quote(requested_model, safe='')}/",
+        f"/serving-endpoints/{quote(fallback_model, safe='')}/",
     )
 
 

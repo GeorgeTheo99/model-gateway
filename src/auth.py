@@ -22,6 +22,11 @@ from fastapi import HTTPException, Request
 
 _PRINCIPAL_ID_RE = re.compile(r"^[a-z0-9-]{1,32}$")
 _PROFILE_PERMISSIONS = {"profiles:read", "profiles:write", "profiles:invoke"}
+# Scoped admin API grants. Each applies only to the credential's ``providers``
+# allowlist; every other admin action still requires a full admin key.
+MANAGEMENT_PERMISSIONS = frozenset({"providers:manage", "models:register"})
+_CONSUMER_PERMISSIONS = _PROFILE_PERMISSIONS | MANAGEMENT_PERMISSIONS
+_PROVIDER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 _client_auth_required_latched = False
 
 
@@ -51,6 +56,7 @@ class ConsumerPrincipal:
     permissions: frozenset[str]
     namespaces: frozenset[str]
     allow_direct_models: bool
+    providers: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -199,7 +205,9 @@ def _consumer_credentials() -> list[tuple[str, ConsumerPrincipal]]:
     for item in raw:
         if not isinstance(item, dict):
             raise ValueError("consumer credential entries must be objects")
-        unknown = set(item) - {"id", "consumer", "key_file", "key", "permissions", "namespaces", "allow_direct_models"}
+        unknown = set(item) - {
+            "id", "consumer", "key_file", "key", "permissions", "namespaces", "allow_direct_models", "providers",
+        }
         if unknown:
             raise ValueError(f"consumer credential has unknown fields: {sorted(unknown)}")
         credential_id = item.get("id")
@@ -229,7 +237,7 @@ def _consumer_credentials() -> list[tuple[str, ConsumerPrincipal]]:
         namespaces = item.get("namespaces")
         if (
             not isinstance(permissions, list)
-            or any(not isinstance(value, str) or value not in _PROFILE_PERMISSIONS for value in permissions)
+            or any(not isinstance(value, str) or value not in _CONSUMER_PERMISSIONS for value in permissions)
             or len(permissions) != len(set(permissions))
         ):
             raise ValueError("consumer credential permissions are invalid")
@@ -242,12 +250,22 @@ def _consumer_credentials() -> list[tuple[str, ConsumerPrincipal]]:
         allow_direct = item.get("allow_direct_models", False)
         if not isinstance(allow_direct, bool):
             raise ValueError("consumer credential allow_direct_models must be boolean")
+        managed = item.get("providers", [])
+        if (
+            not isinstance(managed, list)
+            or any(not isinstance(value, str) or not _PROVIDER_ID_RE.fullmatch(value) for value in managed)
+            or len(managed) != len(set(managed))
+        ):
+            raise ValueError("consumer credential providers are invalid")
+        if bool(managed) != bool(MANAGEMENT_PERMISSIONS.intersection(permissions)):
+            raise ValueError("consumer credential providers are required exactly for management permissions")
         result.append((token, ConsumerPrincipal(
             credential_id=credential_id,
             consumer=consumer,
             permissions=frozenset(permissions),
             namespaces=frozenset(namespaces),
             allow_direct_models=allow_direct,
+            providers=frozenset(managed),
         )))
     return result
 
@@ -504,6 +522,29 @@ def require_admin_auth(request: Request) -> None:
     if _matches(_extract_token(request), keys):
         return
     raise HTTPException(status_code=401, detail="Missing or invalid model-gateway admin key")
+
+
+def require_admin_or_scope(request: Request, *permissions: str) -> ConsumerPrincipal | None:
+    """Admit a full admin (returns None) or a consumer holding any of ``permissions``.
+
+    A returned principal is scoped: callers must confine it to
+    ``principal.providers``. Anything else falls through to full admin auth.
+    """
+    if not permissions or not MANAGEMENT_PERMISSIONS.issuperset(permissions):
+        raise ValueError("scoped admin permissions must be management permissions")
+    token = _extract_token(request)
+    if token:
+        try:
+            consumers, _clients, _admins = validate_credential_separation()
+        except (OSError, UnicodeError, ValueError, yaml.YAMLError):
+            consumers = []  # full admin auth below reports or recovers the config
+        for credential, principal in consumers:
+            if secrets.compare_digest(token, credential):
+                if principal.permissions.isdisjoint(permissions):
+                    raise HTTPException(status_code=403, detail="Consumer credential is not authorized for this admin action")
+                return principal
+    require_admin_auth(request)
+    return None
 
 
 def require_admin_writes() -> None:

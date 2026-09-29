@@ -13,7 +13,14 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
-from src.auth import admin_writes_enabled, auth_mode, require_admin_auth, require_admin_writes
+from src.auth import (
+    admin_writes_enabled,
+    auth_mode,
+    require_admin_auth,
+    require_admin_or_scope,
+    require_admin_writes,
+)
+from src.catalog import canonical_provider
 from src.config_lock import config_write_lock
 from src.providers import (
     MODEL_INFO_PATH,
@@ -39,10 +46,27 @@ async def admin_ui():
     return HTMLResponse(_ADMIN_HTML)
 
 
+def _require_provider_scope(principal, provider_id: object) -> None:
+    """Confine a scoped (non-admin) principal to its provider allowlist."""
+    if principal is None:
+        return
+    # canonical_provider maps an empty name to the local provider; never allow that.
+    raw = provider_id.strip().lower() if isinstance(provider_id, str) else ""
+    if not raw or canonical_provider(raw) not in {canonical_provider(p) for p in principal.providers}:
+        raise HTTPException(status_code=403, detail="Credential is not authorized for this provider")
+
+
 @router.get("/admin/api/status")
 async def admin_status(request: Request):
-    require_admin_auth(request)
+    principal = require_admin_or_scope(request, "providers:manage", "models:register")
     mode = auth_mode()
+    if principal is not None:
+        return {
+            "service": "model-gateway",
+            "status": "ok",
+            "writes_enabled": mode.writes_enabled,
+            "capabilities": {"create_only_model_registration": True},
+        }
     return {
         "service": "model-gateway",
         "status": "ok",
@@ -65,8 +89,12 @@ async def admin_status(request: Request):
 
 @router.get("/admin/api/providers")
 async def admin_providers(request: Request):
-    require_admin_auth(request)
-    return {"providers": provider_status()}
+    principal = require_admin_or_scope(request, "providers:manage")
+    rows = provider_status()
+    if principal is not None:
+        allowed = {canonical_provider(p) for p in principal.providers}
+        rows = [row for row in rows if canonical_provider(row.get("id")) in allowed]
+    return {"providers": rows}
 
 
 @router.get("/admin/api/models")
@@ -396,24 +424,68 @@ async def admin_upsert_provider(provider_id: str, request: Request):
     Body: {base_url, protocol?, api_key?, default_headers?}. ``api_key`` is
     write-only (None preserves the existing key; "" removes it) and is stored
     in a mode-0600 key file. Reloads the provider registry after writing.
+    A scoped credential may only set or clear the key of an existing
+    allowlisted provider; adding providers and endpoint, protocol, or header
+    changes need a full admin.
     """
-    require_admin_auth(request)
+    principal = require_admin_or_scope(request, "providers:manage")
+    _require_provider_scope(principal, provider_id)
     require_admin_writes()
     try:
         body = await request.json()
     except Exception:
         return _bad_request("Invalid JSON body")
+    if not isinstance(body, dict):
+        return _bad_request("Invalid JSON body")
+    base_url, protocol = body.get("base_url", ""), body.get("protocol")
+    if not isinstance(base_url, (str, type(None))) or not isinstance(protocol, (str, type(None))):
+        return _bad_request("base_url and protocol must be strings")
+
+    def scoped_precondition():
+        # Runs under the write lock and resolves the provider the way routing
+        # does, so a synonym, workspace, env, or built-in definition cannot be
+        # mistaken for a new provider and redirected.
+        nonlocal base_url, protocol
+        import src.providers as providers
+
+        canonical = canonical_provider(provider_id)
+        if provider_id != canonical:
+            raise HTTPException(status_code=403, detail=f"Use the canonical provider id {canonical!r}")
+        config = config_io.load_config_full()
+        location = providers._find_provider_location(config, canonical)
+        if location is not None and location[:2] != ("providers", canonical):
+            raise HTTPException(status_code=403, detail="Only a full admin can change this provider's definition")
+        if location is None and not providers._provider_defaults(canonical) and not providers._provider_env_config(canonical):
+            # Defining a provider chooses where traffic goes; that stays with the owner.
+            raise HTTPException(status_code=403, detail="Only a full admin can add a provider")
+        effective = providers._effective_provider_config(config, canonical)
+        current_url = str(effective.get("base_url") or "")
+        current_protocol = effective.get("protocol") or "openai"
+        requested_url = base_url or current_url
+        if (
+            not current_url
+            or requested_url.rstrip("/") != current_url.rstrip("/")
+            or (protocol is not None and protocol != current_protocol)
+            or body.get("default_headers") is not None
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Only a full admin can change an existing provider's endpoint, protocol, or headers",
+            )
+        # Write back only what is already effective, never request values.
+        base_url, protocol = current_url, None
+
     try:
         result, reload_error = _apply_registry_mutation(lambda: config_io.upsert_provider(
             provider_id,
-            base_url=body.get("base_url", ""),
+            base_url=base_url,
             api_key=body.get("api_key"),
-            protocol=body.get("protocol"),
+            protocol=protocol,
             default_headers=body.get("default_headers"),
         ), extra_paths=lambda: [
             path for path in [config_io.api_key_file_target(provider_id)]
             if path and isinstance(body.get("api_key"), str) and body["api_key"].strip()
-        ])
+        ], precondition=scoped_precondition if principal is not None else None)
     except (ValueError, OSError) as exc:
         return _bad_request(str(exc))
     if reload_error is not None:
@@ -446,7 +518,8 @@ async def admin_validate_provider(provider_id: str, request: Request):
 
     Read-only upstream probe. Returns {ok, status_code, model_count?, error?}.
     """
-    require_admin_auth(request)
+    principal = require_admin_or_scope(request, "providers:manage")
+    _require_provider_scope(principal, provider_id)
     require_admin_writes()
     import httpx
     import src.providers as providers
@@ -640,6 +713,11 @@ def _require_model_absent(model_name: str, body: dict) -> None:
     candidate = {key: body.get(key) for key in ("alias", "provider_model_id", "omlx_id")}
     candidate["name"] = model_name.strip()
     candidate_ids = set(entry_routable_ids(candidate))
+    # A federation peer's namespace is reserved: a local model with that id
+    # would silently take over every client's requests for the imported route.
+    peers = getattr(federation.manager().config, "peers", None) or {}
+    if any(rid.split("/", 1)[0] in peers for rid in candidate_ids if "/" in rid):
+        raise HTTPException(status_code=409, detail="Model identifier is reserved by a federation peer")
     # Inspect both sources before catalog merging can hide a canonical name or
     # alias. Do not use the process-local registry cache: another writer may
     # have changed the files while this request was waiting for the lock.
@@ -665,10 +743,13 @@ async def admin_upsert_model(model_name: str, request: Request):
     collision). Other If-None-Match values are unsupported (400); omission is upsert
     only for POST. PUT always requires create-only preconditions so older gateways
     lacking this method fail closed rather than ignoring an unknown header.
+    A scoped credential may only create models for its allowlisted providers.
     """
-    require_admin_auth(request)
+    principal = require_admin_or_scope(request, "models:register")
     require_admin_writes()
     preconditions = request.headers.getlist("if-none-match")
+    if principal is not None and not preconditions:
+        return _bad_request("Scoped credentials may only register new models (If-None-Match: *)", status=403)
     if request.method == "PUT" and not preconditions:
         return _bad_request("PUT model registration requires If-None-Match: *", status=428)
     if request.method == "PUT" and "if-match" in request.headers:
@@ -681,6 +762,7 @@ async def admin_upsert_model(model_name: str, request: Request):
         return _bad_request("Invalid JSON body")
     if not isinstance(body, dict):
         return _bad_request("Model configuration must be an object")
+    _require_provider_scope(principal, body.get("provider"))
     def mutate_model():
         result = config_io.upsert_model(model_name, **body)
         if "enabled" in body:
@@ -804,7 +886,8 @@ async def admin_consumers(request: Request):
 async def admin_add_consumer(request: Request):
     """Create ``<consumer>-<role>``. A generated key is returned once, uncached.
 
-    Body: {consumer, role, namespaces?, allow_direct_models?}.
+    Body: {consumer, role, namespaces?, allow_direct_models?, providers?}.
+    ``providers`` is the allowlist a ``manager`` credential may administer.
     """
     require_admin_auth(request)
     require_admin_writes()
@@ -817,6 +900,7 @@ async def admin_add_consumer(request: Request):
     consumer, role = body.get("consumer"), body.get("role")
     namespaces = body.get("namespaces")
     allow_direct = body.get("allow_direct_models", False)
+    managed = body.get("providers")
     try:
         credential_id = config_io.consumer_credential_id(consumer, role)
     except ValueError as exc:
@@ -827,8 +911,13 @@ async def admin_add_consumer(request: Request):
         return _bad_request("namespaces must be a list of strings")
     if not isinstance(allow_direct, bool):
         return _bad_request("allow_direct_models must be a boolean")
+    if managed is not None and (
+        not isinstance(managed, list) or any(not isinstance(value, str) for value in managed)
+    ):
+        return _bad_request("providers must be a list of strings")
     result, error = _consumer_mutation(credential_id, lambda: config_io.add_consumer_credential(
-        consumer, role, namespaces=namespaces, allow_direct_models=allow_direct, reveal_key=True,
+        consumer, role, namespaces=namespaces, allow_direct_models=allow_direct,
+        providers=managed, reveal_key=True,
     ))
     if error is not None:
         return error
@@ -2626,7 +2715,19 @@ _ADMIN_HTML = r"""
                   ><select id="cRole">
                     <option value="runtime">Runtime — read and invoke profiles</option>
                     <option value="deployer">Deployer — read and publish profiles</option>
+                    <option value="manager">Manager — keys and new models for listed providers</option>
                   </select>
+                </div>
+                <div class="field wide">
+                  <label for="cProviders">Managed providers</label
+                  ><input
+                    id="cProviders"
+                    autocomplete="off"
+                    spellcheck="false"
+                  /><span class="hint"
+                    >Manager role only. Comma-separated provider IDs it may
+                    administer, for example <code>fireworks</code>.</span
+                  >
                 </div>
                 <div class="field wide">
                   <label for="cNamespaces">Profile namespaces</label
@@ -3946,6 +4047,9 @@ _ADMIN_HTML = r"""
                   '<span class="small">' +
                   esc((c.permissions || []).join(", ")) +
                   (c.allow_direct_models ? " · direct models" : "") +
+                  ((c.providers || []).length
+                    ? " · providers " + esc(c.providers.join(", "))
+                    : "") +
                   '</span></td><td data-label="Key file">' +
                   pill(kind, label) +
                   '<span class="small id">' +
@@ -4164,6 +4268,7 @@ _ADMIN_HTML = r"""
           $("cConsumer").value = "";
           $("cRole").value = "runtime";
           $("cNamespaces").value = "";
+          $("cProviders").value = "";
           $("cDirect").checked = false;
           setMsg("cMsg", "", true);
         }
@@ -4217,11 +4322,17 @@ _ADMIN_HTML = r"""
               .value.split(",")
               .map((s) => s.trim())
               .filter(Boolean);
+            const role = $("cRole").value,
+              providers = $("cProviders")
+                .value.split(",")
+                .map((s) => s.trim())
+                .filter(Boolean);
             const r = await request("/admin/api/consumers", "POST", {
               consumer,
-              role: $("cRole").value,
+              role,
               namespaces: namespaces.length ? namespaces : null,
               allow_direct_models: $("cDirect").checked,
+              ...(role === "manager" ? { providers } : {}),
             });
             if (r.status === "unchanged") {
               setMsg(

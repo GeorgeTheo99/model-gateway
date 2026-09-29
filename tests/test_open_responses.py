@@ -486,3 +486,19 @@ def test_responses_stream_is_not_replayed_after_output_starts(mock_responses_ups
     assert "Hello" in result.text
     assert "Provider stream failed" in result.text
     assert seen == ["e2.example.com"]
+
+
+
+def test_invocations_model_id_cannot_escape_its_path_segment(open_responses_registry):
+    from src.upstream import _fallback_endpoint
+
+    open_responses_registry["models"].append(
+        {"name": "sneaky", "provider": "ws-e2", "provider_model_id": "../../api/2.0/token/create?x="},
+    )
+    info = providers.resolve("sneaky")
+    assert info.base_url == (
+        "https://e2.example.com/serving-endpoints/..%2F..%2Fapi%2F2.0%2Ftoken%2Fcreate%3Fx%3D/invocations"
+    )
+    assert _fallback_endpoint(info.base_url, "../../api/2.0/token/create?x=", "plain-model") == (
+        "https://e2.example.com/serving-endpoints/plain-model/invocations"
+    )

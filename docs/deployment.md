@@ -76,6 +76,7 @@ through a discovery file, so nothing hardcodes a port or home directory.
 ```bash
 model-gateway consumer add myai --role runtime --allow-direct-models
 model-gateway consumer add myai --role deployer   # registers profile snapshots
+model-gateway consumer add ha --role manager --provider fireworks   # keys/new models for fireworks only
 model-gateway consumer list                       # ids, permissions, key status; never values
 model-gateway consumer revoke myai-deployer       # removes the entry and deletes its key file
 ```
@@ -83,7 +84,10 @@ model-gateway consumer revoke myai-deployer       # removes the entry and delete
 - `add` creates credential `<consumer>-<role>` with a generated mode-`0600`
   key file at `<config dir>/secrets/consumers/<id>.key` (directory `0700`).
   `runtime` grants `profiles:read` + `profiles:invoke`; `deployer` grants
-  `profiles:read` + `profiles:write`. The namespace defaults to the consumer
+  `profiles:read` + `profiles:write`; `manager` grants `providers:manage` +
+  `models:register`, limited to its `--provider` allowlist (see
+  [scoped management](deployment-auth.md#scoped-management-credentials)).
+  The namespace defaults to the consumer
   id (`--namespace` is repeatable). Re-running an identical `add` is a no-op;
   an existing valid key file at the default path is adopted, not replaced, and
   a missing one is regenerated.

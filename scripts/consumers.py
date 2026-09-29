@@ -24,12 +24,15 @@ def main() -> int:
 
     add = commands.add_parser("add", help="create <consumer>-<role> with a generated 0600 key file")
     add.add_argument("consumer", help="consumer id, e.g. myai")
-    add.add_argument("--role", required=True, choices=["runtime", "deployer"],
-                     help="runtime: profiles read+invoke; deployer: profiles read+write")
+    add.add_argument("--role", required=True, choices=["runtime", "deployer", "manager"],
+                     help="runtime: profiles read+invoke; deployer: profiles read+write; "
+                          "manager: keys and new models for --provider only")
     add.add_argument("--namespace", action="append", dest="namespaces",
                      help="profile namespace (repeatable; default: the consumer id)")
     add.add_argument("--allow-direct-models", action="store_true",
                      help="also allow explicit catalog models outside profiles")
+    add.add_argument("--provider", action="append", dest="providers",
+                     help="provider a manager may administer (repeatable; required for --role manager)")
 
     listing = commands.add_parser("list", help="show credentials without key values")
     listing.add_argument("--json", action="store_true")
@@ -52,14 +55,15 @@ def main() -> int:
                 print("no consumer credentials configured")
             for row in rows if not args.json else ():
                 direct = " direct-models" if row["allow_direct_models"] else ""
+                managed = f" providers={','.join(row['providers'])}" if row["providers"] else ""
                 print(f"{row['id']:<24} consumer={row['consumer']} namespaces={','.join(row['namespaces'])} "
-                      f"permissions={','.join(row['permissions'])}{direct} key={row['key_status']} "
+                      f"permissions={','.join(row['permissions'])}{direct}{managed} key={row['key_status']} "
                       f"{row['key_file'] or ''}".rstrip())
             return 0
         if args.command == "add":
             row = config_io.add_consumer_credential(
                 args.consumer, args.role, namespaces=args.namespaces,
-                allow_direct_models=args.allow_direct_models)
+                allow_direct_models=args.allow_direct_models, providers=args.providers)
             print(f"{row['status']} {row['id']} -> {row['key_file']}")
             if row["enables_client_auth"]:
                 print("warning: /v1 previously accepted requests without a key; it now requires "

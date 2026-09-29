@@ -759,7 +759,7 @@ run_service_python() {
 }
 
 cmd_consumer() {
-  local usage="usage: model-gateway consumer {add CONSUMER --role runtime|deployer [--namespace NS] [--allow-direct-models] | list [--json] | revoke CREDENTIAL_ID}"
+  local usage="usage: model-gateway consumer {add CONSUMER --role runtime|deployer|manager [--namespace NS] [--allow-direct-models] [--provider ID] | list [--json] | revoke CREDENTIAL_ID}"
   [ $# -ge 1 ] || die "$usage"
   local mutate=0 arg rc=0
   case "$1" in

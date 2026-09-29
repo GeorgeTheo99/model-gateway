@@ -583,7 +583,9 @@ def _owner_label(section: str, name: str) -> str:
 
 
 def _key_file_owners(config: dict) -> list[tuple[str, Path]]:
-    """(owner, real path) for every provider, workspace, and federation peer key file."""
+    """(owner, real path) for every provider, workspace, federation peer,
+    consumer credential, and client keys file, so a provider key write can
+    never overwrite another credential."""
     owners = []
     for section in ("providers", "workspaces"):
         entries = config.get(section) or {}
@@ -595,6 +597,14 @@ def _key_file_owners(config: dict) -> list[tuple[str, Path]]:
     for peer, block in peers.items() if isinstance(peers, dict) else ():
         if isinstance(block, dict) and block.get("api_key_file"):
             owners.append((f"federation peer {peer}", resolve_api_key_file(block["api_key_file"], CONFIG_PATH)))
+    auth = config.get("auth") or {}
+    consumers = auth.get("consumer_credentials") if isinstance(auth, dict) else None
+    for entry in consumers if isinstance(consumers, list) else ():
+        if isinstance(entry, dict) and isinstance(entry.get("key_file"), str) and entry["key_file"].strip():
+            owners.append((f"consumer {entry.get('id')}", resolve_api_key_file(entry["key_file"], CONFIG_PATH)))
+    client_keys_file = os.environ.get("MODEL_GATEWAY_CLIENT_KEYS_FILE", "").strip()
+    if client_keys_file:
+        owners.append(("client keys file", resolve_api_key_file(client_keys_file, CONFIG_PATH)))
     return owners
 
 
@@ -679,6 +689,8 @@ def migrate_inline_api_keys(*, dry_run: bool = False) -> list[dict]:
 CONSUMER_ROLES = {
     "runtime": ["profiles:read", "profiles:invoke"],
     "deployer": ["profiles:read", "profiles:write"],
+    # Admin-API access confined to the credential's ``providers`` allowlist.
+    "manager": ["providers:manage", "models:register"],
 }
 
 
@@ -744,6 +756,7 @@ def _consumer_summary(entry: dict) -> dict:
         "namespaces": list(entry.get("namespaces") or []),
         "permissions": list(entry.get("permissions") or []),
         "allow_direct_models": bool(entry.get("allow_direct_models", False)),
+        "providers": list(entry.get("providers") or []),
         "key_file": entry.get("key_file"),
         "key_status": _consumer_key_status(entry),
         "managed_key_file": managed,
@@ -782,6 +795,7 @@ def add_consumer_credential(
     *,
     namespaces: list[str] | None = None,
     allow_direct_models: bool = False,
+    providers: list[str] | None = None,
     reveal_key: bool = False,
 ) -> dict:
     """Create credential ``<consumer>-<role>`` with a generated mode-0600 key file.
@@ -791,6 +805,7 @@ def add_consumer_credential(
     identical entry whose default key file is missing gets a new key.
     Returns the non-secret summary plus ``status`` (``created``/``repaired``/
     ``unchanged``) and ``enables_client_auth`` when ``/v1`` was open before.
+    ``providers`` is required for, and only accepted by, the manager role.
     ``reveal_key`` adds ``key`` only when this call generated it, for the
     admin UI's one-time display; an adopted or unchanged key is never read.
     """
@@ -803,6 +818,11 @@ def add_consumer_credential(
         len(set(namespaces)) != len(namespaces)
     ):
         raise ValueError("namespaces must be unique 1-32 character lowercase ids")
+    if role == "manager":
+        if not providers:
+            raise ValueError("the manager role requires a providers allowlist")
+    elif providers:
+        raise ValueError("providers applies only to the manager role")
     desired = {
         "id": credential_id,
         "consumer": consumer,
@@ -811,6 +831,8 @@ def add_consumer_credential(
         "permissions": list(CONSUMER_ROLES[role]),
         "allow_direct_models": bool(allow_direct_models),
     }
+    if role == "manager":
+        desired["providers"] = list(providers)
 
     config = load_config_full()
     entries = _consumer_entries(config)

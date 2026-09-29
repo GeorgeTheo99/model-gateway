@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from functools import wraps
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import yaml
 
@@ -1103,8 +1103,10 @@ def resolve(model_id: str, provider_override: str | None = None) -> ProviderInfo
         endpoint_suffix = ""
     elif endpoint_style == "invocations":
         # base_url is a workspace host; each model has its own full invocation
-        # URL: <base>/serving-endpoints/<provider_model_id>/invocations.
-        base_url = base_url.rstrip("/") + f"/serving-endpoints/{provider_model_id}/invocations"
+        # URL: <base>/serving-endpoints/<provider_model_id>/invocations. The id
+        # is one path segment; encoding keeps "../" or "?" from retargeting the
+        # provider's credential at another API on the same host.
+        base_url = base_url.rstrip("/") + f"/serving-endpoints/{quote(provider_model_id, safe='')}/invocations"
         endpoint_suffix = ""
     else:
         # Optional per-protocol path prefixes appended to base_url, e.g.

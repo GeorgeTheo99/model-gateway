@@ -64,6 +64,40 @@ consumer credential also counts as configured `/v1` authentication for bind
 safety. See [consumer-profiles.md](consumer-profiles.md) for the manifest,
 registry, ETag, and execution contract.
 
+## Scoped management credentials
+
+A consumer credential with the `manager` role lets an application manage its
+own providers through the admin API without a full admin key. Its
+`providers` allowlist is required and bounds every grant:
+
+| Permission | Allows, for allowlisted providers only |
+|---|---|
+| `providers:manage` | `GET /admin/api/status` (reduced body), `GET /admin/api/providers` (filtered), `POST /admin/api/providers/{id}/validate`, and `POST /admin/api/providers/{id}` to set or clear the key of a provider the owner has already defined |
+| `models:register` | Create-only `PUT`/`POST /admin/api/models/{name}` with `If-None-Match: *` |
+
+```yaml
+auth:
+  consumer_credentials:
+    - id: ha-manager
+      consumer: ha
+      key_file: secrets/consumers/ha-manager.key
+      namespaces: [ha]
+      permissions: [providers:manage, models:register]
+      providers: [fireworks]
+```
+
+A provider already defined anywhere (config, a synonym or `workspaces` key,
+environment overrides, or built-in defaults) counts as existing: a manager must
+use its canonical id, may omit `base_url`/`protocol` (the effective values are
+kept), and may only change its key. Create-only registration also refuses
+identifiers in a federation peer's namespace (409). Adding a provider, changing
+an existing provider's `base_url`, `protocol`, or `default_headers`,
+updating or deleting models, deleting providers, reload, and consumer
+credential management still require a full admin key. The admin write gate
+(`MODEL_GATEWAY_ADMIN_WRITES`) applies to scoped writes too. Granting a provider
+lets the credential replace that provider's key for every client that routes to
+it, so allowlist only providers the application owns.
+
 ## Auth environment variables
 
 These are optional overrides for the config-file keys above.

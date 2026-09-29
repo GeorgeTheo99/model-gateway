@@ -395,12 +395,15 @@ const server = createServer(async (req, res) => {
       const row = consumer(
         id,
         body.consumer,
-        body.role === "runtime"
-          ? ["profiles:read", "profiles:invoke"]
-          : ["profiles:read", "profiles:write"],
+        {
+          runtime: ["profiles:read", "profiles:invoke"],
+          deployer: ["profiles:read", "profiles:write"],
+          manager: ["providers:manage", "models:register"],
+        }[body.role],
         {
           namespaces: body.namespaces || [body.consumer],
           allow_direct_models: body.allow_direct_models,
+          ...(body.providers ? { providers: body.providers } : {}),
         },
       );
       state.consumers.push(row);
@@ -472,6 +475,7 @@ const server = createServer(async (req, res) => {
       roles: {
         runtime: ["profiles:read", "profiles:invoke"],
         deployer: ["profiles:read", "profiles:write"],
+        manager: ["providers:manage", "models:register"],
       },
     });
     return;
@@ -760,6 +764,25 @@ if (process.argv.includes("--serve")) {
     await click("#dismissNewKeyBtn");
     assert(await page.locator("#newKeyPanel").isHidden());
     assert.equal(await page.inputValue("#newKeyValue"), "");
+    await click("[data-add-consumer]");
+    assert.equal(await page.inputValue("#cProviders"), "");
+    await page.fill("#cConsumer", "hs");
+    await page.selectOption("#cRole", "manager");
+    await page.fill("#cProviders", " fireworks , ");
+    await click("#saveConsumerBtn");
+    await page.waitForSelector("#newKeyPanel:not([hidden])");
+    assert.deepEqual(writes.at(-1).body, {
+      consumer: "hs",
+      role: "manager",
+      namespaces: null,
+      allow_direct_models: false,
+      providers: ["fireworks"],
+    });
+    assert.match(
+      await page.locator("#consumers").innerText(),
+      /hs-manager[\s\S]*manager[\s\S]*providers fireworks/,
+    );
+    await click("#dismissNewKeyBtn");
     await click('[data-rotate-consumer="ha-runtime"]');
     assert.match(
       await page.locator("#consumerConfirmWarn").innerText(),
@@ -786,7 +809,7 @@ if (process.argv.includes("--serve")) {
     await page.fill("#cConfirm", "lab-deployer");
     await click("#confirmConsumerBtn");
     await page.waitForFunction(
-      () => document.querySelectorAll("#consumers tbody tr").length === 4,
+      () => document.querySelectorAll("#consumers tbody tr").length === 5,
     );
     assert.equal(writes.at(-1).method, "DELETE");
     assert(await page.locator("#consumerConfirm").isHidden());
