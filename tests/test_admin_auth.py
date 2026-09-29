@@ -12,6 +12,11 @@ from src.server import app
 client = TestClient(app)
 
 
+@pytest.mark.parametrize("path", ["/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"])
+def test_api_schema_and_docs_are_not_published(path):
+    assert client.get(path).status_code == 404
+
+
 def test_v1_auth_is_open_by_default(monkeypatch):
     monkeypatch.delenv("MODEL_GATEWAY_CLIENT_KEYS", raising=False)
     resp = client.get("/v1/models")

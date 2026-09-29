@@ -127,7 +127,15 @@ async def _lifespan(_app: FastAPI):
         await federation.stop()
 
 
-app = FastAPI(title="Model Gateway", lifespan=_lifespan)
+# The gateway is reachable through LAN, tailnet, and Cloudflare ingress; do not
+# publish an unauthenticated route/schema inventory.
+app = FastAPI(
+    title="Model Gateway",
+    lifespan=_lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 app.include_router(admin_router)
 
 DEFAULT_VISION_FALLBACK_MODEL = ""
