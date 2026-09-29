@@ -16,6 +16,7 @@
 #   model-gateway onboard PROFILE [options]      apply a reviewed onboarding profile
 #   model-gateway onboard generate [options]     discover metadata and save a draft profile
 #   model-gateway workspace COMMAND [options]    manage Databricks workspace pools
+#   model-gateway secrets migrate [--dry-run]    move inline provider keys to 0600 key files
 #   model-gateway env                            print resolved config
 set -euo pipefail
 umask 077
@@ -207,8 +208,9 @@ ensure_config() {
   cat >"$CONFIG_PATH" <<EOF
 # model-gateway runtime config.
 # Created by bin/model-gateway install. See config/config.yaml.example for the
-# full provider/auth/export template. Add provider secrets here; this file is
-# gitignored and should never be committed.
+# full provider/auth/export template. Reference provider keys with a mode-0600
+# api_key_file (the admin UI and onboarding write them); this file is gitignored
+# and should never be committed.
 
 auth:
   # admin_keys protects /admin/api/*. Add a real key before using admin APIs.
@@ -675,6 +677,34 @@ cmd_onboard() {
   fi
 }
 
+cmd_secrets() {
+  [ "${1:-}" = "migrate" ] || die "usage: model-gateway secrets migrate [--dry-run]"
+  shift
+  local dry_run=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --dry-run) dry_run=1 ;;
+      *) die "unknown secrets migrate option: $arg" ;;
+    esac
+  done
+  check_prereqs
+  [ "$dry_run" = 1 ] || ensure_runtime_paths_safe "secret migration"
+  local rc=0
+  MODEL_GATEWAY_BACKUP_DIR="$BACKUP_DIR" \
+  MODEL_GATEWAY_MODEL_INFO="$MODEL_INFO_PATH" \
+  MODEL_GATEWAY_MODEL_INFO_SOURCE="$MODEL_INFO_SOURCE_PATH" \
+    "$UV_BIN" run --project "$ROOT_DIR" python "$ROOT_DIR/scripts/migrate_api_keys.py" \
+      --config "$CONFIG_PATH" "$@" || rc=$?
+  # Exit 3: nothing to move, so the running gateway needs no restart.
+  [ "$rc" = 3 ] && return 0
+  [ "$rc" = 0 ] || die "secret migration failed (exit $rc)"
+  if [ "$dry_run" = 0 ]; then
+    restart_service
+    verify
+    ok "provider keys migrated; gateway restarted"
+  fi
+}
+
 cmd_workspace() {
   [ $# -ge 1 ] || die "usage: model-gateway workspace {list|repair|test|add|replace|remove|normalize} [options]"
   check_prereqs
@@ -722,6 +752,7 @@ main() {
     _update-after-pull) cmd_update_after_pull ;;
     onboard) shift; cmd_onboard "$@" ;;
     workspace) shift; cmd_workspace "$@" ;;
+    secrets) shift; cmd_secrets "$@" ;;
     env) cmd_env ;;
     -h|--help|help) usage ;;
     *) die "unknown command: $1" ;;

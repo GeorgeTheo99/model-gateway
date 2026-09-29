@@ -66,6 +66,12 @@ from pathlib import Path
 
 import yaml
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from src.secret_files import read_api_key_file  # noqa: E402
+
 HOME = Path.home()
 # Same resolution as the gateway: MODEL_GATEWAY_CONFIG env, else checkout-local.
 DEFAULT_CONFIG = Path(
@@ -122,6 +128,25 @@ def _load_config(path: Path) -> dict:
         raise _fail(f"config not found: {path}")
     with open(path) as f:
         return yaml.safe_load(f) or {}
+
+
+def _static_token(entry: dict, config_path: Path) -> str:
+    """A workspace's static credential: inline, else its mode-0600 api_key_file."""
+    token = str(entry.get("api_key") or "")
+    if token or not entry.get("api_key_file"):
+        return token
+    try:
+        return read_api_key_file(entry["api_key_file"], config_path)
+    except OSError as exc:
+        raise _fail(f"unusable api_key_file: {exc}") from exc
+
+
+def _static_auth_label(entry: dict, config_path: Path) -> str:
+    try:
+        token = _static_token(entry, config_path)
+    except SystemExit:
+        return "unusable-key"
+    return "pat" if token.startswith("dapi") else "static"
 
 
 def _providers_section(config: dict) -> dict:
@@ -582,7 +607,7 @@ def cmd_list(args) -> None:
             and "databricks" not in host
         ):
             continue
-        auth = entry.get("auth_profile") or ("pat" if str(entry.get("api_key", "")).startswith("dapi") else "static")
+        auth = entry.get("auth_profile") or _static_auth_label(entry, args.config)
         print(f"{name:22s} {entry.get('base_url','')[:55]:55s} {auth:14s} {','.join(member_of.get(name, [])) or '-'}")
     print("\nPools:")
     for pool, members in pools.items():
@@ -672,7 +697,7 @@ def cmd_test(args) -> None:
     if entry.get("auth_refresh") == "databricks-cli":
         token = ensure_auth(host, entry.get("auth_profile") or args.name)
     else:
-        token = str(entry.get("api_key", ""))
+        token = _static_token(entry, args.config)
         print("  auth: static credential from config (PAT)")
         if not token:
             raise _fail(f"workspace {args.name!r} has no api_key configured")

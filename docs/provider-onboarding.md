@@ -343,6 +343,29 @@ An existing macOS Keychain item may be read with
 interaction is not allowed` in SSH/headless sessions; interactive use falls
 back to the hidden prompt.
 
+## Where provider keys are stored
+
+Static provider keys live in mode-0600 files under
+`~/.config/model-gateway/secrets/` (override with `MODEL_GATEWAY_SECRET_DIR`),
+referenced from `config.yaml` by `api_key_file`. Onboarding and the admin
+connection editor both write there; neither writes a key inline. An existing
+`api_key_file` reference is updated in place. `MODEL_GATEWAY_PROVIDER_<ID>_API_KEY`
+still overrides either source, and OAuth-refreshed tokens (`auth_refresh`) stay
+inline because the refresher rewrites them.
+
+The admin status reports each connection's `api_key_source` (`file`, `inline`,
+`env`, `default`, or `missing`) and warns about inline static keys, including
+an inline key that silently overrides a key file. Move them without changing
+the keys:
+
+```bash
+model-gateway secrets migrate --dry-run   # list providers and target files
+model-gateway secrets migrate             # write files, rewrite config, restart
+```
+
+Config backups taken before migration still contain the inline keys until
+backup retention prunes them.
+
 ## Hand-written profile format
 
 Complex providers and stable CI workflows may continue using hand-written

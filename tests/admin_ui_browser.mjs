@@ -116,8 +116,12 @@ function fixture() {
     },
     providers: [
       provider("omlx", { base_url: "http://localhost:9110/v1" }),
-      provider("cloud"),
+      provider("cloud", {
+        api_key_source: "inline",
+        warnings: ["inline_api_key"],
+      }),
       provider("ws-primary", {
+        api_key_source: "file",
         pool_memberships: [{ pool: "claude-routing", position: 1 }],
       }),
       provider("ws-backup", {
@@ -446,6 +450,16 @@ if (process.argv.includes("--serve")) {
         .count(),
       1,
     );
+    await click('#providers [data-open-provider="cloud"]');
+    const cloudDetail = await page.locator("#drawerBody").innerText();
+    assert.match(cloudDetail, /inline in config\.yaml/);
+    assert.match(cloudDetail, /model-gateway secrets migrate/);
+    await click("[data-close-detail]");
+    await click('#providers [data-open-provider="ws-primary"]');
+    const fileDetail = await page.locator("#drawerBody").innerText();
+    assert.match(fileDetail, /private key file/);
+    assert.doesNotMatch(fileDetail, /secrets migrate/);
+    await click("[data-close-detail]");
     await click('#providers [data-open-provider="ws-backup"]');
     assert.match(await page.locator("#drawerBody").innerText(), /pooled-model/);
     await click("[data-close-detail]");

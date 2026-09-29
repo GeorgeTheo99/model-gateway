@@ -41,10 +41,13 @@ def _isolate_runtime_config(tmp_path, monkeypatch):
     monkeypatch.setenv("MODEL_GATEWAY_PROFILE_REGISTRY", str(tmp_path / "consumer-profiles-registry.json"))
     cfg.write_text("providers: {}\n")
     monkeypatch.setenv("MODEL_GATEWAY_BACKUP_DIR", str(tmp_path / "config-backups"))
+    # Provider key writes must never touch ~/.config/model-gateway/secrets.
+    monkeypatch.setenv("MODEL_GATEWAY_SECRET_DIR", str(tmp_path / "secrets"))
     monkeypatch.setenv("MODEL_GATEWAY_LEGACY_BACKUP_DIRS", str(tmp_path / "logs" / "config-backups"))
     from src import config_io
     monkeypatch.setattr(config_io, "log_dir", tmp_path / "logs")
     monkeypatch.setattr(providers, "CONFIG_PATH", cfg)
+    monkeypatch.setattr(config_io, "CONFIG_PATH", cfg)
     monkeypatch.setattr(auth, "_client_auth_required_latched", False)
     providers.reload()
     yield

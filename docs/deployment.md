@@ -57,7 +57,7 @@ roots may not overlap. Uvicorn request access logging is disabled because reques
 URLs can contain temporary capabilities; structured usage remains available in
 the ledger.
 
-After install, edit `config/config.yaml` to add provider secrets/auth. A fresh generated config intentionally has `providers: {}`, so catalog entries remain unavailable until providers are configured. If you deliberately expose the gateway beyond loopback (`MODEL_GATEWAY_HOST=0.0.0.0`), configure `auth.client_keys` and firewall rules first.
+After install, edit `config/config.yaml` to add auth and provider connections; provider keys go in mode-0600 `api_key_file`s (see [provider onboarding](provider-onboarding.md#where-provider-keys-are-stored)). A fresh generated config intentionally has `providers: {}`, so catalog entries remain unavailable until providers are configured. If you deliberately expose the gateway beyond loopback (`MODEL_GATEWAY_HOST=0.0.0.0`), configure `auth.client_keys` and firewall rules first.
 
 The installer refuses to overwrite/stop/remove an existing `com.local.model-gateway` plist whose `WorkingDirectory` points somewhere else (for example a CI-managed runtime checkout). Use `model-gateway install --force` or `MODEL_GATEWAY_FORCE=1` only when you intentionally want this clone to adopt that LaunchAgent label.
 

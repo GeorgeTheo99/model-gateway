@@ -66,12 +66,14 @@ providers:
   # startup; requests for those models return provider_not_configured.
   # Set enabled: false to keep a provider configured but unavailable locally.
 
+  # Static keys belong in mode-0600 files (the admin UI and onboarding write
+  # ~/.config/model-gateway/secrets/<provider>.api-key). Relative paths resolve
+  # beside this config file; MODEL_GATEWAY_PROVIDER_*_API_KEY overrides either.
+  # Inline api_key still works but is flagged; `model-gateway secrets migrate`
+  # moves inline keys into files.
   fireworks:
     base_url: https://api.fireworks.ai/inference/v1
-    api_key: "YOUR_FIREWORKS_API_KEY"
-    # Prefer a mode-0600 file for new providers; relative paths resolve beside
-    # this config file and MODEL_GATEWAY_PROVIDER_*_API_KEY still overrides it.
-    # api_key_file: secrets/fireworks.api-key
+    api_key_file: ~/.config/model-gateway/secrets/fireworks.api-key
   zhipuai:
     base_url: https://open.bigmodel.cn/api/paas/v4
     api_key: "YOUR_ZHIPUAI_API_KEY"

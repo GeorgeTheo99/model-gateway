@@ -183,6 +183,37 @@ def test_workspace_list_excludes_unpooled_non_databricks_provider(tmp_path, caps
     assert "google" not in output
 
 
+def test_workspace_static_pat_can_live_in_api_key_file(tmp_path, capsys, monkeypatch):
+    workspace = load_workspace_module()
+    key = tmp_path / "ws-pat.api-key"
+    key.write_text("dapi-file-token\n")
+    key.chmod(0o600)
+    config = tmp_path / "workspaces.yaml"
+    config.write_text(
+        "providers:\n"
+        "  ws-pat:\n"
+        "    base_url: https://example.cloud.databricks.com/serving-endpoints\n"
+        "    api_key_file: ws-pat.api-key\n"
+        "pools:\n"
+        "  default-pool: [ws-pat]\n"
+    )
+
+    workspace.cmd_list(argparse.Namespace(config=config))
+    row = next(line for line in capsys.readouterr().out.splitlines() if line.startswith("ws-pat"))
+    assert " pat " in row
+
+    seen = {}
+    monkeypatch.setattr(workspace, "probe_endpoints", lambda host, token: seen.setdefault("token", token) and [])
+    monkeypatch.setattr(workspace, "check_coverage", lambda *args, **kwargs: None)
+    monkeypatch.setattr(workspace, "smoke_test", lambda *args, **kwargs: None)
+    workspace.cmd_test(argparse.Namespace(config=config, name="ws-pat"))
+    assert seen["token"] == "dapi-file-token"
+
+    key.chmod(0o644)
+    with pytest.raises(SystemExit, match="unusable api_key_file"):
+        workspace.cmd_test(argparse.Namespace(config=config, name="ws-pat"))
+
+
 def test_operator_cli_help_lists_workspace_command():
     result = subprocess.run([str(CLI), "help"], capture_output=True, text=True)
 

@@ -5,7 +5,8 @@ productionization plan):
 
 - ``config.yaml`` (providers + auth): deployed copy is a symlink to the shared
   gitignored file. Edits are hot (after reload) and durable across deploys.
-  Holds secrets — never echo ``api_key`` back; writes are additive/preserving.
+  Static provider keys written here go to mode-0600 ``api_key_file`` targets,
+  never inline YAML; never echo a key back; writes are additive/preserving.
 - ``model-info.json`` (models): machine-local and Git-ignored. Writes edit the
   live copy (hot) and, when configured, a second machine-local mirror
   (``MODEL_INFO_SOURCE_PATH``) used by deploy tooling or private backup flows.
@@ -31,6 +32,7 @@ import yaml
 from src.catalog import normalize_thinking_capabilities, validate_pricing_policy
 from src.config_lock import config_write_lock
 from src.providers import CONFIG_PATH, MODEL_INFO_PATH, MODEL_INFO_SOURCE_PATH
+from src.secret_files import default_api_key_path, resolve_api_key_file, write_api_key_file
 
 log_dir = Path(
     os.environ.get("MODEL_GATEWAY_LOG_DIR", str(Path.home() / "Library" / "Logs" / "model-gateway"))
@@ -379,9 +381,9 @@ def _backup(path: Path) -> Path | None:
         os.close(backup_fd)
 
 
-def snapshot_writable_files() -> dict[Path, str | None]:
-    """Capture every admin-managed file for validation rollback."""
-    paths = {CONFIG_PATH, MODEL_INFO_PATH}
+def snapshot_writable_files(extra_paths=()) -> dict[Path, str | None]:
+    """Capture every admin-managed file (plus ``extra_paths``) for validation rollback."""
+    paths = {CONFIG_PATH, MODEL_INFO_PATH, *extra_paths}
     if MODEL_INFO_SOURCE_PATH:
         paths.add(MODEL_INFO_SOURCE_PATH)
     snapshot = {}
@@ -413,8 +415,10 @@ def upsert_provider(
     """Create or update a provider block in config.yaml.
 
     ``api_key`` is write-only: if None, the existing key is preserved; if an
-    empty string, it is removed. Other fields are set only when provided.
-    Returns the masked provider status dict (no secrets).
+    empty string, the key reference is removed (the key file is left in place).
+    A static key is stored in the provider's mode-0600 ``api_key_file``, never
+    inline. Other fields are set only when provided. Returns the masked
+    provider status dict (no secrets).
     """
     provider_id = (provider_id or "").strip().lower()
     if not provider_id:
@@ -434,11 +438,14 @@ def upsert_provider(
         block["protocol"] = protocol
     if default_headers is not None:
         block["default_headers"] = default_headers
+    if api_key is not None and not isinstance(api_key, str):
+        raise ValueError("api_key must be a string")
     if api_key is not None:
-        if api_key == "":
+        if api_key.strip() == "":
             block.pop("api_key", None)
+            block.pop("api_key_file", None)
         else:
-            block["api_key"] = api_key
+            _store_api_key(config, provider_id, block, api_key)
     providers[provider_id] = block
     config["providers"] = providers
 
@@ -490,9 +497,138 @@ def _masked_block(provider_id: str, block: dict) -> dict:
         "id": provider_id,
         "base_url": _safe_url(block.get("base_url", "")),
         "protocol": block.get("protocol", "openai"),
-        "has_api_key": bool(block.get("api_key")),
+        "has_api_key": bool(block.get("api_key") or block.get("api_key_file")),
+        "api_key_source": _configured_key_source(block),
         "default_headers": bool(block.get("default_headers")),
     }
+
+
+def _configured_key_source(block: dict) -> str:
+    if block.get("api_key"):
+        return "inline"
+    return "file" if block.get("api_key_file") else "missing"
+
+
+# ── provider API-key files ──────────────────────────────────────────────────
+
+
+def _uses_inline_token(block: dict) -> bool:
+    """OAuth refreshers rewrite short-lived tokens in config.yaml itself."""
+    return bool(block.get("auth_refresh"))
+
+
+def _api_key_file_target(provider_id: str, block: dict) -> Path:
+    """The real file a provider's static key lives in: its reference or the default.
+
+    Like the default location, an existing reference must not be a symlink, so
+    a key write never lands in a file the reference merely points at.
+    """
+    raw = block.get("api_key_file")
+    if not raw:
+        return default_api_key_path(f"{provider_id}.api-key")
+    intended = Path(str(raw)).expanduser()
+    if not intended.is_absolute():
+        intended = _resolve_target(CONFIG_PATH).parent / intended
+    if intended.is_symlink():
+        raise ValueError(f"refusing symlink API key target: {intended}")
+    return resolve_api_key_file(raw, CONFIG_PATH)
+
+
+def _owner_label(section: str, name: str) -> str:
+    from src.providers import _canonical_provider
+
+    return f"{section}.{_canonical_provider(str(name).strip().lower())}"
+
+
+def _key_file_owners(config: dict) -> list[tuple[str, Path]]:
+    """(owner, real path) for every provider, workspace, and federation peer key file."""
+    owners = []
+    for section in ("providers", "workspaces"):
+        entries = config.get(section) or {}
+        for name, block in entries.items() if isinstance(entries, dict) else ():
+            if isinstance(block, dict) and block.get("api_key_file"):
+                owners.append((_owner_label(section, name), resolve_api_key_file(block["api_key_file"], CONFIG_PATH)))
+    federation = config.get("federation") or {}
+    peers = federation.get("peers") if isinstance(federation, dict) else None
+    for peer, block in peers.items() if isinstance(peers, dict) else ():
+        if isinstance(block, dict) and block.get("api_key_file"):
+            owners.append((f"federation peer {peer}", resolve_api_key_file(block["api_key_file"], CONFIG_PATH)))
+    return owners
+
+
+def _check_key_file_target(config: dict, owner: str, target: Path) -> None:
+    managed = {_resolve_target(CONFIG_PATH), _resolve_target(MODEL_INFO_PATH)}
+    if MODEL_INFO_SOURCE_PATH:
+        managed.add(_resolve_target(MODEL_INFO_SOURCE_PATH))
+    if target in managed:
+        raise ValueError(f"API key file must not be a gateway config or catalog file: {target}")
+    for other, path in _key_file_owners(config):
+        if path == target and other != owner:
+            raise ValueError(f"API key file {target} is already used by {other!r}")
+
+
+def _store_api_key(config: dict, provider_id: str, block: dict, api_key: str) -> None:
+    if _uses_inline_token(block):
+        block["api_key"] = api_key.strip()
+        return
+    target = _api_key_file_target(provider_id, block)
+    _check_key_file_target(config, _owner_label("providers", provider_id), target)
+    write_api_key_file(target, api_key)
+    block.setdefault("api_key_file", str(target))
+    block.pop("api_key", None)
+
+
+def api_key_file_target(provider_id: str) -> Path | None:
+    """Key file an ``upsert_provider`` key write for ``provider_id`` would touch."""
+    provider_id = (provider_id or "").strip().lower()
+    block = (load_config_full().get("providers") or {}).get(provider_id)
+    block = block if isinstance(block, dict) else {}
+    if not provider_id or _uses_inline_token(block):
+        return None
+    try:
+        return _api_key_file_target(provider_id, block)
+    except ValueError:
+        return None
+
+
+@_write_transaction
+def migrate_inline_api_keys(*, dry_run: bool = False) -> list[dict]:
+    """Move static inline provider/workspace keys into mode-0600 ``api_key_file``s.
+
+    The inline key is the effective one, so it also replaces the contents of an
+    existing (shadowed) file reference. OAuth-refreshed tokens stay inline. All
+    files are restored if any write fails. Returns one masked entry per move.
+    """
+    config = load_config_full()
+    planned: list[tuple[str, dict, Path]] = []
+    claimed: dict[Path, str] = {}
+    for section in ("providers", "workspaces"):
+        entries = config.get(section) or {}
+        for name, block in entries.items() if isinstance(entries, dict) else ():
+            if not isinstance(block, dict) or not block.get("api_key") or _uses_inline_token(block):
+                continue
+            provider_id = str(name).strip().lower()
+            target = _api_key_file_target(provider_id, block)
+            _check_key_file_target(config, _owner_label(section, provider_id), target)
+            if target in claimed:
+                raise ValueError(f"providers {claimed[target]!r} and {name!r} would share API key file {target}")
+            claimed[target] = str(name)
+            planned.append((str(name), block, target))
+    summary = [{"provider": name, "api_key_file": str(target)} for name, _, target in planned]
+    if dry_run or not planned:
+        return summary
+    _backup(CONFIG_PATH)
+    snapshot = snapshot_writable_files([target for _, _, target in planned])
+    try:
+        for _, block, target in planned:
+            write_api_key_file(target, str(block["api_key"]))
+            block.setdefault("api_key_file", str(target))
+            block.pop("api_key")
+        _atomic_write(CONFIG_PATH, yaml.safe_dump(config, sort_keys=False, default_flow_style=False))
+    except Exception:
+        restore_writable_files(snapshot)
+        raise
+    return summary
 
 
 # ── model config (model-info.json) ──────────────────────────────────────────

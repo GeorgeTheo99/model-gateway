@@ -23,7 +23,7 @@ import yaml
 
 from src.catalog import entry_routable_ids, normalize_thinking_capabilities, validate_pricing_policy
 from src.config_lock import config_write_lock
-from src.secret_files import read_api_key_file, resolve_api_key_file
+from src.secret_files import read_api_key_file, resolve_api_key_file, secret_dir
 
 
 class OnboardingError(ValueError):
@@ -160,11 +160,7 @@ def secret_path_for_provider(config_path: Path, provider: dict) -> Path:
     name = str(provider.get("secret_name") or f"{provider['id']}.api-key")
     if Path(name).name != name or not re.fullmatch(r"[a-zA-Z0-9_.-]+", name):
         raise OnboardingError("provider secret_name must be a safe filename")
-    root = Path(
-        os.environ.get("MODEL_GATEWAY_SECRET_DIR")
-        or Path.home() / ".config" / "model-gateway" / "secrets"
-    ).expanduser()
-    intended = root / name
+    intended = secret_dir() / name
     if intended.is_symlink():
         raise OnboardingError(f"refusing symlink API key target: {intended}")
     return _real_target(intended)

@@ -50,11 +50,313 @@ def test_upsert_provider_creates_new(tmp_config, monkeypatch):
     result = config_io.upsert_provider("openai", base_url="https://api.openai.com/v1", api_key="sk-new")
     assert result["id"] == "openai"
     assert result["has_api_key"] is True
+    assert result["api_key_source"] == "file"
     assert result["base_url"] == "https://api.openai.com/v1"
-    # Verify it landed in config.yaml.
+    # The key lands in a private key file, never inline in config.yaml.
     import yaml
-    cfg = yaml.safe_load((tmp_config / "config.yaml").read_text())
-    assert cfg["providers"]["openai"]["api_key"] == "sk-new"
+    text = (tmp_config / "config.yaml").read_text()
+    assert "sk-new" not in text
+    block = yaml.safe_load(text)["providers"]["openai"]
+    key_file = tmp_config / "secrets" / "openai.api-key"
+    assert "api_key" not in block
+    assert block["api_key_file"] == str(key_file.resolve())
+    assert key_file.read_text() == "sk-new\n"
+    assert key_file.stat().st_mode & 0o777 == 0o600
+    assert key_file.parent.stat().st_mode & 0o777 == 0o700
+    providers.reload()
+    assert providers._effective_provider_config(providers._load_config(), "openai")["api_key"] == "sk-new"
+
+
+def test_upsert_provider_key_replaces_inline_and_existing_file(tmp_config, monkeypatch):
+    import yaml
+    existing = tmp_config / "custom" / "anthropic.key"
+    existing.parent.mkdir()
+    existing.write_text("old-file-key\n")
+    existing.chmod(0o600)
+    cfg = tmp_config / "config.yaml"
+    doc = yaml.safe_load(cfg.read_text())
+    doc["providers"]["anthropic"]["api_key_file"] = str(existing)
+    cfg.write_text(yaml.safe_dump(doc))
+
+    config_io.upsert_provider("anthropic", base_url="https://api.anthropic.com/v1", api_key="rotated")
+
+    block = yaml.safe_load(cfg.read_text())["providers"]["anthropic"]
+    assert "api_key" not in block
+    assert block["api_key_file"] == str(existing)
+    assert existing.read_text() == "rotated\n"
+    assert not (tmp_config / "secrets").exists()
+
+
+def test_upsert_provider_refuses_key_file_owned_by_another_provider(tmp_config, monkeypatch):
+    import yaml
+    config_io.upsert_provider("openai", base_url="https://api.openai.com/v1", api_key="sk-openai")
+    cfg = tmp_config / "config.yaml"
+    doc = yaml.safe_load(cfg.read_text())
+    doc["providers"]["anthropic"]["api_key_file"] = doc["providers"]["openai"]["api_key_file"]
+    cfg.write_text(yaml.safe_dump(doc))
+
+    with pytest.raises(ValueError, match="already used by 'providers.openai'"):
+        config_io.upsert_provider("anthropic", base_url="https://api.anthropic.com/v1", api_key="other")
+    assert (tmp_config / "secrets" / "openai.api-key").read_text() == "sk-openai\n"
+
+
+def test_upsert_provider_refuses_symlinked_default_key_file(tmp_config, monkeypatch):
+    secrets_dir = tmp_config / "secrets"
+    secrets_dir.mkdir()
+    victim = tmp_config / "victim.txt"
+    victim.write_text("keep\n")
+    (secrets_dir / "openai.api-key").symlink_to(victim)
+
+    with pytest.raises(ValueError, match="symlink"):
+        config_io.upsert_provider("openai", base_url="https://api.openai.com/v1", api_key="sk-new")
+    assert victim.read_text() == "keep\n"
+
+
+def _set_provider_blocks(tmp_config, **blocks):
+    import yaml
+    cfg = tmp_config / "config.yaml"
+    doc = yaml.safe_load(cfg.read_text())
+    for name, block in blocks.items():
+        if block is None:
+            doc["providers"].pop(name, None)
+        else:
+            doc["providers"][name] = block
+    cfg.write_text(yaml.safe_dump(doc))
+    return cfg
+
+
+def test_upsert_provider_preserves_relative_key_file_reference(tmp_config, monkeypatch):
+    import yaml
+    (tmp_config / "keys").mkdir()
+    cfg = _set_provider_blocks(tmp_config, openai={"base_url": "https://api.openai.com/v1", "api_key_file": "keys/openai.key"})
+
+    config_io.upsert_provider("openai", base_url="https://api.openai.com/v1", api_key="sk-rel")
+
+    assert yaml.safe_load(cfg.read_text())["providers"]["openai"]["api_key_file"] == "keys/openai.key"
+    assert (tmp_config / "keys" / "openai.key").read_text() == "sk-rel\n"
+
+
+def test_upsert_provider_refuses_symlinked_existing_key_file(tmp_config, monkeypatch):
+    victim = tmp_config / "victim.txt"
+    victim.write_text("keep\n")
+    (tmp_config / "link.key").symlink_to(victim)
+    _set_provider_blocks(tmp_config, openai={"base_url": "https://api.openai.com/v1", "api_key_file": "link.key"})
+
+    with pytest.raises(ValueError, match="symlink"):
+        config_io.upsert_provider("openai", base_url="https://api.openai.com/v1", api_key="sk-new")
+    assert victim.read_text() == "keep\n"
+
+
+def test_upsert_provider_refuses_key_file_that_is_a_gateway_file(tmp_config, monkeypatch):
+    catalog_before = config_io.MODEL_INFO_PATH.read_text()
+    _set_provider_blocks(tmp_config, openai={"base_url": "https://api.openai.com/v1", "api_key_file": "model-info.json"})
+
+    with pytest.raises(ValueError, match="config or catalog"):
+        config_io.upsert_provider("openai", base_url="https://api.openai.com/v1", api_key="sk-new")
+    assert config_io.MODEL_INFO_PATH.read_text() == catalog_before
+
+
+def test_upsert_provider_refuses_federation_peer_key_file(tmp_config, monkeypatch):
+    import yaml
+    peer_key = tmp_config / "peer.key"
+    peer_key.write_text("peer-secret\n")
+    peer_key.chmod(0o600)
+    cfg = tmp_config / "config.yaml"
+    doc = yaml.safe_load(cfg.read_text())
+    doc["federation"] = {"node_id": "main", "peers": {"edge": {"base_url": "https://edge.example", "api_key_file": str(peer_key)}}}
+    doc["providers"]["openai"] = {"base_url": "https://api.openai.com/v1", "api_key_file": str(peer_key)}
+    cfg.write_text(yaml.safe_dump(doc))
+
+    with pytest.raises(ValueError, match="federation peer edge"):
+        config_io.upsert_provider("openai", base_url="https://api.openai.com/v1", api_key="sk-new")
+    assert peer_key.read_text() == "peer-secret\n"
+
+
+def test_upsert_provider_rejects_non_string_key(tmp_config, monkeypatch):
+    with pytest.raises(ValueError, match="must be a string"):
+        config_io.upsert_provider("openai", base_url="https://api.openai.com/v1", api_key=123)
+
+
+def test_upsert_provider_keeps_oauth_refreshed_token_inline(tmp_config, monkeypatch):
+    import yaml
+    cfg = tmp_config / "config.yaml"
+    doc = yaml.safe_load(cfg.read_text())
+    doc["providers"]["ws"] = {"base_url": "https://ws.example/serving-endpoints", "auth_refresh": "databricks-cli"}
+    cfg.write_text(yaml.safe_dump(doc))
+
+    config_io.upsert_provider("ws", base_url="https://ws.example/serving-endpoints", api_key="eyJtoken")
+
+    assert yaml.safe_load(cfg.read_text())["providers"]["ws"]["api_key"] == "eyJtoken"
+    assert not (tmp_config / "secrets").exists()
+
+
+def test_upsert_provider_empty_key_removes_file_reference(tmp_config, monkeypatch):
+    import yaml
+    config_io.upsert_provider("openai", base_url="https://api.openai.com/v1", api_key="sk-openai")
+    config_io.upsert_provider("openai", base_url="https://api.openai.com/v1", api_key="")
+    block = yaml.safe_load((tmp_config / "config.yaml").read_text())["providers"]["openai"]
+    assert "api_key" not in block and "api_key_file" not in block
+
+
+def test_admin_rejected_provider_update_restores_key_file(tmp_config, monkeypatch):
+    config_io.upsert_provider("openai", base_url="https://api.openai.com/v1", api_key="sk-original")
+    providers.reload()
+    key_file = tmp_config / "secrets" / "openai.api-key"
+    monkeypatch.setattr(admin, "_reload_registry_transactionally", lambda snapshot: "synthetic rejection")
+
+    result, error = admin._apply_registry_mutation(
+        lambda: config_io.upsert_provider("openai", base_url="https://api.openai.com/v1", api_key="sk-rejected"),
+        extra_paths=lambda: [config_io.api_key_file_target("openai")],
+    )
+
+    assert result is None and "rolled back" in error
+    assert key_file.read_text() == "sk-original\n"
+    assert key_file.stat().st_mode & 0o777 == 0o600
+
+
+def test_migrate_inline_api_keys(tmp_config, monkeypatch):
+    import yaml
+    cfg = tmp_config / "config.yaml"
+    doc = yaml.safe_load(cfg.read_text())
+    shadowed = tmp_config / "shadowed.key"
+    shadowed.write_text("stale\n")
+    shadowed.chmod(0o600)
+    doc["providers"]["openai"] = {"base_url": "https://api.openai.com/v1", "api_key": "sk-inline", "api_key_file": str(shadowed)}
+    doc["providers"]["ws"] = {"base_url": "https://ws.example", "api_key": "eyJ", "auth_refresh": "databricks-cli"}
+    cfg.write_text(yaml.safe_dump(doc))
+    before = cfg.read_text()
+
+    planned = config_io.migrate_inline_api_keys(dry_run=True)
+    assert {row["provider"] for row in planned} == {"anthropic", "openai"}
+    assert cfg.read_text() == before and not (tmp_config / "secrets").exists()
+
+    moved = config_io.migrate_inline_api_keys()
+    assert moved == planned
+    text = cfg.read_text()
+    assert "secret-existing" not in text and "sk-inline" not in text
+    after = yaml.safe_load(text)["providers"]
+    assert (tmp_config / "secrets" / "anthropic.api-key").read_text() == "secret-existing\n"
+    assert shadowed.read_text() == "sk-inline\n"
+    assert after["openai"]["api_key_file"] == str(shadowed)
+    assert after["ws"]["api_key"] == "eyJ"
+    assert config_io.migrate_inline_api_keys() == []
+    providers.reload()
+    config = providers._load_config()
+    assert providers._effective_provider_config(config, "anthropic")["api_key"] == "secret-existing"
+    assert providers._effective_provider_config(config, "openai")["api_key"] == "sk-inline"
+
+
+def test_migrate_refuses_providers_that_would_share_a_key_file(tmp_config, monkeypatch):
+    cfg = _set_provider_blocks(
+        tmp_config,
+        Foo={"base_url": "https://foo.example/v1", "api_key": "one"},
+        foo={"base_url": "https://foo.example/v1", "api_key": "two"},
+    )
+    before = cfg.read_text()
+
+    with pytest.raises(ValueError, match="would share API key file"):
+        config_io.migrate_inline_api_keys()
+    assert cfg.read_text() == before
+    assert not (tmp_config / "secrets").exists()
+
+
+def test_migrate_covers_workspaces_section(tmp_config, monkeypatch):
+    import yaml
+    cfg = tmp_config / "config.yaml"
+    doc = yaml.safe_load(cfg.read_text())
+    doc["workspaces"] = {"ws-pat": {"base_url": "https://ws.example/serving-endpoints", "api_key": "dapi-inline"}}
+    cfg.write_text(yaml.safe_dump(doc))
+
+    moved = {row["provider"] for row in config_io.migrate_inline_api_keys()}
+
+    assert moved == {"anthropic", "ws-pat"}
+    assert "dapi-inline" not in cfg.read_text()
+    assert (tmp_config / "secrets" / "ws-pat.api-key").read_text() == "dapi-inline\n"
+
+
+def test_migrate_restores_files_when_config_write_fails(tmp_config, monkeypatch):
+    shadowed = tmp_config / "shadowed.key"
+    shadowed.write_text("stale\n")
+    shadowed.chmod(0o600)
+    cfg = _set_provider_blocks(
+        tmp_config,
+        openai={"base_url": "https://api.openai.com/v1", "api_key": "sk-inline", "api_key_file": str(shadowed)},
+    )
+    before = cfg.read_text()
+    real_write = config_io._atomic_write
+
+    def fail_config_write(path, text):
+        if path == config_io.CONFIG_PATH and "sk-inline" not in text:
+            raise OSError("synthetic config write failure")
+        return real_write(path, text)
+
+    monkeypatch.setattr(config_io, "_atomic_write", fail_config_write)
+    with pytest.raises(OSError, match="synthetic"):
+        config_io.migrate_inline_api_keys()
+
+    assert cfg.read_text() == before
+    assert shadowed.read_text() == "stale\n"
+    assert shadowed.stat().st_mode & 0o777 == 0o600
+    assert not (tmp_config / "secrets" / "anthropic.api-key").exists()
+
+
+def test_migrate_script_exit_codes(tmp_path):
+    import subprocess
+    import sys
+    from pathlib import Path as _Path
+
+    root = _Path(__file__).resolve().parents[1]
+    real = _Path(os.path.realpath(tmp_path))
+    cfg = real / "config.yaml"
+    cfg.write_text("providers:\n  demo:\n    base_url: https://x.example/v1\n    api_key: demo-secret\n")
+    cfg.chmod(0o600)
+    env = {
+        **os.environ,
+        "MODEL_GATEWAY_SECRET_DIR": str(real / "secrets"),
+        "MODEL_GATEWAY_BACKUP_DIR": str(real / "backups"),
+    }
+
+    def run(*args):
+        return subprocess.run(
+            [sys.executable, str(root / "scripts" / "migrate_api_keys.py"), "--config", str(cfg), *args],
+            env=env, capture_output=True, text=True, timeout=60,
+        )
+
+    dry = run("--dry-run")
+    assert dry.returncode == 0 and "would move demo" in dry.stdout
+    assert "demo-secret" in cfg.read_text()
+    applied = run()
+    assert applied.returncode == 0 and "moved demo" in applied.stdout
+    assert "demo-secret" not in applied.stdout + applied.stderr + cfg.read_text()
+    assert run().returncode == 3
+    assert run("--dry-run").returncode == 0
+
+
+def test_provider_status_reports_key_source_and_storage_warnings(tmp_config, monkeypatch):
+    import yaml
+    cfg = tmp_config / "config.yaml"
+    doc = yaml.safe_load(cfg.read_text())
+    doc["providers"]["openai"] = {"base_url": "https://api.openai.com/v1", "api_key": "sk", "api_key_file": "x.key"}
+    cfg.write_text(yaml.safe_dump(doc))
+    providers.reload()
+
+    by_id = {p["id"]: p for p in providers.provider_status()}
+    assert by_id["anthropic"]["api_key_source"] == "inline"
+    assert by_id["anthropic"]["warnings"] == ["inline_api_key"]
+    assert by_id["anthropic"]["ready"] is True
+    assert by_id["openai"]["warnings"] == ["inline_api_key_shadows_file"]
+    validation = providers.config_validation()
+    assert validation["ok"] is True
+    assert {w["provider"] for w in validation["warnings"]} == {"anthropic", "openai"}
+
+    config_io.migrate_inline_api_keys()
+    providers.reload()
+    by_id = {p["id"]: p for p in providers.provider_status()}
+    assert by_id["anthropic"]["api_key_source"] == "file"
+    assert by_id["anthropic"]["warnings"] == []
+    monkeypatch.setenv("MODEL_GATEWAY_PROVIDER_ANTHROPIC_API_KEY", "env-key")
+    assert {p["id"]: p for p in providers.provider_status()}["anthropic"]["api_key_source"] == "env"
+    assert "secret-existing" not in json.dumps(providers.config_validation())
 
 
 def test_config_backups_can_live_outside_log_tree(tmp_config, monkeypatch):

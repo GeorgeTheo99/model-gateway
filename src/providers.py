@@ -1193,6 +1193,26 @@ def _safe_url(value: str) -> str:
     return urlunsplit((parts.scheme, host, parts.path, "", ""))
 
 
+def _api_key_source(explicit_config: dict, env_config: dict, provider: str) -> str:
+    """Where a provider's effective key comes from, without reading it."""
+    if env_config.get("api_key"):
+        return "env"
+    if explicit_config.get("api_key"):
+        return "inline"
+    if explicit_config.get("api_key_file"):
+        return "file"
+    return "default" if _provider_defaults(provider).get("api_key") else "missing"
+
+
+def _api_key_warnings(explicit_config: dict, key_source: str) -> list[str]:
+    """Credential-storage findings that do not block routing."""
+    if key_source != "inline" or explicit_config.get("auth_refresh"):
+        return []
+    if explicit_config.get("api_key_file"):
+        return ["inline_api_key_shadows_file"]
+    return ["inline_api_key"]
+
+
 @_registry_locked
 def provider_status() -> list[dict]:
     """Return masked provider configuration status for admin/observability APIs."""
@@ -1220,6 +1240,7 @@ def provider_status() -> list[dict]:
         provider_config = _effective_provider_config(config, provider)
         base_url = _safe_url(provider_config.get("base_url", ""))
         has_api_key = bool(provider_config.get("api_key"))
+        key_source = _api_key_source(explicit_config, env_config, provider)
         model_count = model_counts.get(provider, 0)
         issues = []
         if model_count and provider_config.get("enabled") is False:
@@ -1236,8 +1257,10 @@ def provider_status() -> list[dict]:
             "base_url_redacted": base_url != provider_config.get("base_url", ""),
             "protocol": provider_config.get("protocol", "openai") if provider_config else "openai",
             "has_api_key": has_api_key,
+            "api_key_source": key_source,
             "ready": not issues,
             "issues": issues,
+            "warnings": _api_key_warnings(explicit_config, key_source),
             "pool_memberships": pool_memberships.get(provider, []),
         })
     return result
@@ -1483,5 +1506,12 @@ def config_validation() -> dict:
                 "issues": p["issues"],
             }
             for p in missing
+        ],
+        # Storage findings do not affect readiness. Fix inline keys with
+        # `model-gateway secrets migrate`.
+        "warnings": [
+            {"provider": p["id"], "warnings": p["warnings"]}
+            for p in providers
+            if p["warnings"]
         ],
     }

@@ -190,11 +190,15 @@ def _reload_registry_transactionally(provider_snapshot) -> str | None:
         return None
 
 
-def _apply_registry_mutation(mutate):
-    """Run one locked admin file mutation and publish it only after validation."""
+def _apply_registry_mutation(mutate, extra_paths=None):
+    """Run one locked admin file mutation and publish it only after validation.
+
+    ``extra_paths`` is an optional callable, evaluated under the lock, naming
+    additional files (such as a provider key file) the mutation may write.
+    """
     with config_write_lock(config_io.CONFIG_PATH):
         provider_snapshot = snapshot_provider_registry()
-        file_snapshot = config_io.snapshot_writable_files()
+        file_snapshot = config_io.snapshot_writable_files(extra_paths() if extra_paths else ())
         try:
             result = mutate()
         except Exception:
@@ -385,8 +389,8 @@ async def admin_upsert_provider(provider_id: str, request: Request):
     """Create or update a provider block in config.yaml.
 
     Body: {base_url, protocol?, api_key?, default_headers?}. ``api_key`` is
-    write-only (None preserves the existing key; "" removes it). Reloads the
-    provider registry after writing.
+    write-only (None preserves the existing key; "" removes it) and is stored
+    in a mode-0600 key file. Reloads the provider registry after writing.
     """
     require_admin_auth(request)
     require_admin_writes()
@@ -401,8 +405,11 @@ async def admin_upsert_provider(provider_id: str, request: Request):
             api_key=body.get("api_key"),
             protocol=body.get("protocol"),
             default_headers=body.get("default_headers"),
-        ))
-    except ValueError as exc:
+        ), extra_paths=lambda: [
+            path for path in [config_io.api_key_file_target(provider_id)]
+            if path and isinstance(body.get("api_key"), str) and body["api_key"].strip()
+        ])
+    except (ValueError, OSError) as exc:
         return _bad_request(str(exc))
     if reload_error is not None:
         return _bad_request(f"Provider registry update rejected: {reload_error}")
@@ -2099,8 +2106,8 @@ _ADMIN_HTML = r"""
                     type="password"
                     autocomplete="new-password"
                   /><span class="hint"
-                    >Leave blank when editing to keep the saved key. Existing
-                    keys are never shown.</span
+                    >Leave blank when editing to keep the saved key. Keys are
+                    saved to a private 0600 key file and never shown.</span
                   >
                 </div>
               </div>
@@ -2504,6 +2511,25 @@ _ADMIN_HTML = r"""
             : m.available
               ? pill("ok", "Configured")
               : pill("warn", "Needs attention");
+        }
+        function keySourceText(p) {
+          const sources = {
+            file: "Present (hidden) · private key file",
+            env: "Present (hidden) · environment variable",
+            inline: "Present (hidden) · inline in config.yaml",
+            default: "Built-in local default",
+          };
+          return (p.has_api_key && sources[p.api_key_source]) ||
+            (p.has_api_key ? "Present (hidden)" : "Missing");
+        }
+        function keyWarningsText(warnings) {
+          const names = {
+            inline_api_key:
+              "API key is stored inline in config.yaml (and its backups). Run `model-gateway secrets migrate` to move it to a private key file.",
+            inline_api_key_shadows_file:
+              "An inline API key in config.yaml overrides this connection's key file. Run `model-gateway secrets migrate` to consolidate them.",
+          };
+          return (warnings || []).map((w) => names[w] || w.replace(/_/g, " ")).join(" ");
         }
         function issuesText(issues) {
           const names = {
@@ -3849,7 +3875,7 @@ _ADMIN_HTML = r"""
               "<code>" + esc(p.base_url || "Not configured") + "</code>",
             ) +
             kv("Protocol", esc(p.protocol)) +
-            kv("API key", p.has_api_key ? "Present (hidden)" : "Missing") +
+            kv("API key", esc(keySourceText(p))) +
             kv(
               "Last explicit check",
               esc(
@@ -3861,6 +3887,9 @@ _ADMIN_HTML = r"""
             "</div>" +
             (p.issues?.length
               ? '<p class="notice warn">' + esc(issuesText(p.issues)) + "</p>"
+              : "") +
+            (p.warnings?.length
+              ? '<p class="notice warn">' + esc(keyWarningsText(p.warnings)) + "</p>"
               : "") +
             '</section><section class="detail-section"><h3>Assigned models</h3><div class="assigned-models">' +
             (assigned.map((m) => modelLink(modelName(m))).join(" · ") ||
