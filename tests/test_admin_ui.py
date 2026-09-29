@@ -22,10 +22,10 @@ def elements():
     return parser.elements
 
 
-def test_ui_has_four_primary_destinations_and_secondary_settings():
+def test_ui_has_five_primary_destinations_and_secondary_settings():
     tabs = [attrs for _, attrs in elements() if "data-tab" in attrs]
     assert [attrs["data-tab"] for attrs in tabs] == [
-        "overview", "models", "connections", "activity", "settings",
+        "overview", "models", "connections", "activity", "consumers", "settings",
     ]
     assert tabs[0]["aria-selected"] == "true"
     assert "settings-nav" in tabs[-1]["class"]
@@ -81,3 +81,19 @@ def test_admin_model_status_exposes_scoped_image_policy_without_probes(monkeypat
     assert result[0]["vision_route"] == {"model": "local-helper", "mode": "extract_then_answer"}
     assert result[1]["vision_route"] == {"model": "cloud-helper", "mode": "extract_then_answer"}
     assert all(row["vision_route"] is None for row in result[2:])
+
+
+def test_ui_consumer_changes_are_gated_confirmed_and_show_keys_once():
+    indexed = {attrs["id"]: attrs for _, attrs in elements() if "id" in attrs}
+    assert "hidden" in indexed["newKeyPanel"]
+    assert "readonly" in indexed["newKeyValue"]
+    assert indexed["consumerFormset"]["class"] == "formset"
+    assert indexed["consumerConfirm"]["class"] == "formset"
+    assert "This key is not shown again" in _ADMIN_HTML
+    assert "{ confirm: p.id }" in _ADMIN_HTML
+    # The key never reaches persistent browser storage; lock clears it.
+    lock_body = _ADMIN_HTML.split("function lock(")[1].split("async function unlock(")[0]
+    assert "clearNewKey();" in lock_body
+    assert _ADMIN_HTML.count("sessionStorage.setItem(") == 1
+    assert 'sessionStorage.setItem(STORAGE_KEY, $("adminKey").value.trim())' in _ADMIN_HTML
+    assert "localStorage" not in _ADMIN_HTML

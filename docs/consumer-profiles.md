@@ -12,7 +12,7 @@ This document defines the version 1 contract for consumer-owned, gateway-enforce
 
 ## Consumer credentials
 
-Identity-aware credentials are configured under `auth.consumer_credentials`. Secret values should be stored in owner-only regular files. `model-gateway consumer add|list|revoke` creates, lists, and removes these entries and their key files (see [deployment](deployment.md#connecting-consumers)).
+Identity-aware credentials are configured under `auth.consumer_credentials`. Secret values should be stored in owner-only regular files. `model-gateway consumer add|list|revoke` creates, lists, and removes these entries and their key files; the admin UI Consumers tab can also add, rotate, and revoke them (see [deployment](deployment.md#connecting-consumers)).
 
 ```yaml
 auth:

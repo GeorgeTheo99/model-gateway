@@ -382,6 +382,47 @@ def _backup(path: Path) -> Path | None:
         os.close(backup_fd)
 
 
+def backup_status() -> dict:
+    """Summarize the private backup directory by name and mtime only.
+
+    Read-only: never creates, opens, or re-permissions backups. Managed
+    generations (``<file>.bak.<ns>``, including imported legacy archives) are
+    grouped per source file; anything else, such as a manual snapshot, is
+    counted as ``other``. Symlinks are ignored.
+    """
+    directory = _config_backup_dir()
+    generations: dict[str, list[float]] = {}
+    other: list[float] = []
+
+    def scan(path: Path, *, top: bool) -> None:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if entry.is_symlink():
+                    continue
+                mtime = entry.stat(follow_symlinks=False).st_mtime
+                source, sep, suffix = entry.name.rpartition(".bak.")
+                if sep and suffix.isdigit() and entry.is_file(follow_symlinks=False):
+                    generations.setdefault(source, []).append(mtime)
+                elif top and entry.name.startswith("legacy-config-backups-") and entry.is_dir(follow_symlinks=False):
+                    scan(Path(entry.path), top=False)
+                elif top:
+                    other.append(mtime)
+
+    exists = directory.is_dir() and not directory.is_symlink()
+    if exists:
+        scan(directory, top=True)
+    return {
+        "directory": str(directory),
+        "exists": exists,
+        "retention": _backup_retention(),
+        "generations": [
+            {"file": name, "count": len(times), "newest": max(times), "oldest": min(times)}
+            for name, times in sorted(generations.items())
+        ],
+        "other": {"count": len(other), "newest": max(other) if other else None},
+    }
+
+
 def snapshot_writable_files(extra_paths=()) -> dict[Path, str | None]:
     """Capture every admin-managed file (plus ``extra_paths``) for validation rollback."""
     paths = {CONFIG_PATH, MODEL_INFO_PATH, *extra_paths}
@@ -650,6 +691,23 @@ def consumer_key_path(credential_id: str) -> Path:
     return _resolve_target(CONFIG_PATH).parent / "secrets" / "consumers" / f"{credential_id}.key"
 
 
+def consumer_credential_id(consumer: object, role: object) -> str:
+    """Validate ``consumer`` and ``role`` and return credential id ``<consumer>-<role>``."""
+    from src.auth import _PRINCIPAL_ID_RE
+
+    if role not in CONSUMER_ROLES:
+        raise ValueError(f"role must be one of: {', '.join(CONSUMER_ROLES)}")
+    if not isinstance(consumer, str) or not _PRINCIPAL_ID_RE.fullmatch(consumer):
+        raise ValueError("consumer must be 1-32 lowercase letters, digits, or hyphens")
+    credential_id = f"{consumer}-{role}"
+    if len(credential_id) > 32:
+        raise ValueError(
+            f"consumer id is too long: {credential_id!r} must be at most 32 characters, "
+            f"so a {role} consumer id can have at most {31 - len(role)}"
+        )
+    return credential_id
+
+
 def _consumer_entries(config: dict) -> list:
     auth = config.setdefault("auth", {})
     if not isinstance(auth, dict):
@@ -676,6 +734,10 @@ def _consumer_key_status(entry: dict) -> str:
 
 def _consumer_summary(entry: dict) -> dict:
     """Non-secret view of one credential entry."""
+    try:
+        managed = _managed_consumer_key(entry, str(entry.get("id") or "")) is not None
+    except ValueError:
+        managed = False
     return {
         "id": entry.get("id"),
         "consumer": entry.get("consumer"),
@@ -684,6 +746,7 @@ def _consumer_summary(entry: dict) -> dict:
         "allow_direct_models": bool(entry.get("allow_direct_models", False)),
         "key_file": entry.get("key_file"),
         "key_status": _consumer_key_status(entry),
+        "managed_key_file": managed,
     }
 
 
@@ -719,6 +782,7 @@ def add_consumer_credential(
     *,
     namespaces: list[str] | None = None,
     allow_direct_models: bool = False,
+    reveal_key: bool = False,
 ) -> dict:
     """Create credential ``<consumer>-<role>`` with a generated mode-0600 key file.
 
@@ -727,18 +791,16 @@ def add_consumer_credential(
     identical entry whose default key file is missing gets a new key.
     Returns the non-secret summary plus ``status`` (``created``/``repaired``/
     ``unchanged``) and ``enables_client_auth`` when ``/v1`` was open before.
+    ``reveal_key`` adds ``key`` only when this call generated it, for the
+    admin UI's one-time display; an adopted or unchanged key is never read.
     """
     from src.auth import _PRINCIPAL_ID_RE, _read_consumer_key_file
 
-    if role not in CONSUMER_ROLES:
-        raise ValueError(f"role must be one of: {', '.join(CONSUMER_ROLES)}")
-    if not isinstance(consumer, str) or not _PRINCIPAL_ID_RE.fullmatch(consumer):
-        raise ValueError("consumer must be 1-32 lowercase letters, digits, or hyphens")
-    credential_id = f"{consumer}-{role}"
+    credential_id = consumer_credential_id(consumer, role)
     target = consumer_key_path(credential_id)
     namespaces = list(namespaces or [consumer])
-    if len(set(namespaces)) != len(namespaces) or any(
-        not isinstance(value, str) or not _PRINCIPAL_ID_RE.fullmatch(value) for value in namespaces
+    if any(not isinstance(value, str) or not _PRINCIPAL_ID_RE.fullmatch(value) for value in namespaces) or (
+        len(set(namespaces)) != len(namespaces)
     ):
         raise ValueError("namespaces must be unique 1-32 character lowercase ids")
     desired = {
@@ -773,9 +835,11 @@ def add_consumer_credential(
         if target.is_symlink():
             raise ValueError(f"refusing symlink consumer key target: {target}")
         snapshot = snapshot_writable_files([target])
-        write_api_key_file(target, secrets.token_hex(32))
+        token = secrets.token_hex(32)
+        write_api_key_file(target, token)
         _validate_auth_after_write(snapshot)
-        return {**_consumer_summary(existing), "status": "repaired", "enables_client_auth": False}
+        result = {**_consumer_summary(existing), "status": "repaired", "enables_client_auth": False}
+        return {**result, "key": token} if reveal_key else result
 
     from src import auth, providers
 
@@ -794,11 +858,13 @@ def add_consumer_credential(
             raise ValueError(f"consumer key file {target} is already used by {entry.get('id')!r}")
 
     snapshot = snapshot_writable_files([target])
+    token = None
     try:
         if target.exists():
             _read_consumer_key_file(str(target))  # adopt only a valid private key file
         else:
-            write_api_key_file(target, secrets.token_hex(32))
+            token = secrets.token_hex(32)
+            write_api_key_file(target, token)
         entries.append(desired)
         _backup(CONFIG_PATH)
         _atomic_write(CONFIG_PATH, yaml.safe_dump(config, sort_keys=False, default_flow_style=False))
@@ -806,7 +872,56 @@ def add_consumer_credential(
         restore_writable_files(snapshot)
         raise
     _validate_auth_after_write(snapshot)
-    return {**_consumer_summary(desired), "status": "created", "enables_client_auth": enables_client_auth}
+    result = {**_consumer_summary(desired), "status": "created", "enables_client_auth": enables_client_auth}
+    return {**result, "key": token} if reveal_key and token else result
+
+
+def _managed_consumer_key(entry: dict, credential_id: str) -> Path | None:
+    """The entry's key file if it is this credential's default, non-symlink path."""
+    raw = entry.get("key_file")
+    if not raw:
+        return None
+    intended = Path(str(raw)).expanduser()
+    if not intended.is_absolute():
+        intended = _resolve_target(CONFIG_PATH).parent / intended
+    if intended != consumer_key_path(credential_id) or intended.is_symlink():
+        return None
+    return intended
+
+
+@_write_transaction
+def rotate_consumer_credential(credential_id: str) -> dict:
+    """Replace a credential's managed key file with a new generated key.
+
+    The old key stops authenticating as soon as the file is replaced. Only a
+    valid key at the default ``secrets/consumers/<id>.key`` path is rotated;
+    inline keys, external or symlinked files, and unusable files are refused.
+    Returns the non-secret summary plus the new ``key`` for one-time display.
+    """
+    entries = _consumer_entries(load_config_full())
+    entry = next((item for item in entries if item.get("id") == credential_id), None)
+    if entry is None:
+        raise KeyError(f"consumer credential {credential_id!r} not found")
+    target = _managed_consumer_key(entry, credential_id)
+    if target is None:
+        raise ValueError(
+            f"consumer credential {credential_id!r} does not use its managed key file; rotate it by hand"
+        )
+    status = _consumer_key_status(entry)
+    if status != "ok":
+        raise ValueError(
+            f"consumer credential {credential_id!r} has an unusable key file ({status}); "
+            "repair it with add, or revoke and re-add it"
+        )
+    snapshot = snapshot_writable_files([target])
+    token = secrets.token_hex(32)
+    try:
+        write_api_key_file(target, token)
+    except Exception:
+        restore_writable_files(snapshot)
+        raise
+    _validate_auth_after_write(snapshot)
+    return {**_consumer_summary(entry), "status": "rotated", "key": token}
 
 
 @_write_transaction
@@ -833,11 +948,9 @@ def revoke_consumer_credential(credential_id: str) -> dict:
     summary["key_file_deleted"] = False
     raw = entry.get("key_file")
     if raw:
-        intended = Path(str(raw)).expanduser()
-        if not intended.is_absolute():
-            intended = _resolve_target(CONFIG_PATH).parent / intended
+        intended = _managed_consumer_key(entry, credential_id)
         target = resolve_api_key_file(raw, CONFIG_PATH)
-        managed = intended == consumer_key_path(credential_id) and not intended.is_symlink()
+        managed = intended is not None
         still_used = any(
             "key_file" in other and resolve_api_key_file(other["key_file"], CONFIG_PATH) == target
             for other in entries

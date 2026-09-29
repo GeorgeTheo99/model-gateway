@@ -10,7 +10,8 @@ import time
 from pathlib import Path
 
 from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from src.auth import admin_writes_enabled, auth_mode, require_admin_auth, require_admin_writes
 from src.config_lock import config_write_lock
@@ -27,7 +28,7 @@ from src.providers import (
     routable_ids,
     snapshot_registry as snapshot_provider_registry,
 )
-from src import config_io, discovery, federation, ledger
+from src import bundle, config_io, discovery, federation, ledger, profiles
 
 router = APIRouter()
 _STARTED_AT = time.time()
@@ -711,8 +712,198 @@ async def admin_disable_model(model_name: str, request: Request):
     return result
 
 
+# ── Consumers, profiles, backups, and bundles ────────────────────────────────
+
+# Responses that may carry a newly generated key must never be cached.
+_NO_STORE = {"Cache-Control": "no-store"}
+
+
+def _consumer_mutation(credential_id: str, mutate):
+    """Apply one consumer credential write in-process, then refresh discovery.
+
+    Returns ``(result, None)`` or ``(None, error_response)``. config_io
+    validates auth and rolls back its own files; the registry transaction
+    adds the same post-write validation and rollback as other admin writes.
+    """
+    try:
+        result, reload_error = _apply_registry_mutation(
+            mutate, extra_paths=lambda: [config_io.consumer_key_path(credential_id)],
+        )
+    except KeyError as exc:
+        return None, _bad_request(exc.args[0] if exc.args else "not found", status=404)
+    except (ValueError, OSError, RuntimeError) as exc:
+        return None, _bad_request(str(exc))
+    if reload_error is not None:
+        return None, _bad_request(f"Consumer credential update rejected: {reload_error}")
+    discovery.refresh()
+    return result, None
+
+
+async def _confirmed_body(request: Request, credential_id: str):
+    """Require ``{"confirm": "<credential id>"}`` for key-changing writes."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict) or body.get("confirm") != credential_id:
+        return _bad_request("Confirm by sending the credential id as 'confirm'", status=428)
+    return None
+
+
+@router.get("/admin/api/consumers")
+async def admin_consumers(request: Request):
+    """Consumer credentials without key values."""
+    require_admin_auth(request)
+    try:
+        credentials = config_io.list_consumer_credentials()
+    except ValueError as exc:
+        return _bad_request(str(exc), status=503)
+    return {"consumers": credentials, "roles": config_io.CONSUMER_ROLES}
+
+
+@router.post("/admin/api/consumers")
+async def admin_add_consumer(request: Request):
+    """Create ``<consumer>-<role>``. A generated key is returned once, uncached.
+
+    Body: {consumer, role, namespaces?, allow_direct_models?}.
+    """
+    require_admin_auth(request)
+    require_admin_writes()
+    try:
+        body = await request.json()
+    except Exception:
+        return _bad_request("Invalid JSON body")
+    if not isinstance(body, dict):
+        return _bad_request("Invalid JSON body")
+    consumer, role = body.get("consumer"), body.get("role")
+    namespaces = body.get("namespaces")
+    allow_direct = body.get("allow_direct_models", False)
+    try:
+        credential_id = config_io.consumer_credential_id(consumer, role)
+    except ValueError as exc:
+        return _bad_request(str(exc))
+    if namespaces is not None and (
+        not isinstance(namespaces, list) or any(not isinstance(value, str) for value in namespaces)
+    ):
+        return _bad_request("namespaces must be a list of strings")
+    if not isinstance(allow_direct, bool):
+        return _bad_request("allow_direct_models must be a boolean")
+    result, error = _consumer_mutation(credential_id, lambda: config_io.add_consumer_credential(
+        consumer, role, namespaces=namespaces, allow_direct_models=allow_direct, reveal_key=True,
+    ))
+    if error is not None:
+        return error
+    return JSONResponse(result, headers=_NO_STORE)
+
+
+@router.post("/admin/api/consumers/{credential_id}/rotate")
+async def admin_rotate_consumer(credential_id: str, request: Request):
+    """Replace a credential's key. The old key stops working immediately."""
+    require_admin_auth(request)
+    require_admin_writes()
+    if (refusal := await _confirmed_body(request, credential_id)) is not None:
+        return refusal
+    result, error = _consumer_mutation(
+        credential_id, lambda: config_io.rotate_consumer_credential(credential_id),
+    )
+    if error is not None:
+        return error
+    return JSONResponse(result, headers=_NO_STORE)
+
+
+@router.delete("/admin/api/consumers/{credential_id}")
+async def admin_revoke_consumer(credential_id: str, request: Request):
+    """Remove a credential and its managed key file; refuses the last /v1 key."""
+    require_admin_auth(request)
+    require_admin_writes()
+    if (refusal := await _confirmed_body(request, credential_id)) is not None:
+        return refusal
+    result, error = _consumer_mutation(
+        credential_id, lambda: config_io.revoke_consumer_credential(credential_id),
+    )
+    if error is not None:
+        return error
+    return result
+
+
+@router.get("/admin/api/profiles")
+async def admin_profiles(request: Request):
+    """Registered profile namespaces: latest public snapshot plus version history."""
+    require_admin_auth(request)
+    try:
+        with profiles._lock, profiles._file_lock(exclusive=False) as path:
+            data = profiles._load(path)
+    except (profiles.ProfileError, OSError) as exc:
+        return _bad_request(str(exc) or "Profile registry is unavailable", status=503)
+    namespaces = []
+    for namespace, versions in sorted(data["namespaces"].items()):
+        if not versions:
+            continue
+        namespaces.append({
+            "namespace": namespace,
+            "latest": profiles._public_snapshot(versions[-1]),
+            "versions": [
+                {
+                    "gateway_version": record["gateway_version"],
+                    "registered_at": record["registered_at"],
+                    "source_revision": record["manifest"].get("source_revision"),
+                    "manifest_digest": record["manifest_digest"],
+                }
+                for record in reversed(versions)
+            ],
+        })
+    return {"namespaces": namespaces}
+
+
+@router.get("/admin/api/backups")
+async def admin_backups(request: Request):
+    """Private config backup location, retention, and generation counts."""
+    require_admin_auth(request)
+    try:
+        return config_io.backup_status()
+    except (OSError, RuntimeError) as exc:
+        return _bad_request(str(exc), status=503)
+
+
+@router.get("/admin/api/bundle/manifest")
+async def admin_bundle_manifest(request: Request):
+    """Preview what a portable bundle would contain, without downloading it."""
+    require_admin_auth(request)
+    try:
+        manifest, data, credential_urls = await run_in_threadpool(bundle.build_bundle)
+    except (OSError, ValueError, profiles.ProfileError) as exc:
+        return _bad_request(str(exc), status=503)
+    return {
+        **manifest,
+        "size": len(data),
+        "downloadable": not credential_urls,
+        "credential_urls": credential_urls,
+    }
+
+
+@router.get("/admin/api/bundle")
+async def admin_bundle_download(request: Request):
+    """Download a secret-free bundle for ``model-gateway bundle import``."""
+    require_admin_auth(request)
+    try:
+        manifest, data, credential_urls = await run_in_threadpool(bundle.build_bundle)
+    except (OSError, ValueError, profiles.ProfileError) as exc:
+        return _bad_request(str(exc), status=503)
+    if credential_urls:
+        return _bad_request(
+            "Some URLs embed credentials or query parameters ("
+            + ", ".join(credential_urls)
+            + "). Export locally with `model-gateway bundle export` instead.",
+            status=409,
+        )
+    stamp = manifest["created_at"].replace("-", "").replace(":", "")
+    return Response(data, media_type="application/gzip", headers={
+        **_NO_STORE,
+        "Content-Disposition": f'attachment; filename="model-gateway-bundle-{stamp}.tar.gz"',
+    })
+
+
 def _bad_request(message: str, status: int = 400):
-    from fastapi.responses import JSONResponse
     return JSONResponse(status_code=status, content={"error": {"message": message}})
 
 
@@ -1490,19 +1681,17 @@ _ADMIN_HTML = r"""
           padding: 12px 20px;
         }
         .nav {
+          display: grid;
+          grid-template-columns: repeat(3, minmax(0, 1fr));
           gap: 0;
-          flex-wrap: wrap;
           overflow: visible;
         }
         .nav button {
           padding: 10px 6px;
-          flex: 1;
           font-size: 0.8125rem;
         }
         .nav .settings-nav {
           margin-left: 0;
-          flex: 0 0 100%;
-          text-align: left;
         }
         .statusbar .updated {
           margin-left: 0;
@@ -1673,6 +1862,15 @@ _ADMIN_HTML = r"""
               tabindex="-1"
             >
               Activity</button
+            ><button
+              id="tab-consumers"
+              role="tab"
+              data-tab="consumers"
+              aria-controls="panel-consumers"
+              aria-selected="false"
+              tabindex="-1"
+            >
+              Consumers</button
             ><button
               id="tab-settings"
               role="tab"
@@ -2298,6 +2496,154 @@ _ADMIN_HTML = r"""
             </div>
           </section>
           <section
+            id="panel-consumers"
+            class="tab-panel"
+            data-tab-panel="consumers"
+            role="tabpanel"
+            aria-labelledby="tab-consumers"
+            tabindex="0"
+          >
+            <div class="page-head">
+              <div>
+                <h1>Consumers</h1>
+                <p>
+                  Projects that call the gateway with their own credential, and
+                  the routing profiles they publish.
+                </p>
+              </div>
+              <button class="btn" data-mgmt data-add-consumer>
+                Add a credential
+              </button>
+            </div>
+            <div id="consumersStatus" class="view-status" role="status"></div>
+            <section
+              id="newKeyPanel"
+              class="notice warn"
+              aria-labelledby="newKeyTitle"
+              hidden
+            >
+              <h2 id="newKeyTitle">Copy the new key now</h2>
+              <p id="newKeyMeta"></p>
+              <div class="field">
+                <label for="newKeyValue">Key</label
+                ><input
+                  id="newKeyValue"
+                  readonly
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+              </div>
+              <div class="toolbar" style="margin: 12px 0">
+                <button class="btn" id="copyNewKeyBtn">Copy key</button
+                ><button class="btn secondary" id="dismissNewKeyBtn">
+                  I've saved it
+                </button>
+              </div>
+              <p class="small">
+                This key is not shown again. Reloading or locking this page
+                discards it; rotate the credential if it is lost.
+              </p>
+            </section>
+            <div class="sec-head"><h2>Credentials</h2></div>
+            <div class="scroll">
+              <table id="consumers" class="inventory">
+                <thead>
+                  <tr>
+                    <th>Credential</th>
+                    <th>Access</th>
+                    <th>Key file</th>
+                    <th data-mgmt>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr class="empty">
+                    <td colspan="4">Loading credentials…</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <details class="formset" id="consumerFormset">
+              <summary>Add a credential</summary>
+              <p class="small">
+                Creates <code>&lt;consumer&gt;-&lt;role&gt;</code> with a
+                generated key in a private 0600 key file. The key is shown once.
+              </p>
+              <div class="formgrid">
+                <div class="field">
+                  <label for="cConsumer">Consumer ID</label
+                  ><input
+                    id="cConsumer"
+                    placeholder="myai"
+                    autocomplete="off"
+                    spellcheck="false"
+                  /><span class="hint"
+                    >Lowercase letters, digits, or hyphens. With the role
+                    suffix, the credential ID must be 32 characters or
+                    fewer.</span
+                  >
+                </div>
+                <div class="field">
+                  <label for="cRole">Role</label
+                  ><select id="cRole">
+                    <option value="runtime">Runtime — read and invoke profiles</option>
+                    <option value="deployer">Deployer — read and publish profiles</option>
+                  </select>
+                </div>
+                <div class="field wide">
+                  <label for="cNamespaces">Profile namespaces</label
+                  ><input
+                    id="cNamespaces"
+                    autocomplete="off"
+                    spellcheck="false"
+                  /><span class="hint"
+                    >Comma-separated. Leave blank to use the consumer ID.</span
+                  >
+                </div>
+                <label class="check"
+                  ><input id="cDirect" type="checkbox" /> Also allow explicit
+                  catalog models outside profiles</label
+                >
+              </div>
+              <div class="toolbar">
+                <button class="btn" id="saveConsumerBtn">
+                  Create credential</button
+                ><button class="btn secondary" data-cancel-consumer>
+                  Cancel
+                </button>
+              </div>
+              <div id="cMsg" class="msg" role="status"></div>
+            </details>
+            <details class="formset" id="consumerConfirm" hidden>
+              <summary id="consumerConfirmTitle">Confirm change</summary>
+              <p id="consumerConfirmWarn" class="notice warn"></p>
+              <div class="field">
+                <label for="cConfirm" id="cConfirmLabel"
+                  >Type the credential ID to confirm</label
+                ><input id="cConfirm" autocomplete="off" spellcheck="false" />
+              </div>
+              <div class="toolbar">
+                <button class="btn danger" id="confirmConsumerBtn">
+                  Confirm</button
+                ><button class="btn secondary" data-cancel-consumer-confirm>
+                  Cancel
+                </button>
+              </div>
+              <div id="ccMsg" class="msg" role="status"></div>
+            </details>
+            <p class="mgmt-hint small">
+              Read-only access. Credential changes need write access (see
+              Settings) or <code>model-gateway consumer</code> on the gateway
+              host.
+            </p>
+            <div class="sec-head"><h2>Profiles</h2></div>
+            <p class="small">
+              Read-only. Consumers publish profiles with their deployer
+              credential; the gateway keeps every version.
+            </p>
+            <div id="profilesStatus" class="view-status" role="status"></div>
+            <div id="profiles"></div>
+          </section>
+          <section
             id="panel-settings"
             class="tab-panel"
             data-tab-panel="settings"
@@ -2324,6 +2670,46 @@ _ADMIN_HTML = r"""
             <section class="detail-section">
               <h2>Runtime</h2>
               <div id="runtimeDetails" class="kv-grid"></div>
+            </section>
+            <section class="detail-section">
+              <h2>Backups & export</h2>
+              <div id="backupsStatus" class="view-status" role="status"></div>
+              <p class="small">
+                The gateway copies a file into this private directory before
+                each change it makes. Restoring one is a host operation.
+              </p>
+              <div id="backupDetails" class="kv-grid"></div>
+              <div class="scroll">
+                <table id="backupGenerations" class="inventory">
+                  <thead>
+                    <tr>
+                      <th>File</th>
+                      <th class="num">Kept</th>
+                      <th>Newest</th>
+                      <th>Oldest</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+              <h3 style="margin-top: 24px">Portable bundle</h3>
+              <p class="small">
+                Connections, models, and profiles for moving to another
+                machine. API keys, access settings, federation, and machine
+                paths stay here; the target supplies its own keys.
+              </p>
+              <div id="bundleDetails" class="kv-grid"></div>
+              <div class="toolbar">
+                <button class="btn secondary" id="downloadBundleBtn">
+                  Download bundle
+                </button>
+              </div>
+              <p class="small">
+                On the target machine, run
+                <code>model-gateway bundle import FILE --dry-run</code>, then
+                again without <code>--dry-run</code>.
+              </p>
+              <div id="bundleMsg" class="msg" role="status"></div>
             </section>
             <details>
               <summary>Protocol diagnostics</summary>
@@ -2431,6 +2817,7 @@ _ADMIN_HTML = r"""
           "models",
           "connections",
           "activity",
+          "consumers",
           "settings",
         ];
         const aliases = {
@@ -2673,6 +3060,9 @@ _ADMIN_HTML = r"""
           renderPools();
           renderPresets();
           renderRequests();
+          renderConsumers();
+          renderProfiles();
+          renderBackups();
         }
         async function loadResource(key, path, label, statusId, gen) {
           setStatus(statusId, "Refreshing " + label.toLowerCase() + "…");
@@ -2760,6 +3150,34 @@ _ADMIN_HTML = r"""
                 gen,
               ),
               loadUsage(currentWindow, gen),
+              loadResource(
+                "consumers",
+                "/admin/api/consumers",
+                "Consumers",
+                "consumersStatus",
+                gen,
+              ),
+              loadResource(
+                "profiles",
+                "/admin/api/profiles",
+                "Profiles",
+                "profilesStatus",
+                gen,
+              ),
+              loadResource(
+                "backups",
+                "/admin/api/backups",
+                "Backups",
+                "backupsStatus",
+                gen,
+              ),
+              loadResource(
+                "bundle",
+                "/admin/api/bundle/manifest",
+                "Bundle",
+                null,
+                gen,
+              ),
             ]);
           } finally {
             refreshing = false;
@@ -2785,6 +3203,9 @@ _ADMIN_HTML = r"""
           checks.clear();
           resetProvider();
           resetModel();
+          clearNewKey();
+          resetConsumer();
+          resetConsumerConfirm();
           $("dash").classList.add("hidden");
           $("lockedView").classList.remove("hidden");
           $("lockBtn").classList.add("hidden");
@@ -3437,6 +3858,376 @@ _ADMIN_HTML = r"""
                   : "No requests recorded yet. Copy an example from a model to get started.") +
               "</td></tr>";
         }
+        const isoWhen = (value) => {
+          const d = new Date(value);
+          return isNaN(d) ? text(value) : d.toLocaleString();
+        };
+        const epochWhen = (s) =>
+          s == null ? "Not recorded" : new Date(s * 1000).toLocaleString();
+        const consumerKeyStatus = {
+          ok: ["ok", "Ready"],
+          missing: ["bad", "Key file missing"],
+          invalid: ["bad", "Key file unusable"],
+          inline: ["warn", "Inline key in config"],
+        };
+        function consumerRole(c) {
+          const roles = cache.consumers?.roles || {},
+            perms = [...(c.permissions || [])].sort().join(",");
+          return (
+            Object.keys(roles).find(
+              (r) => [...roles[r]].sort().join(",") === perms,
+            ) || "custom"
+          );
+        }
+        function renderConsumers() {
+          const rows = cache.consumers?.consumers || [];
+          $("consumers").querySelector("tbody").innerHTML =
+            rows
+              .map((c) => {
+                const [kind, label] = consumerKeyStatus[c.key_status] || [
+                  "muted",
+                  "Unknown",
+                ];
+                return (
+                  "<tr><td><strong>" +
+                  esc(c.id) +
+                  '</strong><span class="small">' +
+                  esc(c.consumer) +
+                  " · namespaces " +
+                  esc((c.namespaces || []).join(", ")) +
+                  '</span></td><td data-label="Access">' +
+                  pill(
+                    (c.permissions || []).includes("profiles:invoke")
+                      ? "accent"
+                      : "muted",
+                    consumerRole(c),
+                  ) +
+                  '<span class="small">' +
+                  esc((c.permissions || []).join(", ")) +
+                  (c.allow_direct_models ? " · direct models" : "") +
+                  '</span></td><td data-label="Key file">' +
+                  pill(kind, label) +
+                  '<span class="small id">' +
+                  esc(c.key_file || "No key file") +
+                  '</span></td><td data-mgmt data-label="Actions"><div class="actions">' +
+                  (c.managed_key_file && c.key_status === "ok"
+                    ? button("data-rotate-consumer", c.id, "Rotate", "btn secondary")
+                    : "") +
+                  button("data-revoke-consumer", c.id, "Revoke", "btn danger") +
+                  "</div></td></tr>"
+                );
+              })
+              .join("") ||
+            '<tr class="empty"><td colspan="4">' +
+              (!cache.consumers
+                ? "Credentials not loaded."
+                : "No consumer credentials. Clients can still use the shared client key.") +
+              "</td></tr>";
+        }
+        function renderProfiles() {
+          const list = cache.profiles?.namespaces;
+          if (!list?.length) {
+            $("profiles").innerHTML =
+              '<p class="small">' +
+              (list ? "No profiles registered." : "Profiles not loaded.") +
+              "</p>";
+            return;
+          }
+          const holders = (ns) =>
+            (cache.consumers?.consumers || [])
+              .filter((c) => (c.namespaces || []).includes(ns))
+              .map((c) => c.id);
+          const route = (name) => (name ? modelLink(name) : "Not declared");
+          $("profiles").innerHTML = list
+            .map((n) => {
+              const s = n.latest;
+              return (
+                '<section class="detail-section"><h3>' +
+                esc(n.namespace) +
+                " " +
+                pill("id", "v" + s.gateway_version) +
+                '</h3><div class="kv-grid">' +
+                kv("Registered", esc(isoWhen(s.registered_at))) +
+                kv("Source revision", esc(text(s.source_revision))) +
+                kv("Default profile", esc(text(s.default_profile))) +
+                kv("Credentials", esc(holders(n.namespace).join(", ") || "None")) +
+                '</div><div class="scroll"><table class="inventory"><thead><tr><th>Profile</th><th>Locality</th><th>Text route</th><th>Vision route</th><th>Status</th></tr></thead><tbody>' +
+                s.profiles
+                  .map(
+                    (p) =>
+                      "<tr><td><strong>" +
+                      esc(p.id) +
+                      "</strong>" +
+                      (p.description
+                        ? '<span class="small">' + esc(p.description) + "</span>"
+                        : "") +
+                      '</td><td data-label="Locality">' +
+                      esc(
+                        { local_only: "Local only", cloud_explicit: "Cloud" }[
+                          p.locality
+                        ] || p.locality,
+                      ) +
+                      '</td><td data-label="Text route">' +
+                      route(p.routes?.text) +
+                      '</td><td data-label="Vision route">' +
+                      route(p.routes?.vision) +
+                      '</td><td data-label="Status">' +
+                      pill(
+                        p.executable ? "ok" : "warn",
+                        p.executable ? "Executable" : "Not executable",
+                      ) +
+                      "</td></tr>",
+                  )
+                  .join("") +
+                "</tbody></table></div><details><summary>Version history (" +
+                n.versions.length +
+                ')</summary><div class="scroll"><table class="inventory"><thead><tr><th>Version</th><th>Registered</th><th>Source revision</th></tr></thead><tbody>' +
+                n.versions
+                  .map(
+                    (v) =>
+                      "<tr><td>v" +
+                      esc(v.gateway_version) +
+                      '</td><td data-label="Registered">' +
+                      esc(isoWhen(v.registered_at)) +
+                      '</td><td data-label="Source revision">' +
+                      esc(text(v.source_revision)) +
+                      "</td></tr>",
+                  )
+                  .join("") +
+                "</tbody></table></div></details></section>"
+              );
+            })
+            .join("");
+        }
+        function renderBackups() {
+          const b = cache.backups,
+            m = cache.bundle;
+          $("backupDetails").innerHTML = b
+            ? kv("Location", "<code>" + esc(b.directory) + "</code>") +
+              kv("Retention", esc(num(b.retention) + " per file")) +
+              kv(
+                "Other snapshots",
+                esc(
+                  b.other.count
+                    ? num(b.other.count) + " · newest " + epochWhen(b.other.newest)
+                    : "None",
+                ),
+              )
+            : "";
+          $("backupGenerations").querySelector("tbody").innerHTML =
+            (b?.generations || [])
+              .map(
+                (g) =>
+                  "<tr><td><code>" +
+                  esc(g.file) +
+                  '</code></td><td class="num" data-label="Kept">' +
+                  num(g.count) +
+                  '</td><td data-label="Newest">' +
+                  esc(epochWhen(g.newest)) +
+                  '</td><td data-label="Oldest">' +
+                  esc(epochWhen(g.oldest)) +
+                  "</td></tr>",
+              )
+              .join("") ||
+            '<tr class="empty"><td colspan="4">' +
+              (!b
+                ? "Backups not loaded."
+                : b.exists
+                  ? "No managed backups yet."
+                  : "No backup directory yet. It is created on the first change.") +
+              "</td></tr>";
+          $("bundleDetails").innerHTML = m
+            ? kv("Contents", esc(Object.keys(m.files || {}).join(", "))) +
+              kv("Size", esc(num(Math.ceil(m.size / 1024)) + " KB")) +
+              kv("Left out", esc((m.removed || []).join(", ") || "Nothing"))
+            : "";
+          $("downloadBundleBtn").disabled = !m?.downloadable;
+          if (m?.downloadable && $("bundleMsg").textContent.startsWith("Download is off"))
+            setMsg("bundleMsg", "", true);
+          if (m && !m.downloadable)
+            setMsg(
+              "bundleMsg",
+              "Download is off because some URLs embed credentials or query parameters (" +
+                m.credential_urls.join(", ") +
+                "). Export on the gateway host with model-gateway bundle export.",
+            );
+        }
+        async function downloadBundle() {
+          const btn = $("downloadBundleBtn");
+          if (btn.disabled) return;
+          btn.disabled = true;
+          setMsg("bundleMsg", "Preparing bundle…", true);
+          try {
+            const headers = {},
+              key = $("adminKey").value.trim();
+            if (key) headers.Authorization = "Bearer " + key;
+            const response = await fetch(api("/admin/api/bundle"), { headers });
+            if (response.status === 401)
+              throw new AuthError(
+                "Your admin key was rejected. Unlock with a valid key.",
+              );
+            if (!response.ok) {
+              let data = {};
+              try {
+                data = await response.json();
+              } catch {}
+              throw new Error(
+                data.error?.message ||
+                  "Download failed (HTTP " + response.status + "). Try again.",
+              );
+            }
+            const name =
+              /filename="([^"]+)"/.exec(
+                response.headers.get("Content-Disposition") || "",
+              )?.[1] || "model-gateway-bundle.tar.gz";
+            const url = URL.createObjectURL(await response.blob());
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = name;
+            document.body.append(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+            setMsg("bundleMsg", "Downloaded " + name + ".", true);
+          } catch (e) {
+            if (e instanceof AuthError) lock(e.message);
+            else setMsg("bundleMsg", e.message);
+          } finally {
+            btn.disabled = !cache.bundle?.downloadable;
+          }
+        }
+        let pendingConsumer = null;
+        function showNewKey(r, action) {
+          $("newKeyValue").value = r.key;
+          $("newKeyMeta").textContent =
+            action +
+            " " +
+            r.id +
+            ". The gateway saved it to " +
+            r.key_file +
+            "; consumers that read that file use it once they re-read it. Copies elsewhere, such as env files or other machines, need this value." +
+            (r.enables_client_auth
+              ? " /v1 now requires a key for every client."
+              : "");
+          $("newKeyPanel").hidden = false;
+          $("newKeyPanel").scrollIntoView({ block: "start" });
+          $("newKeyValue").focus();
+          $("newKeyValue").select();
+        }
+        function clearNewKey() {
+          $("newKeyValue").value = "";
+          $("newKeyMeta").textContent = "";
+          $("newKeyPanel").hidden = true;
+        }
+        function resetConsumer() {
+          $("cConsumer").value = "";
+          $("cRole").value = "runtime";
+          $("cNamespaces").value = "";
+          $("cDirect").checked = false;
+          setMsg("cMsg", "", true);
+        }
+        function resetConsumerConfirm() {
+          pendingConsumer = null;
+          $("cConfirm").value = "";
+          setMsg("ccMsg", "", true);
+          $("consumerConfirm").open = false;
+          $("consumerConfirm").hidden = true;
+        }
+        function openConsumerConfirm(action, id) {
+          if (mutationBusy) {
+            toast("Wait for the current operation to finish.");
+            return;
+          }
+          if (document.body.dataset.writes !== "true") {
+            toast("Management is read-only. See Settings.");
+            return;
+          }
+          const c = (cache.consumers?.consumers || []).find((x) => x.id === id);
+          if (!c) return;
+          const live = (c.permissions || []).includes("profiles:invoke")
+            ? " This credential serves live model traffic."
+            : "";
+          pendingConsumer = { action, id };
+          $("consumerConfirmTitle").textContent =
+            (action === "rotate" ? "Rotate " : "Revoke ") + id;
+          $("consumerConfirmWarn").textContent =
+            action === "rotate"
+              ? "The current key stops working immediately. Everything using " +
+                id +
+                " fails to authenticate until it has the new key, which is shown once." +
+                live
+              : "Requests with this key fail immediately and its managed key file is deleted. To restore access, add the credential again and distribute its new key." +
+                live;
+          $("confirmConsumerBtn").textContent =
+            action === "rotate" ? "Rotate key" : "Revoke credential";
+          $("cConfirmLabel").textContent = "Type " + id + " to confirm";
+          $("cConfirm").value = "";
+          setMsg("ccMsg", "", true);
+          $("consumerConfirm").hidden = false;
+          $("consumerConfirm").open = true;
+          $("consumerConfirm").scrollIntoView({ block: "start" });
+          $("cConfirm").focus();
+        }
+        async function saveConsumer() {
+          return mutation("saveConsumerBtn", "cMsg", async () => {
+            const consumer = $("cConsumer").value.trim();
+            if (!consumer) throw new Error("Enter a consumer ID.");
+            const namespaces = $("cNamespaces")
+              .value.split(",")
+              .map((s) => s.trim())
+              .filter(Boolean);
+            const r = await request("/admin/api/consumers", "POST", {
+              consumer,
+              role: $("cRole").value,
+              namespaces: namespaces.length ? namespaces : null,
+              allow_direct_models: $("cDirect").checked,
+            });
+            if (r.status === "unchanged") {
+              setMsg(
+                "cMsg",
+                r.id + " already exists with these settings. Its key is unchanged.",
+                true,
+              );
+              await refresh();
+              return;
+            }
+            resetConsumer();
+            $("consumerFormset").open = false;
+            if (r.key)
+              showNewKey(
+                r,
+                r.status === "repaired" ? "Replaced the missing key for" : "Created",
+              );
+            else toast("Created " + r.id + " with its existing key file.");
+            await refresh();
+          });
+        }
+        async function confirmConsumer() {
+          return mutation("confirmConsumerBtn", "ccMsg", async () => {
+            const p = pendingConsumer;
+            if (!p) throw new Error("Choose a credential first.");
+            if ($("cConfirm").value.trim() !== p.id)
+              throw new Error("Type " + p.id + " exactly to confirm.");
+            const path = "/admin/api/consumers/" + encodeURIComponent(p.id);
+            const r =
+              p.action === "rotate"
+                ? await request(path + "/rotate", "POST", { confirm: p.id })
+                : await request(path, "DELETE", { confirm: p.id });
+            resetConsumerConfirm();
+            if (p.action === "rotate") showNewKey(r, "Rotated");
+            else
+              toast(
+                "Revoked " +
+                  r.id +
+                  (r.warning
+                    ? ". " + r.warning
+                    : r.key_file_deleted
+                      ? " and deleted its key file."
+                      : "."),
+              );
+            await refresh();
+          });
+        }
         async function loadUsage(window, gen = generation) {
           currentWindow = window;
           const seq = ++usageSeq;
@@ -4026,11 +4817,15 @@ _ADMIN_HTML = r"""
             return false;
           }
           closeDrawer({ skipHash: true });
-          showTab(kind === "model" ? "models" : "connections");
-          const form = $(kind === "model" ? "modelFormset" : "providerFormset");
-          form.open = true;
-          form.scrollIntoView({ block: "start" });
-          $(kind === "model" ? "mName" : "pId").focus();
+          const [tab, formId, fieldId] = {
+            model: ["models", "modelFormset", "mName"],
+            provider: ["connections", "providerFormset", "pId"],
+            consumer: ["consumers", "consumerFormset", "cConsumer"],
+          }[kind];
+          showTab(tab);
+          $(formId).open = true;
+          $(formId).scrollIntoView({ block: "start" });
+          $(fieldId).focus();
           return true;
         }
         function editProvider(id) {
@@ -4117,7 +4912,7 @@ _ADMIN_HTML = r"""
           const epoch = sessionEpoch;
           const controls = [
             ...document.querySelectorAll(
-              ".formset input, .formset select, .formset textarea, .formset button, [data-add-model], [data-add-provider], [data-edit-model], [data-edit-provider]",
+              ".formset input, .formset select, .formset textarea, .formset button, [data-add-model], [data-add-provider], [data-edit-model], [data-edit-provider], [data-add-consumer], [data-rotate-consumer], [data-revoke-consumer]",
             ),
           ].map((el) => [el, el.disabled]);
           for (const [el] of controls) el.disabled = true;
@@ -4489,6 +5284,29 @@ _ADMIN_HTML = r"""
             openForm("model");
             return;
           }
+          if (b.hasAttribute("data-add-consumer")) {
+            if (mutationBusy) return;
+            resetConsumer();
+            openForm("consumer");
+            return;
+          }
+          if (b.hasAttribute("data-cancel-consumer")) {
+            resetConsumer();
+            $("consumerFormset").open = false;
+            return;
+          }
+          if (b.dataset.rotateConsumer) {
+            openConsumerConfirm("rotate", b.dataset.rotateConsumer);
+            return;
+          }
+          if (b.dataset.revokeConsumer) {
+            openConsumerConfirm("revoke", b.dataset.revokeConsumer);
+            return;
+          }
+          if (b.hasAttribute("data-cancel-consumer-confirm")) {
+            resetConsumerConfirm();
+            return;
+          }
           if (b.hasAttribute("data-cancel-provider")) {
             resetProvider();
             $("providerFormset").open = false;
@@ -4543,6 +5361,11 @@ _ADMIN_HTML = r"""
           ["saveModelBtn", saveModel],
           ["previewModelBtn", previewModel],
           ["deleteModelBtn", deleteModel],
+          ["saveConsumerBtn", saveConsumer],
+          ["confirmConsumerBtn", confirmConsumer],
+          ["copyNewKeyBtn", () => copy($("newKeyValue").value)],
+          ["dismissNewKeyBtn", clearNewKey],
+          ["downloadBundleBtn", downloadBundle],
         ])
           $(id).addEventListener("click", fn);
         $("keyToggle").addEventListener("click", () => {
@@ -4618,11 +5441,13 @@ _ADMIN_HTML = r"""
         });
         for (const b of document.querySelectorAll("#winSeg button"))
           b.addEventListener("click", () => loadUsage(b.dataset.w));
+        window.addEventListener("pagehide", clearNewKey);
         window.addEventListener("popstate", applyHash);
         window.addEventListener("hashchange", applyHash);
         $("thinkingLink").href = api("/v1/debug/thinking");
         resetProvider();
         resetModel();
+        resetConsumer();
         showTab(location.hash.slice(1).split("/")[0] || "overview", {
           skipHash: true,
         });

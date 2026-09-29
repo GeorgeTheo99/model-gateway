@@ -195,8 +195,96 @@ function fixture() {
         pricing_complete: 1,
       },
     ],
+    consumers: [
+      consumer("ha-runtime", "ha", ["profiles:read", "profiles:invoke"]),
+      consumer("ha-deployer", "ha", ["profiles:read", "profiles:write"]),
+      consumer("myai-runtime", "myai", ["profiles:read", "profiles:invoke"], {
+        allow_direct_models: true,
+      }),
+      consumer("legacy-runtime", "legacy", ["profiles:read", "profiles:invoke"], {
+        key_status: "inline",
+        key_file: null,
+        managed_key_file: false,
+      }),
+    ],
+    profiles: [profileNamespace("ha", 3), profileNamespace("myai", 5)],
+    backups: {
+      directory: "/fixture/config-backups",
+      exists: true,
+      retention: 20,
+      generations: [
+        { file: "config.yaml", count: 4, newest: now - 60, oldest: now - 86400 * 9 },
+        { file: "model-info.json", count: 2, newest: now - 3600, oldest: now - 86400 },
+      ],
+      other: { count: 3, newest: now - 86400 * 30 },
+    },
+    bundle: {
+      format: 1,
+      created_at: "2026-01-01T12:00:00Z",
+      files: { "config.yaml": "a", "model-info.json": "b", "consumer-profiles-registry.json": "c" },
+      removed: ["auth", "federation", "providers.cloud.api_key"],
+      size: 5321,
+      downloadable: true,
+      credential_urls: [],
+    },
   };
 }
+function consumer(id, name, permissions, extra = {}) {
+  return {
+    id,
+    consumer: name,
+    namespaces: [name],
+    permissions,
+    allow_direct_models: false,
+    key_file: "/fixture/secrets/consumers/" + id + ".key",
+    key_status: "ok",
+    managed_key_file: true,
+    ...extra,
+  };
+}
+function profileNamespace(ns, version) {
+  const snapshot = (v) => ({
+    gateway_version: v,
+    registered_at: "2026-01-0" + v + "T12:00:00Z",
+    source_revision: ns + "@rev" + v,
+    manifest_digest: "digest-" + v,
+  });
+  return {
+    namespace: ns,
+    latest: {
+      schema_version: 1,
+      namespace: ns,
+      source_revision: ns + "@rev" + version,
+      gateway_version: version,
+      registered_at: "2026-01-0" + version + "T12:00:00Z",
+      default_profile: ns + "/automatic",
+      profiles: [
+        {
+          id: ns + "/automatic",
+          description: "Local automatic route",
+          locality: "local_only",
+          credential_policy: "gateway_local",
+          executable: true,
+          protocols: ["openai_chat"],
+          routes: { text: "local-model", vision: "local-model" },
+          defaults: {},
+        },
+        {
+          id: ns + "/cloud-best",
+          locality: "cloud_explicit",
+          credential_policy: "consumer_byok",
+          executable: false,
+          protocols: ["openai_chat"],
+          routes: { text: "cloud-model" },
+          defaults: {},
+        },
+      ],
+    },
+    versions: Array.from({ length: version }, (_, i) => snapshot(version - i)),
+  };
+}
+let fixtureKeys = 0;
+const fixtureKey = () => "fixture-generated-key-" + ++fixtureKeys;
 let state = fixture(),
   fail = new Set(),
   delays = new Map(),
@@ -298,6 +386,47 @@ const server = createServer(async (req, res) => {
       respond(200, { name: pathname.split("/").at(-1), reloaded: true });
       return;
     }
+    if (pathname === "/admin/api/consumers") {
+      const id = body.consumer + "-" + body.role;
+      if (state.consumers.some((c) => c.id === id)) {
+        respond(200, { ...state.consumers.find((c) => c.id === id), status: "unchanged" });
+        return;
+      }
+      const row = consumer(
+        id,
+        body.consumer,
+        body.role === "runtime"
+          ? ["profiles:read", "profiles:invoke"]
+          : ["profiles:read", "profiles:write"],
+        {
+          namespaces: body.namespaces || [body.consumer],
+          allow_direct_models: body.allow_direct_models,
+        },
+      );
+      state.consumers.push(row);
+      respond(200, { ...row, status: "created", enables_client_auth: false, key: fixtureKey() });
+      return;
+    }
+    const consumerMatch = pathname.match(/^\/admin\/api\/consumers\/([^/]+)(\/rotate)?$/);
+    if (consumerMatch) {
+      const id = decodeURIComponent(consumerMatch[1]),
+        row = state.consumers.find((c) => c.id === id);
+      if (!row) {
+        respond(404, { error: { message: "consumer credential not found" } });
+        return;
+      }
+      if (body?.confirm !== id) {
+        respond(428, { error: { message: "Confirm by sending the credential id as 'confirm'" } });
+        return;
+      }
+      if (consumerMatch[2]) {
+        respond(200, { ...row, status: "rotated", key: fixtureKey() });
+        return;
+      }
+      state.consumers = state.consumers.filter((c) => c.id !== id);
+      respond(200, { ...row, status: "revoked", key_file_deleted: true });
+      return;
+    }
   }
   if (pathname === "/admin/api/status") {
     respond(200, state.status);
@@ -335,6 +464,36 @@ const server = createServer(async (req, res) => {
   }
   if (pathname === "/admin/api/usage") {
     respond(200, usage());
+    return;
+  }
+  if (pathname === "/admin/api/consumers") {
+    respond(200, {
+      consumers: state.consumers,
+      roles: {
+        runtime: ["profiles:read", "profiles:invoke"],
+        deployer: ["profiles:read", "profiles:write"],
+      },
+    });
+    return;
+  }
+  if (pathname === "/admin/api/profiles") {
+    respond(200, { namespaces: state.profiles });
+    return;
+  }
+  if (pathname === "/admin/api/backups") {
+    respond(200, state.backups);
+    return;
+  }
+  if (pathname === "/admin/api/bundle/manifest") {
+    respond(200, state.bundle);
+    return;
+  }
+  if (pathname === "/admin/api/bundle") {
+    res.writeHead(200, {
+      "Content-Type": "application/gzip",
+      "Content-Disposition": 'attachment; filename="model-gateway-bundle-fixture.tar.gz"',
+    });
+    res.end(Buffer.from("fixture bundle"));
     return;
   }
   const match = pathname.match(
@@ -565,6 +724,105 @@ if (process.argv.includes("--serve")) {
         .textContent.startsWith("Last 7 days ·"),
     );
     assert.match(await page.locator("#usageView").innerText(), /4.6 s/);
+    await nav("consumers");
+    assert.equal(await page.locator("#consumers tbody tr").count(), 4);
+    assert.equal(
+      await page.locator('[data-rotate-consumer="legacy-runtime"]').count(),
+      0,
+    );
+    assert.equal(
+      await page.locator('[data-revoke-consumer="legacy-runtime"]').count(),
+      1,
+    );
+    assert.match(
+      await page.locator("#consumers tbody").innerText(),
+      /myai-runtime[\s\S]*runtime[\s\S]*direct models[\s\S]*Ready/,
+    );
+    const profilesText = await page.locator("#profiles").innerText();
+    assert.match(profilesText, /ha\s*v3[\s\S]*ha-runtime, ha-deployer/);
+    assert.match(profilesText, /myai\s*v5[\s\S]*Not executable/);
+    assert.match(profilesText, /Version history \(5\)/);
+    assert(await page.locator("#newKeyPanel").isHidden());
+    assert(await page.locator("#consumerConfirm").isHidden());
+    await click("[data-add-consumer]");
+    await page.fill("#cConsumer", "lab");
+    await page.selectOption("#cRole", "deployer");
+    await click("#saveConsumerBtn");
+    await page.waitForSelector("#newKeyPanel:not([hidden])");
+    assert.match(await page.inputValue("#newKeyValue"), /^fixture-generated-key-/);
+    assert.deepEqual(writes.at(-1).body, {
+      consumer: "lab",
+      role: "deployer",
+      namespaces: null,
+      allow_direct_models: false,
+    });
+    assert.equal(await page.locator("#consumers tbody tr").count(), 5);
+    await click("#dismissNewKeyBtn");
+    assert(await page.locator("#newKeyPanel").isHidden());
+    assert.equal(await page.inputValue("#newKeyValue"), "");
+    await click('[data-rotate-consumer="ha-runtime"]');
+    assert.match(
+      await page.locator("#consumerConfirmWarn").innerText(),
+      /stops working immediately[\s\S]*live model traffic/,
+    );
+    const writesBefore = writes.length;
+    await page.fill("#cConfirm", "ha-deployer");
+    await click("#confirmConsumerBtn");
+    await page.waitForFunction(() =>
+      document.getElementById("ccMsg").textContent.includes("exactly"),
+    );
+    assert.equal(writes.length, writesBefore);
+    await page.fill("#cConfirm", "ha-runtime");
+    await click("#confirmConsumerBtn");
+    await page.waitForSelector("#newKeyPanel:not([hidden])");
+    assert.deepEqual(writes.at(-1), {
+      path: "/admin/api/consumers/ha-runtime/rotate",
+      method: "POST",
+      body: { confirm: "ha-runtime" },
+    });
+    assert.match(await page.locator("#newKeyMeta").innerText(), /Rotated ha-runtime/);
+    await click("#dismissNewKeyBtn");
+    await click('[data-revoke-consumer="lab-deployer"]');
+    await page.fill("#cConfirm", "lab-deployer");
+    await click("#confirmConsumerBtn");
+    await page.waitForFunction(
+      () => document.querySelectorAll("#consumers tbody tr").length === 4,
+    );
+    assert.equal(writes.at(-1).method, "DELETE");
+    assert(await page.locator("#consumerConfirm").isHidden());
+    assert(await page.locator("#newKeyPanel").isHidden());
+    await nav("settings");
+    assert.equal(await page.locator("#backupGenerations tbody tr").count(), 2);
+    assert.match(
+      await page.locator("#backupDetails").innerText(),
+      /\/fixture\/config-backups[\s\S]*20 per file[\s\S]*3 · newest/,
+    );
+    assert.match(
+      await page.locator("#bundleDetails").innerText(),
+      /config\.yaml, model-info\.json[\s\S]*providers\.cloud\.api_key/,
+    );
+    const [download] = await Promise.all([
+      page.waitForEvent("download"),
+      click("#downloadBundleBtn"),
+    ]);
+    assert.equal(download.suggestedFilename(), "model-gateway-bundle-fixture.tar.gz");
+    state.bundle = {
+      ...state.bundle,
+      downloadable: false,
+      credential_urls: ["providers.cloud.base_url"],
+    };
+    await refresh();
+    assert(await page.locator("#downloadBundleBtn").isDisabled());
+    assert.match(
+      await page.locator("#bundleMsg").innerText(),
+      /providers\.cloud\.base_url/,
+    );
+    state.bundle = fixture().bundle;
+    await nav("consumers");
+    await click('[data-rotate-consumer="myai-runtime"]');
+    await page.fill("#cConfirm", "myai-runtime");
+    await click("#confirmConsumerBtn");
+    await page.waitForSelector("#newKeyPanel:not([hidden])");
     for (const [hash, tab, detail] of [
       ["#providers/cloud", "connections", true],
       ["#pools", "connections", false],
@@ -705,6 +963,10 @@ if (process.argv.includes("--serve")) {
       0,
     );
     await click("[data-close-detail]");
+    await nav("consumers");
+    assert.equal(await page.locator("[data-add-consumer]:visible").count(), 0);
+    assert.equal(await page.locator("[data-rotate-consumer]:visible").count(), 0);
+    assert.equal(await page.locator("#consumers th:visible").count(), 3);
     state.models = [];
     state.providers = [];
     state.pools = [];
@@ -726,6 +988,8 @@ if (process.argv.includes("--serve")) {
     await refresh();
     assert(await page.locator("#lockedView").isVisible());
     assert.equal(await page.inputValue("#adminKey"), "");
+    assert.equal(await page.inputValue("#newKeyValue"), "");
+    assert(await page.locator("#newKeyPanel").isHidden());
     assert.equal(
       await page.evaluate(() => sessionStorage.getItem("mg-admin-key")),
       null,
@@ -747,7 +1011,7 @@ if (process.argv.includes("--serve")) {
     );
     assert.deepEqual(errors, []);
     console.log(
-      "PASS: navigation, legacy links, back navigation, pools, scoped commands, filters, details, safe editing, discovery, stale/error/auth states, request accounting, keyboard, labels, responsive layouts, read-only, empty state, mounted base path.",
+      "PASS: navigation, consumers (add/rotate/revoke, one-time keys), profiles, backups, bundle download, legacy links, back navigation, pools, scoped commands, filters, details, safe editing, discovery, stale/error/auth states, request accounting, keyboard, labels, responsive layouts, read-only, empty state, mounted base path.",
     );
   } finally {
     if (browser) await browser.close();

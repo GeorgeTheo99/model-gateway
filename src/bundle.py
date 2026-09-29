@@ -25,6 +25,7 @@ import re
 import tarfile
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -80,8 +81,36 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def export_bundle(out: Path) -> dict:
-    """Write a bundle to ``out`` (mode 0600) and return its manifest."""
+def credential_urls(config: dict) -> list[str]:
+    """Paths of URL values in a portable config that embed userinfo or a query.
+
+    Export keeps these byte-for-byte so an import restores the exact route, so
+    a bundle containing one is only safe to write locally, not to serve.
+    """
+    found: list[str] = []
+
+    def walk(node: object, where: str) -> None:
+        if isinstance(node, dict):
+            for key, item in node.items():
+                walk(item, f"{where}.{key}" if where else str(key))
+        elif isinstance(node, list):
+            for index, item in enumerate(node):
+                walk(item, f"{where}[{index}]")
+        elif isinstance(node, str) and "://" in node:
+            try:
+                parts = urlsplit(node)
+            except ValueError:
+                found.append(where)
+                return
+            if parts.username or parts.password or parts.query or parts.fragment:
+                found.append(where)
+
+    walk(config, "")
+    return found
+
+
+def build_bundle() -> tuple[dict, bytes, list[str]]:
+    """Build a bundle in memory: (manifest, gzip tar bytes, credential URL paths)."""
     config, removed = portable_config(config_io.load_config_full())
     files = {
         "config.yaml": yaml.safe_dump(config, sort_keys=False, default_flow_style=False).encode(),
@@ -98,18 +127,26 @@ def export_bundle(out: Path) -> dict:
         "removed": removed,
     }
     files = {"manifest.json": (json.dumps(manifest, indent=2) + "\n").encode(), **files}
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        for name, data in files.items():
+            info = tarfile.TarInfo(name)
+            info.size, info.mode, info.mtime = len(data), 0o600, int(time.time())
+            tar.addfile(info, io.BytesIO(data))
+    return manifest, buffer.getvalue(), credential_urls(config)
 
+
+def export_bundle(out: Path) -> dict:
+    """Write a bundle to ``out`` (mode 0600) and return its manifest."""
+    manifest, data, _credential_urls = build_bundle()
     out = out.expanduser()
     if out.is_symlink() or out.exists():
         raise ValueError(f"refusing to overwrite existing bundle: {out}")
     tmp = out.with_name(f".{out.name}.tmp.{os.getpid()}")
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "wb") as handle, tarfile.open(fileobj=handle, mode="w:gz") as tar:
-            for name, data in files.items():
-                info = tarfile.TarInfo(name)
-                info.size, info.mode, info.mtime = len(data), 0o600, int(time.time())
-                tar.addfile(info, io.BytesIO(data))
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
         os.replace(tmp, out)
     finally:
         tmp.unlink(missing_ok=True)
