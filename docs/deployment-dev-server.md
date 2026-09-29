@@ -25,14 +25,18 @@ The development checkout keeps two distinct remotes:
   repository and deployment source
 - `github` — the public GitHub mirror used for distribution
 
-GitHub synchronization is intentionally **manual**. A push to the local bare
-repository deploys this server, but it does not push to GitHub. Publish the same
-commit separately when it is ready to be public:
+Publishing `main` to GitHub is automatic. The bare repository's github-sync hooks
+(`infra/local-ci` `github-sync/`) reject a push that is missing commits already
+on GitHub, then publish the accepted tip after it is received:
 
 ```bash
-git push origin main    # update authoritative bare repo and deploy locally
-git push github main    # update public mirror
+git fetch github && git merge github/main   # only if the push was rejected
+git push origin main    # deploy locally and publish to GitHub
 ```
+
+GitHub outages only warn and never block the local push or deploy. If the push
+warned that publishing failed, run `git push github main` once GitHub is
+reachable. Other branches and tags are published manually.
 
 Verify alignment with `git rev-parse HEAD origin/main github/main`. Consumer
 machines clone or update from GitHub using the portable flow in
