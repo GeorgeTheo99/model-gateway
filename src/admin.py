@@ -2662,9 +2662,11 @@ _ADMIN_HTML = r"""
               <p id="managementState" style="margin-top: 12px"></p>
               <p class="small">
                 The operator controls write access with
-                <code>MODEL_GATEWAY_ADMIN_WRITES=true</code> in the gateway
-                service environment. This browser cannot enable it. Writes
-                update the machine-local configuration immediately.
+                <code>MODEL_GATEWAY_ADMIN_WRITES</code> in the gateway service
+                environment. A fresh <code>model-gateway install</code> enables it
+                unless installed with <code>MODEL_GATEWAY_ADMIN_WRITES=false</code>.
+                This browser cannot change it. Writes update the machine-local
+                configuration immediately.
               </p>
             </section>
             <section class="detail-section">
@@ -3313,7 +3315,7 @@ _ADMIN_HTML = r"""
             ? "Gateway checked " + fresh.status
             : "Not refreshed yet";
           $("managementState").textContent = writable
-            ? "Management is enabled. Saving a connection or model applies changes immediately."
+            ? "Management is enabled. Saving a connection, model, or consumer credential applies changes immediately."
             : "Management is read-only. Browsing does not change configuration or probe providers.";
           $("runtimeDetails").innerHTML = s
             ? kv("Uptime", duration(s.uptime_seconds * 1000)) +

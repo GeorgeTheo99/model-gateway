@@ -179,7 +179,9 @@ API; direct edits are also supported.
   keys are configured (override for trusted private networks with
   `MODEL_GATEWAY_ALLOW_UNAUTHENTICATED_NONLOCAL=true`).
 - `/admin/api` fails closed unless `MODEL_GATEWAY_ADMIN_KEY` is set; admin
-  writes additionally require `MODEL_GATEWAY_ADMIN_WRITES=true`.
+  writes additionally require `MODEL_GATEWAY_ADMIN_WRITES=true`, which
+  a fresh `model-gateway install` sets unless installed with
+  `MODEL_GATEWAY_ADMIN_WRITES=false`.
 - `config/config.yaml` and secret key files are kept at mode `0600`.
 - Provider keys are never returned by the admin API or UI after save.
 - Consumer profile APIs require identity-aware credentials; legacy, admin,

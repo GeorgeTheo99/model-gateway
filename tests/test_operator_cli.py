@@ -16,6 +16,7 @@ def _run_env(home: Path, overrides: dict[str, str] | None = None) -> str:
     for key in (
         "MODEL_GATEWAY_HOST",
         "MODEL_GATEWAY_PORT",
+        "MODEL_GATEWAY_ADMIN_WRITES",
         "MODEL_GATEWAY_PLIST_DIR",
         "GATEWAY_VISION_FALLBACK",
         "GATEWAY_VISION_FALLBACK_LOCAL",
@@ -93,6 +94,34 @@ def test_explicit_environment_overrides_the_persisted_assignment(tmp_path: Path)
     )
     assert "MODEL_GATEWAY_HOST=127.0.0.3" in output
     assert "MODEL_GATEWAY_PORT=29111" in output
+
+
+def test_fresh_install_enables_admin_writes_and_upgrades_keep_read_only(tmp_path: Path) -> None:
+    assert "MODEL_GATEWAY_ADMIN_WRITES=true\n" in _run_env(tmp_path)
+    install_config = (
+        tmp_path / "Library" / "Application Support" / "model-gateway" / "install.env"
+    )
+    install_config.parent.mkdir(parents=True)
+    install_config.write_text("MODEL_GATEWAY_HOST=127.0.0.1\nMODEL_GATEWAY_PORT=9111\n", encoding="utf-8")
+    install_config.chmod(0o600)
+    # An install that predates the setting was read-only; an update keeps it so.
+    assert "MODEL_GATEWAY_ADMIN_WRITES=false\n" in _run_env(tmp_path)
+    install_config.write_text(
+        "MODEL_GATEWAY_HOST=127.0.0.1\nMODEL_GATEWAY_PORT=9111\nMODEL_GATEWAY_ADMIN_WRITES=true\n",
+        encoding="utf-8",
+    )
+    assert "MODEL_GATEWAY_ADMIN_WRITES=true\n" in _run_env(tmp_path)
+    assert "MODEL_GATEWAY_ADMIN_WRITES=false\n" in _run_env(
+        tmp_path, {"MODEL_GATEWAY_ADMIN_WRITES": "false"}
+    )
+
+    script = SCRIPT.read_text(encoding="utf-8")
+    write_plist = script.split("write_plist() {", 1)[1].split("service_target() {", 1)[0]
+    persist = script.split("persist_install_config() {", 1)[1].split("check_macos() {", 1)[0]
+    validate = script.split("validate_bind_config() {", 1)[1].split("persist_install_config() {", 1)[0]
+    assert "<key>MODEL_GATEWAY_ADMIN_WRITES</key><string>${e_admin_writes}</string>" in write_plist
+    assert "MODEL_GATEWAY_ADMIN_WRITES=%s" in persist
+    assert "MODEL_GATEWAY_ADMIN_WRITES must be true or false" in validate
 
 
 def test_env_exposes_scoped_vision_fallback_configuration(tmp_path: Path) -> None:

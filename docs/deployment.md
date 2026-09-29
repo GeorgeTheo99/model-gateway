@@ -34,7 +34,7 @@ model-gateway consumer add|list|revoke   # see "Connecting consumers"
 model-gateway bundle export|import       # see "Moving to another machine"
 ```
 
-Portable defaults are env-overridable. During `install`, the resolved bind host and port are persisted in the owner-only `~/Library/Application Support/model-gateway/install.env`; later `update`, `restart`, `status`, and fresh shell sessions recover that assignment before falling back to the legacy defaults. Updates re-exec the newly pulled operator script before rewriting the LaunchAgent, so future installer changes use the current resolution logic. An explicit environment value still takes precedence when intentionally re-running `install`.
+Portable defaults are env-overridable. During `install`, the resolved bind host, port, and admin write mode are persisted in the owner-only `~/Library/Application Support/model-gateway/install.env`; later `update`, `restart`, `status`, and fresh shell sessions recover that assignment before falling back to the legacy defaults. Updates re-exec the newly pulled operator script before rewriting the LaunchAgent, so future installer changes use the current resolution logic. An explicit environment value still takes precedence when intentionally re-running `install`.
 
 When upgrading from a version that predates persisted bind configuration, first pull the checkout directly with `git -C <model-gateway-checkout> pull --ff-only`, then run `MODEL_GATEWAY_PORT=<currently-installed-port> model-gateway install --no-start` (and include `MODEL_GATEWAY_HOST` if customized). Normal `model-gateway update` commands are safe afterward. This one-time step is necessary because an already-running older Bash script cannot adopt update logic that has not yet been pulled.
 
@@ -42,6 +42,13 @@ When upgrading from a version that predates persisted bind configuration, first 
 - `MODEL_GATEWAY_MODEL_INFO=<repo>/model-info.json`
 - `MODEL_GATEWAY_MODEL_INFO_SOURCE=<repo>/model-info.json`
 - `MODEL_GATEWAY_HOST=127.0.0.1`, `MODEL_GATEWAY_PORT=9111`
+- `MODEL_GATEWAY_ADMIN_WRITES=true` on a fresh install: the admin UI can manage
+  connections, models, and consumer credentials once an admin key is configured
+  (the admin API stays locked until then). Install with
+  `MODEL_GATEWAY_ADMIN_WRITES=false` for a read-only dashboard. An install that
+  predates this setting stays read-only on `update`; opt in with
+  `MODEL_GATEWAY_ADMIN_WRITES=true model-gateway install`. A gateway started
+  without this variable, for example `uv run python -m src.main`, is read-only.
 - `MODEL_GATEWAY_LEDGER_PATH=~/srv/model-gateway/shared/ledger.db`
 - `MODEL_GATEWAY_LOG_DIR=~/Library/Logs/model-gateway`
 - `MODEL_GATEWAY_BACKUP_DIR=~/Library/Application Support/model-gateway/backups/config`
