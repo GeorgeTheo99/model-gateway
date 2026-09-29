@@ -71,6 +71,7 @@ def setup(tmp_path, monkeypatch):
     monkeypatch.setattr(w, "_get_json", get_json)
     monkeypatch.setattr(w, "_smoke_request", smoke)
     monkeypatch.setattr(w, "probe_endpoints", endpoints)
+    monkeypatch.setattr(w, "probe_model_services", lambda host, token: set())
     monkeypatch.setattr(w, "activate_gateway", activate)
     return args, config, catalog, calls
 
@@ -481,3 +482,11 @@ def test_shell_credentials_cannot_override_config_probe(setup, monkeypatch, caps
     assert args.config.read_bytes() == original
     assert calls == {"activate": 0, "smoke": [], "endpoints": 0}
     assert "synthetic-secret-never-log" not in str(error.value) + capsys.readouterr().out
+
+
+def test_unity_model_services_satisfy_add_member_coverage(setup, monkeypatch):
+    args, _, _, calls = setup
+    monkeypatch.setattr(w, "probe_endpoints", lambda host, token: {"fable-5"})
+    monkeypatch.setattr(w, "probe_model_services", lambda host, token: {"fable-5-1"})
+    w.cmd_pool_add_member(args)
+    assert calls["activate"] == 1

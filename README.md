@@ -124,6 +124,7 @@ model-gateway workspace pool add-member fable-pool dogfood
 ```
 
 This appends one backup to an existing nonempty pool; repeating it is a no-op.
+To create a new pool instead, use `workspace pool create` (below).
 It uses the live gateway's model catalog and routing rules, rejects disabled or
 wire-incompatible members, and tests **every enabled pool model** through the
 candidate's configured route. Missing models or failed probes leave config
@@ -134,8 +135,36 @@ config or restarts the gateway. Existing OAuth profile/host selection and
 overrides before using this command: preflight must validate the saved
 connection, not unrelated credentials inherited by an interactive shell.
 
+To give a model its **own failover pool**, register any extra routes under new
+names, then create the pool and bind the model in one step:
+
+```bash
+# Optional: a second route to an already-registered workspace, e.g. to match
+# the model's current wire format (existing entries are left untouched).
+model-gateway workspace add opus55-e2-west \
+  --host https://e2-demo-west.cloud.databricks.com \
+  --profile e2-demo-west-ws --style invocations
+
+model-gateway workspace pool create opus55-pool \
+  --members opus55-fevm,opus55-e2-west,opus55-e2,dogfood-invocations \
+  --model opus55 --dry-run
+# Then run the same command without --dry-run.
+```
+
+The first member is the primary. `--model` accepts a name, alias, or upstream
+ID and may be repeated. Only routing fields change; model metadata stays in
+place, and a catalog-only model gets a minimal overlay entry. Each member must
+resolve to the model's current upstream ID and protocol/API style, so existing
+client sessions keep working. A protocol-changing member is rejected with
+instructions to register a compatible route. Coverage accepts either legacy
+serving endpoints or Unity Catalog model services, and every member receives a
+small real completion through its exact route. Re-running an applied command is
+a no-op; a model already in another pool or a same-named pool with different
+members is rejected.
+
 An admin **read** key (`auth.admin_keys` or `MODEL_GATEWAY_ADMIN_KEY`) is required
-to verify the gateway's config identity and live pool order/readiness. The CLI
+to verify the gateway's config identity and live pool order/readiness (plus, for
+`pool create`, that the pool serves the bound models). The CLI
 uses restart activation even when admin API writes are disabled. Activation or
 live-verification failure restores the backup and reactivates the previous
 config, unless a concurrent edit makes automatic rollback unsafe. Concurrent

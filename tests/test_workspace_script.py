@@ -38,7 +38,7 @@ def test_backup_is_owner_only_even_for_legacy_public_source(tmp_path, monkeypatc
     assert stat.S_IMODE(backup.stat().st_mode) == 0o600
 
 
-def test_backup_refuses_existing_or_symlink_destination(tmp_path, monkeypatch):
+def test_backup_never_reuses_existing_or_symlink_destination(tmp_path, monkeypatch):
     workspace = load_workspace_module()
     source = tmp_path / "config.yaml"
     source.write_text("secret: sentinel\n")
@@ -48,11 +48,13 @@ def test_backup_refuses_existing_or_symlink_destination(tmp_path, monkeypatch):
     destination.symlink_to(protected)
     monkeypatch.setattr(workspace.time, "strftime", lambda _fmt: "20260825-170001")
 
-    with pytest.raises(FileExistsError):
-        workspace._backup(source)
+    # The occupied name is never reused or written through; a fresh sibling is used.
+    backup = workspace._backup(source)
 
     assert protected.read_text() == "unchanged"
     assert destination.is_symlink()
+    assert backup == tmp_path / "config.yaml.bak-20260825-170001-1"
+    assert not backup.is_symlink() and backup.read_text() == source.read_text()
 
 
 def test_atomic_writer_creates_owner_only_config_without_temp_remnants(tmp_path):

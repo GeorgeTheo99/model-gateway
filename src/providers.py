@@ -932,21 +932,49 @@ def pool_candidates(model_id: str) -> list[str]:
     return _configured_pool_members(entry, _load_config())
 
 
-@_registry_locked
-def preview_pool_member(
-    config: dict, config_path: Path, model_info_path: Path, pool: str, member: str,
-) -> list[ProviderInfo]:
-    """Resolve a staged pool addition using runtime rules, without publishing it.
+@contextmanager
+def _preview_snapshot(config: dict, config_path: Path, model_info_path: Path):
+    """Temporarily route against a staged config; always restore the registry.
 
-    The registry lock hides the temporary snapshot from concurrent readers;
-    even failed previews restore the original caches and path configuration.
-    No auth refresh, network calls, or config writes occur here.
+    Callers hold the registry lock, which hides the snapshot from concurrent
+    readers. No auth refresh, network calls, or config writes occur here.
     """
     global _config, _models, CONFIG_PATH, MODEL_INFO_PATH
     saved = _config, _models, CONFIG_PATH, MODEL_INFO_PATH
     try:
         _config, _models = config, None
         CONFIG_PATH, MODEL_INFO_PATH = config_path.resolve(), model_info_path.resolve()
+        yield
+    finally:
+        _config, _models, CONFIG_PATH, MODEL_INFO_PATH = saved
+
+
+@_registry_locked
+def preview_model_route(
+    config: dict, config_path: Path, model_info_path: Path, model_id: str,
+    provider_override: str | None = None,
+) -> ProviderInfo | None:
+    """Resolve a model route against a config snapshot, without publishing it."""
+    with _preview_snapshot(config, config_path, model_info_path):
+        return resolve(model_id, provider_override=provider_override)
+
+
+@_registry_locked
+def preview_model_enabled(config: dict, config_path: Path, model_info_path: Path, name: str) -> bool:
+    """Whether runtime ``model_overrides`` in a config snapshot enable ``name``."""
+    with _preview_snapshot(config, config_path, model_info_path):
+        return _is_model_enabled(name)
+
+
+@_registry_locked
+def preview_pool_member(
+    config: dict, config_path: Path, model_info_path: Path, pool: str, member: str,
+) -> list[ProviderInfo]:
+    """Resolve a staged pool addition using runtime rules, without publishing it.
+
+    Even failed previews restore the original caches and path configuration.
+    """
+    with _preview_snapshot(config, config_path, model_info_path):
         entries = {id(entry): entry for entry in _load_models().values()}
         routes = []
         for entry in entries.values():
@@ -965,8 +993,6 @@ def preview_pool_member(
                 raise ValueError(f"{name}: excluded by {member!r} available_model_ids; revalidate workspace coverage first")
             routes.append(candidate)
         return routes
-    finally:
-        _config, _models, CONFIG_PATH, MODEL_INFO_PATH = saved
 
 
 @_registry_locked

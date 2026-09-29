@@ -13,6 +13,8 @@ Commands:
                                       [--allow-partial]
     model-gateway workspace remove <name>
     model-gateway workspace pool add-member <pool> <name> [--dry-run]
+    model-gateway workspace pool create <pool> --members a,b[,c] --model <id>
+                                          [--model <id> ...] [--dry-run]
     model-gateway workspace normalize <pasted-url>   # validate; print https origin
 
 `add`/`replace` are idempotent and verify BEFORE committing config. If gateway
@@ -28,6 +30,10 @@ activation fails, the previous config is restored and activated automatically:
 
 `replace` gives the new workspace the old one's pool positions, then removes
 the old entry. `remove` refuses to empty a pool. `test` runs steps 1-4 only.
+`pool create` builds a new ordered pool from registered workspaces and binds
+models to it; every member must keep each model's upstream id and wire format,
+coverage accepts legacy serving endpoints or Unity model services, and each
+member is smoked through its exact route before the config is committed.
 
 Accepted --host shapes: https://host, https://host/?o=123, bare host. A bare
 workspace ID (e.g. 7474651766001209) is rejected with instructions to paste
@@ -246,6 +252,42 @@ def probe_endpoints(host: str, token: str) -> set[str]:
     return names
 
 
+def probe_model_services(host: str, token: str) -> set[str]:
+    """Unity Catalog model-service names (e.g. ``system.ai.claude-opus-5-5``).
+
+    Unity Gateway models are not listed by the legacy serving-endpoints API.
+    Workspaces without the API (or without access) report none rather than
+    failing: coverage then falls back to the legacy listing alone.
+    """
+    names: set[str] = set()
+    page, seen = "", set()
+    while True:
+        query = urllib.parse.urlencode({"parent": "schemas/system.ai", **({"page_token": page} if page else {})})
+        try:
+            data = _get_json(f"{host}/api/2.1/unity-catalog/model-services?{query}", token)
+        except (OSError, ValueError) as exc:  # URLError/HTTPError/timeouts are OSErrors
+            print(f"  probe: Unity model services unavailable ({exc})")
+            return names
+        if not isinstance(data, dict):
+            return names
+        for service in data.get("model_services") or []:
+            name = str(service.get("name") or "") if isinstance(service, dict) else ""
+            if name:
+                names.add(name.removeprefix("model-services/"))
+        page = data.get("next_page_token") or ""
+        if not page or page in seen:
+            return names
+        seen.add(page)
+
+
+def _served_model_ids(host: str, token: str, wanted: set[str]) -> set[str]:
+    """Which wanted provider_model_ids the workspace serves (legacy or Unity)."""
+    served = probe_endpoints(host, token) & wanted
+    if wanted - served:
+        served |= probe_model_services(host, token) & wanted
+    return served
+
+
 def _affected_models(config: dict, pool_names: list[str], provider_names: list[str] = ()) -> list[dict]:
     """Models served by the given pools OR bound directly to the given providers."""
     models = []
@@ -421,9 +463,19 @@ def _config_target(path: Path) -> Path:
 def _backup(path: Path) -> Path:
     """Create a collision-safe, owner-only backup of secret-bearing config."""
     path = _config_target(path)
-    backup = path.with_name(path.name + f".bak-{time.strftime('%Y%m%d-%H%M%S')}")
+    stamp = path.name + f".bak-{time.strftime('%Y%m%d-%H%M%S')}"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(backup, flags, 0o600)
+    # Two commits within one second (e.g. back-to-back pool edits) must not
+    # collide; O_EXCL still guarantees an existing backup is never reused.
+    for attempt in range(100):
+        backup = path.with_name(stamp if attempt == 0 else f"{stamp}-{attempt}")
+        try:
+            fd = os.open(backup, flags, 0o600)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise FileExistsError(f"too many config backups named {stamp}*")
     try:
         os.fchmod(fd, 0o600)
         with path.open("rb") as source, os.fdopen(fd, "wb") as target:
@@ -866,7 +918,7 @@ def _pool_runtime_status(path: Path, key: str) -> dict:
     return status
 
 
-def _verify_live_pool(path: Path, key: str, pool: str, members: list[str]) -> None:
+def _verify_live_pool(path: Path, key: str, pool: str, members: list[str], models: list[str] = ()) -> None:
     _pool_runtime_status(path, key)
     data = _get_json(f"{GATEWAY_URL}/admin/api/workspace-pools", key)
     live = next((p for p in data.get("pools", []) if p.get("id") == pool), {})
@@ -874,7 +926,44 @@ def _verify_live_pool(path: Path, key: str, pool: str, members: list[str]) -> No
     expected = [canonical_provider(member) for member in members]
     if [row.get("id") for row in rows] != expected or not rows or not rows[-1].get("ready"):
         raise RuntimeError(f"live pool {pool!r} did not activate the expected member order/readiness")
+    missing = sorted(set(models) - set(live.get("models") or []))
+    if missing:
+        raise RuntimeError(f"live pool {pool!r} is not serving model(s): {', '.join(missing)}")
     print(f"  live pool: {' → '.join(members)}")
+
+
+def _reject_shell_overrides(members) -> None:
+    """Validate the saved connections, not credentials inherited by this shell.
+
+    The interactive shell need not share the launchd service's environment;
+    probing with overrides could publish config the service interprets
+    differently.
+    """
+    from src.providers import _provider_env_prefix
+
+    for candidate in members:
+        prefix = _provider_env_prefix(candidate)
+        variables = [f"{prefix}_{suffix}" for suffix in ("BASE_URL", "API_KEY", "PROTOCOL", "ENABLED")]
+        if candidate == "databricks":
+            variables += ["DATABRICKS_HOST", "DATABRICKS_TOKEN", "DATABRICKS_SERVING_BASE_URL"]
+        if any(variable in os.environ for variable in variables):
+            raise _fail(f"workspace {candidate!r} has shell routing/credential overrides; "
+                        "unset DATABRICKS_* / MODEL_GATEWAY_PROVIDER_* overrides before pool management")
+
+
+def _probe_member(entry: dict, routes) -> None:
+    """Authenticate a registered member, check coverage, and smoke its routes."""
+    host = normalize_host(str(entry.get("workspace_url") or entry.get("base_url", "")))
+    token = (ensure_auth(host, entry.get("auth_profile") or "", allow_login=entry.get("auth_login") is not False)
+             if entry.get("auth_refresh") == "databricks-cli" else routes[0].api_key)
+    wanted = {route.provider_model_id for route in routes}
+    missing = sorted(wanted - _served_model_ids(host, token, wanted))
+    if missing:
+        raise _fail(f"workspace does not serve pool models: {', '.join(missing)}")
+    auth_quirks = entry.get("quirks") or []
+    if isinstance(auth_quirks, str):
+        auth_quirks = [quirk.strip() for quirk in auth_quirks.split(",") if quirk.strip()]
+    _smoke_pool_routes(routes, token, auth_quirks=auth_quirks)
 
 
 def _smoke_pool_routes(routes, token: str, *, auth_quirks=()) -> None:
@@ -910,7 +999,7 @@ def _smoke_pool_routes(routes, token: str, *, auth_quirks=()) -> None:
 
 def cmd_pool_add_member(args) -> None:
     """Attach a registered workspace without rebuilding its provider entry."""
-    from src.providers import _find_provider_location, _provider_env_prefix, preview_pool_member
+    from src.providers import _find_provider_location, preview_pool_member
 
     original = args.config.read_bytes()
     config = yaml.safe_load(original) or {}
@@ -928,17 +1017,7 @@ def cmd_pool_add_member(args) -> None:
         return
     if entry.get("enabled") is False:
         raise _fail(f"workspace {args.name!r} is disabled")
-    # The interactive shell need not share the launchd service's environment.
-    # Do not validate with unrelated shell credentials/URLs and publish config
-    # that the service would interpret differently.
-    for candidate in {member, *(canonical_provider(name) for name in members)}:
-        prefix = _provider_env_prefix(candidate)
-        variables = [f"{prefix}_{suffix}" for suffix in ("BASE_URL", "API_KEY", "PROTOCOL", "ENABLED")]
-        if candidate == "databricks":
-            variables += ["DATABRICKS_HOST", "DATABRICKS_TOKEN", "DATABRICKS_SERVING_BASE_URL"]
-        if any(variable in os.environ for variable in variables):
-            raise _fail(f"workspace {candidate!r} has shell routing/credential overrides; "
-                        "unset DATABRICKS_* / MODEL_GATEWAY_PROVIDER_* overrides before pool management")
+    _reject_shell_overrides({member, *(canonical_provider(name) for name in members)})
     if not args.dry_run:
         _require_activation_path()
     key = _pool_admin_key(config)
@@ -953,18 +1032,8 @@ def cmd_pool_add_member(args) -> None:
         raise _fail(str(exc)) from exc
     if not routes:
         raise _fail(f"pool {args.pool!r} has no enabled models to validate")
-    host = normalize_host(str(entry.get("workspace_url") or entry.get("base_url", "")))
-    token = (ensure_auth(host, entry.get("auth_profile") or "", allow_login=entry.get("auth_login") is not False)
-             if entry.get("auth_refresh") == "databricks-cli" else routes[0].api_key)
-    endpoints = probe_endpoints(host, token)
-    missing = sorted({route.provider_model_id for route in routes} - endpoints)
-    if missing:
-        raise _fail(f"workspace does not serve pool models: {', '.join(missing)}")
     print(f"  planned pool: {' → '.join(staged['pools'][args.pool])}")
-    auth_quirks = entry.get("quirks") or []
-    if isinstance(auth_quirks, str):
-        auth_quirks = [quirk.strip() for quirk in auth_quirks.split(",") if quirk.strip()]
-    _smoke_pool_routes(routes, token, auth_quirks=auth_quirks)
+    _probe_member(entry, routes)
     if args.dry_run:
         print("workspace pool add-member: dry run PASSED — no config write or restart")
         return
@@ -974,6 +1043,125 @@ def cmd_pool_add_member(args) -> None:
     )
     print(f"workspace pool add-member: DONE — {args.name} is live in {args.pool}")
 
+
+def _bind_model(config: dict, catalog_path: Path, model_id: str, pool: str, primary: str) -> str:
+    """Point one model at ``pool`` in the config overlay; return its name.
+
+    Only routing fields change. A catalog-only model gains a minimal overlay
+    entry that inherits every capability from ``model-info.json``.
+    """
+    from src.catalog import entry_routable_ids, load_catalog_entries
+
+    if not isinstance(config.get("models"), list):
+        config["models"] = []
+    overlay = config["models"]
+    # Resolve against the merged catalog first: a minimal overlay entry does not
+    # repeat the alias/upstream id it inherits, so matching the raw overlay alone
+    # would append a duplicate entry on every re-run.
+    try:
+        merged = next((m for m in load_catalog_entries(catalog_path, overlay=overlay)
+                       if model_id in entry_routable_ids(m)), None)
+    except ValueError as exc:
+        raise _fail(f"invalid model catalog: {exc}") from exc
+    if merged is None:
+        raise _fail(f"unknown model {model_id!r}; use a catalog name, alias or upstream id")
+    ids = set(entry_routable_ids(merged))
+    entry = next((m for m in overlay if isinstance(m, dict) and ids & set(entry_routable_ids(m))), None)
+    if entry is None:
+        entry = {"name": merged["name"]}
+        overlay.append(entry)
+    current = entry.get("pool")
+    if current and current != pool:
+        raise _fail(f"model {model_id!r} already uses pool {current!r}; manage that pool instead")
+    entry["provider"] = primary
+    entry["pool"] = pool
+    return str(entry["name"])
+
+
+def cmd_pool_create(args) -> None:
+    """Create an ordered pool from registered workspaces and bind models to it.
+
+    Models keep their upstream id and wire format: every member must resolve
+    to the same protocol/API style as the model's current route, so active
+    client sessions remain compatible after activation. Re-running with an
+    already-applied pool/binding is a no-op.
+    """
+    from src.providers import (_find_provider_location, preview_model_enabled, preview_model_route,
+                               preview_pool_member)
+
+    original = args.config.read_bytes()
+    config = yaml.safe_load(original) or {}
+    raw = [name.strip() for name in args.members.split(",") if name.strip()]
+    members = [canonical_provider(name) for name in raw]
+    if len(members) < 2:
+        raise _fail("a failover pool needs at least two --members")
+    if len(set(members)) != len(members):
+        raise _fail("--members must not repeat a workspace")
+    entries = {}
+    for name, member in zip(raw, members):
+        found = _find_provider_location(config, member)
+        if found is None:
+            raise _fail(f"unknown workspace {name!r}; register it with workspace add first")
+        if found[2].get("enabled") is False:
+            raise _fail(f"workspace {name!r} is disabled")
+        entries[member] = found[2]
+    existing = (config.get("pools") if isinstance(config.get("pools"), dict) else {}).get(args.pool)
+    if existing is not None and [canonical_provider(m) for m in existing or []] != members:
+        raise _fail(f"pool {args.pool!r} already exists with different members; use workspace pool add-member")
+    _reject_shell_overrides(members)
+    if not args.dry_run:
+        _require_activation_path()
+    key = _pool_admin_key(config)
+    status = _pool_runtime_status(args.config, key)
+    catalog_path = Path(status["model_info_path"])
+
+    staged = copy.deepcopy(config)
+    if staged.get("pools") is None:
+        staged["pools"] = {}
+    elif not isinstance(staged["pools"], dict):
+        raise _fail("config 'pools' must be a mapping of pool name to member list")
+    staged["pools"][args.pool] = existing if existing is not None else list(members)
+    names = list(dict.fromkeys(_bind_model(staged, catalog_path, model, args.pool, members[0])
+                               for model in args.model))
+    disabled = [name for name in names if not preview_model_enabled(staged, args.config, catalog_path, name)]
+    if disabled:
+        raise _fail(f"model(s) disabled by runtime model_overrides: {', '.join(disabled)}")
+    if staged == config:
+        print(f"workspace pool create: no change — {args.pool!r} already serves {', '.join(names)}")
+        return
+    if not args.dry_run and not RESTART_BIN and not status.get("writes_enabled"):
+        raise _fail("admin writes are disabled; run through model-gateway workspace for restart activation")
+    for model in names:
+        before = preview_model_route(config, args.config, catalog_path, model)
+        for member in members:
+            after = preview_model_route(staged, args.config, catalog_path, model, provider_override=member)
+            if after is None:
+                raise _fail(f"{model}: workspace {member!r} is not routable")
+            if before is None:
+                continue
+            if (after.protocol, after.api_style) != (before.protocol, before.api_style):
+                raise _fail(
+                    f"{model}: {member!r} speaks {after.protocol}/{after.api_style or 'default'} but the "
+                    f"current route speaks {before.protocol}/{before.api_style or 'default'}; register a "
+                    "compatible route (workspace add --style ...) so active sessions keep working")
+            # The upstream id is preserved by construction: _bind_model changes
+            # only the model's provider/pool routing fields.
+    print(f"  planned pool: {args.pool}: {' → '.join(members)} (models: {', '.join(names)})")
+    for member in members:
+        try:
+            routes = preview_pool_member(staged, args.config, catalog_path, args.pool, member)
+        except ValueError as exc:
+            raise _fail(str(exc)) from exc
+        print(f"  member {member}:")
+        _probe_member(entries[member], routes)
+    if args.dry_run:
+        print("workspace pool create: dry run PASSED — no config write or restart")
+        return
+    _commit_and_activate(
+        args.config, staged, expected_bytes=original,
+        verify=lambda: _verify_live_pool(args.config, key, args.pool, members, names),
+    )
+    print(f"workspace pool create: DONE — {', '.join(names)} now fail over across {args.pool}")
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -1024,10 +1212,18 @@ def main() -> None:
     p.add_argument("pool")
     p.add_argument("name")
     p.add_argument("--dry-run", action="store_true", help="run auth/model probes without writing or restarting")
+    p = pool_commands.add_parser("create", help="create an ordered pool and bind models to it")
+    p.add_argument("pool")
+    p.add_argument("--members", required=True, help="comma-separated registered workspaces, primary first")
+    p.add_argument("--model", action="append", required=True,
+                   help="model name, alias or upstream id to bind (repeatable)")
+    p.add_argument("--dry-run", action="store_true", help="run auth/model probes without writing or restarting")
 
     args = parser.parse_args()
+    pool_commands_map = {"add-member": cmd_pool_add_member, "create": cmd_pool_create}
     {"list": cmd_list, "repair": cmd_repair, "test": cmd_test, "add": cmd_add,
-     "replace": cmd_replace, "remove": cmd_remove, "pool": cmd_pool_add_member,
+     "replace": cmd_replace, "remove": cmd_remove,
+     "pool": lambda a: pool_commands_map[a.pool_command](a),
      "normalize": lambda a: print(normalize_host(a.url))}[args.command](args)
 
 
