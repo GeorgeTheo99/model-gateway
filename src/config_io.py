@@ -18,6 +18,7 @@ failure raises a clear error to the admin API caller.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import secrets
@@ -34,6 +35,8 @@ from src.catalog import normalize_thinking_capabilities, validate_pricing_policy
 from src.config_lock import config_write_lock
 from src.providers import CONFIG_PATH, MODEL_INFO_PATH, MODEL_INFO_SOURCE_PATH
 from src.secret_files import default_api_key_path, resolve_api_key_file, write_api_key_file
+
+log = logging.getLogger("model-gateway")
 
 log_dir = Path(
     os.environ.get("MODEL_GATEWAY_LOG_DIR", str(Path.home() / "Library" / "Logs" / "model-gateway"))
@@ -609,13 +612,21 @@ def managed_key_files(provider_id: str) -> list[Path]:
 
 
 def _delete_unreferenced_key_files(config: dict, paths: list[Path]) -> None:
-    """Delete retired key files once the saved config no longer references them."""
+    """Delete retired key files once the saved config no longer references them.
+
+    Runs after the config is saved, so a failure only leaves the file behind.
+    Files are compared by identity: case-insensitive volumes and hard links can
+    give one file several spellings.
+    """
     if not paths:
         return
-    still_used = {path for _owner, path in _key_file_owners(config)}
+    still_used = [path for _owner, path in _key_file_owners(config) if path.exists()]
     for path in paths:
-        if path not in still_used:
-            path.unlink(missing_ok=True)
+        try:
+            if path.exists() and not any(os.path.samefile(path, used) for used in still_used):
+                path.unlink()
+        except OSError as exc:
+            log.warning("could not delete retired provider key file %s: %s", path, exc)
 
 
 def _owner_label(section: str, name: str) -> str:

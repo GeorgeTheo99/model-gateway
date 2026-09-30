@@ -93,8 +93,11 @@ def test_manager_manages_only_allowlisted_provider_keys(client, cfg):
         "anthropic", "fireworks"}
     # Rotating and clearing the key of an existing allowlisted provider are allowed.
     assert _save_fireworks(client, api_key="fw-key-2").status_code == 200
+    key_file = config_io.api_key_file_target("fireworks")
+    assert key_file.exists()
     assert _save_fireworks(client, api_key="").status_code == 200
     assert client.get("/admin/api/providers", headers=MANAGER).json()["providers"][0]["has_api_key"] is False
+    assert not key_file.exists()
     # Other providers are neither writable nor testable.
     before = cfg.read_bytes()
     response = client.post("/admin/api/providers/anthropic", headers=MANAGER,
