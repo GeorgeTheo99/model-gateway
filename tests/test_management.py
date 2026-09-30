@@ -200,6 +200,58 @@ def test_upsert_provider_empty_key_removes_file_reference(tmp_config, monkeypatc
     assert "api_key" not in block and "api_key_file" not in block
 
 
+def test_clearing_a_key_deletes_its_gateway_managed_file(tmp_config, monkeypatch):
+    config_io.upsert_provider("openai", base_url="https://api.openai.com/v1", api_key="sk-openai")
+    key_file = tmp_config / "secrets" / "openai.api-key"
+    assert key_file.exists()
+    config_io.upsert_provider("openai", base_url="https://api.openai.com/v1", api_key="")
+    assert not key_file.exists()
+
+
+def test_clearing_a_key_keeps_an_owner_supplied_or_shared_file(tmp_config, monkeypatch):
+    import yaml
+    external = tmp_config / "owner.key"
+    external.write_text("sk-owner\n")
+    external.chmod(0o600)
+    config_io.upsert_provider("openai", base_url="https://api.openai.com/v1", api_key="sk-openai")
+    managed = tmp_config / "secrets" / "openai.api-key"
+    doc = yaml.safe_load((tmp_config / "config.yaml").read_text())
+    doc["providers"]["other"] = {"base_url": "https://other.example/v1", "api_key_file": str(external)}
+    doc["workspaces"] = {"ws": {"base_url": "https://ws.example/v1", "api_key_file": str(managed)}}
+    (tmp_config / "config.yaml").write_text(yaml.safe_dump(doc))
+
+    config_io.upsert_provider("other", base_url="https://other.example/v1", api_key="")
+    config_io.upsert_provider("openai", base_url="https://api.openai.com/v1", api_key="")
+    assert external.read_text() == "sk-owner\n"
+    assert managed.read_text() == "sk-openai\n"
+
+
+def test_deleting_a_provider_deletes_its_gateway_managed_key_file(tmp_config, monkeypatch):
+    config_io.upsert_provider("openai", base_url="https://api.openai.com/v1", api_key="sk-openai")
+    config_io.delete_provider("openai")
+    assert not (tmp_config / "secrets" / "openai.api-key").exists()
+
+
+@pytest.mark.parametrize("operation", ["clear", "delete"])
+def test_admin_rejected_key_removal_restores_the_key_file(tmp_config, monkeypatch, operation):
+    if TestClient is None:
+        pytest.skip("fastapi test client unavailable")
+    config_io.upsert_provider("openai", base_url="https://api.openai.com/v1", api_key="sk-original")
+    providers.reload()
+    monkeypatch.setenv("MODEL_GATEWAY_ADMIN_WRITES", "true")
+    monkeypatch.setattr(admin, "_reload_registry_transactionally", lambda snapshot: "synthetic rejection")
+    key_file = tmp_config / "secrets" / "openai.api-key"
+    with TestClient(app) as client:
+        if operation == "clear":
+            response = client.post("/admin/api/providers/openai", headers={"Authorization": "Bearer admin"},
+                                   json={"base_url": "https://api.openai.com/v1", "api_key": ""})
+        else:
+            response = client.delete("/admin/api/providers/openai", headers={"Authorization": "Bearer admin"})
+    assert response.status_code == 400 and "rolled back" in response.text
+    assert key_file.read_text() == "sk-original\n"
+    assert key_file.stat().st_mode & 0o777 == 0o600
+
+
 def test_admin_rejected_provider_update_restores_key_file(tmp_config, monkeypatch):
     config_io.upsert_provider("openai", base_url="https://api.openai.com/v1", api_key="sk-original")
     providers.reload()

@@ -483,8 +483,9 @@ async def admin_upsert_provider(provider_id: str, request: Request):
             protocol=protocol,
             default_headers=body.get("default_headers"),
         ), extra_paths=lambda: [
+            # Setting writes the key file and clearing deletes it; either is rolled back.
             path for path in [config_io.api_key_file_target(provider_id)]
-            if path and isinstance(body.get("api_key"), str) and body["api_key"].strip()
+            if path and isinstance(body.get("api_key"), str)
         ], precondition=scoped_precondition if principal is not None else None)
     except (ValueError, OSError) as exc:
         return _bad_request(str(exc))
@@ -501,7 +502,8 @@ async def admin_delete_provider(provider_id: str, request: Request):
     require_admin_writes()
     try:
         result, reload_error = _apply_registry_mutation(
-            lambda: config_io.delete_provider(provider_id)
+            lambda: config_io.delete_provider(provider_id),
+            extra_paths=lambda: [path for path in [config_io.api_key_file_target(provider_id)] if path],
         )
     except KeyError as exc:
         return _bad_request(str(exc), status=404)

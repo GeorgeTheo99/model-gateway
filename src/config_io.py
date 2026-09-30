@@ -33,7 +33,7 @@ import yaml
 from src.catalog import normalize_thinking_capabilities, validate_pricing_policy
 from src.config_lock import config_write_lock
 from src.providers import CONFIG_PATH, MODEL_INFO_PATH, MODEL_INFO_SOURCE_PATH
-from src.secret_files import default_api_key_path, resolve_api_key_file, write_api_key_file
+from src.secret_files import default_api_key_path, resolve_api_key_file, secret_dir, write_api_key_file
 
 log_dir = Path(
     os.environ.get("MODEL_GATEWAY_LOG_DIR", str(Path.home() / "Library" / "Logs" / "model-gateway"))
@@ -457,7 +457,8 @@ def upsert_provider(
     """Create or update a provider block in config.yaml.
 
     ``api_key`` is write-only: if None, the existing key is preserved; if an
-    empty string, the key reference is removed (the key file is left in place).
+    empty string, the key reference is removed and a gateway-managed key file
+    that nothing else references is deleted.
     A static key is stored in the provider's mode-0600 ``api_key_file``, never
     inline. Other fields are set only when provided. Returns the masked
     provider status dict (no secrets).
@@ -482,8 +483,10 @@ def upsert_provider(
         block["default_headers"] = default_headers
     if api_key is not None and not isinstance(api_key, str):
         raise ValueError("api_key must be a string")
+    retired: list[Path] = []
     if api_key is not None:
         if api_key.strip() == "":
+            retired = _managed_key_files(provider_id, block)
             block.pop("api_key", None)
             block.pop("api_key_file", None)
         else:
@@ -493,6 +496,7 @@ def upsert_provider(
 
     _backup(CONFIG_PATH)
     _atomic_write(CONFIG_PATH, yaml.safe_dump(config, sort_keys=False, default_flow_style=False))
+    _delete_unreferenced_key_files(config, retired)
     return _masked_block(provider_id, block)
 
 
@@ -523,12 +527,16 @@ def delete_provider(provider_id: str) -> dict:
         )
 
     # Remove the key (and any synonym key).
+    retired: list[Path] = []
     for k in list(providers.keys()):
         if k.lower() == provider_id:
+            if isinstance(providers[k], dict):
+                retired += _managed_key_files(provider_id, providers[k])
             del providers[k]
     config["providers"] = providers
     _backup(CONFIG_PATH)
     _atomic_write(CONFIG_PATH, yaml.safe_dump(config, sort_keys=False, default_flow_style=False))
+    _delete_unreferenced_key_files(config, retired)
     return {"id": provider_id, "deleted": True}
 
 
@@ -574,6 +582,31 @@ def _api_key_file_target(provider_id: str, block: dict) -> Path:
     if intended.is_symlink():
         raise ValueError(f"refusing symlink API key target: {intended}")
     return resolve_api_key_file(raw, CONFIG_PATH)
+
+
+def _managed_key_files(provider_id: str, block: dict) -> list[Path]:
+    """The key file a provider block references, if it lives in the gateway secret dir.
+
+    Only gateway-managed files are ever deleted; an owner-supplied key file
+    elsewhere is left alone.
+    """
+    if not block.get("api_key_file") or _uses_inline_token(block):
+        return []
+    try:
+        target = _api_key_file_target(provider_id, block)
+    except ValueError:
+        return []
+    return [target] if target.parent == Path(os.path.realpath(secret_dir())) else []
+
+
+def _delete_unreferenced_key_files(config: dict, paths: list[Path]) -> None:
+    """Delete retired key files once the saved config no longer references them."""
+    if not paths:
+        return
+    still_used = {path for _owner, path in _key_file_owners(config)}
+    for path in paths:
+        if path not in still_used:
+            path.unlink(missing_ok=True)
 
 
 def _owner_label(section: str, name: str) -> str:
