@@ -383,6 +383,12 @@ connection editor both write there; neither writes a key inline. An existing
 still overrides either source, and OAuth-refreshed tokens (`auth_refresh`) stay
 inline because the refresher rewrites them.
 
+Clearing a provider's key or deleting the provider also deletes its own
+`<id>.api-key` file (never an owner-supplied or custom-named file, nor one another
+config entry still references); older config backups then point at a removed file.
+The secret directory belongs to one gateway configuration: do not share it
+between installs.
+
 The admin status reports each connection's `api_key_source` (`file`, `inline`,
 `env`, `default`, or `missing`) and warns about inline static keys, including
 an inline key that silently overrides a key file. Move them without changing

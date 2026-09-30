@@ -33,7 +33,7 @@ import yaml
 from src.catalog import normalize_thinking_capabilities, validate_pricing_policy
 from src.config_lock import config_write_lock
 from src.providers import CONFIG_PATH, MODEL_INFO_PATH, MODEL_INFO_SOURCE_PATH
-from src.secret_files import default_api_key_path, resolve_api_key_file, secret_dir, write_api_key_file
+from src.secret_files import default_api_key_path, resolve_api_key_file, write_api_key_file
 
 log_dir = Path(
     os.environ.get("MODEL_GATEWAY_LOG_DIR", str(Path.home() / "Library" / "Logs" / "model-gateway"))
@@ -513,11 +513,12 @@ def delete_provider(provider_id: str) -> dict:
     ):
         raise KeyError(f"provider {provider_id!r} not found")
 
-    # Refuse if any enabled model routes to this provider.
+    # Refuse if any enabled model routes to this provider, however it is spelled.
     from src.providers import _canonical_provider, _is_model_enabled
+    canonical = _canonical_provider(provider_id)
     dependents = []
     for entry in {id(v): v for v in _load_models().values()}.values():
-        if _canonical_provider(entry.get("provider")) == provider_id and _is_model_enabled(entry.get("name")):
+        if _canonical_provider(entry.get("provider")) == canonical and _is_model_enabled(entry.get("name")):
             dependents.append(entry.get("name", ""))
     if dependents:
         raise ValueError(
@@ -530,8 +531,7 @@ def delete_provider(provider_id: str) -> dict:
     retired: list[Path] = []
     for k in list(providers.keys()):
         if k.lower() == provider_id:
-            if isinstance(providers[k], dict):
-                retired += _managed_key_files(provider_id, providers[k])
+            retired += _managed_key_files(k.lower(), providers[k])
             del providers[k]
     config["providers"] = providers
     _backup(CONFIG_PATH)
@@ -584,19 +584,28 @@ def _api_key_file_target(provider_id: str, block: dict) -> Path:
     return resolve_api_key_file(raw, CONFIG_PATH)
 
 
-def _managed_key_files(provider_id: str, block: dict) -> list[Path]:
-    """The key file a provider block references, if it lives in the gateway secret dir.
+def _managed_key_files(provider_id: str, block: object) -> list[Path]:
+    """The provider's own default key file, if the block references it.
 
-    Only gateway-managed files are ever deleted; an owner-supplied key file
-    elsewhere is left alone.
+    Only ``<secret dir>/<provider id>.api-key`` is ever deleted; an
+    owner-supplied or custom-named key file is left alone.
     """
-    if not block.get("api_key_file") or _uses_inline_token(block):
+    if not isinstance(block, dict) or not block.get("api_key_file") or _uses_inline_token(block):
         return []
     try:
         target = _api_key_file_target(provider_id, block)
+        own = default_api_key_path(f"{provider_id}.api-key")
     except ValueError:
         return []
-    return [target] if target.parent == Path(os.path.realpath(secret_dir())) else []
+    return [target] if target == own else []
+
+
+def managed_key_files(provider_id: str) -> list[Path]:
+    """Key files that clearing or deleting ``provider_id`` could delete (for rollback snapshots)."""
+    provider_id = (provider_id or "").strip().lower()
+    providers = load_config_full().get("providers") or {}
+    return [path for key, block in providers.items() if key.lower() == provider_id
+            for path in _managed_key_files(key.lower(), block)]
 
 
 def _delete_unreferenced_key_files(config: dict, paths: list[Path]) -> None:

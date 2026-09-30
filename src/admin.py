@@ -482,11 +482,12 @@ async def admin_upsert_provider(provider_id: str, request: Request):
             api_key=body.get("api_key"),
             protocol=protocol,
             default_headers=body.get("default_headers"),
-        ), extra_paths=lambda: [
-            # Setting writes the key file and clearing deletes it; either is rolled back.
-            path for path in [config_io.api_key_file_target(provider_id)]
-            if path and isinstance(body.get("api_key"), str)
-        ], precondition=scoped_precondition if principal is not None else None)
+        ), extra_paths=lambda: (
+            # Setting writes the key file; clearing may delete the provider's own one.
+            [path for path in [config_io.api_key_file_target(provider_id)] if path]
+            if isinstance(body.get("api_key"), str) and body["api_key"].strip()
+            else config_io.managed_key_files(provider_id) if isinstance(body.get("api_key"), str) else []
+        ), precondition=scoped_precondition if principal is not None else None)
     except (ValueError, OSError) as exc:
         return _bad_request(str(exc))
     if reload_error is not None:
@@ -503,12 +504,14 @@ async def admin_delete_provider(provider_id: str, request: Request):
     try:
         result, reload_error = _apply_registry_mutation(
             lambda: config_io.delete_provider(provider_id),
-            extra_paths=lambda: [path for path in [config_io.api_key_file_target(provider_id)] if path],
+            extra_paths=lambda: config_io.managed_key_files(provider_id),
         )
     except KeyError as exc:
         return _bad_request(str(exc), status=404)
     except ValueError as exc:
         return _bad_request(str(exc), status=409)
+    except OSError as exc:
+        return _bad_request(str(exc))
     if reload_error is not None:
         return _bad_request(f"Provider registry update rejected: {reload_error}")
     return result

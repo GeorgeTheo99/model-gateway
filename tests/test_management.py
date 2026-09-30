@@ -233,23 +233,74 @@ def test_deleting_a_provider_deletes_its_gateway_managed_key_file(tmp_config, mo
 
 
 @pytest.mark.parametrize("operation", ["clear", "delete"])
-def test_admin_rejected_key_removal_restores_the_key_file(tmp_config, monkeypatch, operation):
+def test_admin_key_removal_deletes_the_file_and_a_rejected_reload_restores_it(tmp_config, monkeypatch, operation):
     if TestClient is None:
         pytest.skip("fastapi test client unavailable")
+    monkeypatch.setenv("MODEL_GATEWAY_ADMIN_WRITES", "true")
+    key_file = tmp_config / "secrets" / "openai.api-key"
+    admin_headers = {"Authorization": "Bearer admin"}
+
+    def remove(client):
+        if operation == "clear":
+            return client.post("/admin/api/providers/openai", headers=admin_headers,
+                               json={"base_url": "https://api.openai.com/v1", "api_key": ""})
+        return client.delete("/admin/api/providers/openai", headers=admin_headers)
+
     config_io.upsert_provider("openai", base_url="https://api.openai.com/v1", api_key="sk-original")
     providers.reload()
-    monkeypatch.setenv("MODEL_GATEWAY_ADMIN_WRITES", "true")
-    monkeypatch.setattr(admin, "_reload_registry_transactionally", lambda snapshot: "synthetic rejection")
-    key_file = tmp_config / "secrets" / "openai.api-key"
     with TestClient(app) as client:
-        if operation == "clear":
-            response = client.post("/admin/api/providers/openai", headers={"Authorization": "Bearer admin"},
-                                   json={"base_url": "https://api.openai.com/v1", "api_key": ""})
-        else:
-            response = client.delete("/admin/api/providers/openai", headers={"Authorization": "Bearer admin"})
+        assert remove(client).status_code == 200
+    assert not key_file.exists()
+
+    config_io.upsert_provider("openai", base_url="https://api.openai.com/v1", api_key="sk-original")
+    providers.reload()
+    seen = []
+
+    def reject(snapshot):
+        seen.append(key_file.exists())
+        return "synthetic rejection"
+
+    monkeypatch.setattr(admin, "_reload_registry_transactionally", reject)
+    with TestClient(app) as client:
+        response = remove(client)
     assert response.status_code == 400 and "rolled back" in response.text
+    assert seen == [False], "the file must be gone before the reload is validated"
     assert key_file.read_text() == "sk-original\n"
     assert key_file.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("case", ["custom-name", "outside", "oauth", "consumer", "federation"])
+def test_removal_keeps_files_that_are_not_the_providers_own_or_are_still_used(tmp_config, monkeypatch, case):
+    import yaml
+    secrets = tmp_config / "secrets"
+    secrets.mkdir(exist_ok=True)
+    kept = {"custom-name": secrets / "custom.key", "outside": tmp_config / "owner.key"}.get(
+        case, secrets / "openai.api-key")
+    kept.write_text("sk-kept\n")
+    kept.chmod(0o600)
+    doc = yaml.safe_load((tmp_config / "config.yaml").read_text())
+    block = {"base_url": "https://api.openai.com/v1", "api_key_file": str(kept)}
+    if case == "oauth":
+        block["auth_refresh"] = "databricks-cli"
+    doc["providers"]["openai"] = block
+    if case == "consumer":
+        doc["auth"]["consumer_credentials"] = [{"id": "c", "consumer": "c", "key_file": str(kept),
+                                                "namespaces": ["c"], "permissions": ["profiles:read"]}]
+    if case == "federation":
+        doc["federation"] = {"peers": {"peer": {"base_url": "http://peer.example/v1", "api_key_file": str(kept)}}}
+    (tmp_config / "config.yaml").write_text(yaml.safe_dump(doc))
+    config_io.upsert_provider("openai", base_url="https://api.openai.com/v1", api_key="")
+    assert kept.read_text() == "sk-kept\n"
+
+
+def test_deleting_a_synonym_provider_still_refuses_dependent_models(tmp_config, monkeypatch):
+    import yaml
+    doc = yaml.safe_load((tmp_config / "config.yaml").read_text())
+    doc["providers"]["claude"] = doc["providers"].pop("anthropic")
+    (tmp_config / "config.yaml").write_text(yaml.safe_dump(doc))
+    providers.reload()
+    with pytest.raises(ValueError, match="depend on it"):
+        config_io.delete_provider("claude")
 
 
 def test_admin_rejected_provider_update_restores_key_file(tmp_config, monkeypatch):
