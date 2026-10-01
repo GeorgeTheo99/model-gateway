@@ -18,6 +18,10 @@ def _run_env(home: Path, overrides: dict[str, str] | None = None) -> str:
         "MODEL_GATEWAY_PORT",
         "MODEL_GATEWAY_ADMIN_WRITES",
         "MODEL_GATEWAY_PLIST_DIR",
+        "MODEL_GATEWAY_LEDGER_PATH",
+        "MODEL_GATEWAY_CONFIG",
+        "MODEL_GATEWAY_MODEL_INFO",
+        "MODEL_GATEWAY_MODEL_INFO_SOURCE",
         "GATEWAY_VISION_FALLBACK",
         "GATEWAY_VISION_FALLBACK_LOCAL",
         "GATEWAY_VISION_FALLBACK_CLOUD",
@@ -204,12 +208,58 @@ def test_fresh_install_config_enables_the_alias_export() -> None:
     text = SCRIPT.read_text(encoding="utf-8")
     start = text.index('cat >"$CONFIG_PATH" <<EOF\n') + len('cat >"$CONFIG_PATH" <<EOF\n')
     template = text[start:text.index("\nEOF\n", start)]
-    assert "$" not in template
-    config = yaml.safe_load(template)
+    # The generated admin key is the only shell expansion in the template.
+    assert template.count("$") == 1
+    config = yaml.safe_load(template.replace("${admin_key}", "mg-admin-test"))
     assert config["exports"] == {
         "model_aliases": "~/Library/Application Support/model-gateway/model-aliases.json"
     }
-    assert config["auth"] == {"admin_keys": [], "client_keys": []}
+    assert config["auth"] == {"admin_keys": ["mg-admin-test"], "client_keys": []}
+
+
+def _packaged_cli(tmp_path: Path) -> Path:
+    """Lay out a Homebrew-style libexec with a version-independent root."""
+    root = tmp_path / "libexec"
+    (root / "bin").mkdir(parents=True)
+    script = root / "bin" / "model-gateway"
+    script.write_text(SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+    script.chmod(0o755)
+    (root / ".package").write_text(
+        f"MANAGER=homebrew\nROOT={root}\nPYTHON={tmp_path}/venv/bin/python\nUPGRADE=brew upgrade model-gateway\n",
+        encoding="utf-8",
+    )
+    return script
+
+
+def test_packaged_install_keeps_state_in_application_support(tmp_path: Path) -> None:
+    script = _packaged_cli(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {key: value for key, value in os.environ.items() if not key.startswith(("MODEL_GATEWAY_", "GATEWAY_VISION"))}
+    env["HOME"] = str(home)
+    output = subprocess.run([str(script), "env"], check=True, capture_output=True, text=True, env=env).stdout
+    app = home / "Library" / "Application Support" / "model-gateway"
+    assert "PACKAGE_MANAGER=homebrew\n" in output
+    assert f"ROOT_DIR={tmp_path / 'libexec'}\n" in output
+    assert f"MODEL_GATEWAY_CONFIG={app / 'config.yaml'}\n" in output
+    assert f"MODEL_GATEWAY_MODEL_INFO={app / 'model-info.json'}\n" in output
+    assert f"MODEL_GATEWAY_MODEL_INFO_SOURCE={app / 'model-info.json'}\n" in output
+    assert f"MODEL_GATEWAY_LEDGER_PATH={app / 'ledger.db'}\n" in output
+
+    update = subprocess.run([str(script), "update"], capture_output=True, text=True, env=env)
+    assert update.returncode == 1
+    assert "update with: brew upgrade model-gateway && model-gateway restart" in update.stderr
+
+
+def test_existing_legacy_ledger_stays_in_use(tmp_path: Path) -> None:
+    legacy = tmp_path / "srv" / "model-gateway" / "shared" / "ledger.db"
+    legacy.parent.mkdir(parents=True)
+    legacy.touch()
+    assert f"MODEL_GATEWAY_LEDGER_PATH={legacy}\n" in _run_env(tmp_path)
+    current = tmp_path / "Library" / "Application Support" / "model-gateway" / "ledger.db"
+    current.parent.mkdir(parents=True)
+    current.touch()
+    assert f"MODEL_GATEWAY_LEDGER_PATH={current}\n" in _run_env(tmp_path)
 
 
 def _cli(home: Path, *args: str, config: Path | None = None) -> subprocess.CompletedProcess:
@@ -428,3 +478,76 @@ def test_onboard_passes_the_service_client_key_source_to_reload_verification(tmp
                             capture_output=True, text=True, env=env, timeout=60)
     assert result.returncode == 0, result.stderr
     assert captured.read_text() == f"keys=operator-token\nfile={key_file}\n"
+
+
+def _write_plist(home: Path, label: str, working_dir: str, env: dict[str, str]) -> Path:
+    plist = home / "Library" / "LaunchAgents" / f"{label}.plist"
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    entries = "".join(f"<key>{key}</key><string>{value}</string>" for key, value in env.items())
+    plist.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        f'<plist version="1.0"><dict><key>Label</key><string>{label}</string>'
+        f"<key>WorkingDirectory</key><string>{working_dir}</string>"
+        f"<key>EnvironmentVariables</key><dict>{entries}</dict></dict></plist>\n",
+        encoding="utf-8",
+    )
+    return plist
+
+
+def test_installed_launchagent_paths_win_over_application_support(tmp_path: Path) -> None:
+    app = tmp_path / "Library" / "Application Support" / "model-gateway"
+    app.mkdir(parents=True)
+    for name in ("config.yaml", "model-info.json", "ledger.db"):
+        (app / name).touch()
+    pinned = tmp_path / "checkout"
+    _write_plist(tmp_path, "com.local.model-gateway", str(pinned), {
+        "MODEL_GATEWAY_CONFIG": f"{pinned}/config/config.yaml",
+        "MODEL_GATEWAY_MODEL_INFO": f"{pinned}/model-info.json",
+        "MODEL_GATEWAY_LEDGER_PATH": f"{pinned}/ledger.db",
+    })
+    output = _run_env(tmp_path)
+    assert f"MODEL_GATEWAY_CONFIG={pinned}/config/config.yaml\n" in output
+    assert f"MODEL_GATEWAY_MODEL_INFO={pinned}/model-info.json\n" in output
+    assert f"MODEL_GATEWAY_LEDGER_PATH={pinned}/ledger.db\n" in output
+
+
+def test_install_refuses_a_foreign_launchagent_before_creating_state(tmp_path: Path) -> None:
+    home = Path(os.path.realpath(tmp_path))
+    label = "com.local.model-gateway-test-does-not-exist"
+    _write_plist(home, label, "/some/other/checkout", {})
+    result = _cli(home, "install", "--no-start")
+    assert result.returncode == 1
+    assert "Refusing to install" in result.stderr
+    assert not (home / "Library" / "Application Support" / "model-gateway" / "config.yaml").exists()
+    assert not (home / "Library" / "Application Support" / "model-gateway" / "model-info.json").exists()
+
+
+def test_packaged_launchagent_runs_the_package_python(tmp_path: Path) -> None:
+    import plistlib
+
+    script = _packaged_cli(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    harness = tmp_path / "harness.sh"
+    harness.write_text('cli="$1"\nset -- env\nsource "$cli" >/dev/null\nwrite_plist >/dev/null\n', encoding="utf-8")
+    env = {key: value for key, value in os.environ.items() if not key.startswith(("MODEL_GATEWAY_", "GATEWAY_VISION"))}
+    env.update({"HOME": str(home), "MODEL_GATEWAY_LAUNCHD_LABEL": "com.local.model-gateway-test-does-not-exist"})
+    result = subprocess.run(["bash", str(harness), str(script)], capture_output=True, text=True, env=env)
+    assert result.returncode == 0, result.stderr
+    plist = plistlib.loads(
+        (home / "Library" / "LaunchAgents" / "com.local.model-gateway-test-does-not-exist.plist").read_bytes()
+    )
+    assert plist["ProgramArguments"] == [f"{tmp_path}/venv/bin/python", "-m", "src.main"]
+    assert plist["WorkingDirectory"] == str(tmp_path / "libexec")
+
+
+def test_packaged_cli_refuses_a_missing_package_root(tmp_path: Path) -> None:
+    script = _packaged_cli(tmp_path)
+    package = script.parents[1] / ".package"
+    package.write_text(package.read_text().replace(f"ROOT={tmp_path / 'libexec'}", f"ROOT={tmp_path / 'gone'}"))
+    env = {key: value for key, value in os.environ.items() if not key.startswith(("MODEL_GATEWAY_", "GATEWAY_VISION"))}
+    env["HOME"] = str(tmp_path)
+    result = subprocess.run([str(script), "env"], capture_output=True, text=True, env=env)
+    assert result.returncode == 1
+    assert "package root is missing" in result.stderr

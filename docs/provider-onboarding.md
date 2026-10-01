@@ -47,10 +47,10 @@ model-gateway onboard generate \
 ```
 
 Generation is non-destructive. By default it attempts read-only `/models`
-discovery and saves:
+discovery and saves the draft next to the runtime config, for example:
 
 ```text
-config/onboarding/drafts/example-example-model.yaml
+~/Library/Application Support/model-gateway/onboarding/drafts/example-example-model.yaml
 ```
 
 The file is never overwritten unless `--force` is explicit. Use `--output
@@ -190,8 +190,8 @@ reviewed.
 A reviewed generated draft and a hand-written profile use the same command:
 
 ```bash
-model-gateway onboard config/onboarding/drafts/example-model.yaml --dry-run
-model-gateway onboard config/onboarding/drafts/example-model.yaml
+model-gateway onboard <config-dir>/onboarding/drafts/example-model.yaml --dry-run
+model-gateway onboard <config-dir>/onboarding/drafts/example-model.yaml
 ```
 
 Generation can also apply its saved draft in one invocation:

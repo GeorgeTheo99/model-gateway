@@ -54,19 +54,33 @@ translation between them.
 ## Requirements
 
 - macOS (the bundled service manager uses launchd)
-- [uv](https://docs.astral.sh/uv/), `git`, `curl`, `python3`
+- [Homebrew](https://brew.sh), or for a git install: [uv](https://docs.astral.sh/uv/), `git`, `curl`, `python3`
 
 ## Quick start
 
 ```bash
-git clone <repo-url> model-gateway
+brew install georgetheo99/tap/model-gateway
+model-gateway install   # create config + starter catalog, start the LaunchAgent, verify /health
+model-gateway admin     # copy the generated admin key and open the admin UI
+```
+
+In the admin UI, add a connection (base URL + API key), discover its models,
+and register the ones you want. Point any OpenAI- or Anthropic-compatible
+client at `http://127.0.0.1:9111`.
+
+Config, catalog, secrets and the usage ledger live in
+`~/Library/Application Support/model-gateway/`, so upgrades never touch them.
+Upgrade with `brew upgrade model-gateway && model-gateway restart`.
+
+To run from a git checkout instead (`model-gateway update` then pulls it):
+
+```bash
+git clone https://github.com/GeorgeTheo99/model-gateway.git
 cd model-gateway
 ./install.sh
 ```
 
-The installer creates a config, bootstraps a starter model catalog
-(`model-info.json`) if none exists, installs and starts a LaunchAgent, and
-verifies `/health`. Then register your first provider and model:
+Providers can also be onboarded from the CLI:
 
 ```bash
 model-gateway onboard generate \
@@ -74,13 +88,10 @@ model-gateway onboard generate \
   --base-url https://api.example.com/v1 \
   --model example-model
 
-# review the generated secret-free draft, then:
-model-gateway onboard config/onboarding/drafts/example-example-model.yaml --dry-run
-model-gateway onboard config/onboarding/drafts/example-example-model.yaml
+# review the generated secret-free draft (path is printed), then:
+model-gateway onboard <draft.yaml> --dry-run
+model-gateway onboard <draft.yaml>
 ```
-
-Point any OpenAI- or Anthropic-compatible client at
-`http://127.0.0.1:9111`.
 
 Day-to-day management:
 
@@ -88,7 +99,7 @@ Day-to-day management:
 model-gateway status    # launchd state + /health probe
 model-gateway logs -f   # follow the service log
 model-gateway restart   # restart + verify
-model-gateway update    # git pull + uv sync + restart + verify
+model-gateway update    # git installs: git pull + uv sync + restart + verify
 model-gateway workspace list                    # show workspace pool order
 model-gateway workspace test <name>             # auth, coverage, smoke test
 model-gateway workspace repair                  # repair dead OAuth/workspaces
@@ -216,11 +227,13 @@ Model-level fallback remains after workspace failover.
 
 ## Configuration
 
-Two layers (see `config/config.yaml.example` and `docs/`):
+Two layers, both in `~/Library/Application Support/model-gateway/` (installs
+that predate 0.2 keep their checkout-local `config/config.yaml` and
+`model-info.json`). See `config/config.yaml.example` and `docs/`:
 
 | Layer | File | Contents |
 |---|---|---|
-| Providers | `config/config.yaml` | Base URLs, credentials (or 0600 key-file refs), protocol, headers, quirks, pools, auth keys, consumer principals |
+| Providers | `config.yaml` | Base URLs, credentials (or 0600 key-file refs), protocol, headers, quirks, pools, auth keys, consumer principals |
 | Model catalog | `model-info.json` (+ optional `models:` overlay in config) | Gateway model IDs, aliases, upstream IDs, context/output limits, capabilities, pricing, fallbacks |
 
 A model is exposed only when its referenced provider is configured and
@@ -237,7 +250,7 @@ API; direct edits are also supported.
   writes additionally require `MODEL_GATEWAY_ADMIN_WRITES=true`, which
   a fresh `model-gateway install` sets unless installed with
   `MODEL_GATEWAY_ADMIN_WRITES=false`.
-- `config/config.yaml` and secret key files are kept at mode `0600`.
+- `config.yaml` and secret key files are kept at mode `0600`.
 - Provider keys are never returned by the admin API or UI after save.
 - Consumer profile APIs require identity-aware credentials; legacy, admin,
   anonymous, and federation credentials cannot read, register, or invoke them.
@@ -280,6 +293,4 @@ commits.
 
 ## License
 
-Proprietary, source-available. See [LICENSE](LICENSE) — viewing and
-personal non-commercial evaluation permitted; redistribution, commercial
-use, and derivative works require written permission.
+[Apache-2.0](LICENSE).

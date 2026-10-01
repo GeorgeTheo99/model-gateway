@@ -12,7 +12,8 @@
 #   model-gateway status                         launchd state + /health probe
 #   model-gateway verify                         /health smoke check
 #   model-gateway logs [-f|lines]                tail service log
-#   model-gateway update                         git pull + uv sync + restart + verify
+#   model-gateway update                         git pull + uv sync + restart + verify (git installs)
+#   model-gateway admin                          copy the admin key and open the admin UI
 #   model-gateway onboard PROFILE [options]      apply a reviewed onboarding profile
 #   model-gateway onboard generate [options]     discover metadata and save a draft profile
 #   model-gateway workspace COMMAND [options]    manage Databricks workspace pools
@@ -38,6 +39,26 @@ done
 SCRIPT_DIR="$(cd "$(dirname "$SOURCE_PATH")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Package managers drop a .package file next to bin/ naming themselves, a
+# version-independent root (so the LaunchAgent survives upgrades), the Python
+# of the prebuilt runtime environment, and the upgrade command. Packaged
+# installs never run uv sync or git pull.
+package_value() {
+  [ -f "$ROOT_DIR/.package" ] || return 0
+  awk -v prefix="$1=" 'index($0, prefix) == 1 {print substr($0, length(prefix) + 1); exit}' "$ROOT_DIR/.package"
+}
+PACKAGE_MANAGER="$(package_value MANAGER)"
+PACKAGE_UPGRADE="$(package_value UPGRADE)"
+PACKAGE_UPGRADE="${PACKAGE_UPGRADE:-upgrade it with $PACKAGE_MANAGER}"
+if [ -n "$PACKAGE_MANAGER" ]; then
+  PACKAGE_ROOT="$(package_value ROOT)"
+  [ -d "$PACKAGE_ROOT" ] || { printf 'package root is missing: %s\n' "${PACKAGE_ROOT:-unset}" >&2; exit 1; }
+  ROOT_DIR="$PACKAGE_ROOT"
+  SCRIPT_DIR="$ROOT_DIR/bin"
+  PACKAGE_PYTHON="$(package_value PYTHON)"
+fi
+is_packaged() { [ -n "$PACKAGE_MANAGER" ]; }
+
 LABEL="${MODEL_GATEWAY_LAUNCHD_LABEL:-com.local.model-gateway}"
 PLIST_DIR="${MODEL_GATEWAY_PLIST_DIR:-$HOME/Library/LaunchAgents}"
 LOG_DIR="${MODEL_GATEWAY_LOG_DIR:-$HOME/Library/Logs/model-gateway}"
@@ -46,7 +67,14 @@ BACKUP_DIR="${MODEL_GATEWAY_BACKUP_DIR:-$HOME/Library/Application Support/model-
 LEGACY_BACKUP_DIRS="${MODEL_GATEWAY_LEGACY_BACKUP_DIRS:-$LOG_DIR/config-backups}"
 BIN_DIR="${MODEL_GATEWAY_BIN_DIR:-$HOME/.local/bin}"
 FORCE="${MODEL_GATEWAY_FORCE:-0}"
-INSTALL_CONFIG="$HOME/Library/Application Support/model-gateway/install.env"
+APP_DIR="$HOME/Library/Application Support/model-gateway"
+INSTALL_CONFIG="$APP_DIR/install.env"
+
+# Machine state lives in APP_DIR. The installed LaunchAgent's paths win, and
+# installs that predate APP_DIR keep using a state file at its old location.
+state_path() { # current legacy
+  if [ ! -e "$1" ] && [ -e "$2" ]; then printf '%s' "$2"; else printf '%s' "$1"; fi
+}
 
 installed_config_value() {
   local metadata
@@ -83,14 +111,17 @@ if [ -z "$INSTALLED_ADMIN_WRITES" ]; then
   fi
 fi
 ADMIN_WRITES="${MODEL_GATEWAY_ADMIN_WRITES:-$INSTALLED_ADMIN_WRITES}"
-CONFIG_PATH="${MODEL_GATEWAY_CONFIG:-$ROOT_DIR/config/config.yaml}"
-MODEL_INFO_PATH="${MODEL_GATEWAY_MODEL_INFO:-$ROOT_DIR/model-info.json}"
+INSTALLED_CONFIG_PATH="$(installed_plist_env MODEL_GATEWAY_CONFIG)"
+INSTALLED_MODEL_INFO_PATH="$(installed_plist_env MODEL_GATEWAY_MODEL_INFO)"
+INSTALLED_LEDGER_PATH="$(installed_plist_env MODEL_GATEWAY_LEDGER_PATH)"
+CONFIG_PATH="${MODEL_GATEWAY_CONFIG:-${INSTALLED_CONFIG_PATH:-$(state_path "$APP_DIR/config.yaml" "$ROOT_DIR/config/config.yaml")}}"
+MODEL_INFO_PATH="${MODEL_GATEWAY_MODEL_INFO:-${INSTALLED_MODEL_INFO_PATH:-$(state_path "$APP_DIR/model-info.json" "$ROOT_DIR/model-info.json")}}"
 ACTIVE_MODEL_INFO_SOURCE=""
 if [ -f "$PLIST_DIR/$LABEL.plist" ] && [ -x /usr/libexec/PlistBuddy ]; then
   ACTIVE_MODEL_INFO_SOURCE="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:MODEL_GATEWAY_MODEL_INFO_SOURCE' "$PLIST_DIR/$LABEL.plist" 2>/dev/null || true)"
 fi
-MODEL_INFO_SOURCE_PATH="${MODEL_GATEWAY_MODEL_INFO_SOURCE:-${ACTIVE_MODEL_INFO_SOURCE:-$ROOT_DIR/model-info.json}}"
-LEDGER_PATH="${MODEL_GATEWAY_LEDGER_PATH:-$HOME/srv/model-gateway/shared/ledger.db}"
+MODEL_INFO_SOURCE_PATH="${MODEL_GATEWAY_MODEL_INFO_SOURCE:-${ACTIVE_MODEL_INFO_SOURCE:-$MODEL_INFO_PATH}}"
+LEDGER_PATH="${MODEL_GATEWAY_LEDGER_PATH:-${INSTALLED_LEDGER_PATH:-$(state_path "$APP_DIR/ledger.db" "$HOME/srv/model-gateway/shared/ledger.db")}}"
 if [ "${GATEWAY_VISION_FALLBACK+x}" = x ]; then
   VISION_FALLBACK="$GATEWAY_VISION_FALLBACK"
 else
@@ -197,13 +228,26 @@ check_macos() {
 
 check_prereqs() {
   check_macos
-  require_cmd git
   require_cmd curl
   require_cmd python3
-  require_cmd uv
   require_cmd launchctl
+  if is_packaged; then
+    [ -x "$PACKAGE_PYTHON" ] || die "packaged Python environment is missing: ${PACKAGE_PYTHON:-unset} (reinstall model-gateway)"
+    return 0
+  fi
+  require_cmd git
+  require_cmd uv
   UV_BIN="${UV_BIN:-$(command -v uv)}"
   [ -n "$UV_BIN" ] || die "uv not found"
+}
+
+# Run the gateway's Python: the packaged venv, or uv's project environment.
+run_python() {
+  if is_packaged; then
+    "$PACKAGE_PYTHON" "$@"
+  else
+    "$UV_BIN" run --project "$ROOT_DIR" python "$@"
+  fi
 }
 
 # --------------------------------------------------------------------------- #
@@ -223,6 +267,8 @@ ensure_config() {
   fi
   mkdir -p "$(dirname "$CONFIG_PATH")"
   ( umask 077; : >"$CONFIG_PATH" )
+  local admin_key
+  admin_key="mg-admin-$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
   cat >"$CONFIG_PATH" <<EOF
 # model-gateway runtime config.
 # Created by bin/model-gateway install. See config/config.yaml.example for the
@@ -231,8 +277,10 @@ ensure_config() {
 # and should never be committed.
 
 auth:
-  # admin_keys protects /admin/api/*. Add a real key before using admin APIs.
-  admin_keys: []
+  # admin_keys protects /admin/api/* and the admin UI. Generated at install;
+  # 'model-gateway admin' copies it and opens the UI.
+  admin_keys:
+    - ${admin_key}
   # client_keys protects /v1/*. Leave empty only when MODEL_GATEWAY_HOST is
   # loopback/private; add keys for any externally reachable gateway.
   client_keys: []
@@ -246,7 +294,7 @@ exports:
   model_aliases: ~/Library/Application Support/model-gateway/model-aliases.json
 EOF
   chmod 600 "$CONFIG_PATH"
-  warn "Created empty config at $CONFIG_PATH; add provider secrets/auth before expecting models to route"
+  warn "Created config at $CONFIG_PATH; run 'model-gateway admin' to add providers in the admin UI"
 }
 
 ensure_model_catalog() {
@@ -275,7 +323,7 @@ EOF
   fi
   (
     cd "$ROOT_DIR"
-    "$UV_BIN" run python - "$MODEL_INFO_PATH" "$CONFIG_PATH" <<'PY'
+    run_python - "$MODEL_INFO_PATH" "$CONFIG_PATH" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -298,12 +346,14 @@ PY
 }
 
 sync_venv() {
+  is_packaged && return 0
   log "Syncing Python environment"
   uv sync --project "$ROOT_DIR" >/dev/null
   ok "uv environment ready"
 }
 
 install_cli_symlink() {
+  is_packaged && return 0
   mkdir -p "$BIN_DIR"
   local dest="$BIN_DIR/model-gateway"
   if [ -e "$dest" ] && [ ! -L "$dest" ]; then
@@ -407,12 +457,17 @@ write_plist() {
   ensure_private_dir "$(dirname "$LEDGER_PATH")"
   ensure_private_dir "$BACKUP_DIR"
   ensure_private_file "$LOG_FILE"
-  local plist plist_tmp e_label e_uv e_root e_host e_port e_admin_writes e_config e_model_info e_model_info_source e_ledger e_vision_fallback e_vision_local e_vision_cloud e_vision_mode e_vision_max_images e_vision_cache_ttl e_vision_total_timeout e_log_dir e_backup e_legacy_backups e_log
+  local plist plist_tmp program_args e_label e_root e_host e_port e_admin_writes e_config e_model_info e_model_info_source e_ledger e_vision_fallback e_vision_local e_vision_cloud e_vision_mode e_vision_max_images e_vision_cache_ttl e_vision_total_timeout e_log_dir e_backup e_legacy_backups e_log
   plist="$(plist_path)"
   plist_tmp="$(mktemp "$PLIST_DIR/.${LABEL}.plist.XXXXXX")"
   chmod 600 "$plist_tmp"
   e_label="$(xml_escape "$LABEL")"
-  e_uv="$(xml_escape "$UV_BIN")"
+  if is_packaged; then
+    program_args="<string>$(xml_escape "$PACKAGE_PYTHON")</string>"
+  else
+    program_args="<string>$(xml_escape "$UV_BIN")</string><string>run</string><string>python</string>"
+  fi
+  program_args="$program_args<string>-m</string><string>src.main</string>"
   e_root="$(xml_escape "$ROOT_DIR")"
   e_host="$(xml_escape "$HOST")"
   e_port="$(xml_escape "$PORT")"
@@ -438,7 +493,7 @@ write_plist() {
 <plist version="1.0"><dict>
 <key>Label</key><string>${e_label}</string>
 <key>ProgramArguments</key><array>
-  <string>${e_uv}</string><string>run</string><string>python</string><string>-m</string><string>src.main</string>
+  ${program_args}
 </array>
 <key>WorkingDirectory</key><string>${e_root}</string>
 <key>EnvironmentVariables</key><dict>
@@ -592,6 +647,7 @@ cmd_logs() {
 cmd_env() {
   cat <<EOF
 ROOT_DIR=$ROOT_DIR
+PACKAGE_MANAGER=${PACKAGE_MANAGER:-git}
 LABEL=$LABEL
 PLIST=$(plist_path)
 LOG_FILE=$LOG_FILE
@@ -635,6 +691,8 @@ cmd_install() {
   done
   check_prereqs
   validate_bind_config
+  # Refuse another checkout's or package's LaunchAgent before creating any state.
+  ensure_label_safe "install"
   log "Installing model-gateway from $ROOT_DIR"
   ensure_config
   sync_venv
@@ -647,6 +705,7 @@ cmd_install() {
     verify || die "verification failed; check 'model-gateway logs'"
   fi
   ok "model-gateway installed"
+  log "Next: run 'model-gateway admin' to open the admin UI and connect a provider"
 }
 
 cmd_uninstall() {
@@ -657,7 +716,11 @@ cmd_uninstall() {
     rm -f "$dest"
     ok "Removed $dest"
   fi
-  ok "Uninstalled (repo and venv retained; rerun 'install' to restore)"
+  if is_packaged; then
+    ok "Uninstalled the service (state in $APP_DIR retained); remove the package with your package manager"
+  else
+    ok "Uninstalled (repo and venv retained; rerun 'install' to restore)"
+  fi
 }
 
 cmd_update_after_pull() {
@@ -671,10 +734,46 @@ cmd_update_after_pull() {
 }
 
 cmd_update() {
+  if is_packaged; then
+    die "installed with $PACKAGE_MANAGER; update with: $PACKAGE_UPGRADE && model-gateway restart"
+  fi
   check_prereqs
   log "Pulling model-gateway repo"
   git -C "$ROOT_DIR" pull --ff-only
   exec "$ROOT_DIR/bin/model-gateway" _update-after-pull
+}
+
+# Package managers call this after installing or upgrading the package to
+# build the locked runtime environment named by .package.
+cmd_sync_packaged_env() {
+  is_packaged || die "_sync-packaged-env is only for package-manager installs"
+  local uv base_python
+  uv="$(package_value UV)"
+  base_python="$(package_value BASE_PYTHON)"
+  [ -x "$uv" ] && [ -x "$base_python" ] && [ -n "$PACKAGE_PYTHON" ] \
+    || die "invalid package metadata: $ROOT_DIR/.package"
+  UV_PROJECT_ENVIRONMENT="$(dirname "$(dirname "$PACKAGE_PYTHON")")" \
+  UV_PYTHON_DOWNLOADS=never UV_NO_CONFIG=1 \
+    "$uv" sync --project "$ROOT_DIR" --frozen --no-dev --no-install-project --no-cache --python "$base_python"
+}
+
+cmd_admin() {
+  check_prereqs
+  local key url="http://127.0.0.1:$PORT/admin"
+  key="$(installed_plist_env MODEL_GATEWAY_ADMIN_KEY | cut -d, -f1)"
+  if [ -z "$key" ]; then
+    key="$(cd "$ROOT_DIR" && MODEL_GATEWAY_ADMIN_KEY='' MODEL_GATEWAY_CONFIG="$CONFIG_PATH" \
+      run_python -c 'from src.auth import _admin_keys; print(min(_admin_keys(), default=""))' 2>/dev/null)" \
+      || die "could not read admin keys from $CONFIG_PATH"
+  fi
+  [ -n "$key" ] || die "no admin key configured; add one under auth.admin_keys in $CONFIG_PATH"
+  if printf '%s' "$key" | pbcopy 2>/dev/null; then
+    ok "Admin key copied to the clipboard; paste it into the admin UI to unlock"
+  else
+    warn "Clipboard unavailable; paste this admin key into the admin UI to unlock:"
+    printf '%s\n' "$key"
+  fi
+  open "$url" 2>/dev/null || log "Open $url"
 }
 
 cmd_onboard() {
@@ -691,7 +790,7 @@ cmd_onboard() {
   elif [ "$generate" = 1 ] && [ "$apply" = 1 ]; then
     ensure_runtime_paths_safe "onboarding"
   fi
-  local cmd=("$UV_BIN" run --project "$ROOT_DIR" python "$ROOT_DIR/scripts/onboard_provider.py" "$@"
+  local cmd=(run_python "$ROOT_DIR/scripts/onboard_provider.py" "$@"
     --config "$CONFIG_PATH" --model-info "$MODEL_INFO_PATH"
     --launchd-label "$LABEL" --health-url "$(health_url)")
   if [ -n "$MODEL_INFO_SOURCE_PATH" ]; then
@@ -727,7 +826,7 @@ cmd_secrets() {
   MODEL_GATEWAY_BACKUP_DIR="${backup_dir:-$BACKUP_DIR}" \
   MODEL_GATEWAY_MODEL_INFO="$MODEL_INFO_PATH" \
   MODEL_GATEWAY_MODEL_INFO_SOURCE="$MODEL_INFO_SOURCE_PATH" \
-    "$UV_BIN" run --project "$ROOT_DIR" python "$ROOT_DIR/scripts/migrate_api_keys.py" \
+    run_python "$ROOT_DIR/scripts/migrate_api_keys.py" \
       --config "$CONFIG_PATH" "$@" || rc=$?
   # Exit 3: nothing to move, so the running gateway needs no restart.
   [ "$rc" = 3 ] && return 0
@@ -759,7 +858,7 @@ run_service_python() {
   GATEWAY_VISION_FALLBACK_MAX_IMAGES="$VISION_FALLBACK_MAX_IMAGES" \
   GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS="$VISION_OBSERVATION_CACHE_TTL_SECONDS" \
   GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS="$VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS" \
-    "$UV_BIN" run --project "$ROOT_DIR" python "$ROOT_DIR/scripts/$script" --config "$CONFIG_PATH" "$@"
+    run_python "$ROOT_DIR/scripts/$script" --config "$CONFIG_PATH" "$@"
 }
 
 cmd_consumer() {
@@ -881,7 +980,7 @@ cmd_workspace() {
   MODEL_GATEWAY_CONFIG="$CONFIG_PATH" \
   MODEL_GATEWAY_URL="http://127.0.0.1:$PORT" \
   MODEL_GATEWAY_RESTART_BIN="$SOURCE_PATH" \
-    "$UV_BIN" run --project "$ROOT_DIR" python "$ROOT_DIR/scripts/workspace.py" \
+    run_python "$ROOT_DIR/scripts/workspace.py" \
       --config "$CONFIG_PATH" "$@"
 }
 
@@ -906,7 +1005,9 @@ main() {
     verify) verify ;;
     logs) shift; cmd_logs "$@" ;;
     update) cmd_update ;;
+    admin) cmd_admin ;;
     _update-after-pull) cmd_update_after_pull ;;
+    _sync-packaged-env) cmd_sync_packaged_env ;;
     onboard) shift; cmd_onboard "$@" ;;
     workspace) shift; cmd_workspace "$@" ;;
     secrets) shift; cmd_secrets "$@" ;;

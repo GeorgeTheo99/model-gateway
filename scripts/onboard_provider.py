@@ -546,7 +546,7 @@ def _generate_main(argv: list[str]) -> dict | None:
         return None
 
     default_name = f"{profile['id']}.yaml"
-    output = args.output or (_REPO_ROOT / "config" / "onboarding" / "drafts" / default_name)
+    output = args.output or (args.config.parent / "onboarding" / "drafts" / default_name)
     draft_path = write_draft(
         profile,
         output,

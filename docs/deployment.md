@@ -4,23 +4,19 @@
 
 ## Portable macOS install (consumer machines)
 
-A second Mac can run the gateway directly from a clone — no `server-ci`, bare repo, or CI hook required:
+Install with Homebrew, or run directly from a clone; neither needs `server-ci`, a bare repo, or a CI hook:
 
 ```bash
-git clone <repo-url> ~/local_code/model-gateway
+brew install georgetheo99/tap/model-gateway
+model-gateway install     # config + starter catalog + launchd plist + start + /health verify
+
+# or from a clone:
+git clone https://github.com/GeorgeTheo99/model-gateway.git ~/local_code/model-gateway
 cd ~/local_code/model-gateway
-cp <reviewed-private-catalog> model-info.json
-./install.sh              # uv sync + launchd plist + start + /health verify
-# or: ./install.sh --no-start
+./install.sh              # uv sync + the same steps; or: ./install.sh --no-start
 ```
 
-Before installing, provision that machine's Git-ignored `model-info.json` catalog (for example, copy a reviewed catalog from the machine's private configuration backup). The repository intentionally does not ship model routes, local model paths, or per-machine pricing metadata. The installer does not create this file.
-
-The installer creates a repo-local `config/config.yaml` if missing, installs the `com.local.model-gateway` LaunchAgent, symlinks `model-gateway` into `~/.local/bin`, and runs from the clone with:
-
-```bash
-uv run python -m src.main
-```
+The installer creates `config.yaml` (with a generated admin key) and a starter `model-info.json` catalog in `~/Library/Application Support/model-gateway/` when absent, installs the `com.local.model-gateway` LaunchAgent and verifies `/health`. The repository does not ship model routes, local model paths, or per-machine pricing; to reuse a reviewed catalog, copy it there before installing. A clone install also symlinks `model-gateway` into `~/.local/bin` and runs `uv run python -m src.main`; a Homebrew install runs from the version-independent `opt` path with the locked virtualenv it builds in `$(brew --prefix)/var/model-gateway/venv`, so `brew upgrade model-gateway && model-gateway restart` keeps the same LaunchAgent. Installs that predate 0.2 keep using an existing checkout-local `config/config.yaml`, `model-info.json` and `~/srv/model-gateway/shared/ledger.db`.
 
 Operator commands:
 
@@ -28,7 +24,8 @@ Operator commands:
 model-gateway status
 model-gateway logs -f
 model-gateway restart
-model-gateway update      # git pull --ff-only + uv sync + restart + verify
+model-gateway update      # clone installs: git pull --ff-only + uv sync + restart + verify
+model-gateway admin       # copy the admin key and open the admin UI
 model-gateway env
 model-gateway consumer add|list|revoke   # see "Connecting consumers"
 model-gateway bundle export|import       # see "Moving to another machine"
@@ -38,18 +35,18 @@ Portable defaults are env-overridable. During `install`, the resolved bind host,
 
 When upgrading from a version that predates persisted bind configuration, first pull the checkout directly with `git -C <model-gateway-checkout> pull --ff-only`, then run `MODEL_GATEWAY_PORT=<currently-installed-port> model-gateway install --no-start` (and include `MODEL_GATEWAY_HOST` if customized). Normal `model-gateway update` commands are safe afterward. This one-time step is necessary because an already-running older Bash script cannot adopt update logic that has not yet been pulled.
 
-- `MODEL_GATEWAY_CONFIG=<repo>/config/config.yaml`
-- `MODEL_GATEWAY_MODEL_INFO=<repo>/model-info.json`
-- `MODEL_GATEWAY_MODEL_INFO_SOURCE=<repo>/model-info.json`
+- `MODEL_GATEWAY_CONFIG=~/Library/Application Support/model-gateway/config.yaml`
+- `MODEL_GATEWAY_MODEL_INFO=~/Library/Application Support/model-gateway/model-info.json`
+- `MODEL_GATEWAY_MODEL_INFO_SOURCE=` the `MODEL_GATEWAY_MODEL_INFO` path
 - `MODEL_GATEWAY_HOST=127.0.0.1`, `MODEL_GATEWAY_PORT=9111`
 - `MODEL_GATEWAY_ADMIN_WRITES=true` on a fresh install: the admin UI can manage
-  connections, models, and consumer credentials once an admin key is configured
-  (the admin API stays locked until then). Install with
+  connections, models, and consumer credentials with the admin key generated
+  into a fresh config (the admin API stays locked while no key is configured). Install with
   `MODEL_GATEWAY_ADMIN_WRITES=false` for a read-only dashboard. An install that
   predates this setting stays read-only on `update`; opt in with
   `MODEL_GATEWAY_ADMIN_WRITES=true model-gateway install`. A gateway started
   without this variable, for example `uv run python -m src.main`, is read-only.
-- `MODEL_GATEWAY_LEDGER_PATH=~/srv/model-gateway/shared/ledger.db`
+- `MODEL_GATEWAY_LEDGER_PATH=~/Library/Application Support/model-gateway/ledger.db`
 - `MODEL_GATEWAY_LOG_DIR=~/Library/Logs/model-gateway`
 - `MODEL_GATEWAY_BACKUP_DIR=~/Library/Application Support/model-gateway/backups/config`
   (always keep this private state outside diagnostic log trees)
@@ -66,7 +63,7 @@ roots may not overlap. Uvicorn request access logging is disabled because reques
 URLs can contain temporary capabilities; structured usage remains available in
 the ledger.
 
-After install, edit `config/config.yaml` to add auth and provider connections; provider keys go in mode-0600 `api_key_file`s (see [provider onboarding](provider-onboarding.md#where-provider-keys-are-stored)). A fresh generated config intentionally has `providers: {}`, so catalog entries remain unavailable until providers are configured. If you deliberately expose the gateway beyond loopback (`MODEL_GATEWAY_HOST=0.0.0.0`), configure `auth.client_keys` and firewall rules first.
+After install, run `model-gateway admin` to add provider connections in the admin UI, or edit `config.yaml`; provider keys go in mode-0600 `api_key_file`s (see [provider onboarding](provider-onboarding.md#where-provider-keys-are-stored)). A fresh generated config intentionally has `providers: {}`, so catalog entries remain unavailable until providers are configured. If you deliberately expose the gateway beyond loopback (`MODEL_GATEWAY_HOST=0.0.0.0`), configure `auth.client_keys` and firewall rules first.
 
 ## Connecting consumers
 

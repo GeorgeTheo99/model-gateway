@@ -1,7 +1,8 @@
 [project]
 name = "model-gateway"
-version = "0.1.0"
+version = "0.2.0"
 description = "Unified model gateway — OpenAI + Anthropic API across model providers"
+license = "Apache-2.0"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",
