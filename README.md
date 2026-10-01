@@ -60,7 +60,7 @@ translation between them.
 
 ```bash
 brew install georgetheo99/tap/model-gateway
-model-gateway install   # create config + starter catalog, start the LaunchAgent, verify /health
+model-gateway install   # create config + empty catalog, start the LaunchAgent, verify /health
 model-gateway admin     # copy the generated admin key and open the admin UI
 ```
 

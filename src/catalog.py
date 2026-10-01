@@ -226,6 +226,20 @@ def _load_model_info(model_info_path: Path) -> list[dict]:
     return llm
 
 
+def allows_empty(model_info_path: Path | str) -> bool:
+    """Whether the catalog explicitly opts in to having no models.
+
+    Fresh installs write ``"allow_empty": true`` so the gateway can start before
+    the first model is registered; other catalogs must stay non-empty.
+    """
+    path = Path(model_info_path)
+    if not path.exists():
+        return False
+    with open(path) as f:
+        data = json.load(f)
+    return isinstance(data, dict) and data.get("allow_empty") is True
+
+
 def _load_overlay(config_path: Path) -> list[dict]:
     if not config_path.exists():
         return []
@@ -269,7 +283,8 @@ def load_catalog_entries(
     ``include_retired`` defaults to False, skipping GGUF/llama.cpp entries to
     match the gateway router. Generators that want the full raw catalog
     (e.g. for reporting) may pass True. ``require_nonempty`` is enabled by the
-    runtime and installer so production cannot publish an empty registry.
+    runtime and installer so production cannot publish an empty registry,
+    unless the catalog explicitly sets ``"allow_empty": true`` (fresh installs).
     """
     model_info_path = Path(model_info_path)
 
@@ -374,7 +389,7 @@ def load_catalog_entries(
             order.append(primary)
 
     result = [by_id[primary] for primary in order]
-    if require_nonempty and not result:
+    if require_nonempty and not result and not allows_empty(model_info_path):
         raise ValueError("effective model catalog is empty")
     return result
 

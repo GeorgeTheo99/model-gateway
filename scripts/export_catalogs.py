@@ -522,6 +522,9 @@ def main() -> int:
     except ValueError as exc:
         parser.error(str(exc))
     exported = _exported_models(entries)
+    if not exported and catalog_mod is not None and catalog_mod.allows_empty(args.model_info):
+        print("export_catalogs: skipped: the catalog allows empty and has no exportable (aliased) models")
+        return 0
     if not exported:
         sys.exit("export_catalogs: refusing to render an empty catalog (no exportable models in model-info.json + config overlay)")
 

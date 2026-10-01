@@ -8,7 +8,7 @@ Install with Homebrew, or run directly from a clone; neither needs `server-ci`, 
 
 ```bash
 brew install georgetheo99/tap/model-gateway
-model-gateway install     # config + starter catalog + launchd plist + start + /health verify
+model-gateway install     # config + empty catalog + launchd plist + start + /health verify
 
 # or from a clone:
 git clone https://github.com/GeorgeTheo99/model-gateway.git ~/local_code/model-gateway
@@ -16,7 +16,7 @@ cd ~/local_code/model-gateway
 ./install.sh              # uv sync + the same steps; or: ./install.sh --no-start
 ```
 
-The installer creates `config.yaml` (with a generated admin key) and a starter `model-info.json` catalog in `~/Library/Application Support/model-gateway/` when absent, installs the `com.local.model-gateway` LaunchAgent and verifies `/health`. The repository does not ship model routes, local model paths, or per-machine pricing; to reuse a reviewed catalog, copy it there before installing. A clone install also symlinks `model-gateway` into `~/.local/bin` and runs `uv run python -m src.main`; a Homebrew install runs from the version-independent `opt` path with the locked virtualenv it builds in `$(brew --prefix)/var/model-gateway/venv`, so `brew upgrade model-gateway && model-gateway restart` keeps the same LaunchAgent. Installs that predate 0.2 keep using an existing checkout-local `config/config.yaml`, `model-info.json` and `~/srv/model-gateway/shared/ledger.db`.
+The installer creates `config.yaml` (with a generated admin key) and an empty `model-info.json` catalog (marked `"allow_empty": true`, so the gateway starts before the first model is registered) in `~/Library/Application Support/model-gateway/` when absent, installs the `com.local.model-gateway` LaunchAgent and verifies `/health`. The repository does not ship model routes, local model paths, or per-machine pricing; to reuse a reviewed catalog, copy it there before installing. A clone install also symlinks `model-gateway` into `~/.local/bin` and runs `uv run python -m src.main`; a Homebrew install runs from the version-independent `opt` path with the locked virtualenv it builds in `$(brew --prefix)/var/model-gateway/venv`, so `brew upgrade model-gateway && model-gateway restart` keeps the same LaunchAgent. Re-running `install` replaces a catalog that still holds only the placeholder seeded by older installers. Installs that predate 0.2 keep using an existing checkout-local `config/config.yaml`, `model-info.json` and `~/srv/model-gateway/shared/ledger.db`.
 
 Operator commands:
 
@@ -286,8 +286,17 @@ Exports are configured in the gitignored `config.yaml`. A config created by
 `~/Library/Application Support/model-gateway/model-aliases.json`, and
 `endpoint.json` publishes that path to consumers. Machines that don't need an
 alias file remove the `exports:` section and the generator is a no-op.
-Generation runs on gateway start (`src/server.py` lifespan) and on
-`/admin/api/reload`; drift is checked with `scripts/export_catalogs.py --check`.
+Generation runs on gateway start (`src/server.py` lifespan), on
+`/admin/api/reload`, and after every admin provider/model save or delete; drift
+is checked with `scripts/export_catalogs.py --check`. Only aliased models are
+exported. With no aliased model left, the previous file is kept (the generator
+never publishes an empty alias catalog) and admin responses report the export
+as `skipped` or `failed`.
+
+The runtime refuses to start with an empty catalog unless `model-info.json`
+sets `"allow_empty": true`. Only `model-gateway install` writes that marker, for
+a fresh machine; it stays until removed by hand, and bundle imports drop it so
+an imported catalog must contain models.
 
 On machines that run a local oMLX service, a machine-local `fan_out_settings.py`
 (kept in deployment shared state, outside this repository — see

@@ -275,6 +275,9 @@ def import_bundle(path: Path, *, force: bool = False, dry_run: bool = False,
     catalog = json.loads(files["model-info.json"])
     if not isinstance(catalog, dict) or not isinstance(catalog.get("llm"), list):
         raise ValueError("bundle model-info.json must be an object with an llm list")
+    # Only a fresh install may run with no models; an imported catalog must not
+    # carry that exemption past startup validation.
+    catalog.pop("allow_empty", None)
     registry_doc = None
     if "consumer-profiles-registry.json" in files:
         registry_doc = json.loads(files["consumer-profiles-registry.json"])

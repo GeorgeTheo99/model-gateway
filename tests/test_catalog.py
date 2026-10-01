@@ -401,6 +401,22 @@ def test_provider_registry_rejects_empty_catalog_without_publishing(tmp_path, mo
     assert providers._models is None
 
 
+def test_explicitly_empty_catalog_is_allowed_only_with_the_marker(tmp_path, monkeypatch):
+    import src.providers as providers
+
+    mi = tmp_path / "model-info.json"
+    _write_model_info(mi, [], allow_empty=True)
+    assert catalog.load_catalog_entries(mi, require_nonempty=True) == []
+    monkeypatch.setattr(providers, "MODEL_INFO_PATH", mi)
+    monkeypatch.setattr(providers, "_models", None)
+    assert providers._load_models() == {}
+
+    for marker in (False, "true", 1):
+        _write_model_info(mi, [], allow_empty=marker)
+        with pytest.raises(ValueError, match="effective model catalog is empty"):
+            catalog.load_catalog_entries(mi, require_nonempty=True)
+
+
 def test_routable_ids_match_providers_module():
     """catalog and providers share the same routable-id logic (providers delegates)."""
     import src.providers as providers

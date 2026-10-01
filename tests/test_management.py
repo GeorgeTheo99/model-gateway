@@ -1528,6 +1528,73 @@ def test_create_only_model_success_then_legacy_upsert(client):
     assert len([e for e in config_io.load_model_info()["llm"] if e["name"] == "new-model"]) == 1
 
 
+def test_admin_model_writes_refresh_the_alias_export(client, tmp_config, monkeypatch):
+    # The exporter runs as a subprocess and reads the catalog from the environment.
+    monkeypatch.setenv("MODEL_GATEWAY_MODEL_INFO", str(tmp_config / "model-info.json"))
+    aliases = tmp_config / "aliases.json"
+    cfg = tmp_config / "config.yaml"
+    cfg.write_text(cfg.read_text() + f"exports:\n  model_aliases: {aliases}\n")
+    headers = {"Authorization": "Bearer admin"}
+    for name, alias in (("keep-model", "keep"), ("new-model", "newm")):
+        payload = {"provider": "anthropic", "provider_model_id": f"{name}-upstream", "alias": alias,
+                   "context": 1000, "max_output_tokens": 100}
+        response = client.post(f"/admin/api/models/{name}", headers=headers, json=payload)
+        assert response.status_code == 200
+        assert response.json()["catalogs"] == "regenerated"
+    assert "newm" in aliases.read_text()
+
+    response = client.delete("/admin/api/models/new-model", headers=headers)
+    assert response.status_code == 200
+    assert response.json()["catalogs"] == "regenerated"
+    assert "newm" not in aliases.read_text() and "keep" in aliases.read_text()
+
+
+def test_admin_writes_report_skipped_and_failed_exports_without_failing(client, tmp_config, monkeypatch):
+    mi = tmp_config / "model-info.json"
+    monkeypatch.setenv("MODEL_GATEWAY_MODEL_INFO", str(mi))
+    cfg = tmp_config / "config.yaml"
+    cfg.write_text(cfg.read_text() + f"exports:\n  model_aliases: {tmp_config}/aliases.json\n")
+    headers = {"Authorization": "Bearer admin"}
+
+    # No aliased model: an unmarked catalog refuses to export, but the save stands.
+    response = client.post("/admin/api/providers/openai", headers=headers,
+                           json={"base_url": "https://api.openai.com/v1", "api_key": "sk-test"})
+    assert response.status_code == 200
+    assert response.json()["catalogs"].startswith("failed: ")
+    assert "openai" in config_io.load_config_full()["providers"]
+
+    doc = json.loads(mi.read_text())
+    mi.write_text(json.dumps({**doc, "allow_empty": True}))
+    response = client.delete("/admin/api/providers/openai", headers=headers)
+    assert response.status_code == 200
+    assert response.json()["catalogs"] == "skipped (no exportable models)"
+    assert not (tmp_config / "aliases.json").exists()
+
+
+def test_timed_out_catalog_export_is_killed(monkeypatch):
+    import asyncio
+    import sys
+
+    from src import admin
+
+    started = []
+    real_exec = asyncio.create_subprocess_exec
+
+    async def slow_exec(*_args, **kwargs):
+        proc = await real_exec(sys.executable, "-c", "import time; time.sleep(30)", **kwargs)
+        started.append(proc)
+        return proc
+
+    async def expire(awaitable, timeout):
+        awaitable.close()
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(admin.asyncio, "create_subprocess_exec", slow_exec)
+    monkeypatch.setattr(admin.asyncio, "wait_for", expire)
+    assert asyncio.run(admin._regenerate_catalogs()).startswith("failed")
+    assert started and started[0].returncode is not None
+
+
 @pytest.mark.parametrize("target,fields,overlay", [
     ("claude-test", {}, False),
     ("%20claude-test%20", {}, False),

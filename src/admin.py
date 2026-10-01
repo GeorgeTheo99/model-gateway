@@ -273,23 +273,36 @@ async def admin_reload(request: Request):
     }
 
 
+# One export at a time, so a slower older render never overwrites a newer one.
+_catalog_export_lock = asyncio.Lock()
+
+
 async def _regenerate_catalogs() -> str:
     """Re-render the downstream alias catalog (model-aliases.json) after a
-    config change. Best-effort: catalog drift is never allowed to fail a reload."""
+    config change, including every admin provider/model write. Best-effort:
+    catalog drift is never allowed to fail a reload or a saved change."""
     script = Path(__file__).resolve().parents[1] / "scripts" / "export_catalogs.py"
     if not script.exists():
         return "skipped (script missing)"
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable, str(script), "--config", str(config_io.CONFIG_PATH),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-        )
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
-        if proc.returncode == 0:
-            return "regenerated"
-        return f"failed: {out.decode(errors='replace')[:200]}"
-    except Exception as exc:  # noqa: BLE001 — reload must survive catalog errors
-        return f"failed: {exc}"
+    async with _catalog_export_lock:
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, str(script), "--config", str(config_io.CONFIG_PATH),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+            text = out.decode(errors="replace")
+            if proc.returncode == 0:
+                return "skipped (no exportable models)" if "skipped:" in text else "regenerated"
+            return f"failed: {text[:200]}"
+        except Exception as exc:  # noqa: BLE001 — reload must survive catalog errors
+            return f"failed: {exc}"
+        finally:
+            # A timed-out or cancelled exporter must not write a stale file later.
+            if proc is not None and proc.returncode is None:
+                proc.kill()
+                await proc.wait()
 
 
 @router.get("/admin/api/usage")
@@ -493,6 +506,7 @@ async def admin_upsert_provider(provider_id: str, request: Request):
     if reload_error is not None:
         return _bad_request(f"Provider registry update rejected: {reload_error}")
     result["reloaded"] = True
+    result["catalogs"] = await _regenerate_catalogs()
     return result
 
 
@@ -514,6 +528,7 @@ async def admin_delete_provider(provider_id: str, request: Request):
         return _bad_request(str(exc))
     if reload_error is not None:
         return _bad_request(f"Provider registry update rejected: {reload_error}")
+    result["catalogs"] = await _regenerate_catalogs()
     return result
 
 
@@ -789,6 +804,7 @@ async def admin_upsert_model(model_name: str, request: Request):
     if reload_error is not None:
         return _bad_request(f"Provider registry update rejected: {reload_error}")
     result["reloaded"] = True
+    result["catalogs"] = await _regenerate_catalogs()
     return result
 
 
@@ -805,6 +821,7 @@ async def admin_delete_model(model_name: str, request: Request):
         return _bad_request(str(exc), status=404)
     if reload_error is not None:
         return _bad_request(f"Provider registry update rejected: {reload_error}")
+    result["catalogs"] = await _regenerate_catalogs()
     return result
 
 

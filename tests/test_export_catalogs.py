@@ -515,6 +515,17 @@ def test_refuses_empty_catalog(tmp_path):
     assert "empty catalog" in r.stderr
 
 
+def test_explicitly_empty_catalog_exports_nothing(tmp_path):
+    mi = tmp_path / "model-info.json"
+    _write_model_info(mi, [], allow_empty=True)
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(f"exports:\n  model_aliases: {tmp_path}/aliases.json\n")
+    r = _run(cfg, mi)
+    assert r.returncode == 0, r.stderr
+    assert "skipped:" in r.stdout
+    assert not (tmp_path / "aliases.json").exists()
+
+
 def test_gateway_does_not_own_pi_launchers():
     assert not (REPO_ROOT / "runtime" / "pi-launcher.zsh").exists()
     assert not (REPO_ROOT / "runtime" / "local_claude" / "zshrc-launcher.zsh").exists()

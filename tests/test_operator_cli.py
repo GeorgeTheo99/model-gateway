@@ -551,3 +551,69 @@ def test_packaged_cli_refuses_a_missing_package_root(tmp_path: Path) -> None:
     result = subprocess.run([str(script), "env"], capture_output=True, text=True, env=env)
     assert result.returncode == 1
     assert "package root is missing" in result.stderr
+
+
+def _ensure_catalog(tmp_path: Path, model_info: Path) -> subprocess.CompletedProcess:
+    harness = tmp_path / "harness.sh"
+    harness.write_text('cli="$1"\nset -- env\nsource "$cli" >/dev/null\ncheck_prereqs\nensure_model_catalog\n')
+    env = {key: value for key, value in os.environ.items() if not key.startswith(("MODEL_GATEWAY_", "GATEWAY_VISION"))}
+    env.update({
+        "HOME": str(tmp_path),
+        "MODEL_GATEWAY_CONFIG": str(tmp_path / "config.yaml"),
+        "MODEL_GATEWAY_MODEL_INFO": str(model_info),
+    })
+    return subprocess.run(["bash", str(harness), str(SCRIPT)], capture_output=True, text=True, env=env, timeout=120)
+
+
+def test_fresh_install_creates_an_explicitly_empty_catalog(tmp_path: Path) -> None:
+    import json
+
+    model_info = tmp_path / "model-info.json"
+    result = _ensure_catalog(tmp_path, model_info)
+    assert result.returncode == 0, result.stderr
+    doc = json.loads(model_info.read_text())
+    assert doc["llm"] == [] and doc["allow_empty"] is True
+
+
+def test_install_replaces_only_the_legacy_starter_placeholder(tmp_path: Path) -> None:
+    import json
+
+    model_info = tmp_path / "model-info.json"
+    placeholder = {"name": "starter-placeholder", "provider": "starter", "provider_model_id": "starter-placeholder"}
+    model_info.write_text(json.dumps({"updated": "1970-01-01T00:00:00+00:00", "_note": "starter", "llm": [placeholder]}))
+    model_info.chmod(0o600)
+    result = _ensure_catalog(tmp_path, model_info)
+    assert result.returncode == 0, result.stderr
+    assert "Removed the starter placeholder" in result.stdout
+    doc = json.loads(model_info.read_text())
+    assert doc == {"updated": "1970-01-01T00:00:00+00:00", "llm": [], "allow_empty": True}
+    assert model_info.stat().st_mode & 0o777 == 0o600
+
+    real = {"name": "real", "provider": "openai", "provider_model_id": "gpt-real"}
+    model_info.write_text(json.dumps({"llm": [placeholder, real]}))
+    result = _ensure_catalog(tmp_path, model_info)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(model_info.read_text())["llm"] == [placeholder, real]
+
+
+def test_placeholder_migration_writes_through_a_symlinked_catalog(tmp_path: Path) -> None:
+    import json
+
+    real = tmp_path / "shared" / "model-info.json"
+    real.parent.mkdir()
+    real.write_text(json.dumps({"llm": [{"name": "starter-placeholder", "provider": "starter"}]}))
+    link = tmp_path / "model-info.json"
+    link.symlink_to(real)
+    result = _ensure_catalog(tmp_path, link)
+    assert result.returncode == 0, result.stderr
+    assert link.is_symlink()
+    assert json.loads(real.read_text()) == {"llm": [], "allow_empty": True}
+
+
+def test_install_still_rejects_an_empty_catalog_without_the_marker(tmp_path: Path) -> None:
+    model_info = tmp_path / "model-info.json"
+    model_info.write_text('{"llm": []}')
+    result = _ensure_catalog(tmp_path, model_info)
+    assert result.returncode == 1
+    assert "invalid machine-local model catalog" in result.stderr
+

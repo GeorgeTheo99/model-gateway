@@ -126,7 +126,9 @@ def test_import_refuses_existing_content_without_force_and_dry_run_writes_nothin
     assert yaml.safe_load((source / "config.yaml").read_text())["auth"]["admin_keys"] == ["admin-secret"]
 
 
-def test_import_rolls_back_when_the_catalog_does_not_load(source, tmp_path, monkeypatch):
+# A fresh install's allow_empty marker must not exempt an imported catalog.
+@pytest.mark.parametrize("empty_catalog", [{"llm": []}, {"llm": [], "allow_empty": True}])
+def test_import_rolls_back_when_the_catalog_does_not_load(source, tmp_path, monkeypatch, empty_catalog):
     out = source / "bundle.tar.gz"
     bundle.export_bundle(out)
     target = Path(os.path.realpath(tmp_path)) / "target"
@@ -134,7 +136,7 @@ def test_import_rolls_back_when_the_catalog_does_not_load(source, tmp_path, monk
     (target / "config.yaml").write_text("auth:\n  client_keys: [t]\n")
     broken = target / "broken.tar.gz"
     _manifest, files = bundle.read_bundle(out)
-    files["model-info.json"] = json.dumps({"llm": []}).encode()
+    files["model-info.json"] = json.dumps(empty_catalog).encode()
     _write_tar(broken, files)
     with pytest.raises(Exception):
         bundle.import_bundle(broken)

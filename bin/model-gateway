@@ -299,32 +299,24 @@ EOF
 
 ensure_model_catalog() {
   if [ ! -f "$MODEL_INFO_PATH" ]; then
-    # Fresh install: create a starter catalog so first run works out of the
-    # box. The placeholder routes nowhere (its provider is unconfigured) and
-    # is replaced by the first real 'model-gateway onboard' apply.
+    # Fresh install: an explicitly empty catalog lets the gateway start before
+    # the first model is registered in the admin UI or with 'onboard'.
     mkdir -p "$(dirname "$MODEL_INFO_PATH")"
     cat >"$MODEL_INFO_PATH" <<'EOF'
 {
   "updated": "1970-01-01T00:00:00+00:00",
-  "_note": "Starter catalog created by 'model-gateway install'. Replace the placeholder entry by onboarding a real provider: model-gateway onboard generate --provider <id> --base-url <url> --model <model>. See docs/provider-onboarding.md.",
-  "llm": [
-    {
-      "name": "starter-placeholder",
-      "provider": "starter",
-      "provider_model_id": "starter-placeholder",
-      "context": 8192,
-      "max_output_tokens": 4096,
-      "desc": "Placeholder entry; not routable until a real provider is onboarded. Safe to delete after onboarding your first model."
-    }
-  ]
+  "_note": "Model catalog created by 'model-gateway install'. Register models in the admin UI ('model-gateway admin') or with 'model-gateway onboard'. allow_empty lets the gateway start with no models.",
+  "allow_empty": true,
+  "llm": []
 }
 EOF
-    warn "Created starter model catalog at $MODEL_INFO_PATH; onboard a real provider to route requests (see docs/provider-onboarding.md)"
+    warn "Created an empty model catalog at $MODEL_INFO_PATH; register models in the admin UI ('model-gateway admin')"
   fi
   (
     cd "$ROOT_DIR"
     run_python - "$MODEL_INFO_PATH" "$CONFIG_PATH" <<'PY'
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -333,13 +325,29 @@ from src.catalog import load_catalog_entries
 path = Path(sys.argv[1])
 config_path = Path(sys.argv[2])
 data = json.loads(path.read_text())
-if not isinstance(data, dict) or not isinstance(data.get("llm"), list) or not data["llm"]:
-    raise SystemExit("model-info.json must contain a non-empty llm list")
+if not isinstance(data, dict) or not isinstance(data.get("llm"), list):
+    raise SystemExit("model-info.json must contain an llm list")
 if any(not isinstance(row, dict) for row in data["llm"]):
     raise SystemExit("model-info.json llm entries must be objects")
-effective = load_catalog_entries(path, config_path, require_nonempty=True)
-if not effective:
-    raise SystemExit("effective model catalog is empty")
+# Installers before 0.2.1 seeded an unroutable placeholder; replace a catalog
+# that still holds only that entry with the explicitly empty catalog. Write
+# through symlinks under the config lock, like every other catalog writer.
+if [(row.get("name"), row.get("provider")) for row in data["llm"]] == [("starter-placeholder", "starter")]:
+    from src.config_lock import config_write_lock
+
+    with config_write_lock(config_path):
+        target = path.resolve()
+        data = json.loads(target.read_text())
+        if [(row.get("name"), row.get("provider")) for row in data["llm"]] == [("starter-placeholder", "starter")]:
+            data["llm"] = []
+            data["allow_empty"] = True
+            data.pop("_note", None)
+            tmp = target.with_name(f".{target.name}.tmp.{os.getpid()}")
+            tmp.write_text(json.dumps(data, indent=2) + "\n")
+            os.chmod(tmp, target.stat().st_mode & 0o777)
+            os.replace(tmp, target)
+            print("Removed the starter placeholder from the model catalog")
+load_catalog_entries(path, config_path, require_nonempty=True)
 PY
   ) || die "invalid machine-local model catalog: $MODEL_INFO_PATH"
   ok "Model catalog ready: $MODEL_INFO_PATH"
