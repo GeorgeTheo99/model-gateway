@@ -7,7 +7,8 @@ so it does not rerun at login) that downloads the pinned payload (HTTPS only,
 resumable, rate-limited, hash-verified), builds oMLX from the locked project
 in ``local-runtime/`` with uv, installs the ``com.local.omlx`` LaunchAgent,
 adds the ``omlx`` provider and model to this gateway, and requires a real
-completion through the gateway.
+completion through the gateway (or, when /v1 needs a key the job does not
+hold, from oMLX with the gateway's files routing to it; see ``check``).
 
 Ownership: the oMLX LaunchAgent and the setup job record
 ``<state directory>#<gateway launchd label>`` under ``ModelGatewayRoot``, so
@@ -970,6 +971,36 @@ def _gateway_token() -> str:
     return keys[0] if keys else ""
 
 
+def _anonymous_refused(gateway: str) -> bool:
+    """Whether the gateway's /v1 requires a client key this process does not hold."""
+    try:
+        _request(f"{gateway}/v1/models")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            return True
+        raise
+    return False
+
+
+def _check_direct(local: LocalModel, payload: dict) -> dict:
+    """Without a gateway key: complete against oMLX and require the gateway's files to route to it.
+
+    Package installs seed no admin key, and once a product adds consumer
+    credentials /v1 refuses anonymous clients. Rather than mint a standing
+    credential (which would also lock /v1 for every anonymous local client),
+    the job proves the model with oMLX's own key and checks the routing the
+    gateway loaded on its restart.
+    """
+    omlx_port = port()
+    provider = (config_io.load_config_full().get("providers") or {}).get("omlx")
+    if (not _our_provider(provider) or provider.get("base_url") != f"http://127.0.0.1:{omlx_port}/v1"
+            or not any(_our_catalog_entry(entry, local) for entry in config_io.load_model_info().get("llm", []))):
+        raise LocalRuntimeError(f"The gateway does not route {local.name} to local AI")
+    return _request(f"http://127.0.0.1:{omlx_port}/v1/chat/completions", _key(api_key_path()), {
+        "model": payload["model_id"], "messages": [{"role": "user", "content": "Reply with exactly OK."}],
+        "max_tokens": 32, "chat_template_kwargs": {"enable_thinking": False}, "stream": False}, timeout=300)
+
+
 def check(local: LocalModel, payload: dict) -> None:
     """oMLX serves exactly the verified payload and the gateway completes with it."""
     model_id = payload["model_id"]
@@ -979,6 +1010,9 @@ def check(local: LocalModel, payload: dict) -> None:
             or os.path.realpath(str(rows[0].get("model_path"))) != os.path.realpath(mlx_dir() / model_id)):
         raise LocalRuntimeError("oMLX is not serving the sole verified local model")
     gateway, token = gateway_origin(), _gateway_token()
+    if not token and _anonymous_refused(gateway):
+        _completion_ok(_check_direct(local, payload))
+        return
     deadline = time.monotonic() + 60
     while True:
         listing = _request(f"{gateway}/v1/models", token)
@@ -990,6 +1024,10 @@ def check(local: LocalModel, payload: dict) -> None:
     completion = _request(f"{gateway}/v1/chat/completions", token, {
         "model": local.name, "messages": [{"role": "user", "content": "Reply with exactly OK."}],
         "max_tokens": 32, "reasoning_effort": "off", "stream": False}, timeout=300)
+    _completion_ok(completion)
+
+
+def _completion_ok(completion: dict) -> None:
     try:
         content = completion["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):

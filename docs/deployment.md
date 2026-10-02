@@ -65,6 +65,65 @@ the ledger.
 
 After install, run `model-gateway admin` to add provider connections in the admin UI, or edit `config.yaml`; provider keys go in mode-0600 `api_key_file`s (see [provider onboarding](provider-onboarding.md#where-provider-keys-are-stored)). A fresh generated config intentionally has `providers: {}`, so catalog entries remain unavailable until providers are configured. If you deliberately expose the gateway beyond loopback (`MODEL_GATEWAY_HOST=0.0.0.0`), configure `auth.client_keys` and firewall rules first.
 
+## Component package
+
+`packaging/component/` builds `com.local.model-gateway.component`, an unsigned
+Installer component package that products (Home Server) embed and that also
+installs on its own:
+
+```bash
+packaging/component/scripts/build-component-pkg.sh --version 0.4.0 --out-dir dist/component [--ref REF] [--product]
+packaging/component/scripts/build-component-pkg.sh --version 0.4.0 --out-dir dist/component --dry-run
+packaging/component/scripts/verify-component-pkg.sh dist/component/ModelGateway-component-0.4.0.pkg
+```
+
+- The build needs a clean tree; `--version` must equal `src/version.py` at
+  `REF`. It exports only runtime files (`bin/model-gateway`, `src`, `scripts`,
+  `config`, `local-models`, `local-runtime`, `pyproject.toml`, `uv.lock`,
+  `LICENSE`, `README.md`; regular Git blobs only) to
+  `/Library/Application Support/ModelGateway/package/gateway/`, with the helper
+  in `ModelGateway/bin/`, a sorted `manifest.sha256` of both, and
+  `package/release.plist` (format 1: version, `release_name`
+  `<version>-<commit12>`, source commit, capabilities, and the manifest,
+  helper, and postinstall hashes). `--dry-run` stages and verifies the payload
+  in `DIR/ModelGateway-X.dry-run` without `pkgbuild`. Signing and notarization
+  are separate release steps.
+- The root `postinstall` verifies every staged file against the manifest and
+  the bindings in `release.plist` (also available as
+  `postinstall --verify-payload DIR`, which the build and verifier use),
+  records the target user in `ModelGateway/target-user.plist` (the console user
+  on first install, or `MODEL_GATEWAY_TARGET_USER`), and runs
+  `model-gateway-install-from-pkg` as that user with a clean environment under a
+  timeout. Its log is `/var/log/model-gateway-pkg-install.log`.
+- The per-user helper acts on the existing `com.local.model-gateway`:
+
+| Existing LaunchAgent | Action |
+|---|---|
+| None | Install a release, start, verify |
+| Component-owned, older | Upgrade: new release, swap `current`, restart, verify; roll back to the previous release on failure |
+| Component-owned, same or newer | Nothing (a downgrade is refused) |
+| Legacy Home Server bundle (`HomeServerCIPath`, `WorkingDirectory` under `HomeServer/runtime/current/model-gateway`) | Nothing; the Home Server package migrates it |
+| Any other owner (git checkout, Homebrew, server-ci) | Nothing (attach-only); prints what it found |
+
+- A component-owned plist carries `ModelGatewayComponentRoot` (the state root,
+  `~/Library/Application Support/model-gateway`) and runs from the
+  version-independent `current` symlink. Releases live in
+  `releases/<version>-<commit12>/`, each with its own venv built by uv from the
+  bundled `uv.lock` (uv from `PATH` or Homebrew; the helper fails clearly
+  without it, and building may download wheels and a Python). `current/.package`
+  names `MANAGER=model-gateway-pkg`. The helper keeps the active and previous
+  releases and links `~/.local/bin/model-gateway` when that path is free.
+- Installing runs `model-gateway install` from the new release: the seeded
+  `config.yaml` has **no admin key** (products use scoped consumer
+  credentials; add `auth.admin_keys` yourself to use the admin UI), and the
+  port is 9111 or the first free port in 9112–9159, persisted in `install.env`.
+  Verification requires the exact `/health` body, an owner-only
+  `endpoint.json` for this version and port, and the ownership marker.
+- Re-running the same package changes nothing. Removing the component is
+  `model-gateway uninstall` (state is kept) plus deleting
+  `/Library/Application Support/ModelGateway` and
+  `pkgutil --forget com.local.model-gateway.component`.
+
 ## Connecting consumers
 
 Each project connects with its own consumer credential and finds the gateway
@@ -160,7 +219,11 @@ pinned payload in `local-models/` over HTTPS only (resumable, capped at
 provider (key file `local-ai/inference/api.key`, mode 0600, marked
 `managed_by: local_ai` so admin provider key edits and deletes refuse it) and
 model to this gateway, restarts the gateway, and requires a real completion
-through `/v1`. If Model Gateway is upgraded while the job downloads, the job
+through `/v1`. Without an admin key the job cannot authenticate to a `/v1`
+that requires keys (a package install with product consumers); then it
+completes against oMLX with oMLX's own key and requires the gateway's config
+and catalog to route the model there, rather than adding a standing
+credential that would also close `/v1` to anonymous local clients. If Model Gateway is upgraded while the job downloads, the job
 restarts itself on the new release before installing. `add` returns the
 current status without doing anything once local AI is installed.
 Progress is in `local-ai/status.json` (`queued`, `downloading`, `installing`,

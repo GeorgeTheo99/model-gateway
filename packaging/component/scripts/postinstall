@@ -1,0 +1,187 @@
+#!/bin/bash
+# Root postinstall for com.local.model-gateway.component: verify the staged
+# payload, bind the package to one owner, and run the per-user helper as that
+# owner with a clean environment and a timeout.
+#
+# `postinstall --verify-payload DIR` only verifies a staged ModelGateway
+# directory (the build and the package verifier use it); it changes nothing.
+
+set -euo pipefail
+umask 077
+
+PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH
+
+fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# The payload is data-driven: manifest.sha256 lists every file under ./bin and
+# ./package/gateway, and release.plist (the only other file) binds the
+# manifest, the helper, and this script by hash.
+verify_payload() {
+  local dir="$1" manifest_sha helper_sha postinstall_sha version release_name
+  for tool in plutil shasum; do
+    have "$tool" || fail "missing prerequisite: $tool"
+  done
+  [ -d "$dir" ] && [ ! -L "$dir" ] || fail "package support path is not a directory: $dir"
+  (
+    cd "$dir"
+    for path in . ./bin ./package ./package/gateway; do
+      [ -d "$path" ] && [ ! -L "$path" ] || exit 1
+    done
+    [ -f manifest.sha256 ] && [ ! -L manifest.sha256 ] || exit 1
+    [ -f package/release.plist ] && [ ! -L package/release.plist ] || exit 1
+    [ -z "$(find ./bin ./package ! -type f ! -type d -print -quit)" ] || exit 1
+    [ "$(find ./package -type f ! -path './package/gateway/*' -print)" = "./package/release.plist" ] || exit 1
+    shasum -a 256 -c manifest.sha256 >/dev/null 2>&1 || exit 1
+    diff <(cut -c 67- manifest.sha256) <(cut -c 67- manifest.sha256 | LC_ALL=C sort -u) >/dev/null || exit 1
+    diff <(cut -c 67- manifest.sha256) \
+      <(find ./bin ./package/gateway -type f -print | LC_ALL=C sort) >/dev/null || exit 1
+    [ "$(find ./bin -type f -print)" = "./bin/model-gateway-install-from-pkg" ] || exit 1
+    for required in bin/model-gateway src/main.py src/version.py pyproject.toml uv.lock; do
+      [ -f "package/gateway/$required" ] || exit 1
+    done
+  ) || fail "package payload checksum or inventory verification failed"
+  plist_value() { plutil -extract "$1" raw -o - "$dir/package/release.plist"; }
+  [ "$(plist_value format_version)" = "1" ] || fail "unsupported package release format"
+  [ "$(plist_value package_identifier)" = "com.local.model-gateway.component" ] || fail "unexpected package identifier"
+  manifest_sha="$(plist_value manifest_sha256)"
+  helper_sha="$(plist_value helper_sha256)"
+  postinstall_sha="$(plist_value postinstall_sha256)"
+  version="$(plist_value package_version)"
+  release_name="$(plist_value release_name)"
+  [ "$(shasum -a 256 "$dir/manifest.sha256" | awk '{print $1}')" = "$manifest_sha" ] || fail "package manifest checksum mismatch"
+  [ "$(shasum -a 256 "$dir/bin/model-gateway-install-from-pkg" | awk '{print $1}')" = "$helper_sha" ] || fail "package helper checksum mismatch"
+  [ "$(shasum -a 256 "$0" | awk '{print $1}')" = "$postinstall_sha" ] || fail "postinstall checksum verification failed"
+  [[ "$version" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]] || fail "invalid package version metadata"
+  [ "${release_name%-*}" = "$version" ] && [[ "${release_name##*-}" =~ ^[0-9a-f]{12}$ ]] \
+    || fail "invalid release name metadata"
+  grep -qx "VERSION = \"$version\"" "$dir/package/gateway/src/version.py" || fail "package version does not match the gateway source"
+}
+
+if [ "${1:-}" = "--verify-payload" ]; then
+  [ $# -eq 2 ] || fail "usage: postinstall --verify-payload DIR"
+  verify_payload "$2"
+  printf 'payload verified: %s\n' "$2"
+  exit 0
+fi
+
+# Installer arguments: $3 is the target volume.
+[ "${3:-/}" = "/" ] || fail "Model Gateway installs only on the startup disk"
+[ "$(id -u)" -eq 0 ] || fail "postinstall must run as root"
+
+SUPPORT_DIR="/Library/Application Support/ModelGateway"
+LOG_FILE="/var/log/model-gateway-pkg-install.log"
+HELPER="$SUPPORT_DIR/bin/model-gateway-install-from-pkg"
+TARGET_RECORD="$SUPPORT_DIR/target-user.plist"
+RELEASE_PLIST="$SUPPORT_DIR/package/release.plist"
+TIMEOUT_OVERRIDE="${MODEL_GATEWAY_PKG_TIMEOUT_SECONDS:-}"
+
+secure_root_log() {
+  local path="$1"
+  [ -f "$path" ] && [ ! -L "$path" ] || fail "refusing unsafe package install log: $path"
+  [ "$(stat -f '%u %l' "$path")" = "0 1" ] || fail "refusing package install log with unsafe owner or hard links: $path"
+  /usr/sbin/chown root:wheel "$path"
+  chmod 600 "$path"
+}
+if [ ! -e "$LOG_FILE" ] && [ ! -L "$LOG_FILE" ]; then
+  : >> "$LOG_FILE"
+fi
+secure_root_log "$LOG_FILE"
+if [ "$(stat -f '%z' "$LOG_FILE")" -ge $((10 * 1024 * 1024)) ]; then
+  [ ! -e "$LOG_FILE.1" ] || secure_root_log "$LOG_FILE.1"
+  mv -f "$LOG_FILE" "$LOG_FILE.1"
+  : >> "$LOG_FILE"
+  secure_root_log "$LOG_FILE"
+fi
+log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | /usr/bin/tee -a "$LOG_FILE"; }
+die() { log "ERROR: $*"; exit 1; }
+
+resolve_python() {
+  local candidate
+  for candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+    [ -x "$candidate" ] || continue
+    if "$candidate" -c 'import os,sys' >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+verify_payload "$SUPPORT_DIR" 2>>"$LOG_FILE" || die "package payload verification failed"
+PYTHON3="$(resolve_python)" || die "missing a functional Python 3 interpreter"
+TIMEOUT_SECONDS="${TIMEOUT_OVERRIDE:-$(plutil -extract helper_timeout raw -o - "$RELEASE_PLIST")}"
+installer_timeout="$(plutil -extract postinstall_timeout raw -o - "$RELEASE_PLIST")"
+case "$TIMEOUT_SECONDS" in *[!0-9]*|'') die "invalid package helper timeout" ;; esac
+case "$installer_timeout" in *[!0-9]*|'') die "invalid Package Installer timeout" ;; esac
+[ "$((TIMEOUT_SECONDS + 15))" -lt "$installer_timeout" ] || die "helper timeout leaves no Package Installer cleanup grace"
+
+target_tmp=""
+if [ -e "$TARGET_RECORD" ] || [ -L "$TARGET_RECORD" ]; then
+  [ -f "$TARGET_RECORD" ] && [ ! -L "$TARGET_RECORD" ] || die "target-owner record is not a regular file"
+  target_user="$(plutil -extract username raw -o - "$TARGET_RECORD")"
+  recorded_uid="$(plutil -extract uid raw -o - "$TARGET_RECORD")"
+  user_home="$(plutil -extract home raw -o - "$TARGET_RECORD")"
+else
+  target_user="${MODEL_GATEWAY_TARGET_USER:-}"
+  if [ -z "$target_user" ]; then
+    target_user="$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || true)"
+  fi
+  if [ -z "$target_user" ] || [ "$target_user" = "root" ] || [ "$target_user" = "loginwindow" ]; then
+    die "could not determine the target user; set MODEL_GATEWAY_TARGET_USER for the first install"
+  fi
+  user_home="$(/usr/bin/dscl . -read "/Users/$target_user" NFSHomeDirectory 2>/dev/null | /usr/bin/awk '{print $2}')"
+  [ -n "$user_home" ] || die "could not determine the home directory for $target_user"
+  recorded_uid="$(/usr/bin/id -u "$target_user")"
+  target_tmp="$SUPPORT_DIR/.target-user.plist.$$"
+  trap 'rm -f "$target_tmp"' EXIT
+  plutil -create xml1 "$target_tmp"
+  plutil -insert username -string "$target_user" "$target_tmp"
+  plutil -insert uid -integer "$recorded_uid" "$target_tmp"
+  plutil -insert home -string "$user_home" "$target_tmp"
+  plutil -lint "$target_tmp" >/dev/null
+  chmod 600 "$target_tmp"
+fi
+
+actual_uid="$(/usr/bin/id -u "$target_user" 2>/dev/null || true)"
+actual_home="$(/usr/bin/dscl . -read "/Users/$target_user" NFSHomeDirectory 2>/dev/null | /usr/bin/awk '{print $2}')"
+[ "$actual_uid" = "$recorded_uid" ] || die "recorded target UID no longer matches $target_user"
+[ "$actual_home" = "$user_home" ] || die "recorded target home no longer matches $target_user"
+[ "$recorded_uid" -ne 0 ] || die "refusing to install for root"
+
+log "Installing Model Gateway $(plutil -extract package_version raw -o - "$RELEASE_PLIST") for user=$target_user uid=$recorded_uid"
+set +e
+"$PYTHON3" -c 'import os,sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])' \
+  /bin/launchctl asuser "$recorded_uid" /usr/bin/sudo -H -u "$target_user" /usr/bin/env -i \
+  HOME="$user_home" USER="$target_user" LOGNAME="$target_user" TMPDIR="/tmp" \
+  PATH="/opt/homebrew/bin:/usr/local/bin:$user_home/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+  "$HELPER" >>"$LOG_FILE" 2>&1 &
+helper_pid=$!
+(
+  sleep "$TIMEOUT_SECONDS" &
+  sleep_pid=$!
+  trap 'kill "$sleep_pid" 2>/dev/null || true; exit 0' TERM INT HUP
+  wait "$sleep_pid" || exit 0
+  if kill -0 "$helper_pid" 2>/dev/null; then
+    log "Package helper exceeded ${TIMEOUT_SECONDS}s; terminating"
+    kill -TERM -- "-$helper_pid" 2>/dev/null || true
+    sleep 10
+    kill -KILL -- "-$helper_pid" 2>/dev/null || true
+  fi
+) &
+watchdog_pid=$!
+wait "$helper_pid"
+status=$?
+kill "$watchdog_pid" 2>/dev/null || true
+wait "$watchdog_pid" 2>/dev/null || true
+set -e
+
+if [ "$status" -ne 0 ]; then
+  die "Model Gateway package install failed with status $status; see $LOG_FILE"
+fi
+if [ -n "$target_tmp" ]; then
+  mv -f "$target_tmp" "$TARGET_RECORD"
+  trap - EXIT
+fi
+log "Model Gateway package install completed"

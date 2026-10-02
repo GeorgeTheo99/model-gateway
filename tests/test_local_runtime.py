@@ -845,6 +845,61 @@ def test_check_requires_the_sole_payload_and_a_real_completion(eligible, monkeyp
         lr.check(QWEN, payload)
 
 
+def test_check_without_a_gateway_key_completes_against_omlx_and_requires_gateway_routing(
+        eligible, gateway, monkeypatch):
+    # A package install: no admin key, and a product's consumers make /v1 refuse anonymous clients.
+    config = yaml.safe_load(gateway.read_text())
+    del config["auth"]["admin_keys"]
+    gateway.write_text(yaml.safe_dump(config))
+    providers.reload()
+    owned_install(9123)
+    omlx_key = lr._key(lr.api_key_path(), create=True)
+    payload = {"model_id": QWEN_ID}
+    path = str(lr.mlx_dir() / QWEN_ID)
+    seen = []
+
+    def fake_request(url, token="", body=None, **kw):
+        seen.append((url, token, body))
+        if url == "http://127.0.0.1:9111/v1/models":
+            raise lr.urllib.error.HTTPError(url, 401, "Unauthorized", {}, None)
+        return {
+            "http://127.0.0.1:9123/v1/models/status": {"models": [{"id": QWEN_ID, "model_path": path}]},
+            "http://127.0.0.1:9123/v1/chat/completions": {"choices": [{"message": {"content": "OK"}}]},
+        }[url]
+
+    monkeypatch.setattr(lr, "_request", fake_request)
+    with pytest.raises(lr.LocalRuntimeError, match="does not route"):
+        lr.check(QWEN, payload)
+    assert not any(url.endswith("/chat/completions") for url, _token, _body in seen)
+
+    monkeypatch.setattr(lr, "manifest", lambda local: payload)
+    monkeypatch.setattr(lr, "_restart_gateway", lambda required: None)
+    lr.configure_gateway(QWEN, 9123)
+    seen.clear()
+    lr.check(QWEN, payload)
+    url, token, body = seen[-1]
+    assert (url, token, body["model"]) == ("http://127.0.0.1:9123/v1/chat/completions", omlx_key, QWEN_ID)
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}
+    # No standing credential was added to the gateway.
+    assert [c["id"] for c in yaml.safe_load(gateway.read_text())["auth"]["consumer_credentials"]] == [
+        "app-runtime", "app-manager", "app-local"]
+
+
+def test_check_through_the_gateway_surfaces_other_gateway_errors(eligible, monkeypatch):
+    owned_install(9123)
+    lr._key(lr.api_key_path(), create=True)
+    path = str(lr.mlx_dir() / QWEN_ID)
+
+    def fake_request(url, token="", body=None, **kw):
+        if url == "http://127.0.0.1:9111/v1/models":
+            raise lr.urllib.error.HTTPError(url, 503, "Misconfigured", {}, None)
+        return {"models": [{"id": QWEN_ID, "model_path": path}]}
+
+    monkeypatch.setattr(lr, "_request", fake_request)
+    with pytest.raises(lr.urllib.error.HTTPError):
+        lr.check(QWEN, {"model_id": QWEN_ID})
+
+
 def test_remove_unwires_only_its_own_routes_and_deletes_local_state(eligible, gateway, launchctl, monkeypatch):
     owned_install(9110)
     key = lr._key(lr.api_key_path(), create=True)

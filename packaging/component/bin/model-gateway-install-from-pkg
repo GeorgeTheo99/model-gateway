@@ -1,0 +1,494 @@
+#!/bin/bash
+# Per-user helper run by the Model Gateway component package postinstall, as
+# the target user with a clean environment. What it does depends on the
+# existing com.local.model-gateway LaunchAgent:
+#
+#   none                                    install a release, start, verify
+#   component-owned, older                  upgrade; roll back on a failed verify
+#   component-owned, same or newer          nothing (never downgrades)
+#   legacy Home Server bundled gateway      nothing; the Home Server package migrates it
+#   any other owner (git, Homebrew, CI)     nothing; products attach to it as it is
+#
+# Component-owned means the plist's ModelGatewayComponentRoot is this user's
+# state root and its WorkingDirectory is the version-independent `current`.
+# Releases live in <state root>/releases/<version>-<commit>, each with its own
+# locked venv; `current` is swapped atomically. Re-running is safe.
+
+set -euo pipefail
+umask 077
+
+SUPPORT_DIR="${MODEL_GATEWAY_PKG_SUPPORT_DIR:-/Library/Application Support/ModelGateway}"
+PACKAGE_DIR="$SUPPORT_DIR/package"
+GATEWAY_PAYLOAD="$PACKAGE_DIR/gateway"
+RELEASE_PLIST="$PACKAGE_DIR/release.plist"
+MANIFEST="$SUPPORT_DIR/manifest.sha256"
+LABEL="${MODEL_GATEWAY_LAUNCHD_LABEL:-com.local.model-gateway}"
+STATE_ROOT="$HOME/Library/Application Support/model-gateway"
+RELEASES="$STATE_ROOT/releases"
+CURRENT="$STATE_ROOT/current"
+INSTALL_ENV="$STATE_ROOT/install.env"
+ENDPOINT_FILE="$STATE_ROOT/endpoint.json"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LEGACY_HOME_SERVER_GATEWAY="$HOME/Library/Application Support/HomeServer/runtime/current/model-gateway"
+LOCK_DIR="$STATE_ROOT/.package-install.lock"
+HEALTH_BODY='{"status":"ok","service":"model-gateway"}'
+
+say() { printf '%s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+resolve_python() {
+  local candidate
+  for candidate in "$(command -v python3 2>/dev/null || true)" /opt/homebrew/bin/python3 \
+    /usr/local/bin/python3 /usr/bin/python3; do
+    [ -x "$candidate" ] || continue
+    if "$candidate" -c 'import hashlib,json,plistlib,socket' >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+resolve_uv() {
+  local candidate
+  if [ -n "${MODEL_GATEWAY_UV_BIN:-}" ]; then
+    [ -x "$MODEL_GATEWAY_UV_BIN" ] && printf '%s\n' "$MODEL_GATEWAY_UV_BIN" && return 0
+    return 1
+  fi
+  for candidate in "$(command -v uv 2>/dev/null || true)" /opt/homebrew/bin/uv /usr/local/bin/uv \
+    "$HOME/.local/bin/uv" "$HOME/.cargo/bin/uv"; do
+    [ -n "$candidate" ] && [ -x "$candidate" ] && printf '%s\n' "$candidate" && return 0
+  done
+  return 1
+}
+
+plist_key() { # file key
+  /usr/libexec/PlistBuddy -c "Print :$2" "$1" 2>/dev/null || true
+}
+
+release_value() { plutil -extract "$1" raw -o - "$RELEASE_PLIST"; }
+
+source_version() { # release dir
+  sed -n 's/^VERSION = "\(.*\)"$/\1/p' "$1/src/version.py" 2>/dev/null || true
+}
+
+version_cmp() { # a b → -1, 0, or 1
+  "$PYTHON3" -c 'import sys
+a, b = (tuple(int(p) for p in v.split(".")) for v in sys.argv[1:])
+print((a > b) - (a < b))' "$1" "$2"
+}
+
+# The same checks as the root postinstall: every staged file is in the
+# manifest with its hash, and release.plist binds the manifest and helper.
+verify_package() {
+  for path in "$SUPPORT_DIR" "$SUPPORT_DIR/bin" "$PACKAGE_DIR" "$GATEWAY_PAYLOAD"; do
+    [ -d "$path" ] && [ ! -L "$path" ] || fail "package payload is missing or unsafe: $path"
+  done
+  [ -f "$MANIFEST" ] && [ -f "$RELEASE_PLIST" ] || fail "package manifest or release metadata is missing"
+  (
+    cd "$SUPPORT_DIR"
+    [ -z "$(find ./bin ./package ! -type f ! -type d -print -quit)" ] || exit 1
+    [ "$(find ./package -type f ! -path './package/gateway/*' -print)" = "./package/release.plist" ] || exit 1
+    shasum -a 256 -c manifest.sha256 >/dev/null 2>&1 || exit 1
+    diff <(cut -c 67- manifest.sha256) \
+      <(find ./bin ./package/gateway -type f -print | LC_ALL=C sort) >/dev/null || exit 1
+  ) || fail "package payload checksum or inventory verification failed"
+  [ "$(release_value format_version)" = "1" ] || fail "unsupported package release format"
+  [ "$(shasum -a 256 "$MANIFEST" | awk '{print $1}')" = "$(release_value manifest_sha256)" ] \
+    || fail "package manifest checksum mismatch"
+  [ "$(shasum -a 256 "$SUPPORT_DIR/bin/model-gateway-install-from-pkg" | awk '{print $1}')" = \
+    "$(release_value helper_sha256)" ] || fail "package helper checksum mismatch"
+  VERSION="$(release_value package_version)"
+  RELEASE_NAME="$(release_value release_name)"
+  SOURCE_COMMIT="$(release_value source_commit)"
+  [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]] || fail "invalid package version metadata"
+  [[ "$RELEASE_NAME" =~ ^[0-9.]+-[0-9a-f]{12}$ ]] && [ "${RELEASE_NAME%-*}" = "$VERSION" ] \
+    || fail "invalid release name metadata"
+  [ "$(source_version "$GATEWAY_PAYLOAD")" = "$VERSION" ] || fail "package version does not match the gateway source"
+}
+
+# A release directory holds exactly the manifest's gateway files (plus its venv,
+# .package, .complete, and Python bytecode caches), each with the manifest hash.
+verify_release() { # dir
+  "$PYTHON3" - "$1" "$MANIFEST" <<'PY'
+import hashlib, os, stat, sys
+from pathlib import Path
+
+root, manifest = Path(sys.argv[1]), Path(sys.argv[2])
+expected = {}
+for line in manifest.read_text().splitlines():
+    digest, path = line[:64], line[66:]
+    if path.startswith("./package/gateway/"):
+        expected[path[len("./package/gateway/"):]] = digest
+for relative, digest in expected.items():
+    path = root / relative
+    for part in (path, *path.parents):
+        if part == root:
+            break
+        if part.is_symlink():
+            raise SystemExit(f"release contains a symlink: {relative}")
+    if not stat.S_ISREG(path.lstat().st_mode) or path.lstat().st_uid != os.getuid():
+        raise SystemExit(f"release file is not a user-owned regular file: {relative}")
+    if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+        raise SystemExit(f"release file differs from the package: {relative}")
+for directory, dirnames, filenames in os.walk(root):
+    rel = Path(directory).relative_to(root)
+    if rel.parts and rel.parts[0] == ".venv" or "__pycache__" in rel.parts:
+        dirnames[:] = []
+        continue
+    for name in filenames:
+        relative = (rel / name).as_posix()
+        if relative not in expected and relative not in {".package", ".complete"}:
+            raise SystemExit(f"release has an unexpected file: {relative}")
+PY
+}
+
+classify() {
+  if [ ! -e "$PLIST" ] && [ ! -L "$PLIST" ]; then
+    if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+      printf 'loaded-without-plist\n'
+    else
+      printf 'none\n'
+    fi
+    return 0
+  fi
+  if [ ! -f "$PLIST" ] || [ -L "$PLIST" ]; then
+    printf 'foreign\n'
+    return 0
+  fi
+  local owner wd ci
+  owner="$(plist_key "$PLIST" ModelGatewayComponentRoot)"
+  wd="$(plist_key "$PLIST" WorkingDirectory)"
+  ci="$(plist_key "$PLIST" HomeServerCIPath)"
+  if [ "$owner" = "$STATE_ROOT" ] && [ "$wd" = "$CURRENT" ]; then
+    printf 'component\n'
+  elif [ -n "$ci" ] && { [ "$wd" = "$LEGACY_HOME_SERVER_GATEWAY" ] || [[ "$wd" == "$LEGACY_HOME_SERVER_GATEWAY"/* ]]; }; then
+    printf 'legacy-home-server\n'
+  else
+    printf 'foreign\n'
+  fi
+}
+
+describe_foreign() {
+  local owner wd ci marker version
+  wd="$(plist_key "$PLIST" WorkingDirectory)"
+  ci="$(plist_key "$PLIST" HomeServerCIPath)"
+  marker="$(plist_key "$PLIST" ModelGatewayComponentRoot)"
+  if [ -L "$PLIST" ] || [ ! -f "$PLIST" ]; then owner="an unknown owner (the plist is not a regular file)"
+  elif [ -n "$ci" ]; then owner="server-ci ($ci)"
+  elif [ -n "$marker" ]; then owner="a Model Gateway package for $marker"
+  elif [[ "$wd" == */Cellar/* || "$wd" == /opt/homebrew/* || "$wd" == /usr/local/* ]]; then owner="Homebrew"
+  elif [ -n "$wd" ] && [ -e "$wd/.git" ]; then owner="a git checkout"
+  else owner="an unknown owner"
+  fi
+  version="$( [ -n "$wd" ] && source_version "$wd" )" || true
+  say "Found $LABEL owned by $owner"
+  say "  plist:             $PLIST"
+  say "  WorkingDirectory:  ${wd:-unknown}"
+  say "  version:           ${version:-unknown}"
+  say "Attach-only: this package leaves that gateway unchanged; products attach to it through"
+  say "$ENDPOINT_FILE. Update it with its own tools if a product needs a newer version."
+}
+
+ensure_state_root() {
+  local path
+  for path in "$HOME/Library" "$HOME/Library/Application Support" "$STATE_ROOT" "$RELEASES"; do
+    [ ! -L "$path" ] || fail "refusing symlinked path: $path"
+  done
+  mkdir -p "$RELEASES"
+  [ "$(stat -f '%u' "$STATE_ROOT")" = "$(id -u)" ] || fail "state root is not owned by this user: $STATE_ROOT"
+  chmod 700 "$STATE_ROOT" "$RELEASES"
+  if [ -e "$CURRENT" ] && [ ! -L "$CURRENT" ]; then
+    fail "expected $CURRENT to be a symlink to a release"
+  fi
+}
+
+acquire_lock() {
+  local holder
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    holder="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    if [[ "$holder" =~ ^[0-9]+$ ]] && kill -0 "$holder" 2>/dev/null; then
+      fail "another Model Gateway package install is running (pid $holder)"
+    fi
+    rm -rf "$LOCK_DIR"
+    mkdir "$LOCK_DIR" || fail "could not take the package install lock"
+  fi
+  printf '%s\n' "$$" > "$LOCK_DIR/pid"
+  trap 'rm -rf "$LOCK_DIR"' EXIT
+}
+
+# Copy, verify, and build one release; an existing complete release is reused.
+stage_release() {
+  local dir="$RELEASES/$RELEASE_NAME"
+  if [ -f "$dir/.complete" ] && [ -x "$dir/.venv/bin/python" ] && verify_release "$dir" 2>/dev/null; then
+    say "Reusing release $RELEASE_NAME"
+    return 0
+  fi
+  [ "$(readlink "$CURRENT" 2>/dev/null || true)" != "releases/$RELEASE_NAME" ] || \
+    fail "the active release $RELEASE_NAME is damaged; remove $CURRENT and re-run the installer"
+  say "Staging release $RELEASE_NAME"
+  rm -rf "$dir"
+  mkdir "$dir"
+  cp -R "$GATEWAY_PAYLOAD/." "$dir/"
+  chmod -R u+w,go-w "$dir"
+  verify_release "$dir" || fail "staged release failed verification"
+  cat > "$dir/.package" <<EOF
+MANAGER=model-gateway-pkg
+ROOT=$CURRENT
+PYTHON=$CURRENT/.venv/bin/python
+UV=$UV
+COMPONENT_ROOT=$STATE_ROOT
+VERSION=$VERSION
+SOURCE_COMMIT=$SOURCE_COMMIT
+UPGRADE=install the newer Model Gateway package
+EOF
+  chmod 600 "$dir/.package"
+  say "Building the Python environment with $UV"
+  UV_PROJECT_ENVIRONMENT="$dir/.venv" UV_NO_CONFIG=1 \
+    "$UV" sync --project "$dir" --frozen --no-dev --no-install-project \
+    || fail "could not build the Python environment for $RELEASE_NAME"
+  [ -x "$dir/.venv/bin/python" ] || fail "the Python environment for $RELEASE_NAME has no python"
+  : > "$dir/.complete"
+}
+
+# Atomically point `current` at releases/NAME.
+activate_release() { # name
+  "$PYTHON3" - "$CURRENT" "releases/$1" <<'PY'
+import os, sys
+current, target = sys.argv[1:]
+tmp = f"{current}.tmp.{os.getpid()}"
+if os.path.lexists(tmp):
+    os.unlink(tmp)
+os.symlink(target, tmp)
+os.replace(tmp, current)
+PY
+}
+
+seed_config() {
+  local config="$STATE_ROOT/config.yaml"
+  if [ -e "$config" ] || [ -L "$config" ]; then
+    return 0
+  fi
+  cat > "$config" <<'EOF'
+# model-gateway runtime config, created by the Model Gateway package.
+# The package seeds no admin key: products manage this gateway with scoped
+# consumer credentials ('model-gateway consumer add'). To use the admin UI,
+# add a key under auth.admin_keys, then run 'model-gateway restart' and
+# 'model-gateway admin'.
+
+auth:
+  client_keys: []
+
+providers: {}
+
+exports:
+  model_aliases: ~/Library/Application Support/model-gateway/model-aliases.json
+EOF
+  chmod 600 "$config"
+  say "Created $config (no admin key)"
+}
+
+installed_port() {
+  [ -f "$INSTALL_ENV" ] && [ ! -L "$INSTALL_ENV" ] || return 0
+  awk -F= '$1 == "MODEL_GATEWAY_PORT" {print $2; exit}' "$INSTALL_ENV"
+}
+
+# 9111, else the first free port in 9112-9159. Chosen once; install.env keeps it.
+choose_port() {
+  if [ -n "${MODEL_GATEWAY_PORT:-}" ]; then
+    [[ "$MODEL_GATEWAY_PORT" =~ ^[0-9]+$ ]] && [ "$MODEL_GATEWAY_PORT" -ge 1024 ] && \
+      [ "$MODEL_GATEWAY_PORT" -le 65535 ] || fail "MODEL_GATEWAY_PORT must be a port from 1024 to 65535"
+    printf '%s\n' "$MODEL_GATEWAY_PORT"
+    return 0
+  fi
+  "$PYTHON3" - <<'PY'
+import socket
+
+def busy(port):
+    for family, address in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+        with socket.socket(family, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.5)
+            try:
+                probe.connect((address, port))
+                return True
+            except OSError:
+                pass
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind(("127.0.0.1", port))
+        except OSError:
+            return True
+    return False
+
+for port in (9111, *range(9112, 9160)):
+    if not busy(port):
+        print(port)
+        break
+else:
+    raise SystemExit("ERROR: no free port for Model Gateway in 9111-9159")
+PY
+}
+
+# The gateway CLI of the active release, with only what it needs from this environment.
+run_cli() {
+  local extra=()
+  [ -z "${CLI_PORT:-}" ] || extra+=("MODEL_GATEWAY_PORT=$CLI_PORT")
+  /usr/bin/env -i HOME="$HOME" USER="${USER:-}" LOGNAME="${LOGNAME:-}" PATH="$PATH" \
+    TMPDIR="${TMPDIR:-/tmp}" MODEL_GATEWAY_LAUNCHD_LABEL="$LABEL" ${extra[@]+"${extra[@]}"} \
+    "$CURRENT/bin/model-gateway" "$@"
+}
+
+# The running service is this release: exact /health body, its endpoint.json, and our plist.
+verify_install() { # expected version
+  local port body i=0
+  port="$(installed_port)"
+  [[ "$port" =~ ^[0-9]+$ ]] || { warn "install.env has no gateway port"; return 1; }
+  while :; do
+    body="$(curl -fsS --max-time 3 "http://127.0.0.1:$port/health" 2>/dev/null || true)"
+    [ "$body" = "$HEALTH_BODY" ] && break
+    i=$((i + 1))
+    [ "$i" -lt 30 ] || { warn "http://127.0.0.1:$port/health did not answer as Model Gateway"; return 1; }
+    sleep 1
+  done
+  i=0
+  until "$PYTHON3" - "$ENDPOINT_FILE" "$1" "$port" <<'PY'
+import json, os, stat, sys
+path, version, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+try:
+    info = os.lstat(path)
+    data = json.loads(open(path).read())
+except (OSError, ValueError):
+    raise SystemExit(1)
+ok = (stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and not info.st_mode & 0o077
+      and isinstance(data, dict) and data.get("version") == 1 and data.get("service") == "model-gateway"
+      and data.get("gateway_version") == version and data.get("port") == port)
+raise SystemExit(0 if ok else 1)
+PY
+  do
+    i=$((i + 1))
+    [ "$i" -lt 15 ] || { warn "$ENDPOINT_FILE does not describe Model Gateway $1 on port $port"; return 1; }
+    sleep 1
+  done
+  [ "$(plist_key "$PLIST" ModelGatewayComponentRoot)" = "$STATE_ROOT" ] && \
+    [ "$(plist_key "$PLIST" WorkingDirectory)" = "$CURRENT" ] || { warn "$PLIST is not marked as this package's"; return 1; }
+}
+
+link_cli() {
+  local dest="$HOME/.local/bin/model-gateway" target="$CURRENT/bin/model-gateway"
+  if [ -L "$dest" ] && [ "$(readlink "$dest")" = "$target" ]; then
+    return 0
+  fi
+  if [ -e "$dest" ] || [ -L "$dest" ]; then
+    say "Leaving the existing $dest; this install's CLI is $target"
+    return 0
+  fi
+  mkdir -p "$(dirname "$dest")"
+  ln -s "$target" "$dest"
+  say "Linked $dest → $target"
+}
+
+# Keep the active release and the one an upgrade would roll back to.
+prune_releases() { # keep...
+  local dir name keep
+  for dir in "$RELEASES"/*; do
+    [ -d "$dir" ] && [ ! -L "$dir" ] || continue
+    name="$(basename "$dir")"
+    [[ "$name" =~ ^[0-9.]+-[0-9a-f]{12}$ ]] || continue
+    for keep in "$@"; do
+      [ "$name" != "$keep" ] || continue 2
+    done
+    rm -rf "$dir"
+    say "Removed old release $name"
+  done
+}
+
+do_install() {
+  local port
+  ensure_state_root
+  acquire_lock
+  stage_release
+  seed_config
+  CLI_PORT=""
+  if [ -z "$(installed_port)" ]; then
+    port="$(choose_port)"
+    CLI_PORT="$port"
+    say "Model Gateway port: $port"
+  fi
+  activate_release "$RELEASE_NAME"
+  if run_cli install && verify_install "$VERSION"; then
+    link_cli
+    prune_releases "$RELEASE_NAME"
+    say "Model Gateway $VERSION installed and verified ($RELEASE_NAME)"
+    return 0
+  fi
+  warn "install did not verify; removing the new LaunchAgent (state is kept)"
+  run_cli uninstall >/dev/null 2>&1 || warn "could not remove $PLIST"
+  rm -f "$CURRENT"
+  fail "Model Gateway $VERSION failed to install; see the log above"
+}
+
+do_upgrade() { # installed version
+  local previous
+  ensure_state_root
+  acquire_lock
+  previous="$(readlink "$CURRENT")"
+  previous="${previous#releases/}"
+  [[ "$previous" =~ ^[0-9.]+-[0-9a-f]{12}$ ]] && [ -d "$RELEASES/$previous" ] \
+    || fail "cannot upgrade: $CURRENT does not point at a release"
+  stage_release
+  CLI_PORT=""
+  activate_release "$RELEASE_NAME"
+  say "Upgrading Model Gateway $1 → $VERSION"
+  if run_cli install && verify_install "$VERSION"; then
+    link_cli
+    prune_releases "$RELEASE_NAME" "$previous"
+    say "Model Gateway upgraded to $VERSION and verified ($RELEASE_NAME)"
+    return 0
+  fi
+  warn "upgrade did not verify; rolling back to $previous"
+  activate_release "$previous"
+  if run_cli install && verify_install "$1"; then
+    fail "Model Gateway $VERSION failed to start; rolled back to $1 ($previous)"
+  fi
+  fail "Model Gateway $VERSION failed to start and the rollback to $previous did not verify; run 'model-gateway logs'"
+}
+
+[ "$(id -u)" -ne 0 ] || fail "must run as the target user, not root"
+[ -n "${HOME:-}" ] && [ "${HOME#/}" != "$HOME" ] || fail "HOME must be an absolute path"
+for tool in curl launchctl plutil shasum /usr/libexec/PlistBuddy; do
+  command -v "$tool" >/dev/null 2>&1 || fail "missing prerequisite: $tool"
+done
+PYTHON3="$(resolve_python)" || fail "missing a functional Python 3 interpreter"
+verify_package
+
+say "== Model Gateway package $VERSION ($RELEASE_NAME) for $(id -un) =="
+case "$(classify)" in
+  none)
+    UV="$(resolve_uv)" || fail "uv is required to build Model Gateway's Python environment; install it (brew install uv) and re-run the installer"
+    do_install
+    ;;
+  component)
+    installed="$(source_version "$CURRENT")"
+    [[ "$installed" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]] || fail "cannot read the installed version from $CURRENT"
+    case "$(version_cmp "$installed" "$VERSION")" in
+      -1)
+        UV="$(resolve_uv)" || fail "uv is required to build Model Gateway's Python environment; install it (brew install uv) and re-run the installer"
+        do_upgrade "$installed"
+        ;;
+      0) say "Model Gateway $installed is already installed ($(readlink "$CURRENT")); nothing to do" ;;
+      1) say "Model Gateway $installed is newer than this package ($VERSION); refusing to downgrade, nothing changed" ;;
+    esac
+    ;;
+  legacy-home-server)
+    say "Found the legacy Home Server gateway ($PLIST, WorkingDirectory under $LEGACY_HOME_SERVER_GATEWAY)."
+    say "Legacy Home Server gateway; migration is handled by the Home Server package. Nothing changed."
+    ;;
+  loaded-without-plist)
+    say "$LABEL is loaded in launchd without $PLIST; attach-only, nothing changed."
+    ;;
+  foreign)
+    describe_foreign
+    ;;
+esac
