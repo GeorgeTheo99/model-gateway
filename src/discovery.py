@@ -2,8 +2,8 @@
 
 The gateway rewrites ``endpoint.json`` at startup and after an admin reload,
 so every deploy path (installer, CI, restart) keeps it current. It holds the
-loopback URL, the alias export path, and credential key-file *paths*, never
-key values. ``MODEL_GATEWAY_ENDPOINT_FILE`` overrides the location; an empty
+loopback URL, the alias export path, credential key-file *paths*, and the
+gateway-owned local AI runtime's URLs, never key values. ``MODEL_GATEWAY_ENDPOINT_FILE`` overrides the location; an empty
 value disables it (e.g. a second gateway on the same machine).
 """
 
@@ -14,7 +14,7 @@ import logging
 import os
 from pathlib import Path
 
-from src import providers
+from src import local_runtime, providers
 from src.secret_files import resolve_api_key_file
 from src.version import CAPABILITIES, VERSION
 
@@ -70,6 +70,7 @@ def endpoint_document() -> dict:
         "model_aliases": str(Path(str(aliases)).expanduser()) if aliases else None,
         "client_key_file": str(Path(client_key_file).expanduser()) if client_key_file else None,
         "consumers": consumers,
+        "local_runtime": local_runtime.endpoint_info(),
     }
 
 

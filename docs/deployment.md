@@ -74,6 +74,7 @@ through a discovery file, so nothing hardcodes a port or home directory.
 model-gateway consumer add myai --role runtime --allow-direct-models
 model-gateway consumer add myai --role deployer   # registers profile snapshots
 model-gateway consumer add ha --role manager --provider fireworks   # keys/new models for fireworks only
+model-gateway consumer add ha --role manager --provider fireworks --local-ai   # also add local AI
 model-gateway consumer list                       # ids, permissions, key status; never values
 model-gateway consumer revoke myai-deployer       # removes the entry and deletes its key file
 ```
@@ -84,6 +85,7 @@ model-gateway consumer revoke myai-deployer       # removes the entry and delete
   `profiles:read` + `profiles:write`; `manager` grants `providers:manage` +
   `models:register`, limited to its `--provider` allowlist (see
   [scoped management](deployment-auth.md#scoped-management-credentials)).
+  `--local-ai` adds `local_ai:manage` to any role (see [Local AI](#local-ai)).
   The namespace defaults to the consumer
   id (`--namespace` is repeatable). Re-running an identical `add` is a no-op;
   an existing valid key file at the default path is adopted, not replaced, and
@@ -127,11 +129,47 @@ discovery file `~/Library/Application Support/model-gateway/endpoint.json`
       "allow_direct_models": true,
       "key_file": "/Users/me/.../secrets/consumers/myai-runtime.key"
     }
-  }
+  },
+  "local_runtime": {"managed": true, "base_url": null, "health_url": null}
 }
 ```
 
-It contains paths only, never key values. Consumers should resolve their
+It contains paths only, never key values. `local_runtime.managed` is false when
+another `com.local.omlx` owns this Mac's local AI; `base_url`/`health_url` name
+the gateway-owned oMLX once it is installed.
+
+## Local AI
+
+One gateway per Mac owns local AI for every product attached to it. On Apple
+silicon with at least 48 GiB of memory:
+
+```bash
+model-gateway local-ai status [--json]   # eligible, managed, installed, model, state, progress
+model-gateway local-ai add [MODEL]       # default and only model: qwen3.8-27b
+model-gateway local-ai cancel            # stop a download; a later add resumes it
+model-gateway local-ai remove            # remove the runtime, its model and routes, and all local AI state
+```
+
+`add` launches a one-shot setup job from
+`~/Library/Application Support/model-gateway/local-ai/launchd/` (never
+`~/Library/LaunchAgents`, so it does not rerun at login). The job downloads the
+pinned payload in `local-models/` over HTTPS only (resumable, capped at
+25 MB/s, SHA-256 verified per file), builds oMLX 0.6.3 from the locked
+`local-runtime/` project with uv, installs the `com.local.omlx` LaunchAgent
+(loopback, port `MODEL_GATEWAY_LOCAL_AI_PORT`, default 9110), adds the `omlx`
+provider (key file `local-ai/inference/api.key`, mode 0600) and model to this
+gateway, restarts the gateway, and requires a real completion through `/v1`.
+Progress is in `local-ai/status.json` (`queued`, `downloading`, `installing`,
+`done`, `failed`, `cancelled`; status reports `interrupted` when an active job
+stopped heartbeating). Products drive the same flow with
+`GET`/`POST /admin/api/local-ai` (`{"action": "add"|"cancel"}`) using a
+`local_ai:manage` credential or a full admin key.
+
+The oMLX LaunchAgent records `ModelGatewayRoot` (this gateway's state
+directory). A `com.local.omlx` without it, such as a developer's own oMLX, is
+never modified: status reports `managed: false` and `add`/`remove` refuse. `add`
+also refuses when the gateway already has a different `omlx` provider or a
+different model with the same name. Consumers should resolve their
 settings in this order: explicit environment variable, then `endpoint.json`,
 then their built-in default.
 

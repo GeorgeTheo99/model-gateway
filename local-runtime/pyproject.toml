@@ -1,0 +1,12 @@
+[project]
+name = "model-gateway-local-runtime"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = ["omlx==0.6.3"]
+
+[tool.uv]
+package = false
+required-environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]
+
+[tool.uv.sources]
+omlx = { url = "https://github.com/jundot/omlx/releases/download/v0.6.3/omlx-0.6.3-cp312-cp312-macosx_15_0_universal2.whl" }

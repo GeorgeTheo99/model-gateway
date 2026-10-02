@@ -29,6 +29,32 @@ def _clear_vision_observation_cache():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_local_runtime(tmp_path, monkeypatch):
+    """Local AI state stays in tmp; launchctl, sysctl, uv, and the network never run."""
+    import subprocess
+
+    from src import local_runtime
+
+    monkeypatch.setenv("MODEL_GATEWAY_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("MODEL_GATEWAY_PLIST_DIR", str(tmp_path / "LaunchAgents"))
+
+    def launchctl(*args):
+        if args[:1] == ("print",):
+            return subprocess.CompletedProcess(["launchctl", *args], 113, "", "")
+        raise AssertionError(f"test attempted launchctl {args}")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("test attempted a local AI system or network call")
+
+    monkeypatch.setattr(local_runtime, "_launchctl", launchctl)
+    monkeypatch.setattr(local_runtime, "_memory_bytes", lambda: 0)
+    monkeypatch.setattr(local_runtime, "_port_in_use", lambda port: False)
+    for name in ("_run", "_request", "_download_opener"):
+        monkeypatch.setattr(local_runtime, name, forbidden)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_ledger(tmp_path, monkeypatch):
     monkeypatch.setenv("MODEL_GATEWAY_LEDGER_PATH", str(tmp_path / "test-ledger.db"))
     yield

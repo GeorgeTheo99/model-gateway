@@ -35,7 +35,7 @@ from src.providers import (
     routable_ids,
     snapshot_registry as snapshot_provider_registry,
 )
-from src import bundle, config_io, discovery, federation, ledger, profiles
+from src import bundle, config_io, discovery, federation, ledger, local_runtime, profiles
 from src.version import CAPABILITIES, VERSION
 
 router = APIRouter()
@@ -59,7 +59,7 @@ def _require_provider_scope(principal, provider_id: object) -> None:
 
 @router.get("/admin/api/status")
 async def admin_status(request: Request):
-    principal = require_admin_or_scope(request, "providers:manage", "models:register")
+    principal = require_admin_or_scope(request, "providers:manage", "models:register", "local_ai:manage")
     mode = auth_mode()
     if principal is not None:
         return {
@@ -98,6 +98,39 @@ async def admin_providers(request: Request):
         allowed = {canonical_provider(p) for p in principal.providers}
         rows = [row for row in rows if canonical_provider(row.get("id")) in allowed]
     return {"providers": rows}
+
+
+@router.get("/admin/api/local-ai")
+async def admin_local_ai(request: Request):
+    """Gateway-owned local AI: eligibility, ownership, and setup progress."""
+    require_admin_or_scope(request, "local_ai:manage")
+    try:
+        return await run_in_threadpool(local_runtime.status)
+    except (local_runtime.LocalRuntimeError, OSError) as exc:
+        return _bad_request(str(exc), status=503)
+
+
+@router.post("/admin/api/local-ai")
+async def admin_local_ai_action(request: Request):
+    """Body: {action: add|cancel, model?}. Add queues a one-shot setup job
+    outside the gateway, which restarts the gateway when it finishes."""
+    require_admin_or_scope(request, "local_ai:manage")
+    require_admin_writes()
+    try:
+        body = await request.json()
+    except Exception:
+        return _bad_request("Invalid JSON body")
+    if not isinstance(body, dict) or body.get("action") not in {"add", "cancel"}:
+        return _bad_request("action must be 'add' or 'cancel'")
+    model = body.get("model")
+    if model is not None and not isinstance(model, str):
+        return _bad_request("model must be a string")
+    try:
+        if body["action"] == "add":
+            return await run_in_threadpool(local_runtime.start_add, model)
+        return await run_in_threadpool(local_runtime.cancel)
+    except (local_runtime.LocalRuntimeError, OSError, RuntimeError) as exc:
+        return _bad_request(str(exc), status=409)
 
 
 @router.get("/admin/api/models")
@@ -911,8 +944,9 @@ async def admin_consumers(request: Request):
 async def admin_add_consumer(request: Request):
     """Create ``<consumer>-<role>``. A generated key is returned once, uncached.
 
-    Body: {consumer, role, namespaces?, allow_direct_models?, providers?}.
-    ``providers`` is the allowlist a ``manager`` credential may administer.
+    Body: {consumer, role, namespaces?, allow_direct_models?, providers?, local_ai?}.
+    ``providers`` is the allowlist a ``manager`` credential may administer;
+    ``local_ai`` also grants ``local_ai:manage``.
     """
     require_admin_auth(request)
     require_admin_writes()
@@ -926,6 +960,7 @@ async def admin_add_consumer(request: Request):
     namespaces = body.get("namespaces")
     allow_direct = body.get("allow_direct_models", False)
     managed = body.get("providers")
+    local_ai = body.get("local_ai", False)
     try:
         credential_id = config_io.consumer_credential_id(consumer, role)
     except ValueError as exc:
@@ -936,13 +971,15 @@ async def admin_add_consumer(request: Request):
         return _bad_request("namespaces must be a list of strings")
     if not isinstance(allow_direct, bool):
         return _bad_request("allow_direct_models must be a boolean")
+    if not isinstance(local_ai, bool):
+        return _bad_request("local_ai must be a boolean")
     if managed is not None and (
         not isinstance(managed, list) or any(not isinstance(value, str) for value in managed)
     ):
         return _bad_request("providers must be a list of strings")
     result, error = _consumer_mutation(credential_id, lambda: config_io.add_consumer_credential(
         consumer, role, namespaces=namespaces, allow_direct_models=allow_direct,
-        providers=managed, reveal_key=True,
+        providers=managed, local_ai=local_ai, reveal_key=True,
     ))
     if error is not None:
         return error

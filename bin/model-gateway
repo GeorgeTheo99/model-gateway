@@ -19,6 +19,7 @@
 #   model-gateway workspace COMMAND [options]    manage Databricks workspace pools
 #   model-gateway secrets migrate [--dry-run]    move inline provider keys to 0600 key files
 #   model-gateway consumer add|list|revoke       manage consumer credentials (0600 key files)
+#   model-gateway local-ai status|add|cancel|remove  gateway-owned local AI (oMLX + a verified model)
 #   model-gateway bundle export|import           move config/catalog/profiles (no secrets)
 #   model-gateway env                            print resolved config
 #   model-gateway version [--json]               release version (and capabilities with --json)
@@ -889,7 +890,7 @@ run_service_python() {
 }
 
 cmd_consumer() {
-  local usage="usage: model-gateway consumer {add CONSUMER --role runtime|deployer|manager [--namespace NS] [--allow-direct-models] [--provider ID] | list [--json] | revoke CREDENTIAL_ID}"
+  local usage="usage: model-gateway consumer {add CONSUMER --role runtime|deployer|manager [--namespace NS] [--allow-direct-models] [--provider ID] [--local-ai] | list [--json] | revoke CREDENTIAL_ID}"
   [ $# -ge 1 ] || die "$usage"
   local mutate=0 arg rc=0
   case "$1" in
@@ -912,6 +913,45 @@ cmd_consumer() {
     verify || die "gateway did not come back after the consumer change; check 'model-gateway logs'"
     ok "consumer credentials updated; gateway restarted"
   fi
+}
+
+# Run src.local_runtime against this gateway's resolved paths and service.
+# The setup job it launches re-enters through _local-ai-job with the same values.
+run_local_ai() {
+  local backup_dir uv="$UV_BIN"
+  backup_dir="$(installed_plist_env MODEL_GATEWAY_BACKUP_DIR)"
+  is_packaged && uv="$(package_value UV)"
+  (
+    cd "$ROOT_DIR"
+    MODEL_GATEWAY_CONFIG="$CONFIG_PATH" \
+    MODEL_GATEWAY_MODEL_INFO="$MODEL_INFO_PATH" \
+    MODEL_GATEWAY_MODEL_INFO_SOURCE="$MODEL_INFO_SOURCE_PATH" \
+    MODEL_GATEWAY_BACKUP_DIR="${MODEL_GATEWAY_BACKUP_DIR:-${backup_dir:-$BACKUP_DIR}}" \
+    MODEL_GATEWAY_STATE_DIR="${MODEL_GATEWAY_STATE_DIR:-$APP_DIR}" \
+    MODEL_GATEWAY_HOST="$HOST" MODEL_GATEWAY_PORT="$PORT" \
+    MODEL_GATEWAY_LAUNCHD_LABEL="$LABEL" MODEL_GATEWAY_PLIST_DIR="$PLIST_DIR" \
+    MODEL_GATEWAY_UV_BIN="${MODEL_GATEWAY_UV_BIN:-$uv}" \
+      run_python -m src.local_runtime "$@"
+  )
+}
+
+cmd_local_ai() {
+  local usage="usage: model-gateway local-ai {status [--json] | add [MODEL] | cancel | remove}"
+  [ $# -ge 1 ] || die "$usage"
+  case "$1" in
+    status|cancel) ;;
+    # The setup job restarts the gateway, so it must be this checkout's loaded service.
+    add) check_prereqs; ensure_runtime_paths_safe "local AI setup" ;;
+    remove) check_prereqs; ensure_runtime_paths_safe "local AI removal" allow-unloaded ;;
+    -h|--help|help) printf '%s\n' "$usage"; return 0 ;;
+    *) die "$usage" ;;
+  esac
+  check_macos
+  is_packaged || UV_BIN="${UV_BIN:-$(command -v uv 2>/dev/null || true)}"
+  is_packaged || [ -n "$UV_BIN" ] || die "required command not found: uv (install it and retry)"
+  local rc=0
+  run_local_ai "$@" || rc=$?
+  [ "$rc" = 0 ] || exit "$rc"
 }
 
 # EXIT/INT/TERM trap for the whole import: any failure, die, or interrupt
@@ -1039,6 +1079,8 @@ main() {
     workspace) shift; cmd_workspace "$@" ;;
     secrets) shift; cmd_secrets "$@" ;;
     consumer) shift; cmd_consumer "$@" ;;
+    local-ai) shift; cmd_local_ai "$@" ;;
+    _local-ai-job) shift; check_macos; run_local_ai job "$@" ;;
     bundle) shift; cmd_bundle "$@" ;;
     env) cmd_env ;;
     version) shift; cmd_version "$@" ;;

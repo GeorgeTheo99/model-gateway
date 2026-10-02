@@ -66,6 +66,13 @@ consumer credential also counts as configured `/v1` authentication for bind
 safety. See [consumer-profiles.md](consumer-profiles.md) for the manifest,
 registry, ETag, and execution contract.
 
+## Local AI credentials
+
+`local_ai:manage` (`model-gateway consumer add ... --local-ai`) allows
+`GET /admin/api/status` (reduced body) and `GET`/`POST /admin/api/local-ai`
+(status, add, cancel; writes need `MODEL_GATEWAY_ADMIN_WRITES`). It needs no
+`providers` allowlist and grants nothing else; removing local AI needs the CLI.
+
 ## Scoped management credentials
 
 A consumer credential with the `manager` role lets an application manage its

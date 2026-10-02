@@ -849,6 +849,7 @@ def add_consumer_credential(
     namespaces: list[str] | None = None,
     allow_direct_models: bool = False,
     providers: list[str] | None = None,
+    local_ai: bool = False,
     reveal_key: bool = False,
 ) -> dict:
     """Create credential ``<consumer>-<role>`` with a generated mode-0600 key file.
@@ -859,6 +860,7 @@ def add_consumer_credential(
     Returns the non-secret summary plus ``status`` (``created``/``repaired``/
     ``unchanged``) and ``enables_client_auth`` when ``/v1`` was open before.
     ``providers`` is required for, and only accepted by, the manager role.
+    ``local_ai`` adds ``local_ai:manage`` (the local AI admin API) to any role.
     ``reveal_key`` adds ``key`` only when this call generated it, for the
     admin UI's one-time display; an adopted or unchanged key is never read.
     """
@@ -881,7 +883,7 @@ def add_consumer_credential(
         "consumer": consumer,
         "key_file": str(target),
         "namespaces": namespaces,
-        "permissions": list(CONSUMER_ROLES[role]),
+        "permissions": list(CONSUMER_ROLES[role]) + (["local_ai:manage"] if local_ai else []),
         "allow_direct_models": bool(allow_direct_models),
     }
     if role == "manager":

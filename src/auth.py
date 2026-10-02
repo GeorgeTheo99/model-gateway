@@ -25,7 +25,10 @@ _PROFILE_PERMISSIONS = {"profiles:read", "profiles:write", "profiles:invoke"}
 # Scoped admin API grants. Each applies only to the credential's ``providers``
 # allowlist; every other admin action still requires a full admin key.
 MANAGEMENT_PERMISSIONS = frozenset({"providers:manage", "models:register"})
-_CONSUMER_PERMISSIONS = _PROFILE_PERMISSIONS | MANAGEMENT_PERMISSIONS
+# Add, cancel, and read the gateway-owned local AI runtime; no provider allowlist.
+LOCAL_AI_PERMISSION = "local_ai:manage"
+ADMIN_SCOPES = MANAGEMENT_PERMISSIONS | {LOCAL_AI_PERMISSION}
+_CONSUMER_PERMISSIONS = _PROFILE_PERMISSIONS | ADMIN_SCOPES
 _PROVIDER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 _client_auth_required_latched = False
 
@@ -532,11 +535,12 @@ def require_admin_auth(request: Request) -> None:
 def require_admin_or_scope(request: Request, *permissions: str) -> ConsumerPrincipal | None:
     """Admit a full admin (returns None) or a consumer holding any of ``permissions``.
 
-    A returned principal is scoped: callers must confine it to
-    ``principal.providers``. Anything else falls through to full admin auth.
+    A returned principal is scoped: callers of provider-scoped permissions must
+    confine it to ``principal.providers``. Anything else falls through to full
+    admin auth.
     """
-    if not permissions or not MANAGEMENT_PERMISSIONS.issuperset(permissions):
-        raise ValueError("scoped admin permissions must be management permissions")
+    if not permissions or not ADMIN_SCOPES.issuperset(permissions):
+        raise ValueError("scoped admin permissions must be admin scopes")
     token = _extract_token(request)
     if token:
         try:
