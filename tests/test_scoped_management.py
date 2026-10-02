@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from src import auth, config_io
 import src.providers as providers
 from src.server import app
+from src.version import CAPABILITIES, VERSION
 
 ADMIN = {"Authorization": "Bearer admin"}
 MANAGER = {"Authorization": "Bearer manager-token"}
@@ -78,7 +79,7 @@ def test_manager_status_is_reduced_and_full_admin_unchanged(client):
     scoped = client.get("/admin/api/status", headers=MANAGER)
     assert scoped.status_code == 200
     assert scoped.json() == {"service": "model-gateway", "status": "ok", "writes_enabled": True,
-                             "capabilities": {"create_only_model_registration": True}}
+                             "version": VERSION, "capabilities": dict.fromkeys(CAPABILITIES, True)}
     full = client.get("/admin/api/status", headers=ADMIN).json()
     assert "config_path" in full and "auth" in full
     assert client.get("/admin/api/status", headers=RUNTIME).status_code == 403

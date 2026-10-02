@@ -21,6 +21,7 @@
 #   model-gateway consumer add|list|revoke       manage consumer credentials (0600 key files)
 #   model-gateway bundle export|import           move config/catalog/profiles (no secrets)
 #   model-gateway env                            print resolved config
+#   model-gateway version [--json]               release version (and capabilities with --json)
 set -euo pipefail
 umask 077
 
@@ -652,6 +653,24 @@ cmd_logs() {
   esac
 }
 
+cmd_version() {
+  case "${1:-}" in
+    "") sed -n 's/^VERSION = "\(.*\)"$/\1/p' "$ROOT_DIR/src/version.py" ;;
+    --json)
+      # No service or project environment needed: works while the gateway is stopped.
+      /usr/bin/python3 - "$ROOT_DIR/src/version.py" <<'PY'
+import ast, json, sys
+values = {node.targets[0].id: ast.literal_eval(node.value)
+          for node in ast.parse(open(sys.argv[1]).read()).body
+          if isinstance(node, ast.Assign) and len(node.targets) == 1}
+print(json.dumps({"service": "model-gateway", "version": values["VERSION"],
+                  "capabilities": list(values["CAPABILITIES"])}))
+PY
+      ;;
+    *) die "usage: model-gateway version [--json]" ;;
+  esac
+}
+
 cmd_env() {
   cat <<EOF
 ROOT_DIR=$ROOT_DIR
@@ -1022,6 +1041,7 @@ main() {
     consumer) shift; cmd_consumer "$@" ;;
     bundle) shift; cmd_bundle "$@" ;;
     env) cmd_env ;;
+    version) shift; cmd_version "$@" ;;
     -h|--help|help) usage ;;
     *) die "unknown command: $1" ;;
   esac

@@ -36,6 +36,7 @@ from src.providers import (
     snapshot_registry as snapshot_provider_registry,
 )
 from src import bundle, config_io, discovery, federation, ledger, profiles
+from src.version import CAPABILITIES, VERSION
 
 router = APIRouter()
 _STARTED_AT = time.time()
@@ -65,7 +66,8 @@ async def admin_status(request: Request):
             "service": "model-gateway",
             "status": "ok",
             "writes_enabled": mode.writes_enabled,
-            "capabilities": {"create_only_model_registration": True},
+            "version": VERSION,
+            "capabilities": dict.fromkeys(CAPABILITIES, True),
         }
     return {
         "service": "model-gateway",
@@ -75,7 +77,8 @@ async def admin_status(request: Request):
         "model_info_path": str(MODEL_INFO_PATH),
         "config_path": str(config_io.CONFIG_PATH),
         "writes_enabled": mode.writes_enabled,
-        "capabilities": {"create_only_model_registration": True},
+        "version": VERSION,
+        "capabilities": dict.fromkeys(CAPABILITIES, True),
         "auth": {
             "client_auth_enabled": mode.client_auth_enabled,
             "admin_auth_enabled": mode.admin_auth_enabled,

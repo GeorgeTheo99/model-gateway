@@ -16,6 +16,7 @@ from pathlib import Path
 
 from src import providers
 from src.secret_files import resolve_api_key_file
+from src.version import CAPABILITIES, VERSION
 
 ENDPOINT_VERSION = 1
 
@@ -61,6 +62,8 @@ def endpoint_document() -> dict:
     return {
         "version": ENDPOINT_VERSION,
         "service": "model-gateway",
+        "gateway_version": VERSION,
+        "capabilities": list(CAPABILITIES),
         "base_url": f"{origin}/v1",
         "health_url": f"{origin}/health",
         "port": port,
