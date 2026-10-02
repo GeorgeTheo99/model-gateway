@@ -36,7 +36,7 @@ class ModelPayloadTests(unittest.TestCase):
         self.write_index({"layer.0": "model-00001.safetensors",
                           "layer.1": "shards/model-00002.safetensors"})
         self.manifest = {"schema_version": 1, "model_id": "tiny-model",
-                         "hf_repo": "test/tiny-model", "hf_revision": "pinned-revision",
+                         "hf_repo": "test/tiny-model", "hf_revision": "0123456789abcdef0123456789abcdef01234567",
                          "license": "apache-2.0"}
         self.refresh_manifest()
         self.manifest_path = self.base / "manifest.json"
@@ -175,6 +175,21 @@ class ModelPayloadTests(unittest.TestCase):
             manifest["files"][0][field] = value
             with self.subTest(field=field, value=value), self.assertRaises(verifier.VerificationError):
                 verifier.verify_payload(self.root, manifest)
+
+    def test_identifiers_that_become_paths_or_urls_must_be_plain_tokens(self):
+        for field, value in (("model_id", "../escape"), ("model_id", "a/b"), ("model_id", ".hidden"),
+                             ("model_id", "tiny-model.partial"), ("model_id", "x" * 129),
+                             ("model_id", "tiny\n"), ("hf_repo", "org"), ("hf_repo", "org/name/extra"),
+                             ("hf_repo", "org/na me"), ("hf_repo", "org/n\u00e4me"), ("hf_revision", "main"),
+                             ("hf_revision", "0123456789ABCDEF0123456789ABCDEF01234567"),
+                             ("hf_revision", "0123456789abcdef0123456789abcdef0123456")):
+            manifest = copy.deepcopy(self.manifest)
+            manifest[field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(verifier.VerificationError):
+                verifier.validate_manifest(manifest)
+        manifest = copy.deepcopy(self.manifest)
+        manifest.update(model_id="Qwen3.8-27B_8bit-30gb", hf_repo="mlx-community/Qwen3.8-27B-8bit")
+        verifier.validate_manifest(manifest)
 
     def test_bad_index_coverage_and_shape(self):
         for weight_map in (None, [], {}, {"": "model-00001.safetensors"},

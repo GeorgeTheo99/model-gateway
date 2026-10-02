@@ -540,6 +540,10 @@ def test_packaged_launchagent_runs_the_package_python(tmp_path: Path) -> None:
     )
     assert plist["ProgramArguments"] == [f"{tmp_path}/venv/bin/python", "-m", "src.main"]
     assert plist["WorkingDirectory"] == str(tmp_path / "libexec")
+    # The gateway restarts itself and identifies its local AI by this label.
+    environment = plist["EnvironmentVariables"]
+    assert environment["MODEL_GATEWAY_LAUNCHD_LABEL"] == "com.local.model-gateway-test-does-not-exist"
+    assert environment["MODEL_GATEWAY_PLIST_DIR"] == str(home / "Library" / "LaunchAgents")
 
 
 def test_packaged_cli_refuses_a_missing_package_root(tmp_path: Path) -> None:

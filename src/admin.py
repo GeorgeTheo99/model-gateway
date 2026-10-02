@@ -9,6 +9,7 @@ import sys
 import time
 from pathlib import Path
 
+import yaml
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -106,8 +107,8 @@ async def admin_local_ai(request: Request):
     require_admin_or_scope(request, "local_ai:manage")
     try:
         return await run_in_threadpool(local_runtime.status)
-    except (local_runtime.LocalRuntimeError, OSError) as exc:
-        return _bad_request(str(exc), status=503)
+    except (ValueError, yaml.YAMLError, OSError) as exc:
+        return _local_ai_error(exc, status=503)
 
 
 @router.post("/admin/api/local-ai")
@@ -129,8 +130,14 @@ async def admin_local_ai_action(request: Request):
         if body["action"] == "add":
             return await run_in_threadpool(local_runtime.start_add, model)
         return await run_in_threadpool(local_runtime.cancel)
-    except (local_runtime.LocalRuntimeError, OSError, RuntimeError) as exc:
-        return _bad_request(str(exc), status=409)
+    except (ValueError, yaml.YAMLError, OSError, RuntimeError) as exc:
+        return _local_ai_error(exc, status=409)
+
+
+def _local_ai_error(exc: Exception, *, status: int) -> JSONResponse:
+    """A refusal or failure keeps ``status``; an invalid config or state file is 422. Messages are safe."""
+    invalid = not isinstance(exc, (local_runtime.LocalRuntimeError, OSError, RuntimeError))
+    return _bad_request(local_runtime.safe_message(exc), status=422 if invalid else status)
 
 
 @router.get("/admin/api/models")

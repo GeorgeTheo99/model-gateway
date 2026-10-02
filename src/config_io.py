@@ -66,6 +66,18 @@ def _write_transaction(function):
 
 # ── provider config (config.yaml) ───────────────────────────────────────────
 
+# ``managed_by`` value on the provider block that ``model-gateway local-ai``
+# writes (src.local_runtime); its key file and lifecycle belong to local AI.
+LOCAL_AI_MANAGED = "local_ai"
+
+
+def _refuse_local_ai_provider(providers: dict, provider_id: str) -> None:
+    for key, block in providers.items():
+        if str(key).lower() == provider_id and isinstance(block, dict) and block.get("managed_by") == LOCAL_AI_MANAGED:
+            raise ValueError(f"provider {provider_id!r} is managed by Model Gateway local AI; "
+                             "change or remove it with 'model-gateway local-ai'")
+
+
 
 def load_config_full() -> dict:
     """Load the full config.yaml (all sections, including auth/providers)."""
@@ -474,6 +486,7 @@ def upsert_provider(
 
     config = load_config_full()
     providers = config.setdefault("providers", {}) or {}
+    _refuse_local_ai_provider(providers, provider_id)
     # Normalize: store under the canonical id. If a synonym key exists, update
     # it in place; otherwise create under provider_id.
     existing = providers.get(provider_id)
@@ -515,6 +528,8 @@ def delete_provider(provider_id: str) -> dict:
         k.lower() == provider_id for k in providers
     ):
         raise KeyError(f"provider {provider_id!r} not found")
+
+    _refuse_local_ai_provider(providers, provider_id)
 
     # Refuse if any enabled model routes to this provider, however it is spelled.
     from src.providers import _canonical_provider, _is_model_enabled

@@ -23,6 +23,12 @@ class VerificationError(ValueError):
     """The manifest or payload failed verification."""
 
 
+# These become a directory name and a download URL, so they must be plain tokens.
+MODEL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+HF_REPO_RE = re.compile(r"[\w.-]+/[\w.-]+", re.ASCII)
+HF_REVISION_RE = re.compile(r"[0-9a-f]{40}")
+
+
 def safe_path(value: object) -> str:
     """Require a canonical relative POSIX path, without platform aliases."""
     if (not isinstance(value, str) or not value
@@ -78,6 +84,12 @@ def validate_manifest(manifest: dict) -> dict[str, dict]:
     for field in ("model_id", "hf_repo", "hf_revision", "license"):
         if not isinstance(manifest.get(field), str) or not manifest[field].strip():
             raise VerificationError(f"manifest {field} must be a nonempty string")
+    if MODEL_ID_RE.fullmatch(manifest["model_id"]) is None or manifest["model_id"].endswith(".partial"):
+        raise VerificationError("manifest model_id must be a plain name of letters, digits, '.', '_', or '-'")
+    if HF_REPO_RE.fullmatch(manifest["hf_repo"]) is None:
+        raise VerificationError("manifest hf_repo must be 'owner/name'")
+    if HF_REVISION_RE.fullmatch(manifest["hf_revision"]) is None:
+        raise VerificationError("manifest hf_revision must be a 40-character lowercase commit hash")
     if type(manifest.get("total_bytes")) is not int or manifest["total_bytes"] < 0:
         raise VerificationError("manifest total_bytes must be a nonnegative integer")
     if not isinstance(manifest.get("files"), list) or not manifest["files"]:

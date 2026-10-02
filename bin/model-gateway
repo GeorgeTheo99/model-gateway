@@ -467,11 +467,12 @@ write_plist() {
   ensure_private_dir "$(dirname "$LEDGER_PATH")"
   ensure_private_dir "$BACKUP_DIR"
   ensure_private_file "$LOG_FILE"
-  local plist plist_tmp program_args e_label e_root e_host e_port e_admin_writes e_config e_model_info e_model_info_source e_ledger e_vision_fallback e_vision_local e_vision_cloud e_vision_mode e_vision_max_images e_vision_cache_ttl e_vision_total_timeout e_log_dir e_backup e_legacy_backups e_log
+  local plist plist_tmp program_args e_label e_plist_dir e_root e_host e_port e_admin_writes e_config e_model_info e_model_info_source e_ledger e_vision_fallback e_vision_local e_vision_cloud e_vision_mode e_vision_max_images e_vision_cache_ttl e_vision_total_timeout e_log_dir e_backup e_legacy_backups e_log
   plist="$(plist_path)"
   plist_tmp="$(mktemp "$PLIST_DIR/.${LABEL}.plist.XXXXXX")"
   chmod 600 "$plist_tmp"
   e_label="$(xml_escape "$LABEL")"
+  e_plist_dir="$(xml_escape "$PLIST_DIR")"
   if is_packaged; then
     program_args="<string>$(xml_escape "$PACKAGE_PYTHON")</string>"
   else
@@ -507,6 +508,8 @@ write_plist() {
 </array>
 <key>WorkingDirectory</key><string>${e_root}</string>
 <key>EnvironmentVariables</key><dict>
+  <key>MODEL_GATEWAY_LAUNCHD_LABEL</key><string>${e_label}</string>
+  <key>MODEL_GATEWAY_PLIST_DIR</key><string>${e_plist_dir}</string>
   <key>MODEL_GATEWAY_HOST</key><string>${e_host}</string>
   <key>MODEL_GATEWAY_PORT</key><string>${e_port}</string>
   <key>MODEL_GATEWAY_ADMIN_WRITES</key><string>${e_admin_writes}</string>
@@ -736,6 +739,16 @@ cmd_install() {
   log "Next: run 'model-gateway admin' to open the admin UI and connect a provider"
 }
 
+# Local AI runs as its own LaunchAgent, so uninstalling the gateway leaves it running.
+warn_local_ai_installed() {
+  local omlx="$PLIST_DIR/com.local.omlx.plist" state="${MODEL_GATEWAY_STATE_DIR:-$APP_DIR}" owner
+  [ -f "$omlx" ] && [ ! -L "$omlx" ] && [ -x /usr/libexec/PlistBuddy ] || return 0
+  owner="$(/usr/libexec/PlistBuddy -c 'Print :ModelGatewayRoot' "$omlx" 2>/dev/null || true)"
+  [ "$owner" = "$state#$LABEL" ] || return 0
+  warn "this gateway's local AI (com.local.omlx, with its model in $state/local-ai) is still installed and running"
+  warn "remove it and its model with: model-gateway local-ai remove"
+}
+
 cmd_uninstall() {
   log "Uninstalling model-gateway service"
   remove_plist
@@ -749,6 +762,7 @@ cmd_uninstall() {
   else
     ok "Uninstalled (repo and venv retained; rerun 'install' to restore)"
   fi
+  warn_local_ai_installed
 }
 
 cmd_update_after_pull() {
@@ -942,7 +956,13 @@ cmd_local_ai() {
     status|cancel) ;;
     # The setup job restarts the gateway, so it must be this checkout's loaded service.
     add) check_prereqs; ensure_runtime_paths_safe "local AI setup" ;;
-    remove) check_prereqs; ensure_runtime_paths_safe "local AI removal" allow-unloaded ;;
+    # Also works after 'uninstall', when there is no gateway LaunchAgent to check or restart.
+    remove)
+      check_prereqs
+      if [ -e "$(plist_path)" ] || [ -L "$(plist_path)" ]; then
+        ensure_runtime_paths_safe "local AI removal" allow-unloaded
+      fi
+      ;;
     -h|--help|help) printf '%s\n' "$usage"; return 0 ;;
     *) die "$usage" ;;
   esac

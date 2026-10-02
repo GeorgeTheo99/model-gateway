@@ -157,19 +157,33 @@ pinned payload in `local-models/` over HTTPS only (resumable, capped at
 25 MB/s, SHA-256 verified per file), builds oMLX 0.6.3 from the locked
 `local-runtime/` project with uv, installs the `com.local.omlx` LaunchAgent
 (loopback, port `MODEL_GATEWAY_LOCAL_AI_PORT`, default 9110), adds the `omlx`
-provider (key file `local-ai/inference/api.key`, mode 0600) and model to this
-gateway, restarts the gateway, and requires a real completion through `/v1`.
+provider (key file `local-ai/inference/api.key`, mode 0600, marked
+`managed_by: local_ai` so admin provider key edits and deletes refuse it) and
+model to this gateway, restarts the gateway, and requires a real completion
+through `/v1`. If Model Gateway is upgraded while the job downloads, the job
+restarts itself on the new release before installing. `add` returns the
+current status without doing anything once local AI is installed.
 Progress is in `local-ai/status.json` (`queued`, `downloading`, `installing`,
 `done`, `failed`, `cancelled`; status reports `interrupted` when an active job
 stopped heartbeating). Products drive the same flow with
 `GET`/`POST /admin/api/local-ai` (`{"action": "add"|"cancel"}`) using a
 `local_ai:manage` credential or a full admin key.
 
-The oMLX LaunchAgent records `ModelGatewayRoot` (this gateway's state
-directory). A `com.local.omlx` without it, such as a developer's own oMLX, is
-never modified: status reports `managed: false` and `add`/`remove` refuse. `add`
-also refuses when the gateway already has a different `omlx` provider or a
-different model with the same name. Consumers should resolve their
+`remove` unwires the provider and model, stops and deletes the runtime and its
+model, then restarts the gateway once so `endpoint.json` no longer advertises
+it. It also works after `model-gateway uninstall` (which warns when this
+gateway's local AI is still installed); then only local AI's own files change.
+
+The oMLX LaunchAgent and setup job record `ModelGatewayRoot` as
+`<state directory>#<gateway launchd label>` (the gateway's LaunchAgent sets
+`MODEL_GATEWAY_LAUNCHD_LABEL` and `MODEL_GATEWAY_PLIST_DIR`; a gateway with a
+non-default label installed before 0.4.0 needs `model-gateway install` once
+before `add`). A
+`com.local.omlx` without this gateway's value, such as a developer's own oMLX or
+another gateway's, is never modified: status reports `managed: false` and
+`add`/`remove` refuse. Jobs are stopped only when launchd loaded them from this
+gateway's plist. `add` also refuses when the gateway already has a different
+`omlx` provider or a different model with the same name. Consumers should resolve their
 settings in this order: explicit environment variable, then `endpoint.json`,
 then their built-in default.
 

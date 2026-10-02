@@ -9,10 +9,13 @@ in ``local-runtime/`` with uv, installs the ``com.local.omlx`` LaunchAgent,
 adds the ``omlx`` provider and model to this gateway, and requires a real
 completion through the gateway.
 
-Ownership: the oMLX LaunchAgent records this gateway's state directory under
-``ModelGatewayRoot``. A ``com.local.omlx`` without it (such as a developer's
-own oMLX) is never modified: status reports ``managed: false`` and add and
-remove refuse.
+Ownership: the oMLX LaunchAgent and the setup job record
+``<state directory>#<gateway launchd label>`` under ``ModelGatewayRoot``, so
+a second gateway on the same Mac (another label) never treats this one's
+runtime as its own. A ``com.local.omlx`` without this gateway's value (such as
+a developer's own oMLX) is never modified: status reports ``managed: false``
+and add and remove refuse. launchd jobs are stopped only when launchd loaded
+them from this gateway's plist.
 
 Every launchctl, sysctl, network, and subprocess edge is a module-level
 function so tests replace them. Messages never include keys or response bodies.
@@ -73,6 +76,8 @@ DOWNLOAD_ATTEMPTS = 5
 HEARTBEAT_SECONDS = 5
 # An active state whose heartbeat is older than this, with no running job, was interrupted.
 STALE_SECONDS = 60
+# How long cancel and remove wait for a stopped setup job to exit.
+JOB_STOP_SECONDS = 30
 ACTIVE_STATES = frozenset({"queued", "downloading", "installing"})
 METAL_SMOKE = ("import mlx.core as m; assert m.metal.is_available(); "
                "a=m.ones((64,64)); b=a@a; m.eval(b); assert b[0,0].item()==64")
@@ -86,8 +91,20 @@ class Cancelled(Exception):
     """launchd stopped the setup job (cancel)."""
 
 
-class _Busy(RuntimeError):
-    """Another process holds the provision lock."""
+class _Busy(LocalRuntimeError):
+    """Another process holds a local AI lock."""
+
+
+def safe_message(exc: BaseException) -> str:
+    """A message for operators and API clients: never config contents, keys, or bodies."""
+    if isinstance(exc, LocalRuntimeError):
+        return str(exc)
+    if isinstance(exc, yaml.YAMLError):
+        # YAML errors quote the offending line, which may hold a key.
+        return "The gateway configuration is not valid YAML"
+    if isinstance(exc, ValueError):
+        return "The gateway configuration or local AI state is invalid"
+    return str(exc)
 
 
 @dataclass(frozen=True)
@@ -169,11 +186,29 @@ def api_key_path() -> Path:
 
 
 def owner_value() -> str:
-    return str(state_dir())
+    """``ModelGatewayRoot``: identifies this gateway among any others on the Mac."""
+    return f"{state_dir()}#{gateway_label()}"
 
 
 def gateway_label() -> str:
     return os.environ.get("MODEL_GATEWAY_LAUNCHD_LABEL", "").strip() or GATEWAY_LABEL
+
+
+def _require_known_gateway() -> None:
+    """Refuse to guess the label of a gateway whose LaunchAgent predates recording it.
+
+    The setup job restarts the gateway by label, and the label is part of the
+    ownership value, so without ``MODEL_GATEWAY_LAUNCHD_LABEL`` the default
+    LaunchAgent must be the one running this gateway's config.
+    """
+    if os.environ.get("MODEL_GATEWAY_LAUNCHD_LABEL", "").strip():
+        return
+    environment = (_plist(launch_agents_dir() / f"{GATEWAY_LABEL}.plist") or {}).get("EnvironmentVariables")
+    configured = environment.get("MODEL_GATEWAY_CONFIG") if isinstance(environment, dict) else None
+    if not isinstance(configured, str) or (
+            os.path.realpath(os.path.expanduser(configured)) != os.path.realpath(config_io.CONFIG_PATH)):
+        raise LocalRuntimeError(
+            "This gateway's LaunchAgent label is unknown; run 'model-gateway install' to record it, then retry")
 
 
 def gateway_origin() -> str:
@@ -215,6 +250,24 @@ def _atomic(path: Path, data: str | bytes, base: Path | None = None) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(name, path)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+def _create_new(path: Path, data: bytes) -> None:
+    """Write a new private file; never replace anything that appeared at ``path``."""
+    _no_symlinks(path.parent, path.parent)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        # Unlike rename, link fails with EEXIST instead of replacing the target.
+        os.link(name, path)
+    except FileExistsError:
+        raise LocalRuntimeError(f"{path} appeared during setup; Model Gateway will not replace it") from None
     finally:
         Path(name).unlink(missing_ok=True)
 
@@ -311,13 +364,30 @@ def _job_running() -> bool:
     return result.returncode == 0 and "state = running" in (result.stdout or "")
 
 
-def _bootout(label: str) -> None:
-    if _loaded(label) and _launchctl("bootout", _target(label)).returncode != 0:
+def _loaded_path(output: str) -> str | None:
+    """The plist path in ``launchctl print`` output."""
+    for line in output.splitlines():
+        name, _, value = line.strip().partition(" = ")
+        if name == "path" and value:
+            return value
+    return None
+
+
+def _bootout(label: str, plist: Path) -> None:
+    """Stop ``label`` only when launchd loaded it from ``plist``."""
+    result = _launchctl("print", _target(label))
+    if result.returncode != 0:
+        return
+    loaded = _loaded_path(result.stdout or "")
+    if loaded is None or os.path.realpath(loaded) != os.path.realpath(plist):
+        raise LocalRuntimeError(
+            f"{label} is loaded from {loaded or 'an unknown plist'}, not {plist}; Model Gateway will not stop it")
+    if _launchctl("bootout", _target(label)).returncode != 0:
         raise LocalRuntimeError(f"Could not stop {label}")
 
 
 def _bootstrap(plist: Path, label: str) -> None:
-    _bootout(label)
+    _bootout(label, plist)
     # bootout returns before the job releases its launchd slot; bootstrap then
     # reports EIO (5) for a moment.
     for attempt in range(30):
@@ -349,11 +419,19 @@ def omlx_owner() -> str | None:
     return "external" if _loaded(OMLX_LABEL) else None
 
 
+def _require_setup_owned() -> None:
+    """Refuse a setup job that another gateway sharing this state directory queued."""
+    path = setup_plist_path()
+    if path.exists() and (_plist(path) or {}).get(OWNER_KEY) != owner_value():
+        raise LocalRuntimeError(f"Local AI setup in {runtime_root()} belongs to another Model Gateway")
+
+
 def _require_owned() -> None:
     if omlx_owner() == "external":
         raise LocalRuntimeError(
             f"{OMLX_LABEL} is managed outside Model Gateway ({omlx_plist_path()}); "
             "Model Gateway will not modify it")
+    _require_setup_owned()
 
 
 def _configured_port() -> int:
@@ -496,7 +574,9 @@ class Progress:
     def update(self, **fields) -> None:
         with self.lock:
             self.value.update(fields, updated_at=_now())
-            _write_status(self.value)
+            # After remove, never recreate the state it deleted.
+            if runtime_root().is_dir():
+                _write_status(self.value)
 
     def _beat(self) -> None:
         while not self.stop.wait(HEARTBEAT_SECONDS):
@@ -507,26 +587,55 @@ class Progress:
         self.heartbeat.start()
         return self
 
-    def __exit__(self, *exc) -> None:
+    def close(self) -> None:
         self.stop.set()
         self.heartbeat.join()
 
+    def __exit__(self, *exc) -> None:
+        self.close()
+
 
 @contextlib.contextmanager
-def provision_lock(*, wait: bool):
-    """Serialize installing and removing between the setup job, CLI, and admin API."""
-    path = runtime_root() / ".provision.lock"
+def _lock(name: str, timeout: float | None, busy: str):
+    """Hold an exclusive flock on ``local-ai/<name>``, waiting up to ``timeout`` seconds (None: forever)."""
+    path = runtime_root() / name
     _regular(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise _Busy("Local AI setup is installing") from None
+        if timeout is None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        else:
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise _Busy(busy) from None
+                    time.sleep(0.2)
         yield
     finally:
         os.close(fd)
+
+
+def provision_lock(*, wait: bool, busy: str = "Local AI setup is installing"):
+    """Serialize installing and removing between the setup job, CLI, and admin API."""
+    return _lock(".provision.lock", None if wait else 0, busy)
+
+
+def job_lock(timeout: float, busy: str = "Local AI setup is still stopping; retry in a moment"):
+    """Held by the setup job for its whole run, so its holder knows no job is writing."""
+    return _lock(".job.lock", timeout, busy)
+
+
+def _job_alive() -> bool:
+    try:
+        with job_lock(0):
+            return False
+    except _Busy:
+        return True
 
 
 # ── gateway configuration ────────────────────────────────────────────────────
@@ -591,10 +700,12 @@ def configure_gateway(local: LocalModel, omlx_port: int) -> None:
             config.setdefault("providers", {})
             if config["providers"] is None:
                 config["providers"] = {}
-            # An empty api_key overrides the built-in omlx default so api_key_file applies.
+            # An empty api_key overrides the built-in omlx default so api_key_file applies;
+            # managed_by makes admin provider key edits and deletes refuse this block.
             config["providers"]["omlx"] = {
                 "base_url": f"http://127.0.0.1:{omlx_port}/v1", "protocol": "openai", "api_key": "",
                 "api_key_file": str(api_key_path()), "enabled": True,
+                "managed_by": config_io.LOCAL_AI_MANAGED,
             }
             _write_config(config)
             config_io.upsert_model(local.name, provider="omlx", omlx_id=manifest(local)["model_id"],
@@ -608,28 +719,31 @@ def configure_gateway(local: LocalModel, omlx_port: int) -> None:
 
 
 def unconfigure_gateway() -> bool:
-    """Remove only this runtime's provider and models; return whether anything changed."""
+    """Remove only this runtime's provider and models from the files; return whether anything changed.
+
+    The running gateway keeps its loaded config until the caller restarts it.
+    """
     with config_write_lock(config_io.CONFIG_PATH):
         snapshot = config_io.snapshot_writable_files()
         changed = False
         try:
-            for local in MODELS.values():
+            config = config_io.load_config_full()
+            configured = config.get("providers")
+            configured = configured if isinstance(configured, dict) else {}
+            # With someone else's oMLX provider, a matching catalog entry routes to it, so it is theirs.
+            foreign = any(canonical_provider(str(provider_id)) == "omlx" and not _our_provider(block)
+                          for provider_id, block in configured.items())
+            for local in () if foreign else MODELS.values():
                 entries = config_io.load_model_info().get("llm", [])
                 if any(_our_catalog_entry(entry, local) for entry in entries):
                     config_io.delete_model(local.name)
                     changed = True
-            config = config_io.load_config_full()
-            configured = config.get("providers")
-            if isinstance(configured, dict) and _our_provider(configured.get("omlx")):
+            if _our_provider(configured.get("omlx")):
                 del configured["omlx"]
                 _write_config(config)
                 changed = True
-            if changed:
-                _restart_gateway(required=False)
         except BaseException:
             config_io.restore_writable_files(snapshot)
-            with contextlib.suppress(Exception):
-                _restart_gateway(required=False)
             raise
         return changed
 
@@ -687,6 +801,13 @@ def download_file(url: str, path: Path, entry: dict, progress: Progress, done: i
         raise RuntimeError(f"Downloaded {entry['path']} did not match the release manifest")
 
 
+def _size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except FileNotFoundError:
+        return 0
+
+
 def download_payload(payload: dict, progress: Progress) -> None:
     """Fetch the pinned payload into the .partial directory that install verifies and promotes."""
     destination = mlx_dir() / payload["model_id"]
@@ -703,14 +824,19 @@ def download_payload(payload: dict, progress: Progress) -> None:
         path = partial / entry["path"]
         _regular(path)
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        for attempt in range(DOWNLOAD_ATTEMPTS):
+        failures, size = 0, _size(path)
+        while True:
             try:
                 download_file(base + urllib.parse.quote(entry["path"]), path, entry, progress, done, opener)
                 break
             except (OSError, RuntimeError, http.client.HTTPException) as exc:
-                if attempt == DOWNLOAD_ATTEMPTS - 1:
+                # Only consecutive attempts that added nothing count toward giving up.
+                if (current := _size(path)) > size:
+                    failures, size = 0, current
+                failures += 1
+                if failures == DOWNLOAD_ATTEMPTS:
                     raise RuntimeError(f"Could not download the local AI model ({exc})") from None
-                time.sleep(min(60, 5 * 2**attempt))
+                time.sleep(min(60, 5 * 2 ** (failures - 1)))
         done += entry["size_bytes"]
         progress.update(bytes_done=done)
 
@@ -730,7 +856,7 @@ def omlx_plist(omlx_port: int) -> dict:
                              "--paged-ssd-cache-max-size", "8GB"],
         "WorkingDirectory": str(inference_dir()),
         "EnvironmentVariables": {
-            "PATH": f"{Path.home()}/.local/bin:/opt/homebrew/bin:/usr/bin:/bin",
+            "PATH": f"{Path.home()}/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
             "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
         "StandardOutPath": str(root / "logs" / "omlx.log"),
         "StandardErrorPath": str(root / "logs" / "omlx.log"),
@@ -759,11 +885,15 @@ def _job_environment(omlx_port: int) -> dict:
     return env
 
 
+def _job_command(name: str) -> list[str]:
+    return ["/bin/bash", str(PACKAGE_ROOT / "bin" / "model-gateway"), "_local-ai-job", name]
+
+
 def setup_plist(local: LocalModel, omlx_port: int) -> dict:
     root = runtime_root()
     return {
         "Label": SETUP_LABEL, OWNER_KEY: owner_value(),
-        "ProgramArguments": ["/bin/bash", str(PACKAGE_ROOT / "bin" / "model-gateway"), "_local-ai-job", local.name],
+        "ProgramArguments": _job_command(local.name),
         "WorkingDirectory": str(root),
         "EnvironmentVariables": _job_environment(omlx_port),
         "StandardOutPath": str(root / "logs" / "setup.log"),
@@ -792,6 +922,7 @@ def _wait_health(url: str, seconds: int = 90) -> None:
 
 def install(local: LocalModel, payload: dict) -> None:
     """Verify and promote the payload, build oMLX, start it, and wire it into the gateway."""
+    _require_owned()
     model_id = payload["model_id"]
     destination = mlx_dir() / model_id
     partial = destination.with_name(model_id + ".partial")
@@ -818,9 +949,14 @@ def install(local: LocalModel, payload: dict) -> None:
     cache_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
     (runtime_root() / "logs").mkdir(parents=True, exist_ok=True, mode=0o700)
     omlx_port = port()
+    # Again: a com.local.omlx may have appeared while this job downloaded and built.
+    owner = omlx_owner()
     _require_owned()
     plist = omlx_plist_path()
-    _atomic(plist, plistlib.dumps(omlx_plist(omlx_port)), base=plist.parent)
+    if owner is None:
+        _create_new(plist, plistlib.dumps(omlx_plist(omlx_port)))
+    else:
+        _atomic(plist, plistlib.dumps(omlx_plist(omlx_port)), base=plist.parent)
     _bootstrap(plist, OMLX_LABEL)
     _wait_health(f"http://127.0.0.1:{omlx_port}/health")
     configure_gateway(local, omlx_port)
@@ -869,40 +1005,49 @@ def start_add(name: str | None = None) -> dict:
     """Queue the setup job; reuse a running one. Partial downloads resume."""
     local = model(name)
     _require_owned()
-    if not eligible():
-        raise LocalRuntimeError("This Mac needs Apple silicon and at least 48 GB of memory for local AI")
     installed = installed_model()
     if installed is not None and installed != local:
         raise LocalRuntimeError(f"Local AI already serves {installed.name}; remove it first")
-    if _job_running():
-        return status()
-    conflict = gateway_conflict(local)
-    if conflict:
-        raise LocalRuntimeError(conflict)
-    omlx_port = port()
-    if omlx_owner() is None and _port_in_use(omlx_port):
-        raise LocalRuntimeError(f"Port {omlx_port} is in use; set MODEL_GATEWAY_LOCAL_AI_PORT to a free port")
-    payload = manifest(local)
+    current = status()
+    if current["installed"] and current["state"] == "done":
+        return current
+    if not eligible():
+        raise LocalRuntimeError("This Mac needs Apple silicon and at least 48 GB of memory for local AI")
+    _require_known_gateway()
     root = runtime_root()
     _no_symlinks(root, root)
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    partial = mlx_dir() / (payload["model_id"] + ".partial")
-    staged = sum((partial / e["path"]).stat().st_size for e in payload["files"]
-                 if (partial / e["path"]).is_file() and (partial / e["path"]).stat().st_size <= e["size_bytes"])
-    remaining = 0 if (mlx_dir() / payload["model_id"]).exists() else payload["total_bytes"] - staged
-    needed = remaining + DISK_MARGIN
-    if _disk_free(root) < needed:
-        raise LocalRuntimeError(f"Local AI needs {needed / 1e9:.0f} GB of free disk space")
-    value = {"schema_version": 1, "state": "queued", "model": local.name, "bytes_done": 0,
-             "bytes_total": payload["total_bytes"], "message": "", "started_at": _now(), "updated_at": _now()}
-    _write_status(value)
-    try:
-        _atomic(setup_plist_path(), plistlib.dumps(setup_plist(local, omlx_port)))
-        (root / "logs").mkdir(parents=True, exist_ok=True, mode=0o700)
-        _bootstrap(setup_plist_path(), SETUP_LABEL)
-    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
-        record_failure(str(exc))
-        raise
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(_lock(".start.lock", 0, ""))
+        except _Busy:
+            return status()  # another add is starting the job right now
+        if _job_running() or _job_alive():
+            return status()
+        conflict = gateway_conflict(local)
+        if conflict:
+            raise LocalRuntimeError(conflict)
+        omlx_port = port()
+        if omlx_owner() is None and _port_in_use(omlx_port):
+            raise LocalRuntimeError(f"Port {omlx_port} is in use; set MODEL_GATEWAY_LOCAL_AI_PORT to a free port")
+        payload = manifest(local)
+        partial = mlx_dir() / (payload["model_id"] + ".partial")
+        staged = sum((partial / e["path"]).stat().st_size for e in payload["files"]
+                     if (partial / e["path"]).is_file() and (partial / e["path"]).stat().st_size <= e["size_bytes"])
+        remaining = 0 if (mlx_dir() / payload["model_id"]).exists() else payload["total_bytes"] - staged
+        needed = remaining + DISK_MARGIN
+        if _disk_free(root) < needed:
+            raise LocalRuntimeError(f"Local AI needs {needed / 1e9:.0f} GB of free disk space")
+        value = {"schema_version": 1, "state": "queued", "model": local.name, "bytes_done": 0,
+                 "bytes_total": payload["total_bytes"], "message": "", "started_at": _now(), "updated_at": _now()}
+        _write_status(value)
+        try:
+            _atomic(setup_plist_path(), plistlib.dumps(setup_plist(local, omlx_port)))
+            (root / "logs").mkdir(parents=True, exist_ok=True, mode=0o700)
+            _bootstrap(setup_plist_path(), SETUP_LABEL)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+            record_failure(safe_message(exc))
+            raise
     return status()
 
 
@@ -910,40 +1055,82 @@ def cancel() -> dict:
     """Stop a download; the partial payload stays so a later add resumes it."""
     if not runtime_root().exists():
         return status()
-    try:
-        # The job holds this lock while it installs; stopping it then would leave a half-configured install.
-        with provision_lock(wait=False):
-            _bootout(SETUP_LABEL)
+    _require_setup_owned()
+    # The job holds the provision lock while it installs; stopping it then would leave a half-configured install.
+    with provision_lock(wait=False, busy="Local AI is being installed and can no longer be cancelled"):
+        _bootout(SETUP_LABEL, setup_plist_path())
+        with job_lock(JOB_STOP_SECONDS):
             current = read_status()
             if current.get("state") in ACTIVE_STATES:
                 current.update(state="cancelled", message="", updated_at=_now())
                 _write_status(current)
-    except _Busy:
-        raise LocalRuntimeError("Local AI is being installed and can no longer be cancelled") from None
     return status()
+
+
+def _teardown() -> bool:
+    """Unwire, stop, and delete this runtime; return whether the gateway must restart."""
+    # Edit the gateway's files first so nothing routes to the runtime once it restarts.
+    changed = unconfigure_gateway()
+    if omlx_owner() == "gateway":
+        _bootout(OMLX_LABEL, omlx_plist_path())
+        omlx_plist_path().unlink()
+        changed = True
+    shutil.rmtree(runtime_root())
+    return changed
 
 
 def remove() -> dict:
-    """Remove this gateway's runtime, its provider and model, and all local AI state."""
+    """Remove this gateway's runtime, its provider and model, and all local AI state.
+
+    The gateway restarts once, after teardown, so it and endpoint.json stop
+    advertising the runtime. Without a loaded gateway (uninstalled), only the
+    files change.
+    """
     _require_owned()
     root = runtime_root()
     _no_symlinks(root, root)
+    tearing_down = False
     try:
-        with provision_lock(wait=False):
-            _bootout(SETUP_LABEL)
-            # Stop routing to the runtime before stopping it.
-            unconfigure_gateway()
-            if omlx_owner() == "gateway":
-                _bootout(OMLX_LABEL)
-                omlx_plist_path().unlink()
-            shutil.rmtree(root)
-    except _Busy:
-        raise LocalRuntimeError("Local AI is being installed; wait for it to finish, then remove it") from None
+        with provision_lock(wait=False, busy="Local AI is being installed; wait for it to finish, then remove it"):
+            _bootout(SETUP_LABEL, setup_plist_path())
+            with job_lock(JOB_STOP_SECONDS):
+                tearing_down = True
+                restart = _teardown()
+    except BaseException:
+        if tearing_down:
+            # Teardown may have unwired the config before failing; the gateway should match it.
+            with contextlib.suppress(Exception):
+                _restart_gateway(required=False)
+        raise
+    if restart:
+        _restart_gateway(required=False)
     return status()
+
+
+def _source_digest() -> str:
+    """The installed code and data the job runs, to notice an upgrade mid-download."""
+    digest = hashlib.sha256()
+    paths = [*PACKAGE_ROOT.glob("src/**/*.py"), PACKAGE_ROOT / "bin" / "model-gateway",
+             *MODELS_DIR.glob("*.json"), RUNTIME_PROJECT / "pyproject.toml", RUNTIME_PROJECT / "uv.lock"]
+    for path in sorted(paths):
+        digest.update(path.relative_to(PACKAGE_ROOT).as_posix().encode() + b"\0")
+        with contextlib.suppress(OSError):
+            digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
+
+
+def _reexec(name: str) -> None:
+    """Replace this job with the installed release's job; the job lock is released on exec."""
+    command = _job_command(name)
+    os.execv(command[0], command)
 
 
 def run_job(name: str) -> None:
     """The one-shot setup job: download, verify, install, and prove local AI."""
+    # Imported now, with the rest of this release, so an upgrade cannot mix code mid-job.
+    from src import auth, discovery  # noqa: F401
+
+    source = _source_digest()
     local = model(name)
     payload = manifest(local)
 
@@ -951,13 +1138,20 @@ def run_job(name: str) -> None:
         raise Cancelled
 
     previous = signal.signal(signal.SIGTERM, stop)
-    with contextlib.ExitStack() as cleanup, Progress(local, payload["total_bytes"]) as progress:
+    with contextlib.ExitStack() as cleanup:
         cleanup.callback(signal.signal, signal.SIGTERM, previous)
+        cleanup.enter_context(job_lock(0, busy="Local AI setup is already running"))
+        progress = cleanup.enter_context(Progress(local, payload["total_bytes"]))
         try:
             _require_owned()
             if not eligible():
                 raise LocalRuntimeError("This Mac needs Apple silicon and at least 48 GB of memory for local AI")
             download_payload(payload, progress)
+            if _source_digest() != source:
+                # Model Gateway was upgraded during the download: install with the new release's code.
+                progress.update()
+                progress.close()  # so no heartbeat write straddles the exec
+                _reexec(local.name)
             with provision_lock(wait=True):
                 progress.update(state="installing")
                 install(local, payload)
@@ -969,8 +1163,8 @@ def run_job(name: str) -> None:
             else:
                 progress.update(state="cancelled", message="")
         except Exception as exc:
-            # Our own messages or network/OS errors; never response bodies or keys.
-            progress.update(state="failed", message=str(exc)[:300])
+            # Our own messages or network/OS errors; never response bodies, config contents, or keys.
+            progress.update(state="failed", message=safe_message(exc)[:300])
             raise
 
 
@@ -1030,14 +1224,15 @@ def main(argv: list[str] | None = None) -> int:
         remove()
         print("Local AI removed")
         return 0
-    except (LocalRuntimeError, OSError, RuntimeError, subprocess.SubprocessError,
+    except (ValueError, yaml.YAMLError, OSError, RuntimeError, subprocess.SubprocessError,
             http.client.HTTPException) as exc:
-        if args.command == "job":
-            # The job failed before it could report progress.
+        message = safe_message(exc)
+        # The job failed before it could report progress; a busy job lock means another job is.
+        if args.command == "job" and not isinstance(exc, _Busy):
             with contextlib.suppress(OSError, ValueError):
                 if read_status().get("state") in ACTIVE_STATES:
-                    record_failure(str(exc))
-        print(f"error: {exc}", file=sys.stderr)
+                    record_failure(message)
+        print(f"error: {message}", file=sys.stderr)
         return 2
 
 
