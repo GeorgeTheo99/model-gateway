@@ -12,6 +12,7 @@ CAPABILITIES = (
     "consumer_credentials.v1",
     "create_only_model_registration",
     "endpoint_file.v1",
+    "legacy_home_server_import.v1",
     "local_runtime.v1",
     "profiles.v1",
     "scoped_manager.v1",
