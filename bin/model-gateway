@@ -471,7 +471,7 @@ write_plist() {
   ensure_private_dir "$(dirname "$LEDGER_PATH")"
   ensure_private_dir "$BACKUP_DIR"
   ensure_private_file "$LOG_FILE"
-  local plist plist_tmp program_args owner_key="" client_keys="" e_label e_plist_dir e_root e_host e_port e_admin_writes e_config e_model_info e_model_info_source e_ledger e_vision_fallback e_vision_local e_vision_cloud e_vision_mode e_vision_max_images e_vision_cache_ttl e_vision_total_timeout e_log_dir e_backup e_legacy_backups e_log
+  local plist plist_tmp program_args owner_key="" client_keys="" launchd_keys="" e_label e_plist_dir e_root e_host e_port e_admin_writes e_config e_model_info e_model_info_source e_ledger e_vision_fallback e_vision_local e_vision_cloud e_vision_mode e_vision_max_images e_vision_cache_ttl e_vision_total_timeout e_log_dir e_backup e_legacy_backups e_log
   plist="$(plist_path)"
   plist_tmp="$(mktemp "$PLIST_DIR/.${LABEL}.plist.XXXXXX")"
   chmod 600 "$plist_tmp"
@@ -485,6 +485,16 @@ write_plist() {
   program_args="$program_args<string>-m</string><string>src.main</string>"
   if [ -n "${PACKAGE_COMPONENT_ROOT:-}" ]; then
     owner_key="<key>ModelGatewayComponentRoot</key><string>$(xml_escape "$PACKAGE_COMPONENT_ROOT")</string>"
+  fi
+  # Only non-default values: the gateway assumes the defaults, and setup tools that
+  # preserve this environment (pi-shared 0.1.28) refuse entries they do not know.
+  if [ "$LABEL" != "com.local.model-gateway" ]; then
+    launchd_keys="
+  <key>MODEL_GATEWAY_LAUNCHD_LABEL</key><string>${e_label}</string>"
+  fi
+  if [ "$PLIST_DIR" != "$HOME/Library/LaunchAgents" ]; then
+    launchd_keys="${launchd_keys}
+  <key>MODEL_GATEWAY_PLIST_DIR</key><string>${e_plist_dir}</string>"
   fi
   if [ -n "$CLIENT_KEYS_FILE" ]; then
     client_keys="
@@ -518,9 +528,7 @@ write_plist() {
   ${program_args}
 </array>
 <key>WorkingDirectory</key><string>${e_root}</string>
-<key>EnvironmentVariables</key><dict>
-  <key>MODEL_GATEWAY_LAUNCHD_LABEL</key><string>${e_label}</string>
-  <key>MODEL_GATEWAY_PLIST_DIR</key><string>${e_plist_dir}</string>
+<key>EnvironmentVariables</key><dict>${launchd_keys}
   <key>MODEL_GATEWAY_HOST</key><string>${e_host}</string>
   <key>MODEL_GATEWAY_PORT</key><string>${e_port}</string>
   <key>MODEL_GATEWAY_ADMIN_WRITES</key><string>${e_admin_writes}</string>

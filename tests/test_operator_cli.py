@@ -543,7 +543,26 @@ def test_packaged_launchagent_runs_the_package_python(tmp_path: Path) -> None:
     # The gateway restarts itself and identifies its local AI by this label.
     environment = plist["EnvironmentVariables"]
     assert environment["MODEL_GATEWAY_LAUNCHD_LABEL"] == "com.local.model-gateway-test-does-not-exist"
-    assert environment["MODEL_GATEWAY_PLIST_DIR"] == str(home / "Library" / "LaunchAgents")
+    # The default plist directory is assumed, never written.
+    assert "MODEL_GATEWAY_PLIST_DIR" not in environment
+
+
+def test_a_default_launchagent_records_no_launchd_overrides(tmp_path: Path) -> None:
+    import plistlib
+
+    # pi-shared 0.1.28 refuses to update a gateway whose environment has keys it does not know.
+    home = tmp_path / "home"
+    home.mkdir()
+    harness = tmp_path / "harness.sh"
+    harness.write_text('cli="$1"\nset -- env\nsource "$cli" >/dev/null\nwrite_plist >/dev/null\n', encoding="utf-8")
+    env = {key: value for key, value in os.environ.items() if not key.startswith(("MODEL_GATEWAY_", "GATEWAY_VISION"))}
+    env["HOME"] = str(home)
+    result = subprocess.run(["bash", str(harness), str(SCRIPT)], capture_output=True, text=True, env=env)
+    assert result.returncode == 0, result.stderr
+    plist = plistlib.loads((home / "Library" / "LaunchAgents" / "com.local.model-gateway.plist").read_bytes())
+    environment = plist["EnvironmentVariables"]
+    assert "MODEL_GATEWAY_LAUNCHD_LABEL" not in environment and "MODEL_GATEWAY_PLIST_DIR" not in environment
+    assert {"MODEL_GATEWAY_HOST", "MODEL_GATEWAY_PORT", "MODEL_GATEWAY_CONFIG"} <= set(environment)
 
 
 def test_packaged_cli_refuses_a_missing_package_root(tmp_path: Path) -> None:
