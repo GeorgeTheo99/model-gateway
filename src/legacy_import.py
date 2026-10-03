@@ -690,6 +690,10 @@ def _copy_state(journal: Journal) -> None:
         # Attached Home Server's Settings also manages the gateway-owned local AI.
         if entry.get("id") == "ha-manager" and entry.get("permissions") == CONSUMER_PERMISSIONS["ha-manager"]:
             entry["permissions"] = [*entry["permissions"], "local_ai:manage"]
+        # Packages before Home Server 0.5.0 let ha-runtime call models directly; every request
+        # already runs through an ha profile, and attached Home Server requires it profile-only.
+        if entry.get("id") == "ha-runtime" and entry.get("consumer") == "ha":
+            entry["allow_direct_models"] = False
     journal.data["consumers"] = ids
     journal.save()
 

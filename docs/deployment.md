@@ -186,7 +186,8 @@ release:
      (two different keys that would share a file stop the import; key paths
      are written resolved and absolute), `profiles.registry_path`
      to `state/consumer-profiles.json`, and a legacy `exports.model_aliases`
-     to the state root; `ha-manager` also gains `local_ai:manage`. Providers,
+     to the state root; `ha-manager` also gains `local_ai:manage` and `ha-runtime`
+     becomes profile-only (`allow_direct_models: false`). Providers,
      models, and the catalog are kept; any other value that still names the
      Home Server root stops the import. Also `model-info.json`, the ledger,
      the profile registry, `secrets/client.keys` (the new LaunchAgent keeps it

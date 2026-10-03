@@ -200,7 +200,7 @@ class Legacy:
         private(secrets / "providers/unreferenced", "other-secret\n")
         credentials = [
             {"id": "ha-runtime", "consumer": "ha", "key_file": str(secrets / "ha-runtime.key"), "namespaces": ["ha"],
-             "permissions": ["profiles:read", "profiles:invoke"], "allow_direct_models": False},
+             "permissions": ["profiles:read", "profiles:invoke"], "allow_direct_models": True},
             {"id": "ha-deployer", "consumer": "ha", "key_file": str(secrets / "ha-deployer.key"), "namespaces": ["ha"],
              "permissions": ["profiles:read", "profiles:write"], "allow_direct_models": False},
             {"id": "ha-manager", "consumer": "ha", "key_file": str(secrets / "ha-manager.key"), "namespaces": ["ha"],
@@ -353,6 +353,7 @@ def test_imports_a_bundled_gateway_with_local_ai(legacy, staged):
         assert key.read_text() == f"key-{name}\n" and key.stat().st_mode & 0o777 == 0o600
     assert credentials["ha-manager"]["permissions"] == ["providers:manage", "models:register", "local_ai:manage"]
     assert credentials["ha-manager"]["providers"] == ["fireworks"]
+    assert credentials["ha-runtime"]["allow_direct_models"] is False
     assert config["providers"]["fireworks"]["api_key_file"] == str(app / "secrets/providers/fireworks.api-key")
     assert (app / "secrets/providers/fireworks.api-key").read_text() == "fw-secret\n"
     assert not (app / "secrets/providers/fireworks").exists()
