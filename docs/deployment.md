@@ -158,10 +158,12 @@ release:
    `HomeServerCIPath=<root>/ci/bin/server-ci`; the gateway must be healthy on
    the port in `<root>/ci/config/install.env`
    (`INSTALLED_SERVER_MODEL_GATEWAY_PORT`, `INSTALLED_SERVER_OMLX_PORT`, which
-   must match the plists); the local AI setup job must not be running; no
-   component state (`config.yaml`, `secrets/`, `local-ai/`, …) or
-   `com.local.omlx` may exist; the Home Server root and the state root must be on
-   one volume with room for the oMLX environment and the copies.
+   must match the plists); the local AI setup job must not be running; the
+   installed model must be the one this package's `local-models/` manifest
+   names; no component state (`config.yaml`, `ledger.db` or its SQLite
+   sidecars, `secrets/`, `local-ai/`, …) or `com.local.omlx` may exist; the
+   Home Server root, the model, `models/cache`, and `inference` must be on the
+   state root's volume, with room for the oMLX environment and the copies.
 2. **Prepare**, recorded step by step in
    `~/Library/Application Support/model-gateway/state/migration-journal.json`
    (every created or moved path is written there first):
@@ -169,13 +171,20 @@ release:
      `local-ai/omlx-<version>` with uv (`UV_PYTHON_PREFERENCE=only-managed`) and
      check Metal, before anything stops;
    - stop the setup job, gateway, and inference jobs (each only when
-     `launchctl print` shows it loaded from the legacy plist);
-   - snapshot, without models, into `<root>/backups/w3-migration-<timestamp>/`:
+     `launchctl print` shows it loaded from the legacy plist); a setup job
+     that started since preflight is not stopped: the import fails and rolls
+     back;
+   - snapshot, without models, into
+     `<root>/backups/w3-migration-<timestamp>-<pid>-<random>/`:
      `runtime/shared/model-gateway`, `runtime/shared/inference`, `install.env`,
      both plists, and the ledger through the SQLite backup API;
+   - remove the two legacy plists (the snapshot holds them), so a restart
+     mid-import cannot load the legacy gateway or inference again;
    - copy (never move) the gateway state: `config.yaml` with consumer
      `key_file`s rewritten to `secrets/consumers/<id>.key` (0600),
-     provider `api_key_file`s to `secrets/providers/`, `profiles.registry_path`
+     provider `api_key_file`s to `secrets/providers/<provider id>.api-key`
+     (two different keys that would share a file stop the import; key paths
+     are written resolved and absolute), `profiles.registry_path`
      to `state/consumer-profiles.json`, and a legacy `exports.model_aliases`
      to the state root; `ha-manager` also gains `local_ai:manage`. Providers,
      models, and the catalog are kept; any other value that still names the
@@ -188,8 +197,7 @@ release:
      into `local-ai/inference/` with their paths rewritten, copy
      `local-ai-setup.json` to `local-ai/status.json`, write `com.local.omlx`
      (`ModelGatewayRoot=<state root>#<label>`, the legacy oMLX port), and make
-     the `omlx` provider the `managed_by: local_ai` block;
-   - remove the two legacy plists.
+     the `omlx` provider the `managed_by: local_ai` block (`api.key` is 0600).
 3. **Install** this release exactly like a fresh install, on the imported
    config and port, and verify `/health` and `endpoint.json`.
 4. **Finish**: start `com.local.omlx`, check its health, require every imported
@@ -204,21 +212,29 @@ release:
 | 1 | `MODEL_GATEWAY_IMPORT=rolled-back` | Failed; rolled back and the legacy jobs restarted (without this line: failed before anything changed) |
 | 2 | `MODEL_GATEWAY_IMPORT=refused` | Preflight refused; nothing changed |
 | 3 | `MODEL_GATEWAY_IMPORT=rollback-failed` | Rollback incomplete (errors are in the journal); a re-run retries it |
+| other nonzero | none | An unexpected error or a kill: the journal's `state` is the outcome (no journal: nothing changed) |
 
-- An interrupted run (journal `in-progress`) resumes on the next run; a
-  failure rolls back from the journal: stop and remove the component's
-  LaunchAgents and `current`, rename the models and inference files back
-  (restoring rewritten settings from the snapshot), remove only paths the
-  journal created, restore the legacy plists from the snapshot, and bootstrap
-  the jobs it stopped. The snapshot is kept either way.
+- An interrupted run (journal `in-progress`) resumes on the next run, for the
+  same Home Server root and label only; a failure rolls back from the
+  journal, which first records `rolling-back` (an interrupted rollback is
+  retried by the next run, never resumed as an import): stop and remove the
+  component's gateway (and `current`) and its oMLX, each separately; rename
+  the models and inference files back (restoring rewritten settings from the
+  snapshot); move the component state the import created (`config.yaml`,
+  `ledger.db*`, `secrets/`, and `state/` except the journal) into
+  `<backup>/component-at-rollback/`; remove the other paths the journal
+  created; restore the legacy plists from the snapshot; and bootstrap the
+  jobs it stopped. If the component's oMLX cannot be stopped, local AI stays
+  in place, the legacy jobs stay stopped, and the rollback is
+  `rollback-failed`. The snapshot is kept either way.
 - After success the legacy `runtime/shared/model-gateway` and inference
   directories stay in place; the Home Server package switches to attached mode
   and then moves them into its backup. Until a run finishes or rolls back, the
   plain package helper leaves the import alone.
 - Journal fields for the Home Server helper: `state` (`in-progress`,
-  `completed`, `rolled-back`, `rollback-failed`), `home_server_root`,
-  `backup_dir`, `gateway_port`, `omlx_port`, `local_ai`, `model_id`,
-  `consumers`, `steps`, `created`, `moved`.
+  `completed`, `rolling-back`, `rolled-back`, `rollback-failed`),
+  `home_server_root`, `label`, `backup_dir`, `gateway_port`, `omlx_port`,
+  `local_ai`, `model_id`, `consumers`, `steps`, `created`, `moved`.
 - Tests inject faults with `MODEL_GATEWAY_MIGRATION_FAIL_AT=<step>[,<step>]` or
   `MODEL_GATEWAY_MIGRATION_INTERRUPT_AT=<step>`, honored only with
   `MODEL_GATEWAY_MIGRATION_TEST=1` (the root postinstall passes neither).

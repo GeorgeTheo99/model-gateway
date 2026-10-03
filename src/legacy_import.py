@@ -3,8 +3,8 @@
 The component package helper runs this as the user, in phases:
 
   preflight   refuse anything unexpected; change nothing (system Python, stdlib only)
-  prepare     journal, build oMLX, stop the legacy jobs, snapshot, copy the gateway
-              state, move local AI, and remove the legacy LaunchAgents
+  prepare     journal, build oMLX, stop the legacy jobs, snapshot, remove the legacy
+              LaunchAgents, copy the gateway state, and move local AI
   finish      start the component's oMLX and verify the consumers and local runtime
   rollback    undo exactly what the journal recorded (system Python, stdlib only)
 
@@ -14,7 +14,9 @@ finish. Every step and every path this import creates or moves is recorded in
 after an interruption resumes and a failure rolls back only this import's
 changes. The legacy gateway state is copied, never moved; models and the oMLX
 inference files are renamed on the same volume. A snapshot without models goes
-to ``<Home Server root>/backups/w3-migration-<timestamp>/`` and is kept.
+to ``<Home Server root>/backups/w3-migration-<timestamp>-<suffix>/`` and is kept;
+a rollback moves the component state it created into its
+``component-at-rollback/`` rather than deleting it.
 
 launchctl and curl come from PATH (as in the helper), so tests substitute them.
 """
@@ -27,6 +29,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import shutil
 import signal
 import sqlite3
@@ -47,11 +50,14 @@ STALE_SECONDS = 60
 VENV_BYTES = 3 * 1024**3
 MARGIN_BYTES = 256 * 1024**2
 CONSUMER_PERMISSIONS = {"ha-manager": ["providers:manage", "models:register"]}
+SAFE_KEY_NAME = re.compile(r"[a-z0-9_][a-z0-9_.-]*")
 LEDGER_FILES = ("ledger.db", "ledger.db-wal", "ledger.db-shm", "ledger.db-journal")
 # Exit codes shared with the package helper.
 REFUSED = 2
 ALREADY_IMPORTED = 10
 ROLLBACK_PENDING = 11
+# A rollback that started (and may have been interrupted) or did not finish.
+ROLLBACK_STATES = frozenset({"rolling-back", "rollback-failed"})
 
 
 class ImportFailure(RuntimeError):
@@ -158,6 +164,10 @@ def _loaded(label: str) -> tuple[bool, str | None, bool]:
 
 def _same(a: str | Path | None, b: Path) -> bool:
     return a is not None and os.path.realpath(str(a)) == os.path.realpath(b)
+
+
+def _device(path: Path) -> int:
+    return os.stat(path).st_dev
 
 
 def _stop(label: str, plist: Path) -> bool:
@@ -431,6 +441,8 @@ def inspect(paths: Paths) -> dict:
         if len(found) != 1:
             raise Refused(f"expected exactly one installed model in {mlx}")
         model_id = found[0]
+        if model_id not in _managed_model_ids():
+            raise Refused(f"the installed model {model_id} is not one this gateway manages")
         _no_symlinks(paths.inference / "api.key", paths.root)
         _user_file(paths.inference / "api.key")
         if paths.omlx_plist.exists() or paths.omlx_plist.is_symlink() or _loaded(OMLX_LABEL)[0]:
@@ -439,13 +451,51 @@ def inspect(paths: Paths) -> dict:
     _no_symlinks(paths.legacy_config, paths.root)
     _user_file(paths.legacy_config)
     _user_file(paths.gateway / "model-info.json")
-    for existing in (paths.config, paths.model_info, paths.ledger, paths.state_install_env, paths.secrets,
-                     paths.local_ai, paths.registry, paths.current):
+    for existing in (paths.config, paths.model_info, *(paths.state / name for name in LEDGER_FILES),
+                     paths.state_install_env, paths.secrets, paths.local_ai, paths.registry, paths.current):
         if existing.exists() or existing.is_symlink():
             raise Refused(f"Model Gateway state already exists at {existing}; the import will not replace it")
 
     if not _gateway_healthy(gateway_port):
         raise Refused(f"the Home Server gateway is not healthy on port {gateway_port}")
+    if _setup_active(paths):
+        raise Refused("Home Server local AI setup is running; wait for it to finish or cancel it, then retry")
+
+    # Everything the import renames must be on the state root's volume.
+    state_volume = paths.state if paths.state.exists() else paths.state.parent
+    renamed = [root]
+    if local_ai:
+        renamed += [paths.models / "mlx" / model_id, paths.inference]
+        if (paths.models / "cache").is_dir():
+            renamed.append(paths.models / "cache")
+    for path in renamed:
+        if _device(path) != _device(state_volume):
+            raise Refused(f"{path} and {paths.state} must be on the same volume")
+    needed = (2 * _tree_size(paths.gateway) + _tree_size(paths.inference) + MARGIN_BYTES
+              + (VENV_BYTES if local_ai else 0))
+    free = shutil.disk_usage(state_volume).free
+    if free < needed:
+        raise Refused(f"the import needs {needed / 1e9:.1f} GB of free disk space; {free / 1e9:.1f} GB is free")
+    return {"gateway_port": gateway_port, "omlx_port": omlx_port, "local_ai": local_ai, "model_id": model_id}
+
+
+def _managed_model_ids() -> set[str]:
+    """Model ids of this package's local-models manifests (stdlib only, for preflight)."""
+    from src import model_payload
+
+    ids = set()
+    for path in sorted((Path(__file__).resolve().parents[1] / "local-models").glob("*.json")):
+        try:
+            value = model_payload.read_json(path, "model manifest")
+            model_payload.validate_manifest(value)
+        except model_payload.VerificationError:
+            continue
+        ids.add(value["model_id"])
+    return ids
+
+
+def _setup_active(paths: Paths) -> bool:
+    """Whether the Home Server local AI setup job is running or recently reported progress."""
     _loaded_setup, _path, running = _loaded(SETUP_LABEL)
     status = {}
     if paths.setup_status.is_file() and not paths.setup_status.is_symlink():
@@ -453,18 +503,7 @@ def inspect(paths: Paths) -> dict:
             status = json.loads(paths.setup_status.read_text())
         except ValueError:
             status = {}
-    if running or (isinstance(status, dict) and status.get("state") in ACTIVE_STATES and not _stale(status)):
-        raise Refused("Home Server local AI setup is running; wait for it to finish or cancel it, then retry")
-
-    state_volume = paths.state if paths.state.exists() else paths.state.parent
-    if os.stat(root).st_dev != os.stat(state_volume).st_dev:
-        raise Refused(f"{root} and {paths.state} must be on the same volume")
-    needed = (2 * _tree_size(paths.gateway) + _tree_size(paths.inference) + MARGIN_BYTES
-              + (VENV_BYTES if local_ai else 0))
-    free = shutil.disk_usage(state_volume).free
-    if free < needed:
-        raise Refused(f"the import needs {needed / 1e9:.1f} GB of free disk space; {free / 1e9:.1f} GB is free")
-    return {"gateway_port": gateway_port, "omlx_port": omlx_port, "local_ai": local_ai, "model_id": model_id}
+    return running or (isinstance(status, dict) and status.get("state") in ACTIVE_STATES and not _stale(status))
 
 
 def _stale(status: dict) -> bool:
@@ -485,10 +524,9 @@ def preflight(paths: Paths) -> int:
             return ALREADY_IMPORTED
         raise Refused(f"{paths.journal} records a completed import, but {paths.gateway_plist} is not this "
                       "component's gateway")
-    if journal is not None and journal.state in {"in-progress", "rollback-failed"}:
-        if journal.data.get("home_server_root") != str(paths.root):
-            raise Refused(f"{paths.journal} records an import from {journal.data.get('home_server_root')}")
-        if journal.state == "rollback-failed":
+    if journal is not None and (journal.state == "in-progress" or journal.state in ROLLBACK_STATES):
+        _require_same_import(journal)
+        if journal.state in ROLLBACK_STATES:
             print(f"An earlier import did not finish rolling back ({paths.journal})")
             return ROLLBACK_PENDING
         print(f"Resuming the import recorded in {paths.journal}")
@@ -499,19 +537,31 @@ def preflight(paths: Paths) -> int:
     return 0
 
 
+def _require_same_import(journal: Journal) -> None:
+    """A recorded import resumes or rolls back only for its own Home Server root and label."""
+    paths = journal.paths
+    if journal.data.get("home_server_root") != str(paths.root):
+        raise Refused(f"{paths.journal} records an import from {journal.data.get('home_server_root')}")
+    if journal.data.get("label") != paths.label:
+        raise Refused(f"{paths.journal} records an import for {journal.data.get('label')}, not {paths.label}")
+
+
 # ── prepare ──────────────────────────────────────────────────────────────────
 
 
 def _begin(paths: Paths) -> Journal:
     journal = Journal.load(paths)
+    if journal is not None and journal.state in ROLLBACK_STATES:
+        raise ImportFailure(f"an earlier import did not finish rolling back ({paths.journal})")
     if journal is not None and journal.state == "in-progress":
+        _require_same_import(journal)
         return journal
     plan = inspect(paths)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     journal = Journal(paths, {
         "schema_version": SCHEMA_VERSION, "state": "in-progress", "home_server_root": str(paths.root),
         "label": paths.label, "started_at": _now(), **plan,
-        "backup_dir": str(paths.backups / f"w3-migration-{stamp}"),
+        "backup_dir": str(paths.backups / f"w3-migration-{stamp}-{os.getpid()}-{os.urandom(3).hex()}"),
         "steps": [], "created": [], "moved": [], "rewritten": [], "stopped": [], "removed_plists": [],
         "consumers": [],
     })
@@ -528,7 +578,7 @@ def _build_runtime(journal: Journal) -> None:
     from src import local_runtime
 
     if journal.data["model_id"] != local_runtime.manifest(local_runtime.model(None))["model_id"]:
-        raise Refused(f"the installed model {journal.data['model_id']} is not one this gateway manages")
+        raise ImportFailure(f"the installed model {journal.data['model_id']} is not one this gateway manages")
     venv = local_runtime.venv_dir()
     journal.claim_dirs(venv.parent)
     journal.claim(venv)
@@ -543,6 +593,9 @@ def _build_runtime(journal: Journal) -> None:
 
 def _stop_legacy(journal: Journal) -> None:
     paths = journal.paths
+    # Preflight saw no setup running; one that started since is not stopped mid-install.
+    if _setup_active(paths):
+        raise ImportFailure("Home Server local AI setup started during the import; not stopping it")
     jobs = [(SETUP_LABEL, paths.setup_plist), (paths.label, paths.gateway_plist)]
     if journal.data["local_ai"]:
         jobs.append((INFERENCE_LABEL, paths.inference_plist))
@@ -604,7 +657,7 @@ def _legacy_references(value: object, root: Path, where: str = "") -> list[str]:
 def _copy_state(journal: Journal) -> None:
     import yaml
 
-    from src import local_runtime
+    from src import config_io, local_runtime
 
     paths = journal.paths
     legacy_dir = paths.legacy_config.parent
@@ -614,8 +667,7 @@ def _copy_state(journal: Journal) -> None:
         raise ImportFailure(f"{paths.legacy_config} is not valid YAML") from None
     if not isinstance(config, dict):
         raise ImportFailure(f"{paths.legacy_config} is not a mapping")
-    consumers = paths.secrets / "consumers"
-    providers_dir = paths.secrets / "providers"
+    providers_dir = Path(os.path.realpath(paths.secrets / "providers"))
 
     auth = config.get("auth") or {}
     entries = (auth.get("consumer_credentials") or []) if isinstance(auth, dict) else []
@@ -629,7 +681,10 @@ def _copy_state(journal: Journal) -> None:
             source = source if source.is_absolute() else legacy_dir / source
             if not _under(source, paths.root):
                 continue
-            destination = consumers / f"{entry['id']}.key"
+            try:
+                destination = config_io.consumer_key_path(entry.get("id"))
+            except (TypeError, ValueError):
+                raise ImportFailure(f"the legacy consumer credential id {entry.get('id')!r} is invalid") from None
             _copy_secret(journal, source, destination)
             entry["key_file"] = str(destination)
         # Attached Home Server's Settings also manages the gateway-owned local AI.
@@ -637,6 +692,15 @@ def _copy_state(journal: Journal) -> None:
             entry["permissions"] = [*entry["permissions"], "local_ai:manage"]
     journal.data["consumers"] = ids
     journal.save()
+
+    # Each provider key goes to <provider id>.api-key; two different keys never share a file.
+    copied: dict[str, str] = {}
+
+    def copy_provider_key(source: Path, destination: Path) -> None:
+        key, origin = destination.name.lower(), os.path.realpath(source)
+        if copied.setdefault(key, origin) != origin:
+            raise ImportFailure(f"two different legacy provider keys would both be imported as {destination}")
+        _copy_secret(journal, source, destination)
 
     providers = config.get("providers")
     providers = providers if isinstance(providers, dict) else {}
@@ -647,21 +711,24 @@ def _copy_state(journal: Journal) -> None:
             # Exactly the block src.local_runtime.configure_gateway writes for its own runtime.
             providers[provider_id] = {
                 "base_url": f"http://127.0.0.1:{journal.data['omlx_port']}/v1", "protocol": "openai",
-                "api_key": "", "api_key_file": str(local_runtime.api_key_path()), "enabled": True,
+                "api_key": "", "api_key_file": os.path.realpath(local_runtime.api_key_path()), "enabled": True,
                 "managed_by": "local_ai"}
             continue
         if isinstance(block, dict) and isinstance(block.get("api_key_file"), str):
             source = Path(os.path.expanduser(block["api_key_file"]))
             source = source if source.is_absolute() else legacy_dir / source
             if _under(source, paths.root):
-                destination = providers_dir / source.name
-                _copy_secret(journal, source, destination)
+                name = f"{str(provider_id).lower()}.api-key"
+                if not SAFE_KEY_NAME.fullmatch(name):
+                    raise ImportFailure(f"the legacy provider id {provider_id!r} is not a safe file name")
+                destination = providers_dir / name
+                copy_provider_key(source, destination)
                 block["api_key_file"] = str(destination)
     legacy_providers = paths.gateway / "secrets" / "providers"
     if legacy_providers.is_dir():
         for source in sorted(legacy_providers.iterdir()):
-            if source.is_file() and not source.is_symlink() and not (providers_dir / source.name).exists():
-                _copy_secret(journal, source, providers_dir / source.name)
+            if source.is_file() and not source.is_symlink() and os.path.realpath(source) not in copied.values():
+                copy_provider_key(source, providers_dir / source.name)
 
     profiles = config.get("profiles")
     config["profiles"] = {**(profiles if isinstance(profiles, dict) else {}), "registry_path": str(paths.registry)}
@@ -685,7 +752,9 @@ def _copy_state(journal: Journal) -> None:
         _copy_secret(journal, client_keys, paths.secrets / "client.keys")
     ledger = paths.gateway / "state" / "ledger.db"
     if ledger.is_file():
-        journal.claim(paths.ledger)
+        # The component gateway's SQLite sidecars are this import's too, so a rollback takes them.
+        for name in LEDGER_FILES:
+            journal.claim(paths.state / name)
         _sqlite_copy(ledger, paths.ledger)
     journal.claim(paths.state_install_env)
     _write_private(paths.state_install_env,
@@ -722,6 +791,7 @@ def _move_local_ai(journal: Journal) -> None:
                     (str(paths.models / "cache"), str(local_runtime.cache_dir())),
                     (str(paths.root / "logs" / "inference"), str(local_runtime.runtime_root() / "logs" / "omlx"))]
     journal.move(paths.inference / "api.key", inference / "api.key")
+    os.chmod(inference / "api.key", 0o600)
     for name in ("settings.json", "model_settings.json"):
         source, destination = paths.inference / name, inference / name
         if not source.exists() and not destination.exists():
@@ -783,8 +853,10 @@ def prepare(paths: Paths) -> None:
         # Every resume: a restart may have loaded the legacy LaunchAgents again.
         _stop_legacy(journal)
         _fault("stop-legacy")
-    for step, function in (("snapshot", _snapshot), ("copy-state", _copy_state),
-                           ("local-ai", _move_local_ai), ("remove-legacy-plists", _remove_legacy_plists)):
+    # The plists go right after the snapshot that holds them, so a restart mid-import
+    # cannot load the legacy gateway or inference again.
+    for step, function in (("snapshot", _snapshot), ("remove-legacy-plists", _remove_legacy_plists),
+                           ("copy-state", _copy_state), ("local-ai", _move_local_ai)):
         if step == "local-ai" and not journal.data["local_ai"]:
             continue
         if not journal.done(step):
@@ -826,35 +898,59 @@ def finish(paths: Paths) -> None:
 # ── rollback ─────────────────────────────────────────────────────────────────
 
 
+def _kept_at_rollback(paths: Paths, path: Path) -> bool:
+    """Component state a rollback keeps in the snapshot: config, ledger, secrets, and state but the journal."""
+    if _same(path, paths.config) or _under(path, paths.secrets):
+        return True
+    if any(_same(path, paths.state / name) for name in LEDGER_FILES):
+        return True
+    state = paths.journal.parent
+    return _under(path, state) and not _same(path, state) and not _same(path, paths.journal)
+
+
 def rollback(paths: Paths) -> int:
     journal = Journal.load(paths)
-    if journal is None or journal.state not in {"in-progress", "rollback-failed"}:
+    if journal is None or not (journal.state == "in-progress" or journal.state in ROLLBACK_STATES):
         print("No import to roll back")
         return 0
+    # Recorded first: an interrupted rollback is retried, never resumed as an import.
+    journal.data["state"] = "rolling-back"
+    journal.save()
     errors: list[str] = []
 
-    def attempt(description: str, function, *args) -> None:
+    def attempt(description: str, function, *args) -> bool:
         try:
             function(*args)
-        except (OSError, ImportFailure, shutil.Error, sqlite3.Error) as exc:
+        except Exception as exc:  # noqa: BLE001 - every step is attempted; failures are recorded
             errors.append(f"{description}: {exc}")
+            return False
+        return True
 
     attempt("rolling back", _fault, "rollback")
 
-    def stop_component() -> None:
+    def stop_gateway() -> None:
         if (_plist(paths.gateway_plist) or {}).get("ModelGatewayComponentRoot") == str(paths.state):
             _stop(paths.label, paths.gateway_plist)
             paths.gateway_plist.unlink()
-        if (_plist(paths.omlx_plist) or {}).get("ModelGatewayRoot") == paths.owner:
-            _stop(OMLX_LABEL, paths.omlx_plist)
-            paths.omlx_plist.unlink()
         # Preflight found no component install, so `current` is this import's.
         if paths.current.is_symlink():
             paths.current.unlink()
 
-    attempt("stopping the component", stop_component)
+    def stop_omlx() -> None:
+        if (_plist(paths.omlx_plist) or {}).get("ModelGatewayRoot") == paths.owner:
+            _stop(OMLX_LABEL, paths.omlx_plist)
+            paths.omlx_plist.unlink()
+
+    attempt("stopping the component gateway", stop_gateway)
+    # While the component's oMLX may still serve local AI, its files stay and the legacy jobs stay stopped.
+    omlx_stopped = attempt("stopping the component oMLX", stop_omlx)
+
+    def held(path: Path) -> bool:
+        return not omlx_stopped and (_under(path, paths.local_ai) or _same(path, paths.omlx_plist)
+                                     or _same(path, paths.inference_plist))
+
     backup = Path(journal.data["backup_dir"])
-    for source, destination in reversed(journal.data["moved"]):
+    for source, destination in reversed(journal.data["moved"] if omlx_stopped else []):
         source, destination = Path(source), Path(destination)
 
         def move_back(source=source, destination=destination) -> None:
@@ -865,9 +961,26 @@ def rollback(paths: Paths) -> int:
                 shutil.copy2(backup / "inference" / source.name, source)
 
         attempt(f"moving {destination} back", move_back)
+    kept = backup / "component-at-rollback"
+    for created in journal.data["created"]:
+        path = Path(created)
+        if not _kept_at_rollback(paths, path) or not os.path.lexists(path):
+            continue  # a parent directory already moved it
+
+        def keep(path=path) -> None:
+            relative = Path(os.path.relpath(os.path.realpath(path.parent), os.path.realpath(paths.state)))
+            target = kept / relative / path.name
+            if os.path.lexists(target):
+                raise ImportFailure(f"{target} already exists; not moving {path} there")
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.rename(path, target)
+
+        attempt(f"moving {path} into {kept}", keep)
     pending = [Path(destination) for _source, destination in journal.data["moved"] if Path(destination).exists()]
     for created in reversed(journal.data["created"]):
         path = Path(created)
+        if _kept_at_rollback(paths, path) or held(path):
+            continue
 
         def remove(path=path) -> None:
             if any(_under(item, path) for item in pending):
@@ -880,13 +993,15 @@ def rollback(paths: Paths) -> int:
         attempt(f"removing {path}", remove)
     for plist, saved in journal.data["removed_plists"]:
         plist, saved = Path(plist), Path(saved)
+        if held(plist):
+            continue
 
         def restore(plist=plist, saved=saved) -> None:
             if not plist.exists():
                 shutil.copy2(saved, plist)
 
         attempt(f"restoring {plist}", restore)
-    for label, plist in journal.data["stopped"]:
+    for label, plist in journal.data["stopped"] if omlx_stopped else []:
         plist = Path(plist)
 
         def start(label=label, plist=plist) -> None:

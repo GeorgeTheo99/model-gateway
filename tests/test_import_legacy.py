@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -20,6 +22,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from src import legacy_import
 from src.version import VERSION
 from test_component_pkg import LABEL, SUPPORT, SYSTEM_PATH, release_name, staged, write_fake  # noqa: F401
 
@@ -80,7 +83,10 @@ case "$1" in
     [ ! -e "$state/running-$label" ] || run="running"
     printf '%s = {\\n\\tpath = %s\\n\\tstate = %s\\n}\\n' "$2" "$(cat "$state/loaded/$label")" "$run"
     ;;
-  bootout) rm -f "$state/loaded/$label" ;;
+  bootout)
+    [ ! -e "$state/stuck-$label" ] || exit 1
+    rm -f "$state/loaded/$label"
+    ;;
   bootstrap) start "$3" ;;
   load) start "$2" ;;
   kickstart) label="${3##*/}"; start "$(cat "$state/loaded/$label" 2>/dev/null || echo "$HOME/Library/LaunchAgents/$label.plist")" ;;
@@ -124,6 +130,8 @@ printf 'UV_PYTHON_PREFERENCE=%s UV_PROJECT_ENVIRONMENT=%s %s\\n' "${UV_PYTHON_PR
 mkdir -p "$UV_PROJECT_ENVIRONMENT/bin"
 case "$(basename "$UV_PROJECT_ENVIRONMENT")" in
   omlx-*)
+    # The legacy local AI setup job starting while the import runs.
+    [ ! -e "$HOME/.fake/setup-starts" ] || touch "$HOME/.fake/running-com.local.home-server-local-ai-setup"
     printf '#!/bin/sh\\nexit 0\\n' > "$UV_PROJECT_ENVIRONMENT/bin/python"
     printf '#!/bin/sh\\nexit 0\\n' > "$UV_PROJECT_ENVIRONMENT/bin/omlx"
     chmod 755 "$UV_PROJECT_ENVIRONMENT/bin/omlx"
@@ -345,8 +353,9 @@ def test_imports_a_bundled_gateway_with_local_ai(legacy, staged):
         assert key.read_text() == f"key-{name}\n" and key.stat().st_mode & 0o777 == 0o600
     assert credentials["ha-manager"]["permissions"] == ["providers:manage", "models:register", "local_ai:manage"]
     assert credentials["ha-manager"]["providers"] == ["fireworks"]
-    assert config["providers"]["fireworks"]["api_key_file"] == str(app / "secrets/providers/fireworks")
-    assert (app / "secrets/providers/fireworks").read_text() == "fw-secret\n"
+    assert config["providers"]["fireworks"]["api_key_file"] == str(app / "secrets/providers/fireworks.api-key")
+    assert (app / "secrets/providers/fireworks.api-key").read_text() == "fw-secret\n"
+    assert not (app / "secrets/providers/fireworks").exists()
     assert (app / "secrets/providers/unreferenced").stat().st_mode & 0o777 == 0o600
     assert config["providers"]["omlx"] == {
         "base_url": f"http://127.0.0.1:{OMLX_PORT}/v1", "protocol": "openai", "api_key": "",
@@ -394,10 +403,13 @@ def test_imports_a_bundled_gateway_with_local_ai(legacy, staged):
     assert (legacy.inference / ".provision.lock").exists()
     journal = legacy.journal()
     assert journal["state"] == "completed" and journal["home_server_root"] == str(legacy.root)
-    assert journal["steps"] == ["runtime", "snapshot", "copy-state", "local-ai", "remove-legacy-plists",
+    assert journal["steps"] == ["runtime", "snapshot", "remove-legacy-plists", "copy-state", "local-ai",
                                 "install", "start-local-ai"]
+    assert {str(app / name) for name in ("ledger.db", "ledger.db-wal", "ledger.db-shm", "ledger.db-journal")} <= \
+        set(journal["created"])
     backup = Path(journal["backup_dir"])
-    assert backup.parent == legacy.root / "backups" and backup.name.startswith("w3-migration-")
+    assert backup.parent == legacy.root / "backups"
+    assert re.fullmatch(r"w3-migration-\d{8}T\d{6}Z-\d+-[0-9a-f]{6}", backup.name)
     assert (backup / "model-gateway/config/config.yaml").read_bytes() == \
         (legacy.gateway / "config/config.yaml").read_bytes()
     assert (backup / "inference/api.key").read_text() == "omlx-key\n"
@@ -416,7 +428,7 @@ def test_imports_a_cloud_only_gateway(cloud_only, staged):
     assert "omlx" not in config["providers"]
     assert not (cloud_only.app / "local-ai").exists() and not cloud_only.omlx_plist.exists()
     assert "omlx-" not in (cloud_only.fake / "uv.log").read_text()
-    assert cloud_only.journal()["steps"] == ["snapshot", "copy-state", "remove-legacy-plists", "install"]
+    assert cloud_only.journal()["steps"] == ["snapshot", "remove-legacy-plists", "copy-state", "install"]
 
 
 def test_rerunning_after_an_import_is_a_no_op(legacy, staged):
@@ -498,7 +510,7 @@ def test_usage_errors_change_nothing(legacy, staged):
 
 
 TEST = {"MODEL_GATEWAY_MIGRATION_TEST": "1"}
-STEPS = ["runtime", "stop-legacy", "snapshot", "copy-state", "local-ai", "remove-legacy-plists", "install",
+STEPS = ["runtime", "stop-legacy", "snapshot", "remove-legacy-plists", "copy-state", "local-ai", "install",
          "start-local-ai", "verify"]
 
 
@@ -557,7 +569,7 @@ def test_an_interrupted_import_can_still_roll_back(legacy, staged):
 
 def test_rollback_restores_rewritten_inference_settings(legacy, staged):
     original = (legacy.inference / "settings.json").read_bytes()
-    result = legacy.import_(staged / SUPPORT, MODEL_GATEWAY_MIGRATION_FAIL_AT="remove-legacy-plists", **TEST)
+    result = legacy.import_(staged / SUPPORT, MODEL_GATEWAY_MIGRATION_FAIL_AT="local-ai", **TEST)
     assert result.returncode == 1
     assert (legacy.inference / "settings.json").read_bytes() == original
     assert (legacy.root / "models/mlx" / MODEL_ID / "config.json").exists()
@@ -581,3 +593,246 @@ def test_a_failure_before_the_journal_changes_nothing(legacy, staged):
     assert result.returncode == 1 and "uv is required" in result.stderr and "nothing changed" in result.stderr
     assert legacy.snapshot() == before and not (legacy.app / "state").exists()
     assert legacy.loaded(LABEL) == str(legacy.gateway_plist)
+
+
+def test_an_interrupted_rollback_is_retried_not_resumed(legacy, staged):
+    before = legacy.snapshot()
+    killed = legacy.import_(staged / SUPPORT, MODEL_GATEWAY_MIGRATION_FAIL_AT="install",
+                            MODEL_GATEWAY_MIGRATION_INTERRUPT_AT="rollback", **TEST)
+    assert killed.returncode != 0 and "MODEL_GATEWAY_IMPORT=" not in killed.stdout
+    assert legacy.journal()["state"] == "rolling-back"
+    retried = legacy.import_(staged / SUPPORT)
+    assert retried.returncode == 1 and "did not finish rolling back" in retried.stderr
+    assert "MODEL_GATEWAY_IMPORT=rolled-back" in retried.stdout
+    assert_legacy_restored(legacy, before)
+
+
+def test_a_failed_import_keeps_component_state_in_the_snapshot(legacy, staged):
+    result = legacy.import_(staged / SUPPORT, MODEL_GATEWAY_MIGRATION_FAIL_AT="install", **TEST)
+    assert result.returncode == 1, result.stdout + result.stderr
+    kept = Path(legacy.journal()["backup_dir"]) / "component-at-rollback"
+    assert yaml.safe_load((kept / "config.yaml").read_text())["auth"]["consumer_credentials"]
+    assert (kept / "secrets/consumers/ha-runtime.key").read_text() == "key-ha-runtime\n"
+    assert (kept / "secrets/client.keys").exists() and (kept / "secrets/providers/fireworks.api-key").exists()
+    assert (kept / "state/consumer-profiles.json").exists()
+    assert sqlite3.connect(kept / "ledger.db").execute("SELECT count(*) FROM usage").fetchone() == (2,)
+    assert not (kept / "state/migration-journal.json").exists() and not any(kept.rglob(MODEL_ID))
+    assert not (kept / "model-info.json").exists() and not (legacy.app / "model-info.json").exists()
+
+
+def test_legacy_plists_are_removed_right_after_the_snapshot(legacy, staged):
+    legacy.import_(staged / SUPPORT, MODEL_GATEWAY_MIGRATION_INTERRUPT_AT="copy-state", **TEST)
+    # A restart now cannot load the legacy gateway or inference again.
+    assert not legacy.gateway_plist.exists() and not legacy.inference_plist.exists()
+    journal = legacy.journal()
+    assert journal["steps"] == ["runtime", "snapshot", "remove-legacy-plists"]
+    assert all(Path(saved).is_file() for _plist, saved in journal["removed_plists"])
+    imported(legacy, staged)
+
+
+def test_a_setup_job_started_during_the_import_is_not_stopped(legacy, staged):
+    setup = legacy.root / "ci/launchd" / f"{SETUP_LABEL}.plist"
+    legacy.write_plist(setup, {"Label": SETUP_LABEL})
+    (legacy.fake / "setup-starts").touch()
+    before = legacy.snapshot()
+    result = legacy.import_(staged / SUPPORT)
+    assert result.returncode == 1 and "setup started during the import" in result.stderr
+    assert "MODEL_GATEWAY_IMPORT=rolled-back" in result.stdout
+    assert legacy.loaded(SETUP_LABEL) == str(setup)
+    assert f"bootout gui/{os.getuid()}/{SETUP_LABEL}" not in (legacy.fake / "launchctl.log").read_text()
+    assert_legacy_restored(legacy, before)
+
+
+def test_rollback_leaves_local_ai_alone_while_omlx_cannot_stop(legacy, staged):
+    before = legacy.snapshot()
+    (legacy.fake / "stuck-com.local.omlx").touch()
+    result = legacy.import_(staged / SUPPORT, MODEL_GATEWAY_MIGRATION_FAIL_AT="verify", **TEST)
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert "stopping the component oMLX" in result.stderr
+    assert legacy.journal()["state"] == "rollback-failed"
+    # oMLX still serves the moved model: it stays, and nothing legacy starts on its port.
+    assert legacy.loaded("com.local.omlx") == str(legacy.omlx_plist)
+    assert (legacy.app / "local-ai/models/mlx" / MODEL_ID / "config.json").exists()
+    assert (legacy.app / "local-ai/inference/api.key").exists()
+    assert legacy.loaded(INFERENCE_LABEL) is None and not legacy.inference_plist.exists()
+    assert legacy.loaded(LABEL) is None
+    (legacy.fake / "stuck-com.local.omlx").unlink()
+    retried = legacy.import_(staged / SUPPORT)
+    assert retried.returncode == 1 and "MODEL_GATEWAY_IMPORT=rolled-back" in retried.stdout
+    assert_legacy_restored(legacy, before)
+
+
+def test_cli_link_and_prune_failures_do_not_fail_a_completed_import(legacy, staged):
+    private(legacy.home / ".local/bin", "not a directory\n")
+    locked = legacy.app / "releases/0.0.1-aaaaaaaaaaaa/locked"
+    locked.mkdir(parents=True)
+    (locked / "file").write_text("x")
+    locked.chmod(0o500)
+    try:
+        result = imported(legacy, staged)
+    finally:
+        locked.chmod(0o700)
+    assert "could not link the model-gateway CLI" in result.stderr and "Linked" not in result.stdout
+    assert "could not remove old Model Gateway releases" in result.stderr
+    assert legacy.journal()["state"] == "completed"
+
+
+def test_an_activation_failure_rolls_back(legacy, staged):
+    write_fake(legacy.fakes, "python3", f"""#!/bin/bash
+if [ "${{1:-}}" = - ] && [[ "${{3:-}}" == releases/* ]]; then exit 1; fi
+exec "{sys.executable}" "$@"
+""")
+    before = legacy.snapshot()
+    result = legacy.import_(staged / SUPPORT)
+    assert result.returncode == 1 and "could not activate Model Gateway" in result.stderr
+    assert "MODEL_GATEWAY_IMPORT=rolled-back" in result.stdout
+    assert_legacy_restored(legacy, before)
+
+
+def test_a_staging_failure_stops_at_its_first_error(legacy, staged, tmp_path):
+    copy = tmp_path / "staged"
+    shutil.copytree(staged, copy, symlinks=True)
+    # An empty directory passes the manifest checks, but the release metadata cannot be written over it.
+    (copy / SUPPORT / "package/gateway/.package").mkdir()
+    before = legacy.snapshot()
+    result = legacy.import_(copy / SUPPORT)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "could not stage Model Gateway" in result.stderr and "nothing changed" in result.stderr
+    assert legacy.snapshot() == before and not (legacy.app / "state").exists()
+    assert not (legacy.app / "releases" / release_name(copy / SUPPORT) / ".complete").exists()
+
+
+def _rewrite_legacy_config(machine: Legacy, change) -> None:
+    path = machine.gateway / "config/config.yaml"
+    config = yaml.safe_load(path.read_text())
+    change(config)
+    private(path, yaml.safe_dump(config, sort_keys=False))
+
+
+def test_provider_keys_are_imported_by_provider_id(legacy, staged):
+    private(legacy.gateway / "secrets/other/fireworks", "other-provider-secret\n")
+    _rewrite_legacy_config(legacy, lambda config: config["providers"].update(other={
+        "base_url": "https://example.invalid/v1", "protocol": "openai", "enabled": True,
+        "api_key_file": str(legacy.gateway / "secrets/other/fireworks")}))
+    imported(legacy, staged)
+    config = yaml.safe_load((legacy.app / "config.yaml").read_text())
+    providers = legacy.app / "secrets/providers"
+    assert config["providers"]["other"]["api_key_file"] == str(providers / "other.api-key")
+    assert (providers / "other.api-key").read_text() == "other-provider-secret\n"
+    assert (providers / "fireworks.api-key").read_text() == "fw-secret\n"
+
+
+def test_two_provider_keys_for_one_destination_roll_back(legacy, staged):
+    private(legacy.gateway / "secrets/providers/fireworks.api-key", "a different secret\n")
+    before = legacy.snapshot()
+    result = legacy.import_(staged / SUPPORT)
+    assert result.returncode == 1 and "would both be imported as" in result.stderr
+    assert_legacy_restored(legacy, before)
+
+
+def test_refuses_existing_ledger_sidecars(legacy, staged):
+    private(legacy.app / "ledger.db-wal", "")
+    refused(legacy, staged, "Model Gateway state already exists")
+
+
+def test_an_invalid_consumer_id_rolls_back(legacy, staged):
+    def change(config):
+        config["auth"]["consumer_credentials"][0]["id"] = "../escape"
+    _rewrite_legacy_config(legacy, change)
+    before = legacy.snapshot()
+    result = legacy.import_(staged / SUPPORT)
+    assert result.returncode == 1 and "consumer credential id '../escape' is invalid" in result.stderr
+    assert_legacy_restored(legacy, before)
+    assert not list(legacy.root.parent.rglob("escape.key"))
+
+
+def test_relative_legacy_key_paths_are_written_absolute(legacy, staged):
+    def change(config):
+        config["auth"]["consumer_credentials"][0]["key_file"] = "../secrets/ha-runtime.key"
+        config["providers"]["fireworks"]["api_key_file"] = "../secrets/providers/fireworks"
+    _rewrite_legacy_config(legacy, change)
+    imported(legacy, staged)
+    config = yaml.safe_load((legacy.app / "config.yaml").read_text())
+    key = config["auth"]["consumer_credentials"][0]["key_file"]
+    assert key == os.path.realpath(legacy.app / "secrets/consumers/ha-runtime.key")
+    assert Path(key).read_text() == "key-ha-runtime\n"
+    assert config["providers"]["fireworks"]["api_key_file"] == \
+        os.path.realpath(legacy.app / "secrets/providers/fireworks.api-key")
+
+
+def test_the_moved_local_ai_key_is_private(legacy, staged):
+    (legacy.inference / "api.key").chmod(0o644)
+    imported(legacy, staged)
+    assert (legacy.app / "local-ai/inference/api.key").stat().st_mode & 0o777 == 0o600
+
+
+def test_refuses_a_model_this_gateway_does_not_manage(legacy, staged):
+    (legacy.root / "models/mlx" / MODEL_ID).rename(legacy.root / "models/mlx/some-other-model")
+    refused(legacy, staged, "the installed model some-other-model is not one this gateway manages")
+
+
+def test_a_resume_for_another_label_is_refused(legacy, staged):
+    legacy.import_(staged / SUPPORT, MODEL_GATEWAY_MIGRATION_INTERRUPT_AT="copy-state", **TEST)
+    other = legacy.import_(staged / SUPPORT, MODEL_GATEWAY_LAUNCHD_LABEL="com.local.model-gateway-other")
+    assert other.returncode == 2 and f"records an import for {LABEL}" in other.stderr
+    assert legacy.journal()["state"] == "in-progress"
+    imported(legacy, staged)
+
+
+# ── in-process checks of the import module ───────────────────────────────────
+
+
+@pytest.fixture
+def module_paths(legacy, monkeypatch) -> legacy_import.Paths:
+    """``legacy_import.Paths`` as the helper sets it up, with the fake launchctl and curl."""
+    monkeypatch.setenv("HOME", str(legacy.home))
+    monkeypatch.setenv("PATH", f"{legacy.fakes}:{SYSTEM_PATH}")
+    monkeypatch.setenv("MODEL_GATEWAY_STATE_DIR", str(legacy.app))
+    monkeypatch.setenv("MODEL_GATEWAY_PLIST_DIR", str(legacy.agents))
+    monkeypatch.setenv("MODEL_GATEWAY_LAUNCHD_LABEL", LABEL)
+    return legacy_import.Paths(legacy.root)
+
+
+def _journal(paths: legacy_import.Paths, state: str, **fields) -> legacy_import.Journal:
+    paths.journal.parent.mkdir(parents=True, exist_ok=True)
+    journal = legacy_import.Journal(paths, {
+        "schema_version": legacy_import.SCHEMA_VERSION, "state": state, "home_server_root": str(paths.root),
+        "label": paths.label, "backup_dir": str(paths.backups / "w3-migration-test"), "local_ai": False,
+        "steps": [], "created": [], "moved": [], "rewritten": [], "stopped": [], "removed_plists": [],
+        "consumers": [], **fields})
+    journal.save()
+    return journal
+
+
+@pytest.mark.parametrize("name", [MODEL_ID, "cache", "inference"])
+def test_preflight_refuses_local_ai_on_another_volume(module_paths, monkeypatch, name):
+    assert legacy_import.inspect(module_paths)["model_id"] == MODEL_ID
+    device = legacy_import._device
+    monkeypatch.setattr(legacy_import, "_device", lambda path: device(path) + (path.name == name))
+    with pytest.raises(legacy_import.Refused, match="must be on the same volume"):
+        legacy_import.inspect(module_paths)
+
+
+def test_rollback_records_any_exception_and_keeps_going(module_paths, legacy, monkeypatch):
+    (legacy.fake / "loaded" / LABEL).unlink()
+    _journal(module_paths, "in-progress", stopped=[[LABEL, str(legacy.gateway_plist)]],
+             created=[str(legacy.app / "endpoint.json")])
+    private(legacy.app / "endpoint.json", "{}")
+
+    def broken(_plist, _label):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(legacy_import, "_start", broken)
+    assert legacy_import.rollback(module_paths) == 1
+    journal = json.loads(module_paths.journal.read_text())
+    assert journal["state"] == "rollback-failed"
+    assert journal["errors"] == [f"starting {LABEL}: unexpected"]
+    assert not (legacy.app / "endpoint.json").exists()
+
+
+@pytest.mark.parametrize("state", ["rolling-back", "rollback-failed"])
+def test_an_unfinished_rollback_is_never_resumed_as_an_import(module_paths, state):
+    _journal(module_paths, state)
+    assert legacy_import.preflight(module_paths) == legacy_import.ROLLBACK_PENDING
+    with pytest.raises(legacy_import.ImportFailure, match="did not finish rolling back"):
+        legacy_import._begin(module_paths)
