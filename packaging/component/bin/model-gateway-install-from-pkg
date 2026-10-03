@@ -7,8 +7,17 @@
 #   component-owned, older                  upgrade; roll back on a failed verify
 #   component-owned, same                   verify; reinstall the active release if it is not running
 #   component-owned, newer                  nothing (never downgrades)
-#   legacy Home Server bundled gateway      nothing; the Home Server package migrates it
+#   legacy Home Server bundled gateway      nothing; the Home Server package imports it (below)
 #   any other owner (git, Homebrew, CI)     nothing; products attach to it as it is
+#
+# With --import-legacy-home-server ROOT (run by the Home Server package helper
+# after this package is staged), it imports that Home Server's bundled gateway
+# and local AI into this layout (src/legacy_import.py): preflight, then a
+# journaled prepare, this package's install on the imported state, and a final
+# verification. A failure rolls the import back and restarts the Home Server
+# gateway; an interrupted run resumes. Exit codes: 0 imported or already
+# imported, 1 failed and rolled back (or nothing changed), 2 refused by
+# preflight (nothing changed), 3 failed and the rollback is incomplete.
 #
 # Component-owned means the plist's ModelGatewayComponentRoot is this user's
 # state root and its WorkingDirectory is the version-independent `current`.
@@ -34,12 +43,17 @@ ENDPOINT_FILE="$STATE_ROOT/endpoint.json"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LEGACY_HOME_SERVER_GATEWAY="$HOME/Library/Application Support/HomeServer/runtime/current/model-gateway"
 LOCK_DIR="$STATE_ROOT/.package-install.lock"
+IMPORT_JOURNAL="$STATE_ROOT/state/migration-journal.json"
 PENDING_ROLLBACK="$STATE_ROOT/.pending-rollback"
 HEALTH_BODY='{"status":"ok","service":"model-gateway"}'
 
 say() { printf '%s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+fail_with() { # code message
+  printf 'ERROR: %s\n' "$2" >&2
+  exit "$1"
+}
 
 resolve_python() {
   local candidate
@@ -353,6 +367,7 @@ PY
 run_cli() {
   local extra=()
   [ -z "${CLI_PORT:-}" ] || extra+=("MODEL_GATEWAY_PORT=$CLI_PORT")
+  [ -z "${CLI_CLIENT_KEYS_FILE:-}" ] || extra+=("MODEL_GATEWAY_CLIENT_KEYS_FILE=$CLI_CLIENT_KEYS_FILE")
   /usr/bin/env -i HOME="$HOME" USER="${USER:-}" LOGNAME="${LOGNAME:-}" PATH="$PATH" \
     TMPDIR="${TMPDIR:-/tmp}" MODEL_GATEWAY_LAUNCHD_LABEL="$LABEL" ${extra[@]+"${extra[@]}"} \
     "$CURRENT/bin/model-gateway" "$@"
@@ -540,6 +555,85 @@ do_upgrade() { # installed version
   fail "Model Gateway $VERSION failed to start and the rollback to $previous did not verify; run 'model-gateway logs'"
 }
 
+# ── import of a Home Server bundled gateway ──────────────────────────────────
+
+# One phase of src/legacy_import.py: preflight and rollback with the system
+# Python from the verified payload, prepare and finish with the staged release.
+run_import() { # phase python source
+  local name extra=()
+  for name in MODEL_GATEWAY_MIGRATION_TEST MODEL_GATEWAY_MIGRATION_FAIL_AT MODEL_GATEWAY_MIGRATION_INTERRUPT_AT; do
+    [ -z "${!name:-}" ] || extra+=("$name=${!name}")
+  done
+  (
+    cd "$3"
+    exec /usr/bin/env -i HOME="$HOME" USER="${USER:-}" LOGNAME="${LOGNAME:-}" PATH="$PATH" \
+      TMPDIR="${TMPDIR:-/tmp}" PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$3" \
+      MODEL_GATEWAY_STATE_DIR="$STATE_ROOT" MODEL_GATEWAY_LAUNCHD_LABEL="$LABEL" \
+      MODEL_GATEWAY_PLIST_DIR="$HOME/Library/LaunchAgents" MODEL_GATEWAY_CONFIG="$STATE_ROOT/config.yaml" \
+      MODEL_GATEWAY_MODEL_INFO="$STATE_ROOT/model-info.json" \
+      MODEL_GATEWAY_MODEL_INFO_SOURCE="$STATE_ROOT/model-info.json" \
+      MODEL_GATEWAY_PACKAGE_ROOT="$3" MODEL_GATEWAY_UV_BIN="${UV:-}" ${extra[@]+"${extra[@]}"} \
+      "$2" -m src.legacy_import "$1" --root "$IMPORT_ROOT"
+  )
+}
+
+import_in_progress() {
+  [ -f "$IMPORT_JOURNAL" ] && "$PYTHON3" - "$IMPORT_JOURNAL" <<'PY'
+import json, sys
+try:
+    state = json.load(open(sys.argv[1])).get("state")
+except (OSError, ValueError, AttributeError):
+    state = "unreadable"
+raise SystemExit(0 if state != "completed" and state != "rolled-back" else 1)
+PY
+}
+
+import_rollback() { # reason
+  warn "$1; rolling back the import"
+  if run_import rollback "$PYTHON3" "$GATEWAY_PAYLOAD"; then
+    say "MODEL_GATEWAY_IMPORT=rolled-back"
+    fail_with 1 "the Home Server gateway was not imported; the import was rolled back and the Home Server gateway restored"
+  fi
+  say "MODEL_GATEWAY_IMPORT=rollback-failed"
+  fail_with 3 "the import failed and could not be fully rolled back; see $IMPORT_JOURNAL"
+}
+
+do_import_legacy() {
+  local rc=0 release
+  run_import preflight "$PYTHON3" "$GATEWAY_PAYLOAD" || rc=$?
+  case "$rc" in
+    0) ;;
+    10) say "MODEL_GATEWAY_IMPORT=already-imported"; return 0 ;;
+    2) say "MODEL_GATEWAY_IMPORT=refused"; fail_with 2 "the Home Server gateway was not imported; nothing changed" ;;
+    *) fail "the import preflight failed (exit $rc)" ;;
+  esac
+  UV="$(resolve_uv)" || import_rollback "uv is required to build Model Gateway's Python environment"
+  # A failed build exits its subshell; roll back an import this run resumed.
+  ( stage_release ) || import_rollback "could not stage Model Gateway $VERSION"
+  release="$RELEASES/$RELEASE_NAME"
+  run_import prepare "$release/.venv/bin/python" "$release" || import_rollback "the import did not complete"
+  activate_release "$RELEASE_NAME"
+  CLI_PORT=""
+  CLI_CLIENT_KEYS_FILE=""
+  [ ! -f "$STATE_ROOT/secrets/client.keys" ] || CLI_CLIENT_KEYS_FILE="$STATE_ROOT/secrets/client.keys"
+  { cli_install && verify_install "$VERSION"; } || import_rollback "Model Gateway $VERSION did not start on the imported state"
+  run_import finish "$release/.venv/bin/python" "$release" || import_rollback "the imported gateway did not verify"
+  link_cli
+  prune_releases "$RELEASE_NAME"
+  say "Model Gateway $VERSION imported the Home Server gateway from $IMPORT_ROOT and verified ($RELEASE_NAME)"
+  say "MODEL_GATEWAY_IMPORT=imported"
+}
+
+IMPORT_ROOT=""
+case "${1:-}" in
+  "") [ $# -eq 0 ] || fail_with 2 "usage: model-gateway-install-from-pkg [--import-legacy-home-server ROOT]" ;;
+  --import-legacy-home-server)
+    [ $# -eq 2 ] && [ "${2#/}" != "$2" ] || fail_with 2 "--import-legacy-home-server needs an absolute Home Server root"
+    IMPORT_ROOT="${2%/}"
+    ;;
+  *) fail_with 2 "usage: model-gateway-install-from-pkg [--import-legacy-home-server ROOT]" ;;
+esac
+
 [ "$(id -u)" -ne 0 ] || fail "must run as the target user, not root"
 [ -n "${HOME:-}" ] && [ "${HOME#/}" != "$HOME" ] || fail "HOME must be an absolute path"
 for tool in curl launchctl plutil shasum /usr/libexec/PlistBuddy; do
@@ -549,6 +643,17 @@ PYTHON3="$(resolve_python)" || fail "missing a functional Python 3 interpreter"
 verify_package
 
 say "== Model Gateway package $VERSION ($RELEASE_NAME) for $(id -un) =="
+if [ -n "$IMPORT_ROOT" ]; then
+  ensure_state_root
+  acquire_lock
+  do_import_legacy
+  exit 0
+fi
+if import_in_progress; then
+  say "A Home Server gateway import is recorded in $IMPORT_JOURNAL and has not finished;"
+  say "the Home Server package resumes or rolls it back. Nothing changed."
+  exit 0
+fi
 kind="$(classify)"
 case "$kind" in
   none|component)
