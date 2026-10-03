@@ -679,6 +679,21 @@ def test_an_interrupted_upgrade_is_rolled_back_before_anything_else(machine, sta
     assert json.loads((machine.app / "endpoint.json").read_text())["gateway_version"] == "99.0.0"
 
 
+def test_a_healthy_interrupted_upgrade_is_kept_not_rolled_back(machine, staged, tmp_path):
+    installed(machine, staged)
+    old = machine.current()
+    newer = variant(staged, tmp_path / "newer", "99.0.0")
+    assert machine.run(newer).returncode == 0
+    # As if the helper died after the swap but the new release came up fine.
+    (machine.app / ".pending-rollback").write_text(old.removeprefix("releases/") + "\n")
+    result = machine.run(newer)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "running and verified; keeping it" in result.stdout
+    assert "rolling back" not in result.stderr
+    assert machine.current() == f"releases/{release_name(newer)}"
+    assert not (machine.app / ".pending-rollback").exists()
+
+
 def test_an_upgrade_seeds_a_missing_config_without_an_admin_key(machine, staged, tmp_path):
     installed(machine, staged)
     (machine.app / "config.yaml").unlink()

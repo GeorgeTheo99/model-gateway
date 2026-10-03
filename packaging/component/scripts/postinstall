@@ -12,6 +12,8 @@ umask 077
 # Root runs only system tools: Homebrew and /usr/local are user-writable.
 PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 export PATH
+# Root runs /usr/bin/perl and shasum; never with caller-supplied module paths.
+unset PERL5OPT PERL5LIB PERLLIB
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }

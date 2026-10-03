@@ -70,7 +70,18 @@ def _package_root() -> Path:
     configured = os.environ.get("MODEL_GATEWAY_PACKAGE_ROOT", "").strip()
     if configured and os.path.isabs(configured):
         return Path(configured)
-    return Path(os.path.abspath(__file__)).parents[1]
+    resolved = Path(os.path.abspath(__file__)).parents[1]
+    # The server runs from the resolved release too; a package's .package names
+    # its version-independent ROOT, exactly as the CLI reads it.
+    try:
+        lines = (resolved / ".package").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return resolved
+    for line in lines:
+        key, _, value = line.partition("=")
+        if key.strip() == "ROOT" and os.path.isabs(value.strip()):
+            return Path(value.strip())
+    return resolved
 
 
 PACKAGE_ROOT = _package_root()

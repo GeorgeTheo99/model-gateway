@@ -1239,3 +1239,18 @@ def test_shipped_payload_manifest_and_locked_runtime_match_the_code():
     lock = (lr.RUNTIME_PROJECT / "uv.lock").read_text()
     assert f'name = "omlx"\nversion = "{lr.OMLX_VERSION}"' in lock
     assert 'name = "model-gateway-local-runtime"' in lock
+
+
+def test_package_root_follows_the_package_root_file_when_run_from_a_release(tmp_path, monkeypatch):
+    """The server imports from the resolved release; .package names the stable root."""
+    release = tmp_path / "releases" / "r1"
+    (release / "src").mkdir(parents=True)
+    module = release / "src" / "local_runtime.py"
+    module.write_text("")
+    current = tmp_path / "current"
+    (release / ".package").write_text(f"MANAGER=model-gateway-pkg\nROOT={current}\n")
+    monkeypatch.delenv("MODEL_GATEWAY_PACKAGE_ROOT", raising=False)
+    monkeypatch.setattr(lr, "__file__", str(module))
+    assert lr._package_root() == current
+    (release / ".package").unlink()
+    assert lr._package_root() == release

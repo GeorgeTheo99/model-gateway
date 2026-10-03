@@ -434,6 +434,14 @@ recover_interrupted_upgrade() {
   [[ "$previous" =~ ^[0-9.]+-[0-9a-f]{12}$ ]] && [ -f "$RELEASES/$previous/.complete" ] && \
     [ -x "$RELEASES/$previous/.venv/bin/python" ] || \
     fail "an earlier upgrade did not finish and its rollback target is unusable: ${previous:-unknown}"
+  # The interrupted release may have come up fine (e.g. a reboot before the
+  # helper verified it); rolling back a healthy gateway would be a downgrade.
+  version="$(source_version "$CURRENT")"
+  if [ -n "$version" ] && verify_install "$version" >/dev/null 2>&1; then
+    rm -f "$PENDING_ROLLBACK"
+    say "The interrupted upgrade to Model Gateway $version is running and verified; keeping it"
+    return 0
+  fi
   version="$(source_version "$RELEASES/$previous")"
   warn "an earlier upgrade did not finish; rolling back to $version ($previous) first"
   activate_release "$previous"
