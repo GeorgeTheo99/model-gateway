@@ -1,7 +1,9 @@
 #!/bin/bash
 # Verify a Model Gateway component package (or a product archive holding only it)
 # without executing anything from the package: the payload is checked with this
-# checkout's postinstall, which must be byte-identical to the package's.
+# checkout's postinstall, which must be byte-identical to the package's. Verify a
+# package with the verifier from the revision it was built from
+# (build-component-pkg.sh does this for --ref itself).
 
 set -euo pipefail
 umask 077
@@ -34,12 +36,13 @@ SUPPORT="$COMPONENT/Payload/Library/Application Support/ModelGateway"
 RELEASE_PLIST="$SUPPORT/package/release.plist"
 [ -f "$RELEASE_PLIST" ] || fail "package has no release metadata"
 VERSION="$(plutil -extract package_version raw -o - "$RELEASE_PLIST")"
+POSTINSTALL_TIMEOUT="$(plutil -extract postinstall_timeout raw -o - "$RELEASE_PLIST")"
 
-python3 - "$COMPONENT/PackageInfo" "$IDENTIFIER" "$VERSION" <<'PY'
+python3 - "$COMPONENT/PackageInfo" "$IDENTIFIER" "$VERSION" "$POSTINSTALL_TIMEOUT" <<'PY'
 import sys
 import xml.etree.ElementTree as ET
 
-path, identifier, version = sys.argv[1:]
+path, identifier, version, timeout = sys.argv[1:]
 info = ET.parse(path).getroot()
 if info.get("identifier") != identifier:
     raise SystemExit(f"package identifier is {info.get('identifier')!r}, not {identifier!r}")
@@ -47,8 +50,15 @@ if info.get("version") != version:
     raise SystemExit("package version differs from its release metadata")
 if info.get("install-location", "/") != "/":
     raise SystemExit("package must install at /")
-if info.find("./scripts/postinstall") is None or info.find("./scripts/preinstall") is not None:
+if info.get("auth") != "root":
+    raise SystemExit("package must install with root authorization")
+if info.get("relocatable") != "false":
+    raise SystemExit("package must not be relocatable")
+postinstall = info.find("./scripts/postinstall")
+if postinstall is None or info.find("./scripts/preinstall") is not None:
     raise SystemExit("package scripts must be exactly a postinstall")
+if postinstall.get("timeout") != timeout:
+    raise SystemExit("package postinstall timeout differs from its release metadata")
 PY
 [ "$(cd "$COMPONENT/Payload" && find . -mindepth 1 -maxdepth 3 -print | LC_ALL=C sort)" = \
   "$(printf '%s\n' ./Library './Library/Application Support' './Library/Application Support/ModelGateway')" ] \

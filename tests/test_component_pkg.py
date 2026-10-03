@@ -178,7 +178,7 @@ done
 work="$(mktemp -d)"
 cp -R "$root" "$work/Payload"
 cp -R "$scripts" "$work/Scripts"
-printf '<?xml version="1.0"?>\\n<pkg-info identifier="%s" version="%s" install-location="/"><scripts><postinstall file="./postinstall"/></scripts></pkg-info>\\n' \\
+printf '<?xml version="1.0"?>\\n<pkg-info relocatable="false" identifier="%s" version="%s" install-location="/" auth="root"><scripts><postinstall file="./postinstall" timeout="600"/></scripts></pkg-info>\\n' \\
   "$identifier" "$version" > "$work/PackageInfo"
 tar -cf "$1" -C "$work" .
 """
@@ -227,7 +227,31 @@ def test_build_and_verify_a_component_package_with_fake_pkgbuild(tmp_path):
     subprocess.run([str(fakes / "pkgutil"), "--flatten", str(expanded), str(tampered)], check=True)
     refused = subprocess.run([str(verifier), str(tampered)], capture_output=True, text=True, env=env)
     assert refused.returncode != 0 and "verification failed" in refused.stderr
+    gateway_main.write_text(gateway_main.read_text().removesuffix("# tampered\n"))
+    # PackageInfo must keep root authorization, no relocation, and the release's postinstall timeout.
+    info = (expanded / "PackageInfo").read_text()
+    for old, new, message in (('auth="root"', 'auth="none"', "root authorization"),
+                              ('relocatable="false"', 'relocatable="true"', "relocatable"),
+                              ('timeout="1560"', 'timeout="600"', "postinstall timeout")):
+        (expanded / "PackageInfo").write_text(info.replace(old, new))
+        subprocess.run([str(fakes / "pkgutil"), "--flatten", str(expanded), str(tampered)], check=True)
+        refused = subprocess.run([str(verifier), str(tampered)], capture_output=True, text=True, env=env)
+        assert refused.returncode != 0 and message in refused.stderr, refused.stderr
     assert build(repo, out, "--version", VERSION, path=f"{fakes}:{SYSTEM_PATH}").returncode != 0  # never overwrites
+
+
+def test_a_ref_build_is_verified_with_that_refs_postinstall(tmp_path):
+    repo = make_repo(tmp_path / "repo")
+    fakes = tmp_path / "fakes"
+    write_fake(fakes, "pkgbuild", FAKE_PKGBUILD)
+    write_fake(fakes, "pkgutil", FAKE_PKGUTIL)
+    release = _git(repo, "rev-parse", "HEAD")
+    postinstall = repo / "packaging/component/scripts/postinstall"
+    postinstall.write_text(postinstall.read_text() + "# a later change\n")
+    _git(repo, "commit", "-qam", "later")
+    result = build(repo, tmp_path / "out", "--version", VERSION, "--ref", release, path=f"{fakes}:{SYSTEM_PATH}")
+    assert result.returncode == 0, result.stderr
+    assert release in result.stdout
 
 
 # ── postinstall payload verification ─────────────────────────────────────────
@@ -319,6 +343,87 @@ def test_postinstall_and_helper_share_the_payload_contract():
     assert "/usr/bin/env -i" in postinstall
 
 
+def test_postinstall_runs_only_system_tools_as_root():
+    postinstall = (COMPONENT / "scripts/postinstall").read_text()
+    assert 'PATH="/usr/bin:/bin:/usr/sbin:/sbin"\nexport PATH' in postinstall
+    assert "python" not in postinstall.lower()
+    assert "/usr/bin/perl -MPOSIX -e 'POSIX::setsid() or die" in postinstall
+    # Homebrew and ~/.local/bin appear only in the PATH handed to the user helper.
+    homebrew = [line.strip() for line in postinstall.splitlines() if "/opt/homebrew" in line or ".local/bin" in line]
+    assert homebrew == ['PATH="/opt/homebrew/bin:/usr/local/bin:$user_home/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \\']
+
+
+# ── stale payload cleanup (root postinstall only) ────────────────────────────
+
+
+def run_cleanup(support: Path, owner_uid: int | None = None) -> subprocess.CompletedProcess:
+    """The postinstall's exact cleanup function; owner_uid stands in for root in this sandbox."""
+    text = (COMPONENT / "scripts/postinstall").read_text()
+    function = text[text.index("# BEGIN stale payload cleanup"):text.index("# END stale payload cleanup")]
+    if owner_uid is not None:
+        assert function.count('[ "$metadata" = "0 1" ]') == 1
+        function = function.replace('[ "$metadata" = "0 1" ]', f'[ "$metadata" = "{owner_uid} 1" ]')
+    script = ('set -euo pipefail\nlog() { printf "%s\\n" "$*"; }\n'
+              'die() { printf "ERROR: %s\\n" "$*" >&2; exit 1; }\n' + function + 'remove_stale_payload_files "$1"\n')
+    return subprocess.run(["/bin/bash", "-c", script, "cleanup", str(support)], capture_output=True, text=True,
+                          env={"PATH": SYSTEM_PATH})
+
+
+def overlaid(staged: Path, destination: Path) -> Path:
+    """This package's payload installed over an older one with since-removed files, as Installer leaves it."""
+    old = destination / "old"
+    shutil.copytree(staged / SUPPORT, old)
+    (old / "package/gateway/src/retired.py").write_text("x = 1\n")
+    (old / "package/gateway/src/legacy").mkdir()
+    (old / "package/gateway/src/legacy/old.py").write_text("x = 2\n")
+    rebind(old)
+    support = destination / "ModelGateway"
+    shutil.copytree(old, support)
+    shutil.copytree(staged / SUPPORT, support, dirs_exist_ok=True)
+    return support
+
+
+def test_postinstall_removes_files_an_older_package_left_behind(staged, tmp_path):
+    support = overlaid(staged, tmp_path)
+    assert verify_payload(staged, support).returncode != 0
+    result = run_cleanup(support, os.getuid())
+    assert result.returncode == 0, result.stderr
+    assert "Removed stale package file package/gateway/src/retired.py" in result.stdout
+    assert not (support / "package/gateway/src/retired.py").exists()
+    assert not (support / "package/gateway/src/legacy").exists()
+    assert verify_payload(staged, support).returncode == 0
+    assert run_cleanup(support, os.getuid()).stdout == ""  # idempotent
+
+
+@pytest.mark.parametrize("unsafe", ["not-root", "hard-link", "symlink", "unbound-manifest"])
+def test_postinstall_refuses_to_remove_unsafe_stale_files(staged, tmp_path, unsafe):
+    support = overlaid(staged, tmp_path)
+    stray = support / "package/gateway/src/retired.py"
+    owner = os.getuid()
+    if unsafe == "not-root":
+        owner = None  # the production check: these test files are not root's
+    elif unsafe == "hard-link":
+        os.link(stray, tmp_path / "elsewhere.py")
+    elif unsafe == "symlink":
+        (support / "package/gateway/src/link.py").symlink_to(tmp_path / "elsewhere.py")
+    else:
+        with (support / "manifest.sha256").open("a") as manifest:
+            manifest.write(f"{sha256(stray)}  ./package/gateway/src/retired.py\n")
+    result = run_cleanup(support, owner)
+    assert result.returncode != 0 and "ERROR:" in result.stderr
+    assert stray.exists()
+
+
+def test_only_the_root_install_path_cleans_before_verifying():
+    postinstall = (COMPONENT / "scripts/postinstall").read_text()
+    verify_only = postinstall.index('if [ "${1:-}" = "--verify-payload" ]')
+    root_only = postinstall.index('[ "$(id -u)" -eq 0 ] || fail "postinstall must run as root"')
+    cleanup = postinstall.index('\nremove_stale_payload_files "$SUPPORT_DIR"\n')
+    verify = postinstall.index('\nverify_payload "$SUPPORT_DIR" 2>>"$LOG_FILE"')
+    assert verify_only < root_only < cleanup < verify
+    assert postinstall.count("remove_stale_payload_files") == 2  # the definition and the root call
+
+
 # ── per-user helper ──────────────────────────────────────────────────────────
 
 
@@ -327,8 +432,25 @@ FAKE_LAUNCHCTL = """#!/bin/bash
 state="$HOME/.fake"
 mkdir -p "$state/loaded"
 printf '%s\\n' "$*" >> "$state/launchctl.log"
+# Like a reboot or an Installer timeout: kill everything up to and including the package helper.
+interrupt() {
+  local pid=$PPID chain=()
+  while [ "$pid" -gt 1 ]; do
+    chain+=("$pid")
+    case "$(ps -o command= -p "$pid")" in
+      *model-gateway-install-from-pkg*) kill -KILL "${chain[@]}"; exit 1 ;;
+    esac
+    pid="$(ps -o ppid= -p "$pid" | tr -d ' ')"
+  done
+  echo "fake launchctl: no package helper to interrupt" >&2
+  exit 1
+}
 start() {
   local plist="$1" label
+  if [ -e "$state/interrupt" ]; then
+    rm -f "$state/interrupt"
+    interrupt
+  fi
   label="$(basename "$plist" .plist)"
   touch "$state/loaded/$label"
   "$FAKE_PYTHON" - "$plist" <<'PY'
@@ -368,7 +490,7 @@ printf '%s' '{"status":"ok","service":"model-gateway"}'
 
 FAKE_UV = """#!/bin/bash
 # Fake uv: a venv whose python is this test run's interpreter.
-printf '%s\\n' "$*" >> "$HOME/.fake/uv.log"
+printf 'UV_PYTHON_PREFERENCE=%s %s\\n' "${UV_PYTHON_PREFERENCE:-}" "$*" >> "$HOME/.fake/uv.log"
 [ ! -e "$HOME/.fake/uv-fail" ] || exit 1
 [ "$1" = sync ] || exit 2
 mkdir -p "$UV_PROJECT_ENVIRONMENT/bin"
@@ -451,14 +573,70 @@ def test_fresh_install_creates_a_component_owned_gateway(machine, staged):
     assert any(call.startswith("bootstrap ") for call in machine.launchctl_calls())
     sync = (machine.state / "uv.log").read_text()
     assert "sync --project" in sync and "--frozen --no-dev --no-install-project" in sync
+    assert sync.startswith("UV_PYTHON_PREFERENCE=only-managed ")
 
 
 def test_rerunning_the_same_package_is_a_no_op(machine, staged):
     installed(machine, staged)
     calls, plist = machine.launchctl_calls(), machine.plist.read_bytes()
     again = installed(machine, staged)
-    assert "already installed" in again.stdout
+    assert "already installed and running" in again.stdout
     assert machine.launchctl_calls() == calls and machine.plist.read_bytes() == plist
+
+
+def test_an_interrupted_install_is_repaired_by_the_next_run(machine, staged):
+    (machine.state / "interrupt").touch()
+    interrupted = machine.run(staged / SUPPORT)
+    assert interrupted.returncode != 0
+    assert machine.plist.exists() and not (machine.state / "loaded" / LABEL).exists()
+    result = installed(machine, staged)
+    assert "did not verify; reinstalling" in result.stderr and f"Model Gateway {VERSION} repaired" in result.stdout
+    assert (machine.state / "loaded" / LABEL).exists()
+    assert json.loads((machine.app / "endpoint.json").read_text())["gateway_version"] == VERSION
+
+
+def test_a_same_version_install_that_cannot_start_fails(machine, staged):
+    installed(machine, staged)
+    (machine.state / "loaded" / LABEL).unlink()
+    (machine.state / "fail-version").write_text(VERSION)
+    result = machine.run(staged / SUPPORT)
+    assert result.returncode != 0 and "did not verify after reinstalling" in result.stderr
+
+
+def test_a_different_build_of_the_same_version_is_reported_and_kept(machine, staged, tmp_path):
+    installed(machine, staged)
+    current = machine.current()
+    other = tmp_path / "other" / "ModelGateway"
+    shutil.copytree(staged / SUPPORT, other)
+    rebind(other, source_commit="f" * 40, release_name=f"{VERSION}-{'f' * 12}")
+    result = machine.run(other)
+    assert result.returncode == 0, result.stderr
+    assert f"installed from a different build ({current.removeprefix('releases/')})" in result.stdout
+    assert f"this package's build is {VERSION}-{'f' * 12}" in result.stdout
+    assert machine.current() == current
+
+
+def test_versions_compare_with_missing_parts_as_zero(machine, staged, tmp_path):
+    installed(machine, staged)
+    current, calls = machine.current(), machine.launchctl_calls()
+    parts = VERSION.split(".")
+    alias = ".".join(parts[:-1]) if parts[-1] == "0" else f"{VERSION}.0"
+    result = machine.run(variant(staged, tmp_path / "alias", alias))
+    assert result.returncode == 0, result.stderr
+    assert "already installed and running" in result.stdout and "downgrade" not in result.stdout
+    assert machine.current() == current and machine.launchctl_calls() == calls
+
+
+def test_an_install_env_the_cli_would_not_trust_is_ignored(machine, staged):
+    installed(machine, staged)
+    install_env = machine.app / "install.env"
+    port = plistlib.loads(machine.plist.read_bytes())["EnvironmentVariables"]["MODEL_GATEWAY_PORT"]
+    install_env.write_text(install_env.read_text().replace(f"MODEL_GATEWAY_PORT={port}", "MODEL_GATEWAY_PORT=1"))
+    install_env.chmod(0o644)
+    result = installed(machine, staged)
+    assert "install.env has no gateway port" in result.stderr and "repaired" in result.stdout
+    assert f"MODEL_GATEWAY_PORT={port}" in install_env.read_text()
+    assert install_env.stat().st_mode & 0o777 == 0o600
 
 
 def test_first_install_honors_an_explicit_port(machine, staged):
@@ -483,6 +661,33 @@ def test_upgrade_swaps_current_restarts_and_keeps_the_previous_release(machine, 
     assert plistlib.loads(machine.plist.read_bytes())["ModelGatewayComponentRoot"] == str(machine.app)
 
 
+def test_an_interrupted_upgrade_is_rolled_back_before_anything_else(machine, staged, tmp_path):
+    installed(machine, staged)
+    old = machine.current()
+    newer = variant(staged, tmp_path / "newer", "99.0.0")
+    (machine.state / "interrupt").touch()
+    interrupted = machine.run(newer)
+    assert interrupted.returncode != 0
+    assert machine.current() == f"releases/{release_name(newer)}"
+    assert (machine.app / ".pending-rollback").read_text() == old.removeprefix("releases/") + "\n"
+    result = machine.run(newer)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"an earlier upgrade did not finish; rolling back to {VERSION}" in result.stderr
+    assert result.stdout.index(f"Rolled back to Model Gateway {VERSION}") < result.stdout.index("Upgrading")
+    assert "upgraded to 99.0.0" in result.stdout
+    assert not (machine.app / ".pending-rollback").exists()
+    assert json.loads((machine.app / "endpoint.json").read_text())["gateway_version"] == "99.0.0"
+
+
+def test_an_upgrade_seeds_a_missing_config_without_an_admin_key(machine, staged, tmp_path):
+    installed(machine, staged)
+    (machine.app / "config.yaml").unlink()
+    result = machine.run(variant(staged, tmp_path / "newer", "99.0.0"))
+    assert result.returncode == 0, result.stdout + result.stderr
+    config = yaml.safe_load((machine.app / "config.yaml").read_text())
+    assert config["auth"] == {"client_keys": []}
+
+
 def test_failed_upgrade_rolls_back_to_the_previous_release(machine, staged, tmp_path):
     installed(machine, staged)
     old = machine.current()
@@ -491,7 +696,7 @@ def test_failed_upgrade_rolls_back_to_the_previous_release(machine, staged, tmp_
     result = machine.run(newer)
     assert result.returncode != 0
     assert f"rolled back to {VERSION}" in result.stderr
-    assert machine.current() == old
+    assert machine.current() == old and not (machine.app / ".pending-rollback").exists()
     assert json.loads((machine.app / "endpoint.json").read_text())["gateway_version"] == VERSION
     assert (machine.state / "loaded" / LABEL).exists()
 
@@ -514,6 +719,17 @@ def test_a_newer_component_install_is_never_downgraded(machine, staged, tmp_path
     result = installed(machine, staged)
     assert "refusing to downgrade" in result.stdout
     assert machine.current() == current and machine.launchctl_calls() == calls
+
+
+def test_an_orphaned_current_on_a_newer_release_is_never_downgraded(machine, staged, tmp_path):
+    newer = variant(staged, tmp_path / "newer", "99.0.0")
+    assert machine.run(newer).returncode == 0
+    machine.plist.unlink()
+    (machine.state / "loaded" / LABEL).unlink()
+    current = machine.current()
+    result = machine.run(staged / SUPPORT)
+    assert result.returncode != 0 and "refusing to downgrade" in result.stderr
+    assert machine.current() == current and not machine.plist.exists()
 
 
 def foreign_plist(machine: Machine, working_directory: Path | str, **extra) -> bytes:
@@ -548,6 +764,45 @@ def test_a_foreign_gateway_is_attach_only_and_never_modified(machine, staged, ow
     assert machine.launchctl_calls() == [] and not machine.app.exists()
     if owner == "a git checkout":
         assert "version:           0.2.1" in result.stdout
+
+
+def test_the_production_git_gateway_is_never_modified(machine, staged):
+    # The shape of this machine's server-ci-era LaunchAgent: no package or Home Server markers.
+    checkout = machine.home / "srv/model-gateway/current"
+    (checkout / ".git").mkdir(parents=True)
+    (checkout / "src").mkdir()
+    (checkout / "src/version.py").write_text('VERSION = "0.4.0"\n')
+    support = machine.home / "Library/Application Support/HomeServer"
+    shared = machine.home / "srv/model-gateway/shared"
+    machine.plist.parent.mkdir(parents=True)
+    raw = plistlib.dumps({
+        "Label": LABEL,
+        "ProgramArguments": [str(machine.home / ".local/bin/uv"), "run", "python", "-m", "src.main"],
+        "WorkingDirectory": str(checkout),
+        "EnvironmentVariables": {
+            "GATEWAY_VISION_FALLBACK_CLOUD": "", "GATEWAY_VISION_FALLBACK_LOCAL": "",
+            "GATEWAY_VISION_FALLBACK_MODE": "auto", "MODEL_GATEWAY_ADMIN_WRITES": "true",
+            "MODEL_GATEWAY_BACKUP_DIR": str(shared / "backups"),
+            "MODEL_GATEWAY_CLIENT_KEYS_FILE": str(shared / "client-keys"),
+            "MODEL_GATEWAY_CONFIG": str(shared / "config.yaml"),
+            "MODEL_GATEWAY_LEGACY_BACKUP_DIRS": str(support / "logs/config-backups"),
+            "MODEL_GATEWAY_LOG_DIR": str(support / "logs"),
+            "MODEL_GATEWAY_MODEL_INFO": str(shared / "model-info.json"),
+            "MODEL_GATEWAY_MODEL_INFO_SOURCE": str(shared / "model-info.json")},
+        "StandardOutPath": str(support / "logs/model-gateway.log"),
+        "StandardErrorPath": str(support / "logs/model-gateway.log"),
+        "Umask": 63, "KeepAlive": True, "RunAtLoad": True, "ThrottleInterval": 5})
+    machine.plist.write_bytes(raw)
+    machine.plist.chmod(0o600)
+    (machine.state / "loaded").mkdir()
+    (machine.state / "loaded" / LABEL).touch()
+    result = installed(machine, staged)
+    assert "owned by a git checkout" in result.stdout and "Attach-only" in result.stdout
+    assert "version:           0.4.0" in result.stdout
+    assert machine.plist.read_bytes() == raw and machine.plist.stat().st_mode & 0o777 == 0o600
+    assert machine.launchctl_calls() == [] and not machine.app.exists()
+    assert (machine.state / "loaded" / LABEL).exists()
+    assert sorted(path.name for path in checkout.iterdir()) == [".git", "src"]
 
 
 def test_a_legacy_home_server_gateway_is_left_for_the_home_server_package(machine, staged):

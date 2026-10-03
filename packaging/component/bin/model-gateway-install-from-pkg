@@ -5,14 +5,17 @@
 #
 #   none                                    install a release, start, verify
 #   component-owned, older                  upgrade; roll back on a failed verify
-#   component-owned, same or newer          nothing (never downgrades)
+#   component-owned, same                   verify; reinstall the active release if it is not running
+#   component-owned, newer                  nothing (never downgrades)
 #   legacy Home Server bundled gateway      nothing; the Home Server package migrates it
 #   any other owner (git, Homebrew, CI)     nothing; products attach to it as it is
 #
 # Component-owned means the plist's ModelGatewayComponentRoot is this user's
 # state root and its WorkingDirectory is the version-independent `current`.
 # Releases live in <state root>/releases/<version>-<commit>, each with its own
-# locked venv; `current` is swapped atomically. Re-running is safe.
+# locked venv; `current` is swapped atomically. Re-running is safe: an upgrade
+# records its rollback target in .pending-rollback until it verifies, and a
+# later run that finds the record rolls back before doing anything else.
 
 set -euo pipefail
 umask 077
@@ -31,6 +34,7 @@ ENDPOINT_FILE="$STATE_ROOT/endpoint.json"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LEGACY_HOME_SERVER_GATEWAY="$HOME/Library/Application Support/HomeServer/runtime/current/model-gateway"
 LOCK_DIR="$STATE_ROOT/.package-install.lock"
+PENDING_ROLLBACK="$STATE_ROOT/.pending-rollback"
 HEALTH_BODY='{"status":"ok","service":"model-gateway"}'
 
 say() { printf '%s\n' "$*"; }
@@ -73,10 +77,17 @@ source_version() { # release dir
   sed -n 's/^VERSION = "\(.*\)"$/\1/p' "$1/src/version.py" 2>/dev/null || true
 }
 
-version_cmp() { # a b → -1, 0, or 1
-  "$PYTHON3" -c 'import sys
-a, b = (tuple(int(p) for p in v.split(".")) for v in sys.argv[1:])
-print((a > b) - (a < b))' "$1" "$2"
+version_cmp() { # a b → -1, 0, or 1; missing parts are 0, so 0.4 == 0.4.0
+  local i x y a b
+  IFS=. read -ra a <<<"$1"
+  IFS=. read -ra b <<<"$2"
+  for ((i = 0; i < 4; i++)); do
+    x=$((10#${a[i]:-0}))
+    y=$((10#${b[i]:-0}))
+    if [ "$x" -lt "$y" ]; then printf '%s\n' -1; return 0; fi
+    if [ "$x" -gt "$y" ]; then printf '%s\n' 1; return 0; fi
+  done
+  printf '%s\n' 0
 }
 
 # The same checks as the root postinstall: every staged file is in the
@@ -245,7 +256,7 @@ UPGRADE=install the newer Model Gateway package
 EOF
   chmod 600 "$dir/.package"
   say "Building the Python environment with $UV"
-  UV_PROJECT_ENVIRONMENT="$dir/.venv" UV_NO_CONFIG=1 \
+  UV_PROJECT_ENVIRONMENT="$dir/.venv" UV_NO_CONFIG=1 UV_PYTHON_PREFERENCE=only-managed \
     "$UV" sync --project "$dir" --frozen --no-dev --no-install-project \
     || fail "could not build the Python environment for $RELEASE_NAME"
   [ -x "$dir/.venv/bin/python" ] || fail "the Python environment for $RELEASE_NAME has no python"
@@ -289,8 +300,10 @@ EOF
   say "Created $config (no admin key)"
 }
 
+# As the gateway CLI reads it: only a private, single-link install.env of this user.
 installed_port() {
   [ -f "$INSTALL_ENV" ] && [ ! -L "$INSTALL_ENV" ] || return 0
+  [ "$(stat -f '%u %l %Lp' "$INSTALL_ENV")" = "$(id -u) 1 600" ] || return 0
   awk -F= '$1 == "MODEL_GATEWAY_PORT" {print $2; exit}' "$INSTALL_ENV"
 }
 
@@ -404,12 +417,46 @@ prune_releases() { # keep...
   done
 }
 
-do_install() {
-  local port
-  ensure_state_root
-  acquire_lock
-  stage_release
+# Install the active release's LaunchAgent. The package seeds the config first,
+# so the CLI never generates an admin key.
+cli_install() {
   seed_config
+  run_cli install
+}
+
+# An upgrade that was interrupted before it verified (Installer timeout, reboot,
+# kill) left `current` on an unverified release: restore the recorded one first.
+recover_interrupted_upgrade() {
+  local previous version
+  [ -e "$PENDING_ROLLBACK" ] || [ -L "$PENDING_ROLLBACK" ] || return 0
+  [ -f "$PENDING_ROLLBACK" ] && [ ! -L "$PENDING_ROLLBACK" ] || fail "rollback record is not a regular file: $PENDING_ROLLBACK"
+  previous="$(head -n 1 "$PENDING_ROLLBACK")"
+  [[ "$previous" =~ ^[0-9.]+-[0-9a-f]{12}$ ]] && [ -f "$RELEASES/$previous/.complete" ] && \
+    [ -x "$RELEASES/$previous/.venv/bin/python" ] || \
+    fail "an earlier upgrade did not finish and its rollback target is unusable: ${previous:-unknown}"
+  version="$(source_version "$RELEASES/$previous")"
+  warn "an earlier upgrade did not finish; rolling back to $version ($previous) first"
+  activate_release "$previous"
+  CLI_PORT=""
+  if cli_install && verify_install "$version"; then
+    rm -f "$PENDING_ROLLBACK"
+    say "Rolled back to Model Gateway $version ($previous)"
+    return 0
+  fi
+  fail "the rollback to $previous did not verify; run 'model-gateway logs'"
+}
+
+do_install() {
+  local port orphan orphan_version
+  # `current` without a LaunchAgent: never replace a newer release with this one.
+  orphan="$(readlink "$CURRENT" 2>/dev/null || true)"
+  if [[ "$orphan" =~ ^releases/[0-9.]+-[0-9a-f]{12}$ ]]; then
+    orphan_version="$(source_version "$STATE_ROOT/$orphan")"
+    if [[ "$orphan_version" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]] && [ "$(version_cmp "$orphan_version" "$VERSION")" = 1 ]; then
+      fail "$CURRENT points at Model Gateway $orphan_version ($orphan), newer than this package ($VERSION), but $PLIST is missing; refusing to downgrade. Run '$CURRENT/bin/model-gateway install' to restore it."
+    fi
+  fi
+  stage_release
   CLI_PORT=""
   if [ -z "$(installed_port)" ]; then
     port="$(choose_port)"
@@ -417,7 +464,7 @@ do_install() {
     say "Model Gateway port: $port"
   fi
   activate_release "$RELEASE_NAME"
-  if run_cli install && verify_install "$VERSION"; then
+  if cli_install && verify_install "$VERSION"; then
     link_cli
     prune_releases "$RELEASE_NAME"
     say "Model Gateway $VERSION installed and verified ($RELEASE_NAME)"
@@ -429,19 +476,42 @@ do_install() {
   fail "Model Gateway $VERSION failed to install; see the log above"
 }
 
+# The same version: report a different build, and reinstall the active release
+# if an earlier run was interrupted before the gateway verified.
+do_verify_same() { # installed version
+  local active
+  active="$(readlink "$CURRENT")"
+  if [ "$active" != "releases/$RELEASE_NAME" ]; then
+    say "Model Gateway $1 is installed from a different build (${active#releases/}); this package's build is $RELEASE_NAME. Keeping the installed build."
+  fi
+  if verify_install "$1"; then
+    say "Model Gateway $1 is already installed and running ($active); nothing to do"
+    return 0
+  fi
+  warn "Model Gateway $1 ($active) is installed but did not verify; reinstalling its LaunchAgent"
+  CLI_PORT=""
+  if cli_install && verify_install "$1"; then
+    link_cli
+    say "Model Gateway $1 repaired and verified ($active)"
+    return 0
+  fi
+  fail "Model Gateway $1 ($active) did not verify after reinstalling; run 'model-gateway logs'"
+}
+
 do_upgrade() { # installed version
   local previous
-  ensure_state_root
-  acquire_lock
   previous="$(readlink "$CURRENT")"
   previous="${previous#releases/}"
   [[ "$previous" =~ ^[0-9.]+-[0-9a-f]{12}$ ]] && [ -d "$RELEASES/$previous" ] \
     || fail "cannot upgrade: $CURRENT does not point at a release"
   stage_release
   CLI_PORT=""
+  printf '%s\n' "$previous" > "$PENDING_ROLLBACK.tmp.$$"
+  mv -f "$PENDING_ROLLBACK.tmp.$$" "$PENDING_ROLLBACK"
   activate_release "$RELEASE_NAME"
   say "Upgrading Model Gateway $1 → $VERSION"
-  if run_cli install && verify_install "$VERSION"; then
+  if cli_install && verify_install "$VERSION"; then
+    rm -f "$PENDING_ROLLBACK"
     link_cli
     prune_releases "$RELEASE_NAME" "$previous"
     say "Model Gateway upgraded to $VERSION and verified ($RELEASE_NAME)"
@@ -449,9 +519,11 @@ do_upgrade() { # installed version
   fi
   warn "upgrade did not verify; rolling back to $previous"
   activate_release "$previous"
-  if run_cli install && verify_install "$1"; then
+  if cli_install && verify_install "$1"; then
+    rm -f "$PENDING_ROLLBACK"
     fail "Model Gateway $VERSION failed to start; rolled back to $1 ($previous)"
   fi
+  # The record stays, so the next run retries the rollback before anything else.
   fail "Model Gateway $VERSION failed to start and the rollback to $previous did not verify; run 'model-gateway logs'"
 }
 
@@ -464,7 +536,16 @@ PYTHON3="$(resolve_python)" || fail "missing a functional Python 3 interpreter"
 verify_package
 
 say "== Model Gateway package $VERSION ($RELEASE_NAME) for $(id -un) =="
-case "$(classify)" in
+kind="$(classify)"
+case "$kind" in
+  none|component)
+    ensure_state_root
+    acquire_lock
+    recover_interrupted_upgrade
+    kind="$(classify)"
+    ;;
+esac
+case "$kind" in
   none)
     UV="$(resolve_uv)" || fail "uv is required to build Model Gateway's Python environment; install it (brew install uv) and re-run the installer"
     do_install
@@ -477,7 +558,7 @@ case "$(classify)" in
         UV="$(resolve_uv)" || fail "uv is required to build Model Gateway's Python environment; install it (brew install uv) and re-run the installer"
         do_upgrade "$installed"
         ;;
-      0) say "Model Gateway $installed is already installed ($(readlink "$CURRENT")); nothing to do" ;;
+      0) do_verify_same "$installed" ;;
       1) say "Model Gateway $installed is newer than this package ($VERSION); refusing to downgrade, nothing changed" ;;
     esac
     ;;

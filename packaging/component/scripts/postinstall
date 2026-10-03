@@ -9,7 +9,8 @@
 set -euo pipefail
 umask 077
 
-PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# Root runs only system tools: Homebrew and /usr/local are user-writable.
+PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 export PATH
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -97,20 +98,38 @@ fi
 log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | /usr/bin/tee -a "$LOG_FILE"; }
 die() { log "ERROR: $*"; exit 1; }
 
-resolve_python() {
-  local candidate
-  for candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
-    [ -x "$candidate" ] || continue
-    if "$candidate" -c 'import os,sys' >/dev/null 2>&1; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
+# BEGIN stale payload cleanup
+# Installer adds and replaces payload files but never removes ones an older
+# package version had. Delete every file under ./bin and ./package/gateway that
+# this package's manifest (bound by release.plist) does not list, but only
+# root-owned, single-link regular files; anything else is refused.
+remove_stale_payload_files() {
+  local dir="$1" path file metadata
+  for path in "$dir" "$dir/bin" "$dir/package" "$dir/package/gateway"; do
+    [ -d "$path" ] && [ ! -L "$path" ] || die "refusing unsafe package directory: $path"
   done
-  return 1
+  for path in "$dir/manifest.sha256" "$dir/package/release.plist"; do
+    [ -f "$path" ] && [ ! -L "$path" ] || die "package manifest or release metadata is missing or unsafe: $path"
+  done
+  [ "$(shasum -a 256 "$dir/manifest.sha256" | awk '{print $1}')" = \
+    "$(plutil -extract manifest_sha256 raw -o - "$dir/package/release.plist")" ] || die "package manifest checksum mismatch"
+  [ -z "$(find "$dir/bin" "$dir/package/gateway" ! -type f ! -type d -print -quit)" ] || \
+    die "refusing package payload with a symlink or special file"
+  while IFS= read -r path; do
+    file="$dir/${path#./}"
+    [ -f "$file" ] && [ ! -L "$file" ] || die "refusing unsafe stale package file: $file"
+    metadata="$(stat -f '%u %l' "$file")"
+    [ "$metadata" = "0 1" ] || die "refusing stale package file with unsafe owner or hard links: $file"
+    rm -f "$file"
+    log "Removed stale package file ${path#./}"
+  done < <(cd "$dir" && LC_ALL=C comm -23 <(find ./bin ./package/gateway -type f -print | LC_ALL=C sort) \
+    <(cut -c 67- manifest.sha256 | LC_ALL=C sort))
+  find "$dir/package/gateway" -mindepth 1 -depth -type d -empty -delete
 }
+# END stale payload cleanup
 
+remove_stale_payload_files "$SUPPORT_DIR"
 verify_payload "$SUPPORT_DIR" 2>>"$LOG_FILE" || die "package payload verification failed"
-PYTHON3="$(resolve_python)" || die "missing a functional Python 3 interpreter"
 TIMEOUT_SECONDS="${TIMEOUT_OVERRIDE:-$(plutil -extract helper_timeout raw -o - "$RELEASE_PLIST")}"
 installer_timeout="$(plutil -extract postinstall_timeout raw -o - "$RELEASE_PLIST")"
 case "$TIMEOUT_SECONDS" in *[!0-9]*|'') die "invalid package helper timeout" ;; esac
@@ -152,7 +171,7 @@ actual_home="$(/usr/bin/dscl . -read "/Users/$target_user" NFSHomeDirectory 2>/d
 
 log "Installing Model Gateway $(plutil -extract package_version raw -o - "$RELEASE_PLIST") for user=$target_user uid=$recorded_uid"
 set +e
-"$PYTHON3" -c 'import os,sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])' \
+/usr/bin/perl -MPOSIX -e 'POSIX::setsid() or die "setsid: $!"; exec @ARGV or die "exec: $!"' \
   /bin/launchctl asuser "$recorded_uid" /usr/bin/sudo -H -u "$target_user" /usr/bin/env -i \
   HOME="$user_home" USER="$target_user" LOGNAME="$target_user" TMPDIR="/tmp" \
   PATH="/opt/homebrew/bin:/usr/local/bin:$user_home/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \

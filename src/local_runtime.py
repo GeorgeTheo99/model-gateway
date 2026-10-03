@@ -8,7 +8,8 @@ resumable, rate-limited, hash-verified), builds oMLX from the locked project
 in ``local-runtime/`` with uv, installs the ``com.local.omlx`` LaunchAgent,
 adds the ``omlx`` provider and model to this gateway, and requires a real
 completion through the gateway (or, when /v1 needs a key the job does not
-hold, from oMLX with the gateway's files routing to it; see ``check``).
+hold, a completion from oMLX while the gateway's config and catalog route the
+model to it; see ``check``).
 
 Ownership: the oMLX LaunchAgent and the setup job record
 ``<state directory>#<gateway launchd label>`` under ``ModelGatewayRoot``, so
@@ -58,8 +59,21 @@ from src.config_lock import config_write_lock
 from src.model_payload import VerificationError, read_json, validate_manifest, verify_payload
 from src.secret_files import resolve_api_key_file
 
-# Unresolved, so a package manager's version-independent path survives upgrades.
-PACKAGE_ROOT = Path(os.path.abspath(__file__)).parents[1]
+
+def _package_root() -> Path:
+    """This install's root, unresolved, so a package's version-independent path survives upgrades.
+
+    The CLI passes its root (for the component package, ``current``): Python
+    imports this module through the resolved working directory, so ``__file__``
+    names the release directory itself.
+    """
+    configured = os.environ.get("MODEL_GATEWAY_PACKAGE_ROOT", "").strip()
+    if configured and os.path.isabs(configured):
+        return Path(configured)
+    return Path(os.path.abspath(__file__)).parents[1]
+
+
+PACKAGE_ROOT = _package_root()
 MODELS_DIR = PACKAGE_ROOT / "local-models"
 RUNTIME_PROJECT = PACKAGE_ROOT / "local-runtime"
 OMLX_VERSION = "0.6.3"
@@ -875,6 +889,7 @@ def _job_environment(omlx_port: int) -> dict:
         "MODEL_GATEWAY_PLIST_DIR": str(launch_agents_dir()),
         "MODEL_GATEWAY_LAUNCHD_LABEL": gateway_label(),
         "MODEL_GATEWAY_LOCAL_AI_PORT": str(omlx_port),
+        "MODEL_GATEWAY_PACKAGE_ROOT": str(PACKAGE_ROOT),
         "MODEL_GATEWAY_HOST": os.environ.get("MODEL_GATEWAY_HOST", "").strip() or "127.0.0.1",
         "MODEL_GATEWAY_PORT": os.environ.get("MODEL_GATEWAY_PORT", "").strip() or "9111",
     }
@@ -983,17 +998,20 @@ def _anonymous_refused(gateway: str) -> bool:
 
 
 def _check_direct(local: LocalModel, payload: dict) -> dict:
-    """Without a gateway key: complete against oMLX and require the gateway's files to route to it.
+    """Without a gateway key: complete against oMLX and require the gateway's config to route to it.
 
     Package installs seed no admin key, and once a product adds consumer
     credentials /v1 refuses anonymous clients. Rather than mint a standing
     credential (which would also lock /v1 for every anonymous local client),
-    the job proves the model with oMLX's own key and checks the routing the
-    gateway loaded on its restart.
+    the job proves the model with oMLX's own key and checks that the config and
+    catalog the gateway was restarted on enable this job's managed ``omlx``
+    provider and route the model to it.
     """
     omlx_port = port()
     provider = (config_io.load_config_full().get("providers") or {}).get("omlx")
-    if (not _our_provider(provider) or provider.get("base_url") != f"http://127.0.0.1:{omlx_port}/v1"
+    if (not _our_provider(provider) or provider.get("enabled") is not True
+            or provider.get("managed_by") != config_io.LOCAL_AI_MANAGED
+            or provider.get("base_url") != f"http://127.0.0.1:{omlx_port}/v1"
             or not any(_our_catalog_entry(entry, local) for entry in config_io.load_model_info().get("llm", []))):
         raise LocalRuntimeError(f"The gateway does not route {local.name} to local AI")
     return _request(f"http://127.0.0.1:{omlx_port}/v1/chat/completions", _key(api_key_path()), {

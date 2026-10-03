@@ -28,7 +28,8 @@ a manifest, and release metadata in /Library/Application Support/ModelGateway.
 Options:
   --version X     package version; must equal VERSION in src/version.py at REF
   --out-dir DIR   output directory
-  --ref REF       committed revision to package (default: HEAD)
+  --ref REF       committed revision to package (default: HEAD); the package is
+                  verified with REF's own postinstall and verifier
   --product       also build a product archive (productbuild) around the component
   --dry-run       stage and verify the payload in DIR/ModelGateway-X.dry-run without pkgbuild
   -h, --help      show this help
@@ -78,7 +79,7 @@ while IFS=$'\t' read -r metadata path; do
 done < <(git -C "$SOURCE_TREE" ls-tree -r "$SOURCE_COMMIT" -- "${RUNTIME_PATHS[@]}")
 [ "$file_count" -gt 0 ] || fail "selected ref has no runtime files"
 for required in "${RUNTIME_PATHS[@]}" packaging/component/scripts/postinstall \
-  packaging/component/bin/model-gateway-install-from-pkg; do
+  packaging/component/scripts/verify-component-pkg.sh packaging/component/bin/model-gateway-install-from-pkg; do
   git -C "$SOURCE_TREE" cat-file -e "$SOURCE_COMMIT:$required" 2>/dev/null || \
     fail "selected ref does not contain required path: $required"
 done
@@ -174,7 +175,13 @@ postinstall.set("timeout", timeout)
 tree.write(path, encoding="utf-8", xml_declaration=True)
 PY
 pkgutil --flatten "$WORK_DIR/expanded" "$WORK_DIR/component.pkg"
-"$SCRIPT_DIR/verify-component-pkg.sh" "$WORK_DIR/component.pkg" >/dev/null
+# REF's verifier, which checks the package's postinstall against REF's (not this checkout's).
+mkdir "$WORK_DIR/verifier"
+cp "$SCRIPTS_DIR/postinstall" "$WORK_DIR/verifier/postinstall"
+git -C "$SOURCE_TREE" show "$SOURCE_COMMIT:packaging/component/scripts/verify-component-pkg.sh" \
+  > "$WORK_DIR/verifier/verify-component-pkg.sh"
+chmod 755 "$WORK_DIR/verifier/postinstall" "$WORK_DIR/verifier/verify-component-pkg.sh"
+"$WORK_DIR/verifier/verify-component-pkg.sh" "$WORK_DIR/component.pkg" >/dev/null
 mv -n "$WORK_DIR/component.pkg" "$PKG_PATH"
 (cd "$OUT_DIR" && shasum -a 256 "$(basename "$PKG_PATH")" > "$(basename "$PKG_PATH").sha256")
 say "built:         $PKG_PATH"

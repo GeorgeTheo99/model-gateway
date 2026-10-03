@@ -86,12 +86,21 @@ packaging/component/scripts/verify-component-pkg.sh dist/component/ModelGateway-
   `package/release.plist` (format 1: version, `release_name`
   `<version>-<commit12>`, source commit, capabilities, and the manifest,
   helper, and postinstall hashes). `--dry-run` stages and verifies the payload
-  in `DIR/ModelGateway-X.dry-run` without `pkgbuild`. Signing and notarization
-  are separate release steps.
-- The root `postinstall` verifies every staged file against the manifest and
-  the bindings in `release.plist` (also available as
-  `postinstall --verify-payload DIR`, which the build and verifier use),
-  records the target user in `ModelGateway/target-user.plist` (the console user
+  in `DIR/ModelGateway-X.dry-run` without `pkgbuild`. The built package is
+  checked with `REF`'s own `verify-component-pkg.sh` and `postinstall`; to
+  verify a package later, use the verifier from the revision it was built from
+  (it requires a byte-identical `postinstall`, root authorization, no
+  relocation, and the `release.plist` postinstall timeout). Signing and
+  notarization are separate release steps.
+- The root `postinstall` runs only system tools (`PATH=/usr/bin:/bin:/usr/sbin:/sbin`;
+  nothing from Homebrew or the user's home). Installer never removes files an
+  older package version installed, so it first deletes files under
+  `ModelGateway/bin` and `package/gateway` that this package's manifest (bound
+  by `release.plist`) does not list, refusing anything that is not a root-owned,
+  single-link regular file. It then verifies every staged file against the
+  manifest and the bindings in `release.plist` (the read-only check is also
+  available as `postinstall --verify-payload DIR`, which the build and verifier
+  use), records the target user in `ModelGateway/target-user.plist` (the console user
   on first install, or `MODEL_GATEWAY_TARGET_USER`), and runs
   `model-gateway-install-from-pkg` as that user with a clean environment under a
   timeout. Its log is `/var/log/model-gateway-pkg-install.log`.
@@ -99,9 +108,10 @@ packaging/component/scripts/verify-component-pkg.sh dist/component/ModelGateway-
 
 | Existing LaunchAgent | Action |
 |---|---|
-| None | Install a release, start, verify |
+| None | Install a release, start, verify (refused if an orphaned `current` points at a newer release) |
 | Component-owned, older | Upgrade: new release, swap `current`, restart, verify; roll back to the previous release on failure |
-| Component-owned, same or newer | Nothing (a downgrade is refused) |
+| Component-owned, same version | Verify the running gateway; if it does not verify, reinstall the active release's LaunchAgent and verify again, else fail. A different build of the same version is reported and kept |
+| Component-owned, newer | Nothing (a downgrade is refused) |
 | Legacy Home Server bundle (`HomeServerCIPath`, `WorkingDirectory` under `HomeServer/runtime/current/model-gateway`) | Nothing; the Home Server package migrates it |
 | Any other owner (git checkout, Homebrew, server-ci) | Nothing (attach-only); prints what it found |
 
@@ -110,7 +120,8 @@ packaging/component/scripts/verify-component-pkg.sh dist/component/ModelGateway-
   version-independent `current` symlink. Releases live in
   `releases/<version>-<commit12>/`, each with its own venv built by uv from the
   bundled `uv.lock` (uv from `PATH` or Homebrew; the helper fails clearly
-  without it, and building may download wheels and a Python). `current/.package`
+  without it, and building uses only a uv-managed Python, so it may download
+  wheels and a Python). `current/.package`
   names `MANAGER=model-gateway-pkg`. The helper keeps the active and previous
   releases and links `~/.local/bin/model-gateway` when that path is free.
 - Installing runs `model-gateway install` from the new release: the seeded
@@ -119,7 +130,12 @@ packaging/component/scripts/verify-component-pkg.sh dist/component/ModelGateway-
   port is 9111 or the first free port in 9112–9159, persisted in `install.env`.
   Verification requires the exact `/health` body, an owner-only
   `endpoint.json` for this version and port, and the ownership marker.
-- Re-running the same package changes nothing. Removing the component is
+- An upgrade writes `.pending-rollback` (the previous release) before it swaps
+  `current` and removes it once the new release verifies or the rollback does.
+  If an upgrade is interrupted, the next run rolls back to that release before
+  anything else. Local AI setup jobs run through `current`, so an upgrade
+  mid-download re-runs the job on the new release.
+- Re-running the same package changes nothing once the gateway verifies. Removing the component is
   `model-gateway uninstall` (state is kept) plus deleting
   `/Library/Application Support/ModelGateway` and
   `pkgutil --forget com.local.model-gateway.component`.

@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -497,6 +498,7 @@ def test_add_queues_a_one_shot_job_outside_launch_agents(eligible, gateway, laun
     assert "KeepAlive" not in job and job[lr.OWNER_KEY] == lr.owner_value()
     env = job["EnvironmentVariables"]
     assert env["MODEL_GATEWAY_CONFIG"] == str(gateway)
+    assert env["MODEL_GATEWAY_PACKAGE_ROOT"] == str(lr.PACKAGE_ROOT)
     assert env["MODEL_GATEWAY_STATE_DIR"] == str(lr.state_dir())
     assert "/usr/sbin" in env["PATH"]
     assert plist.stat().st_mode & 0o777 == 0o600
@@ -671,6 +673,65 @@ def test_source_digest_covers_code_models_and_the_runtime_lock(tmp_path, monkeyp
         before = lr._source_digest()
         (package / name).write_text(name + " upgraded")
         assert lr._source_digest() != before
+
+
+PACKAGE_ROOT_PROBE = """
+import json, os
+from pathlib import Path
+from src import local_runtime as lr
+
+root = Path(os.environ["MODEL_GATEWAY_PACKAGE_ROOT"])
+before = lr._source_digest()
+target = os.readlink(root)
+os.unlink(root)
+os.symlink(target.replace("A", "B"), root)
+print(json.dumps({"root": str(lr.PACKAGE_ROOT), "models": str(lr.MODELS_DIR), "runtime": str(lr.RUNTIME_PROJECT),
+                  "command": lr._job_command("m"), "changed": lr._source_digest() != before}))
+"""
+
+
+def test_a_package_root_from_the_cli_follows_current_across_an_upgrade(tmp_path):
+    # Python imports this module from the resolved release; the CLI's unresolved root must win.
+    for release in ("A", "B"):
+        for name in ("bin/model-gateway", "src/x.py", "local-models/m.json", "local-runtime/uv.lock"):
+            path = tmp_path / "releases" / release / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"{release} {name}")
+    current = tmp_path / "current"
+    current.symlink_to("releases/A")
+    env = {**os.environ, "MODEL_GATEWAY_PACKAGE_ROOT": str(current)}
+    result = subprocess.run([sys.executable, "-c", PACKAGE_ROOT_PROBE], cwd=ROOT, env=env,
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    probe = json.loads(result.stdout)
+    assert probe == {"root": str(current), "models": str(current / "local-models"),
+                     "runtime": str(current / "local-runtime"),
+                     "command": ["/bin/bash", str(current / "bin/model-gateway"), "_local-ai-job", "m"],
+                     "changed": True}
+    relative = {**os.environ, "MODEL_GATEWAY_PACKAGE_ROOT": "current"}
+    fallback = subprocess.run([sys.executable, "-c", "from src import local_runtime as lr; print(lr.PACKAGE_ROOT)"],
+                              cwd=ROOT, env=relative, capture_output=True, text=True, timeout=60)
+    assert fallback.stdout.strip() == str(ROOT)
+
+
+def test_cli_passes_its_unresolved_package_root_to_local_ai(tmp_path):
+    release = tmp_path / "releases/0.4.0-0123456789ab"
+    (release / "bin").mkdir(parents=True)
+    shutil.copy2(ROOT / "bin/model-gateway", release / "bin/model-gateway")
+    current = tmp_path / "current"
+    current.symlink_to("releases/0.4.0-0123456789ab")
+    (release / ".package").write_text(f"MANAGER=model-gateway-pkg\nROOT={current}\nPYTHON={sys.executable}\n")
+    harness = tmp_path / "harness.sh"
+    harness.write_text('cli="$1"\nset -- env\nsource "$cli" >/dev/null\n'
+                       'run_python() { printf "%s|%s\\n" "$MODEL_GATEWAY_PACKAGE_ROOT" "$PWD"; }\n'
+                       'run_local_ai status\n')
+    env = {key: value for key, value in os.environ.items() if not key.startswith(("MODEL_GATEWAY_", "GATEWAY_VISION"))}
+    env.update(HOME=str(tmp_path), MODEL_GATEWAY_LAUNCHD_LABEL="com.local.model-gateway-test-does-not-exist",
+               MODEL_GATEWAY_PLIST_DIR=str(tmp_path / "LaunchAgents"))
+    result = subprocess.run(["bash", str(harness), str(current / "bin/model-gateway")],
+                            capture_output=True, text=True, env=env, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"{current}|{current}\n"
 
 
 def test_progress_never_recreates_removed_state(eligible):
@@ -883,6 +944,18 @@ def test_check_without_a_gateway_key_completes_against_omlx_and_requires_gateway
     # No standing credential was added to the gateway.
     assert [c["id"] for c in yaml.safe_load(gateway.read_text())["auth"]["consumer_credentials"]] == [
         "app-runtime", "app-manager", "app-local"]
+
+    # The routing must be this job's enabled, local-AI-managed provider.
+    wired = yaml.safe_load(gateway.read_text())
+    for change in ({"enabled": False}, {"enabled": "true"}, {"managed_by": None}, {"managed_by": "operator"}):
+        edited = {**wired, "providers": {**wired["providers"], "omlx": {**wired["providers"]["omlx"], **change}}}
+        if change.get("managed_by", "") is None:
+            del edited["providers"]["omlx"]["managed_by"]
+        gateway.write_text(yaml.safe_dump(edited))
+        seen.clear()
+        with pytest.raises(lr.LocalRuntimeError, match="does not route"):
+            lr.check(QWEN, payload)
+        assert not any(url.endswith("/chat/completions") for url, _token, _body in seen)
 
 
 def test_check_through_the_gateway_surfaces_other_gateway_errors(eligible, monkeypatch):

@@ -936,6 +936,8 @@ cmd_consumer() {
 
 # Run src.local_runtime against this gateway's resolved paths and service.
 # The setup job it launches re-enters through _local-ai-job with the same values.
+# MODEL_GATEWAY_PACKAGE_ROOT is ROOT_DIR unresolved (a package's `current`), so
+# the job follows an upgrade instead of pinning the release Python imported from.
 run_local_ai() {
   local backup_dir uv="$UV_BIN"
   backup_dir="$(installed_plist_env MODEL_GATEWAY_BACKUP_DIR)"
@@ -950,6 +952,7 @@ run_local_ai() {
     MODEL_GATEWAY_HOST="$HOST" MODEL_GATEWAY_PORT="$PORT" \
     MODEL_GATEWAY_LAUNCHD_LABEL="$LABEL" MODEL_GATEWAY_PLIST_DIR="$PLIST_DIR" \
     MODEL_GATEWAY_UV_BIN="${MODEL_GATEWAY_UV_BIN:-$uv}" \
+    MODEL_GATEWAY_PACKAGE_ROOT="$ROOT_DIR" \
       run_python -m src.local_runtime "$@"
   )
 }
