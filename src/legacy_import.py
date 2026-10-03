@@ -51,6 +51,7 @@ LEDGER_FILES = ("ledger.db", "ledger.db-wal", "ledger.db-shm", "ledger.db-journa
 # Exit codes shared with the package helper.
 REFUSED = 2
 ALREADY_IMPORTED = 10
+ROLLBACK_PENDING = 11
 
 
 class ImportFailure(RuntimeError):
@@ -116,7 +117,7 @@ def _fault(step: str) -> None:
     """Test-only fault injection; ignored unless MODEL_GATEWAY_MIGRATION_TEST=1."""
     if os.environ.get("MODEL_GATEWAY_MIGRATION_TEST") != "1":
         return
-    if os.environ.get("MODEL_GATEWAY_MIGRATION_FAIL_AT") == step:
+    if step in os.environ.get("MODEL_GATEWAY_MIGRATION_FAIL_AT", "").split(","):
         raise ImportFailure(f"injected failure at {step}")
     if os.environ.get("MODEL_GATEWAY_MIGRATION_INTERRUPT_AT") == step:
         # Like a reboot: kill everything up to the package helper, so nothing rolls back.
@@ -488,7 +489,8 @@ def preflight(paths: Paths) -> int:
         if journal.data.get("home_server_root") != str(paths.root):
             raise Refused(f"{paths.journal} records an import from {journal.data.get('home_server_root')}")
         if journal.state == "rollback-failed":
-            raise Refused(f"an earlier import could not be rolled back; see {paths.journal}")
+            print(f"An earlier import did not finish rolling back ({paths.journal})")
+            return ROLLBACK_PENDING
         print(f"Resuming the import recorded in {paths.journal}")
         return 0
     plan = inspect(paths)
@@ -836,6 +838,8 @@ def rollback(paths: Paths) -> int:
             function(*args)
         except (OSError, ImportFailure, shutil.Error, sqlite3.Error) as exc:
             errors.append(f"{description}: {exc}")
+
+    attempt("rolling back", _fault, "rollback")
 
     def stop_component() -> None:
         if (_plist(paths.gateway_plist) or {}).get("ModelGatewayComponentRoot") == str(paths.state):

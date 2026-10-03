@@ -17,7 +17,8 @@
 # verification. A failure rolls the import back and restarts the Home Server
 # gateway; an interrupted run resumes. Exit codes: 0 imported or already
 # imported, 1 failed and rolled back (or nothing changed), 2 refused by
-# preflight (nothing changed), 3 failed and the rollback is incomplete.
+# preflight (nothing changed), 3 failed and the rollback is incomplete (a
+# re-run retries the rollback).
 #
 # Component-owned means the plist's ModelGatewayComponentRoot is this user's
 # state root and its WorkingDirectory is the version-independent `current`.
@@ -589,6 +590,7 @@ PY
 }
 
 import_rollback() { # reason
+  import_in_progress || fail_with 1 "$1; nothing changed"
   warn "$1; rolling back the import"
   if run_import rollback "$PYTHON3" "$GATEWAY_PAYLOAD"; then
     say "MODEL_GATEWAY_IMPORT=rolled-back"
@@ -604,6 +606,7 @@ do_import_legacy() {
   case "$rc" in
     0) ;;
     10) say "MODEL_GATEWAY_IMPORT=already-imported"; return 0 ;;
+    11) import_rollback "an earlier import did not finish rolling back" ;;
     2) say "MODEL_GATEWAY_IMPORT=refused"; fail_with 2 "the Home Server gateway was not imported; nothing changed" ;;
     *) fail "the import preflight failed (exit $rc)" ;;
   esac

@@ -561,3 +561,23 @@ def test_rollback_restores_rewritten_inference_settings(legacy, staged):
     assert result.returncode == 1
     assert (legacy.inference / "settings.json").read_bytes() == original
     assert (legacy.root / "models/mlx" / MODEL_ID / "config.json").exists()
+
+
+def test_an_incomplete_rollback_is_retried_by_the_next_run(legacy, staged):
+    before = legacy.snapshot()
+    result = legacy.import_(staged / SUPPORT, MODEL_GATEWAY_MIGRATION_FAIL_AT="install,rollback", **TEST)
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert "MODEL_GATEWAY_IMPORT=rollback-failed" in result.stdout
+    assert legacy.journal()["state"] == "rollback-failed"
+    retried = legacy.import_(staged / SUPPORT)
+    assert retried.returncode == 1 and "did not finish rolling back" in retried.stderr
+    assert "MODEL_GATEWAY_IMPORT=rolled-back" in retried.stdout
+    assert_legacy_restored(legacy, before)
+
+
+def test_a_failure_before_the_journal_changes_nothing(legacy, staged):
+    before = legacy.snapshot()
+    result = legacy.import_(staged / SUPPORT, MODEL_GATEWAY_UV_BIN=str(legacy.home / "missing-uv"))
+    assert result.returncode == 1 and "uv is required" in result.stderr and "nothing changed" in result.stderr
+    assert legacy.snapshot() == before and not (legacy.app / "state").exists()
+    assert legacy.loaded(LABEL) == str(legacy.gateway_plist)
