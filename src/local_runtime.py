@@ -493,7 +493,8 @@ def model(name: str | None) -> LocalModel:
 
 def manifest(local: LocalModel) -> dict:
     try:
-        value = read_json(MODELS_DIR / local.manifest, "model manifest")
+        # The strict reader refuses symlinked ancestors; a package's root is the `current` link.
+        value = read_json(Path(os.path.realpath(MODELS_DIR / local.manifest)), "model manifest")
         validate_manifest(value)
     except VerificationError as exc:
         raise LocalRuntimeError(f"Invalid model manifest for {local.name}: {exc}") from None

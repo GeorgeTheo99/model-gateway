@@ -1230,6 +1230,14 @@ def test_cli_uninstall_warns_about_this_gateways_local_ai(tmp_path):
     assert omlx.exists()
 
 
+def test_the_manifest_is_read_through_a_current_symlink(tmp_path, monkeypatch):
+    release = tmp_path / "releases/0.4.0-0123456789ab"
+    shutil.copytree(ROOT / "local-models", release / "local-models")
+    (tmp_path / "current").symlink_to("releases/0.4.0-0123456789ab")
+    monkeypatch.setattr(lr, "MODELS_DIR", tmp_path / "current/local-models")
+    assert lr.manifest(lr.MODELS["qwen3.8-27b"])["model_id"] == "qwen3.8-27b-8bit-30gb"
+
+
 def test_shipped_payload_manifest_and_locked_runtime_match_the_code():
     payload = lr.manifest(QWEN)
     assert (payload["model_id"], payload["license"]) == (QWEN_ID, "apache-2.0")
