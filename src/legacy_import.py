@@ -853,6 +853,9 @@ def prepare(paths: Paths) -> None:
         # Every resume: a restart may have loaded the legacy LaunchAgents again.
         _stop_legacy(journal)
         _fault("stop-legacy")
+    elif journal.data["local_ai"] and not journal.done("local-ai") and _setup_active(paths):
+        # A resume after a restart: a setup job may have started before the models move.
+        raise ImportFailure("Home Server local AI setup started during the import; not moving its models")
     # The plists go right after the snapshot that holds them, so a restart mid-import
     # cannot load the legacy gateway or inference again.
     for step, function in (("snapshot", _snapshot), ("remove-legacy-plists", _remove_legacy_plists),
@@ -908,6 +911,14 @@ def _kept_at_rollback(paths: Paths, path: Path) -> bool:
     return _under(path, state) and not _same(path, state) and not _same(path, paths.journal)
 
 
+def _rollback_failed(journal: Journal, errors: list[str]) -> int:
+    journal.data.update(state="rollback-failed", errors=errors)
+    journal.save()
+    for error in errors:
+        print(f"ERROR: {error}", file=sys.stderr)
+    return 1
+
+
 def rollback(paths: Paths) -> int:
     journal = Journal.load(paths)
     if journal is None or not (journal.state == "in-progress" or journal.state in ROLLBACK_STATES):
@@ -941,9 +952,13 @@ def rollback(paths: Paths) -> int:
             _stop(OMLX_LABEL, paths.omlx_plist)
             paths.omlx_plist.unlink()
 
-    attempt("stopping the component gateway", stop_gateway)
+    gateway_stopped = attempt("stopping the component gateway", stop_gateway)
     # While the component's oMLX may still serve local AI, its files stay and the legacy jobs stay stopped.
     omlx_stopped = attempt("stopping the component oMLX", stop_omlx)
+    if not gateway_stopped:
+        # A running gateway would recreate the state being moved, and the legacy one needs its port:
+        # nothing more is undone until a retry can stop it.
+        return _rollback_failed(journal, errors)
 
     def held(path: Path) -> bool:
         return not omlx_stopped and (_under(path, paths.local_ai) or _same(path, paths.omlx_plist)
@@ -1010,11 +1025,8 @@ def rollback(paths: Paths) -> int:
 
         attempt(f"starting {label}", start)
     if errors:
-        journal.data.update(state="rollback-failed", errors=errors)
-        journal.save()
-        for error in errors:
-            print(f"ERROR: {error}", file=sys.stderr)
-        return 1
+        return _rollback_failed(journal, errors)
+    journal.data.pop("errors", None)
     journal.data.update(state="rolled-back", rolled_back_at=_now())
     journal.save()
     print(f"Rolled back the import; the Home Server gateway in {paths.root} is restored")

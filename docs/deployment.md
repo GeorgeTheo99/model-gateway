@@ -224,9 +224,12 @@ release:
   `ledger.db*`, `secrets/`, and `state/` except the journal) into
   `<backup>/component-at-rollback/`; remove the other paths the journal
   created; restore the legacy plists from the snapshot; and bootstrap the
-  jobs it stopped. If the component's oMLX cannot be stopped, local AI stays
-  in place, the legacy jobs stay stopped, and the rollback is
-  `rollback-failed`. The snapshot is kept either way.
+  jobs it stopped. If the component's gateway cannot be stopped, nothing
+  else is undone and the rollback is `rollback-failed`. If its oMLX cannot be
+  stopped, local AI and the inference plist stay in place, no legacy job is
+  started (the legacy gateway plist is restored, so it loads at the next
+  login), and the rollback is `rollback-failed`. The snapshot is kept either
+  way.
 - After success the legacy `runtime/shared/model-gateway` and inference
   directories stay in place; the Home Server package switches to attached mode
   and then moves them into its backup. Until a run finishes or rolls back, the

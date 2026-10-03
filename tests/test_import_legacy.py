@@ -662,6 +662,28 @@ def test_rollback_leaves_local_ai_alone_while_omlx_cannot_stop(legacy, staged):
     assert_legacy_restored(legacy, before)
 
 
+def test_rollback_moves_nothing_while_the_component_gateway_cannot_stop(legacy, staged):
+    before = legacy.snapshot()
+    legacy.import_(staged / SUPPORT, MODEL_GATEWAY_MIGRATION_FAIL_AT="verify",
+                   MODEL_GATEWAY_MIGRATION_INTERRUPT_AT="rollback", **TEST)
+    assert legacy.journal()["state"] == "rolling-back"
+    (legacy.fake / f"stuck-{LABEL}").touch()
+    stuck = legacy.import_(staged / SUPPORT)
+    assert stuck.returncode == 3, stuck.stdout + stuck.stderr
+    assert "stopping the component gateway" in stuck.stderr
+    assert legacy.journal()["state"] == "rollback-failed"
+    # The running gateway keeps its state, and the legacy one does not start on its port.
+    assert (legacy.app / "config.yaml").exists() and (legacy.app / "ledger.db").exists()
+    assert not (Path(legacy.journal()["backup_dir"]) / "component-at-rollback").exists()
+    assert legacy.loaded(LABEL) == str(legacy.gateway_plist)
+    assert "ModelGatewayComponentRoot" in plistlib.loads(legacy.gateway_plist.read_bytes())
+    (legacy.fake / f"stuck-{LABEL}").unlink()
+    retried = legacy.import_(staged / SUPPORT)
+    assert retried.returncode == 1 and "MODEL_GATEWAY_IMPORT=rolled-back" in retried.stdout
+    assert "errors" not in legacy.journal()
+    assert_legacy_restored(legacy, before)
+
+
 def test_cli_link_and_prune_failures_do_not_fail_a_completed_import(legacy, staged):
     private(legacy.home / ".local/bin", "not a directory\n")
     locked = legacy.app / "releases/0.0.1-aaaaaaaaaaaa/locked"
