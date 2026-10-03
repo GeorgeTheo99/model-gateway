@@ -112,7 +112,7 @@ packaging/component/scripts/verify-component-pkg.sh dist/component/ModelGateway-
 | Component-owned, older | Upgrade: new release, swap `current`, restart, verify; roll back to the previous release on failure |
 | Component-owned, same version | Verify the running gateway; if it does not verify, reinstall the active release's LaunchAgent and verify again, else fail. A different build of the same version is reported and kept |
 | Component-owned, newer | Nothing (a downgrade is refused) |
-| Legacy Home Server bundle (`HomeServerCIPath`, `WorkingDirectory` under `HomeServer/runtime/current/model-gateway`) | Nothing; the Home Server package migrates it |
+| Legacy Home Server bundle (`HomeServerCIPath`, `WorkingDirectory` under `HomeServer/runtime/current/model-gateway`) | Nothing; the Home Server package imports it (see [Migrating a Home Server bundled gateway](#migrating-a-home-server-bundled-gateway)) |
 | Any other owner (git checkout, Homebrew, server-ci) | Nothing (attach-only); prints what it found |
 
 - A component-owned plist carries `ModelGatewayComponentRoot` (the state root,
@@ -139,6 +139,89 @@ packaging/component/scripts/verify-component-pkg.sh dist/component/ModelGateway-
   `model-gateway uninstall` (state is kept) plus deleting
   `/Library/Application Support/ModelGateway` and
   `pkgutil --forget com.local.model-gateway.component`.
+
+### Migrating a Home Server bundled gateway
+
+Home Server 0.4.x ran its own gateway (`com.local.model-gateway` with
+`HomeServerCIPath`) and local AI (`com.local.home-server-inference`). After
+this package is staged, the Home Server package helper runs, as the user:
+
+```bash
+"/Library/Application Support/ModelGateway/bin/model-gateway-install-from-pkg" \
+  --import-legacy-home-server "$HOME/Library/Application Support/HomeServer"
+```
+
+It runs `src/legacy_import.py` in phases around a normal install of this
+release:
+
+1. **Preflight** (changes nothing). Both legacy plists must carry
+   `HomeServerCIPath=<root>/ci/bin/server-ci`; the gateway must be healthy on
+   the port in `<root>/ci/config/install.env`
+   (`INSTALLED_SERVER_MODEL_GATEWAY_PORT`, `INSTALLED_SERVER_OMLX_PORT`, which
+   must match the plists); the local AI setup job must not be running; no
+   component state (`config.yaml`, `secrets/`, `local-ai/`, …) or
+   `com.local.omlx` may exist; the Home Server root and the state root must be on
+   one volume with room for the oMLX environment and the copies.
+2. **Prepare**, recorded step by step in
+   `~/Library/Application Support/model-gateway/state/migration-journal.json`
+   (every created or moved path is written there first):
+   - with local AI, rebuild oMLX from the bundled locked `local-runtime/` into
+     `local-ai/omlx-<version>` with uv (`UV_PYTHON_PREFERENCE=only-managed`) and
+     check Metal, before anything stops;
+   - stop the setup job, gateway, and inference jobs (each only when
+     `launchctl print` shows it loaded from the legacy plist);
+   - snapshot, without models, into `<root>/backups/w3-migration-<timestamp>/`:
+     `runtime/shared/model-gateway`, `runtime/shared/inference`, `install.env`,
+     both plists, and the ledger through the SQLite backup API;
+   - copy (never move) the gateway state: `config.yaml` with consumer
+     `key_file`s rewritten to `secrets/consumers/<id>.key` (0600),
+     provider `api_key_file`s to `secrets/providers/`, `profiles.registry_path`
+     to `state/consumer-profiles.json`, and a legacy `exports.model_aliases`
+     to the state root; `ha-manager` also gains `local_ai:manage`. Providers,
+     models, and the catalog are kept; any other value that still names the
+     Home Server root stops the import. Also `model-info.json`, the ledger,
+     the profile registry, `secrets/client.keys` (the new LaunchAgent keeps it
+     as `MODEL_GATEWAY_CLIENT_KEYS_FILE`), and an `install.env` that keeps the
+     legacy gateway port;
+   - with local AI, rename `models/mlx/<model>` and `models/cache` into
+     `local-ai/models/`, move `inference/{api.key,settings.json,model_settings.json}`
+     into `local-ai/inference/` with their paths rewritten, copy
+     `local-ai-setup.json` to `local-ai/status.json`, write `com.local.omlx`
+     (`ModelGatewayRoot=<state root>#<label>`, the legacy oMLX port), and make
+     the `omlx` provider the `managed_by: local_ai` block;
+   - remove the two legacy plists.
+3. **Install** this release exactly like a fresh install, on the imported
+   config and port, and verify `/health` and `endpoint.json`.
+4. **Finish**: start `com.local.omlx`, check its health, require every imported
+   consumer credential (`ha-runtime`, `ha-deployer`, `ha-manager`) to be listed
+   with a usable key and local AI to report installed and managed, then mark the
+   journal `completed`.
+
+| Exit | Stdout marker | Meaning |
+|---|---|---|
+| 0 | `MODEL_GATEWAY_IMPORT=imported` | Imported and verified |
+| 0 | `MODEL_GATEWAY_IMPORT=already-imported` | The journal records a completed import and the component owns the label |
+| 1 | `MODEL_GATEWAY_IMPORT=rolled-back` | Failed; rolled back and the legacy jobs restarted (without this line: failed before anything changed) |
+| 2 | `MODEL_GATEWAY_IMPORT=refused` | Preflight refused; nothing changed |
+| 3 | `MODEL_GATEWAY_IMPORT=rollback-failed` | Rollback incomplete (errors are in the journal); a re-run retries it |
+
+- An interrupted run (journal `in-progress`) resumes on the next run; a
+  failure rolls back from the journal: stop and remove the component's
+  LaunchAgents and `current`, rename the models and inference files back
+  (restoring rewritten settings from the snapshot), remove only paths the
+  journal created, restore the legacy plists from the snapshot, and bootstrap
+  the jobs it stopped. The snapshot is kept either way.
+- After success the legacy `runtime/shared/model-gateway` and inference
+  directories stay in place; the Home Server package switches to attached mode
+  and then moves them into its backup. Until a run finishes or rolls back, the
+  plain package helper leaves the import alone.
+- Journal fields for the Home Server helper: `state` (`in-progress`,
+  `completed`, `rolled-back`, `rollback-failed`), `home_server_root`,
+  `backup_dir`, `gateway_port`, `omlx_port`, `local_ai`, `model_id`,
+  `consumers`, `steps`, `created`, `moved`.
+- Tests inject faults with `MODEL_GATEWAY_MIGRATION_FAIL_AT=<step>[,<step>]` or
+  `MODEL_GATEWAY_MIGRATION_INTERRUPT_AT=<step>`, honored only with
+  `MODEL_GATEWAY_MIGRATION_TEST=1` (the root postinstall passes neither).
 
 ## Connecting consumers
 
