@@ -564,7 +564,10 @@ def test_fresh_install_creates_a_component_owned_gateway(machine, staged):
     assert plist["ProgramArguments"][0] == package["PYTHON"]
     # A config with no admin key, the first free port persisted, and discovery written.
     config = yaml.safe_load((machine.app / "config.yaml").read_text())
-    assert config["auth"] == {"client_keys": []} and config["providers"] == {}
+    assert config["auth"] == {"client_keys": []}
+    # Keyless, so a product's scoped manager credential can set the key.
+    assert config["providers"] == {"fireworks": {
+        "base_url": "https://api.fireworks.ai/inference/v1", "protocol": "openai", "enabled": True}}
     assert oct((machine.app / "config.yaml").stat().st_mode & 0o777) == "0o600"
     port = dict(line.split("=", 1) for line in (machine.app / "install.env").read_text().splitlines())
     assert 9111 <= int(port["MODEL_GATEWAY_PORT"]) <= 9159

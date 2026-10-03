@@ -573,7 +573,24 @@ def status() -> dict:
         "bytes_total": int(current.get("bytes_total") or 0),
         "message": message,
         "base_url": f"http://127.0.0.1:{port()}" if installed else None,
+        "loaded": _model_loaded(installed) if installed is not None and owner != "external" else None,
     }
+
+
+def _model_loaded(local: LocalModel) -> bool | None:
+    """Whether oMLX has the installed model in memory, so products can say it must load.
+
+    Unknown (None) whenever the runtime cannot be asked; never claims a reload.
+    """
+    try:
+        model_id = manifest(local)["model_id"]
+        inventory = _request(f"http://127.0.0.1:{port()}/v1/models/status", _key(api_key_path()), timeout=3)
+    except Exception:  # noqa: BLE001 — status must never fail on a busy or stopped runtime
+        return None
+    for row in inventory.get("models", []) if isinstance(inventory, dict) else []:
+        if isinstance(row, dict) and row.get("id") == model_id and isinstance(row.get("loaded"), bool):
+            return row["loaded"]
+    return None
 
 
 def endpoint_info() -> dict:

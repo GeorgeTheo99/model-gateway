@@ -291,7 +291,12 @@ seed_config() {
 auth:
   client_keys: []
 
-providers: {}
+# Products may set or clear keys only on providers the owner defined.
+providers:
+  fireworks:
+    base_url: https://api.fireworks.ai/inference/v1
+    protocol: openai
+    enabled: true
 
 exports:
   model_aliases: ~/Library/Application Support/model-gateway/model-aliases.json

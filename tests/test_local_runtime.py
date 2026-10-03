@@ -119,7 +119,7 @@ def owned_install(port: int = 9123) -> None:
 
 def test_status_on_a_mac_that_cannot_run_local_ai():
     assert lr.status() == {"eligible": False, "installed": False, "managed": True, "model": None, "state": None,
-                           "bytes_done": 0, "bytes_total": 0, "message": "", "base_url": None}
+                           "bytes_done": 0, "bytes_total": 0, "message": "", "base_url": None, "loaded": None}
     assert not lr.runtime_root().exists()  # reading status creates nothing
 
 
@@ -1254,3 +1254,22 @@ def test_package_root_follows_the_package_root_file_when_run_from_a_release(tmp_
     assert lr._package_root() == current
     (release / ".package").unlink()
     assert lr._package_root() == release
+
+
+def test_status_reports_whether_the_installed_model_is_loaded(monkeypatch):
+    local = lr.MODELS["qwen3.8-27b"]
+    monkeypatch.setattr(lr, "omlx_owner", lambda: "ours")
+    monkeypatch.setattr(lr, "installed_model", lambda: local)
+    monkeypatch.setattr(lr, "_key", lambda *a, **k: "omlx-key")
+    model_id = lr.manifest(local)["model_id"]
+    for rows, expected in (([{"id": model_id, "loaded": False}], False),
+                           ([{"id": model_id, "loaded": True}], True),
+                           ([{"id": "other", "loaded": True}], None)):
+        monkeypatch.setattr(lr, "_request", lambda *a, rows=rows, **k: {"models": rows})
+        assert lr.status()["loaded"] is expected
+    def unreachable(*a, **k):
+        raise OSError("refused")
+    monkeypatch.setattr(lr, "_request", unreachable)
+    assert lr.status()["loaded"] is None
+    monkeypatch.setattr(lr, "omlx_owner", lambda: "external")
+    assert lr.status()["loaded"] is None
