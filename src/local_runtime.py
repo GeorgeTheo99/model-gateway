@@ -87,7 +87,7 @@ def _package_root() -> Path:
 PACKAGE_ROOT = _package_root()
 MODELS_DIR = PACKAGE_ROOT / "local-models"
 RUNTIME_PROJECT = PACKAGE_ROOT / "local-runtime"
-OMLX_VERSION = "0.6.3"
+OMLX_VERSION = "0.7.0"
 OMLX_LABEL = "com.local.omlx"
 SETUP_LABEL = "com.local.model-gateway.local-ai-setup"
 GATEWAY_LABEL = "com.local.model-gateway"

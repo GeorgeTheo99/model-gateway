@@ -332,7 +332,7 @@ model-gateway local-ai remove            # remove the runtime, its model and rou
 `~/Library/Application Support/model-gateway/local-ai/launchd/` (never
 `~/Library/LaunchAgents`, so it does not rerun at login). The job downloads the
 pinned payload in `local-models/` over HTTPS only (resumable, capped at
-25 MB/s, SHA-256 verified per file), builds oMLX 0.6.3 from the locked
+25 MB/s, SHA-256 verified per file), builds oMLX 0.7.0 from the locked
 `local-runtime/` project with uv, installs the `com.local.omlx` LaunchAgent
 (loopback, port `MODEL_GATEWAY_LOCAL_AI_PORT`, default 9110), adds the `omlx`
 provider (key file `local-ai/inference/api.key`, mode 0600, marked

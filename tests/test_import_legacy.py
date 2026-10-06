@@ -23,6 +23,7 @@ import pytest
 import yaml
 
 from src import legacy_import
+from src.local_runtime import OMLX_VERSION
 from src.version import VERSION
 from test_component_pkg import LABEL, SUPPORT, SYSTEM_PATH, release_name, staged, write_fake  # noqa: F401
 
@@ -392,11 +393,11 @@ def test_imports_a_bundled_gateway_with_local_ai(legacy, staged):
     assert status["state"] == "done" and status["model"] == "qwen3.8-27b"
     omlx = plistlib.loads(legacy.omlx_plist.read_bytes())
     assert omlx["ModelGatewayRoot"] == f"{app}#{LABEL}"
-    assert omlx["ProgramArguments"][0] == str(local / "omlx-0.6.3/bin/omlx")
+    assert omlx["ProgramArguments"][0] == str(local / f"omlx-{OMLX_VERSION}/bin/omlx")
     assert omlx["ProgramArguments"][omlx["ProgramArguments"].index("--port") + 1] == str(OMLX_PORT)
     assert legacy.loaded("com.local.omlx") == str(legacy.omlx_plist)
     uv = (legacy.fake / "uv.log").read_text()
-    assert f"UV_PYTHON_PREFERENCE=only-managed UV_PROJECT_ENVIRONMENT={local / 'omlx-0.6.3'} sync --locked" in uv
+    assert f"UV_PYTHON_PREFERENCE=only-managed UV_PROJECT_ENVIRONMENT={local / f'omlx-{OMLX_VERSION}'} sync --locked" in uv
 
     # The legacy jobs are gone, their state stays for the Home Server package.
     assert not legacy.inference_plist.exists() and legacy.loaded(INFERENCE_LABEL) is None
