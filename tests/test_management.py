@@ -1060,6 +1060,63 @@ def test_unconfigured_provider_models_are_hidden_from_v1_models(tmp_config, monk
         assert row["availability_reason"] == "provider_not_configured"
 
 
+def test_unconnected_providers_are_not_configuration_issues(tmp_config, monkeypatch):
+    import yaml
+    monkeypatch.delenv("MODEL_GATEWAY_PROVIDER_FIREWORKS_API_KEY", raising=False)
+    doc = json.loads((tmp_config / "model-info.json").read_text())
+    doc["llm"] += [
+        {"name": "glm-fw", "provider": "fireworks", "provider_model_id": "accounts/fireworks/models/glm"},
+        {"name": "glm-zai", "provider": "zai_coding", "provider_model_id": "glm"},
+        {"name": "broken-file", "provider": "openai", "provider_model_id": "gpt-test"},
+    ]
+    (tmp_config / "model-info.json").write_text(json.dumps(doc))
+    cfg = tmp_config / "config.yaml"
+    config = yaml.safe_load(cfg.read_text())
+    # A package-seeded connection without a key is optional, like an absent one.
+    config["providers"]["fireworks"] = {"base_url": "https://api.fireworks.ai/inference/v1"}
+    config["providers"]["openai"] = {
+        "base_url": "https://api.openai.com/v1",
+        "api_key_file": str(tmp_config / "missing.key"),
+    }
+    cfg.write_text(yaml.safe_dump(config))
+    providers.reload()
+
+    by_id = {p["id"]: p for p in providers.provider_status()}
+    for provider in ("fireworks", "zai_coding"):
+        assert by_id[provider]["state"] == "not_connected"
+        assert by_id[provider]["ready"] is False
+        assert by_id[provider]["issues"] == []
+    # A configured key file that cannot be read is a real problem.
+    assert by_id["openai"]["state"] == "needs_attention"
+    assert by_id["openai"]["issues"] == ["unreadable_api_key_file"]
+    assert by_id["anthropic"]["state"] == "ready"
+
+    validation = providers.config_validation()
+    assert [i["provider"] for i in validation["issues"]] == ["openai"]
+
+    rows = {m["name"]: m for m in providers.model_status()}
+    assert rows["glm-fw"]["provider_state"] == "not_connected"
+    assert rows["glm-fw"]["needs_attention"] is False
+    assert rows["glm-zai"]["needs_attention"] is False
+    assert rows["broken-file"]["needs_attention"] is True
+    assert rows["claude-test"]["needs_attention"] is False
+
+
+def test_disabled_provider_is_not_a_configuration_issue(tmp_config):
+    doc = json.loads((tmp_config / "model-info.json").read_text())
+    doc["llm"].append({"name": "dbx-chat", "provider": "databricks", "provider_model_id": "endpoint"})
+    (tmp_config / "model-info.json").write_text(json.dumps(doc))
+    with open(tmp_config / "config.yaml", "a") as f:
+        f.write("  databricks:\n    enabled: false\n")
+    providers.reload()
+
+    row = next(p for p in providers.provider_status() if p["id"] == "databricks")
+    assert (row["state"], row["issues"]) == ("disabled", [])
+    assert providers.config_validation()["ok"] is True
+    model = next(m for m in providers.model_status() if m["name"] == "dbx-chat")
+    assert model["needs_attention"] is False
+
+
 def test_requesting_unconfigured_model_returns_clear_error(tmp_config, monkeypatch):
     doc = json.loads((tmp_config / "model-info.json").read_text())
     doc["llm"].append({"name": "gpt-unconfigured", "provider": "openai", "provider_model_id": "gpt-test"})

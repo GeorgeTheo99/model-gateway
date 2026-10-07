@@ -71,38 +71,41 @@ providers:
   # beside this config file; MODEL_GATEWAY_PROVIDER_*_API_KEY overrides either.
   # Inline api_key still works but is flagged; `model-gateway secrets migrate`
   # moves inline keys into files.
-  fireworks:
-    base_url: https://api.fireworks.ai/inference/v1
-    api_key_file: ~/.config/model-gateway/secrets/fireworks.api-key
-  zhipuai:
-    base_url: https://open.bigmodel.cn/api/paas/v4
-    api_key: "YOUR_ZHIPUAI_API_KEY"
+  #
+  # The entries below are commented examples: uncomment only the providers this
+  # machine uses. Placeholder keys would otherwise count as real credentials.
+  # fireworks:
+  #   base_url: https://api.fireworks.ai/inference/v1
+  #   api_key_file: ~/.config/model-gateway/secrets/fireworks.api-key
+  #
+  # zhipuai:
+  #   base_url: https://open.bigmodel.cn/api/paas/v4
+  #   api_key_file: ~/.config/model-gateway/secrets/zhipuai.api-key
+  #
+  # zai_coding:
+  #   base_url: https://api.z.ai/api/coding/paas/v4
+  #   api_key_file: ~/.config/model-gateway/secrets/zai_coding.api-key
+  #
+  # anthropic:
+  #   base_url: https://api.anthropic.com/v1
+  #   api_key_file: ~/.config/model-gateway/secrets/anthropic.api-key
+  #   protocol: anthropic
+  #
+  # openai:
+  #   base_url: https://api.openai.com/v1
+  #   api_key_file: ~/.config/model-gateway/secrets/openai.api-key
 
-  zai_coding:
-    base_url: https://api.z.ai/api/coding/paas/v4
-    api_key: "YOUR_ZAI_CODING_API_KEY"
-
-  anthropic:
-    base_url: https://api.anthropic.com/v1
-    api_key: "YOUR_ANTHROPIC_API_KEY"
-    protocol: anthropic
-
-  openai:
-    base_url: https://api.openai.com/v1
-    api_key: "YOUR_OPENAI_API_KEY"
-
-  # Optional Databricks Model Serving / Foundation Model APIs. Leave disabled
-  # or omit entirely on machines that should not use Databricks. You can also
-  # configure it with env only:
+  # Optional Databricks Model Serving / Foundation Model APIs. Omit it on
+  # machines that should not use Databricks. You can also configure it with
+  # env only:
   #   DATABRICKS_HOST=https://your-workspace.cloud.databricks.com
   #   DATABRICKS_TOKEN=...
   #   # optional explicit OpenAI-compatible base URL override:
   #   DATABRICKS_SERVING_BASE_URL=https://your-workspace.cloud.databricks.com/serving-endpoints
-  databricks:
-    enabled: false
-    base_url: https://your-workspace.cloud.databricks.com/serving-endpoints
-    api_key: "YOUR_DATABRICKS_TOKEN"
-    protocol: openai
+  # databricks:
+  #   base_url: https://your-workspace.cloud.databricks.com/serving-endpoints
+  #   api_key_file: ~/.config/model-gateway/secrets/databricks.api-key
+  #   protocol: openai
 
   # ── Advanced provider keys (all optional, all runtime-local) ───────────────
   # Everything provider- or workspace-specific stays in this file — the repo

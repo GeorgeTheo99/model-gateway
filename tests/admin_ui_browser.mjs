@@ -128,6 +128,12 @@ function fixture() {
         pool_memberships: [{ pool: "claude-routing", position: 2 }],
       }),
       provider("unused", { enabled_models: 0 }),
+      provider("fireworks", {
+        has_api_key: false,
+        api_key_source: "missing",
+        state: "not_connected",
+        ready: false,
+      }),
     ],
     models: [
       model("local-model", "omlx", { tools: true }),
@@ -139,6 +145,13 @@ function fixture() {
         pool: "claude-routing",
         declared_providers: ["ws-primary", "ws-backup"],
         candidate_providers: ["ws-primary", "ws-backup"],
+      }),
+      model("unconnected-model", "fireworks", {
+        available: false,
+        needs_attention: false,
+        provider_ready: false,
+        provider_state: "not_connected",
+        availability_reason: "provider_not_configured",
       }),
     ],
     pools: [
@@ -580,7 +593,7 @@ if (process.argv.includes("--serve")) {
     await page.waitForFunction(
       () =>
         !document.getElementById("refreshBtn").disabled &&
-        document.getElementById("modelsMeta").textContent === "3 of 3 models",
+        document.getElementById("modelsMeta").textContent === "4 of 4 models",
     );
     assert(await page.locator("#panel-overview").isVisible());
     assert.equal(
@@ -594,8 +607,23 @@ if (process.argv.includes("--serve")) {
         .evaluate((el) => getComputedStyle(el).paddingTop),
       "0px",
     );
+    // Optional, never-connected providers are not configuration problems.
+    const attention = await page.locator("#attention").innerText();
+    assert.doesNotMatch(attention, /fireworks|unconnected-model/);
     await nav("connections");
-    assert.equal(await page.locator("#providers tbody tr").count(), 5);
+    assert.equal(await page.locator("#providers tbody tr").count(), 6);
+    assert.match(
+      await page
+        .locator('#providers tr:has([data-open-provider="fireworks"])')
+        .innerText(),
+      /Not connected/,
+    );
+    assert.doesNotMatch(
+      await page
+        .locator('#providers tr:has([data-open-provider="fireworks"])')
+        .innerText(),
+      /Needs configuration/,
+    );
     await click("#routingGroups > summary");
     assert(
       await page

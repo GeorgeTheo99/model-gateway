@@ -1196,13 +1196,21 @@ def provider_status() -> list[dict]:
         has_api_key = bool(provider_config.get("api_key"))
         key_source = _api_key_source(explicit_config, env_config, provider)
         model_count = model_counts.get(provider, 0)
-        issues = []
-        if model_count and provider_config.get("enabled") is False:
-            issues.append("provider_disabled")
-        if model_count and provider_config.get("enabled") is not False and not base_url:
-            issues.append("missing_base_url")
-        if model_count and provider_config.get("enabled") is not False and not has_api_key:
-            issues.append("missing_api_key")
+        # Connecting a provider is optional: the catalog may list models for
+        # providers this machine never uses. Only a provider that is enabled
+        # and has a credential configured can be misconfigured.
+        problems = []
+        if not base_url:
+            problems.append("missing_base_url")
+        if not has_api_key:
+            problems.append("unreadable_api_key_file")
+        if provider_config.get("enabled") is False:
+            state = "disabled"
+        elif not has_api_key and not provider_config.get("api_key_file"):
+            state = "not_connected"
+        else:
+            state = "needs_attention" if problems else "ready"
+        issues = problems if model_count and state == "needs_attention" else []
         result.append({
             "id": provider,
             "configured": bool(explicit_config or _provider_defaults(provider) or env_config),
@@ -1212,7 +1220,8 @@ def provider_status() -> list[dict]:
             "protocol": provider_config.get("protocol", "openai") if provider_config else "openai",
             "has_api_key": has_api_key,
             "api_key_source": key_source,
-            "ready": not issues,
+            "state": state,
+            "ready": state == "ready",
             "issues": issues,
             "warnings": _api_key_warnings(explicit_config, key_source),
             "pool_memberships": pool_memberships.get(provider, []),
@@ -1223,7 +1232,7 @@ def provider_status() -> list[dict]:
 @_registry_locked
 def model_status() -> list[dict]:
     """Return the shared effective inventory in the admin API shape."""
-    ready = {p["id"]: p["ready"] for p in provider_status()}
+    states = {p["id"]: p["state"] for p in provider_status()}
     configured = _configured_provider_ids() | {"omlx"}
     fallback_map = _load_config().get("model_fallbacks") or {}
     if not isinstance(fallback_map, dict):
@@ -1238,6 +1247,11 @@ def model_status() -> list[dict]:
         locality = next(iter(localities)) if len(localities) == 1 else "mixed" if localities else None
         provider_model_id = model.get("provider_model_id") or model.get("omlx_id") or model.get("name", "")
         fallback = fallback_map.get(provider_model_id)
+        provider_state = states.get(provider, "not_connected")
+        # A model whose single provider was never connected (or was turned off)
+        # is intentionally unused here, not broken. Pools are explicit routing
+        # config, so an unroutable pool model still needs attention.
+        intentionally_unavailable = not model.get("pool") and provider_state in {"not_connected", "disabled"}
         result.append({
             "id": model.get("id"),
             "name": model.get("name", ""),
@@ -1259,10 +1273,16 @@ def model_status() -> list[dict]:
             "provider_model_id": provider_model_id,
             "omlx_id": model.get("omlx_id", ""),
             "provider_configured": provider in configured,
-            "provider_ready": ready.get(provider, False),
+            "provider_ready": provider_state == "ready",
+            "provider_state": provider_state,
             "availability_reason": model.get("availability_reason", ""),
             "availability_message": model.get("availability_message", ""),
             "available": model.get("available", False),
+            "needs_attention": bool(
+                model.get("enabled", True)
+                and not model.get("available", False)
+                and not intentionally_unavailable
+            ),
             "context": model.get("context", 0),
             "max_output_tokens": model.get("max_output_tokens", 0),
             "thinking": model.get("thinking", ""),

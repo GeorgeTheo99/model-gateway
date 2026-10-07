@@ -3107,7 +3107,14 @@ _ADMIN_HTML = r"""
             ? pill("muted", "Disabled")
             : m.available
               ? pill("ok", "Configured")
-              : pill("warn", "Needs attention");
+              : m.needs_attention
+                ? pill("warn", "Needs attention")
+                : pill(
+                    "muted",
+                    m.provider_state === "disabled"
+                      ? "Connection disabled"
+                      : "Not connected",
+                  );
         }
         function keySourceText(p) {
           const sources = {
@@ -3133,6 +3140,7 @@ _ADMIN_HTML = r"""
             circuit_open: "temporarily skipped after failures",
             missing_api_key: "API key missing",
             missing_base_url: "base URL missing",
+            unreadable_api_key_file: "API key file missing or unreadable",
             provider_disabled: "disabled",
             disabled: "disabled",
           };
@@ -3161,6 +3169,12 @@ _ADMIN_HTML = r"""
         }
         function configReady(p) {
           return p.ready && !!p.base_url && p.has_api_key;
+        }
+        function connectionPill(p, complete) {
+          if (configReady(p)) return pill("ok", complete);
+          if (p.state === "not_connected") return pill("muted", "Not connected");
+          if (p.state === "disabled") return pill("muted", "Disabled");
+          return pill("warn", "Needs configuration");
         }
         function outcome(r) {
           return r.error || (r.status != null && r.status >= 400)
@@ -3550,7 +3564,7 @@ _ADMIN_HTML = r"""
             ms = models();
           const items = [];
           for (const p of ps.filter(
-            (p) => associatedModels(p).length && !configReady(p),
+            (p) => associatedModels(p).length && p.issues?.length,
           ))
             items.push(
               "<li><strong>" +
@@ -3580,7 +3594,7 @@ _ADMIN_HTML = r"""
                 button("data-show-pool", p.id, "Inspect routing group") +
                 "</li>",
             );
-          for (const m of ms.filter((m) => m.enabled !== false && !m.available))
+          for (const m of ms.filter((m) => m.needs_attention))
             items.push(
               "<li><strong>" +
                 esc(modelName(m)) +
@@ -3608,9 +3622,9 @@ _ADMIN_HTML = r"""
           $("inventorySummary").innerHTML =
             cache.models && cache.providers
               ? "<strong>" +
-                ms.filter((m) => m.enabled !== false).length +
-                " enabled models</strong> across " +
-                ps.length +
+                ms.filter((m) => m.available).length +
+                " ready models</strong> across " +
+                ps.filter((p) => p.ready).length +
                 " connections.<br>" +
                 button("data-go", "models", "Browse models") +
                 " · " +
@@ -3787,10 +3801,7 @@ _ADMIN_HTML = r"""
                   '</span></td><td data-label="Models">' +
                   (n ? num(n) : pill("muted", "Unused")) +
                   '</td><td data-label="Configuration">' +
-                  pill(
-                    configReady(p) ? "ok" : "warn",
-                    configReady(p) ? "Complete" : "Needs configuration",
-                  ) +
+                  connectionPill(p, "Complete") +
                   '</td><td data-label="Recent outcomes">' +
                   (recent?.requests
                     ? num(recent.failures) +
@@ -4856,10 +4867,7 @@ _ADMIN_HTML = r"""
           let html =
             detailHeader(id, "Connection") +
             '<div class="toolbar">' +
-            pill(
-              configReady(p) ? "ok" : "warn",
-              configReady(p) ? "Configuration complete" : "Needs configuration",
-            ) +
+            connectionPill(p, "Configuration complete") +
             button(
               "data-edit-provider",
               id,
