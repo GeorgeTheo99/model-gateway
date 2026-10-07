@@ -178,7 +178,7 @@ def _configured_vision_fallback_model(locality: str | None = None) -> str:
 
 
 def _configured_vision_fallback_mode() -> str:
-    """Default image-handling mode for the global (non-composite) vision fallback."""
+    """Default image-handling mode for the process-wide vision fallback."""
     configured = os.environ.get("GATEWAY_VISION_FALLBACK_MODE", "").strip().lower()
     if configured:
         return configured
@@ -335,7 +335,7 @@ def _clear_vision_observation_cache() -> None:
 
 
 def _configured_vision_fallback_max_images() -> int:
-    """Per-request image limit for global (non-composite) fallback extraction."""
+    """Per-request image limit for process-wide fallback extraction."""
     raw = os.environ.get("GATEWAY_VISION_FALLBACK_MAX_IMAGES", "").strip()
     if not raw:
         return DEFAULT_VISION_FALLBACK_MAX_IMAGES
@@ -391,8 +391,8 @@ def _vision_fallback_policies() -> list[tuple[str, str, str | None]]:
 
 def _validate_vision_fallback_policy(*, log_policy: bool = True) -> None:
     """Fail startup/reload on invalid opt-ins and enforce locality boundaries."""
-    # Composites use the shared cache and extraction timeout even when no
-    # process-wide fallback is enabled, so validate these controls first.
+    # Validate shared extraction controls even when no fallback is enabled so
+    # a later opt-in cannot expose a latent invalid value.
     cache_ttl = _configured_vision_observation_cache_ttl_seconds()
     total_timeout = _configured_vision_extraction_total_timeout_seconds()
     policies = _vision_fallback_policies()
@@ -425,8 +425,6 @@ def _validate_vision_fallback_policy(*, log_policy: bool = True) -> None:
             raise RuntimeError(f"{variable} model '{fallback_model}' is not resolvable")
         for provider, fallback_info in candidate_infos:
             provider_label = provider or fallback_info.provider
-            if getattr(fallback_info, "composite", None) is not None:
-                raise RuntimeError(f"{variable} must name a native vision model, not a composite")
             if not fallback_info.vision:
                 raise RuntimeError(
                     f"{variable} model '{fallback_model}' is not vision-capable "
@@ -1260,7 +1258,7 @@ def _prepare_model_reasoning_control(req: dict, info) -> None:
 
 
 def _thinking_validation_response(req: dict, info, error_factory):
-    # Validation occurs before vision/composite routing finalizes the served
+    # Validation occurs before vision routing finalizes the served
     # model. Normalize a copy so GLM-5.3 defaults cannot leak into a different
     # fallback model's second validation pass; dispatch mutates only after the
     # final route is selected.
@@ -1466,35 +1464,24 @@ def _strip_gateway_controls(body: dict) -> None:
 
 
 def _resolve_vision_fallback(original_model: str, info, error_factory=_error_openai):
-    composite = getattr(info, "composite", None)
-    if composite is not None:
-        # Logical composites are deliberately scoped and local-only. Never let
-        # their image turns escape through the process-wide/cloud fallback.
-        fallback_model = composite.vision_model
-    else:
-        try:
-            _validate_vision_fallback_policy(log_policy=False)
-            original_locality = _vision_route_locality(original_model, info)
-        except RuntimeError as exc:
-            log.error("Vision fallback policy rejected at request time: %s", exc)
-            return None, None, error_factory(
-                502,
-                "api_error",
-                f"Vision fallback policy is invalid: {exc}",
-            )
-        fallback_model = _configured_vision_fallback_model(original_locality)
-    if not fallback_model:
-        locality_hint = f" for {original_locality} routes" if composite is None else ""
-        configuration_hint = (
-            f"GATEWAY_VISION_FALLBACK_{original_locality.upper()}=<model>"
-            if composite is None
-            else "an explicit composite"
+    try:
+        _validate_vision_fallback_policy(log_policy=False)
+        original_locality = _vision_route_locality(original_model, info)
+    except RuntimeError as exc:
+        log.error("Vision fallback policy rejected at request time: %s", exc)
+        return None, None, error_factory(
+            502,
+            "api_error",
+            f"Vision fallback policy is invalid: {exc}",
         )
+    fallback_model = _configured_vision_fallback_model(original_locality)
+    if not fallback_model:
         return None, None, error_factory(
             400,
             "invalid_request_error",
-            f"Model '{original_model}' is text-only and vision fallback{locality_hint} is disabled. "
-            f"Use a native vision model or explicit composite, or configure {configuration_hint}.",
+            f"Model '{original_model}' is text-only and vision fallback for {original_locality} routes "
+            f"is disabled. Use a native vision model, or configure "
+            f"GATEWAY_VISION_FALLBACK_{original_locality.upper()}=<model>.",
         )
     fallback_info = resolve(fallback_model)
     if not fallback_info:
@@ -1521,17 +1508,11 @@ def _resolve_vision_fallback(original_model: str, info, error_factory=_error_ope
             f"Vision fallback model '{fallback_model}' is not vision-capable; "
             f"cannot route image input for text-only model '{original_model}'.",
         )
-    if composite is None and fallback_info.protocol != "openai":
+    if fallback_info.protocol != "openai":
         return None, None, error_factory(
             502,
             "api_error",
             f"Vision fallback model '{fallback_model}' must use an OpenAI-compatible protocol.",
-        )
-    if composite is not None and fallback_info.provider != "omlx":
-        return None, None, error_factory(
-            502,
-            "api_error",
-            f"Composite vision model '{fallback_model}' must use local oMLX.",
         )
     return fallback_model, fallback_info, None
 
@@ -1629,16 +1610,6 @@ def _replace_anthropic_images_with_extracted_text(
         raise ValueError("Vision observation count does not match image count")
     rewritten["messages"] = messages
     return rewritten
-
-
-def _inline_image_size(part: dict) -> int:
-    try:
-        image_bytes = _inline_image_bytes(part)
-    except ValueError as exc:
-        raise ValueError("Local composite vision received malformed base64 image data") from exc
-    if image_bytes is None:
-        raise ValueError("Local composite vision accepts only inline data:image/...;base64 images")
-    return len(image_bytes)
 
 
 async def _await_client_bound_operation(request: Request, operation):
@@ -1883,22 +1854,9 @@ async def _apply_chat_vision_fallback(
     error_factory=_error_openai,
 ):
     """Apply staged vision handling to a Chat-shaped request."""
-    composite = getattr(info, "composite", None)
-    default_mode = (
-        composite.image_handling
-        if composite is not None
-        else _configured_vision_fallback_mode()
-    )
     requested_mode = _gateway_image_handling_mode(request, body)
     _strip_gateway_controls(body)
-    if composite is not None and requested_mode and requested_mode != default_mode:
-        return body, requested_model, info, error_factory(
-            400,
-            "invalid_request_error",
-            f"Composite model '{requested_model}' requires gateway image handling mode "
-            f"'{default_mode}'; client overrides are not allowed.",
-        )
-    mode = requested_mode or default_mode
+    mode = requested_mode or _configured_vision_fallback_mode()
     if mode not in {"reroute", IMAGE_HANDLING_EXTRACT_THEN_ANSWER}:
         return body, requested_model, info, error_factory(
             400, "invalid_request_error", f"Unsupported gateway image handling mode '{mode}'.",
@@ -1925,7 +1883,7 @@ async def _apply_chat_vision_fallback(
             log.info("vision_fallback endpoint=%s requested=%s served=%s mode=native outcome=bypass image_count=%d", endpoint_name, requested_model, requested_model, image_count)
         return body, requested_model, info, None
 
-    if getattr(request.state, "profile_execution", None) is not None and composite is None:
+    if getattr(request.state, "profile_execution", None) is not None:
         return body, requested_model, info, error_factory(
             409,
             "invalid_request_error",
@@ -1942,11 +1900,7 @@ async def _apply_chat_vision_fallback(
             fallback_model,
             fallback_info,
             error_factory,
-            max_images=(
-                composite.max_images
-                if composite is not None
-                else _configured_vision_fallback_max_images()
-            ),
+            max_images=_configured_vision_fallback_max_images(),
         )
         if isinstance(observations, JSONResponse):
             return body, requested_model, info, observations
@@ -2950,7 +2904,7 @@ async def create_response(request: Request):
     if thinking_error is not None:
         return thinking_error
 
-    # Seed a resolution receipt before composite validation/extraction so
+    # Seed a resolution receipt before vision validation/extraction so
     # rejected image requests still retain the semantic and concrete model IDs.
     _set_ledger_ctx(request, model, info, is_stream=is_stream)
     _inject_responses_instruction(body, info.system_instruction)

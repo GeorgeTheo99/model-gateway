@@ -45,7 +45,6 @@ def test_model_status_metadata_is_whitelisted(registry):
     assert row["pool"] == ""
     assert row["declared_providers"] == ["openai"]
     assert row["locality"] == "cloud"
-    assert row["composite"] is None
     assert row["fallback_model"] is None
     serialized = json.dumps(row)
     for private in (
@@ -94,29 +93,6 @@ def test_declared_pool_order_includes_unavailable_members(registry, members, dec
     assert row["locality"] == locality
 
 
-@pytest.mark.parametrize("vision_provider", ["omlx", "openai"])
-def test_composite_targets_are_whitelisted_without_claiming_wrapper_locality(registry, vision_provider):
-    registry["models"] = [
-        {"name": "text", "provider": "omlx"},
-        {"name": "vision", "provider": vision_provider, "vision": True},
-        {
-            "name": "combined", "provider": "omlx", "vision": True,
-            "composite": {
-                "text_model": "text", "vision_model": "vision",
-                "system_instruction": "private-composite-instruction",
-                "api_key": "composite-secret", "unknown": {"secret": "nested-secret"},
-            },
-        },
-    ]
-    registry["model_fallbacks"] = {"combined": "not-an-upstream-fallback"}
-    row = status_by_name()["combined"]
-    assert row["composite"] == {"text_model": "text", "vision_model": "vision", "image_handling": "extract_then_answer"}
-    assert row["locality"] is None
-    assert row["fallback_model"] is None
-    assert "secret" not in json.dumps(row)
-    assert "private-composite-instruction" not in json.dumps(row)
-
-
 @pytest.mark.parametrize("id_field", ["provider_model_id", "omlx_id", "name"])
 def test_fallback_uses_upstream_model_id_not_alias(registry, id_field):
     model = {"name": "logical", "alias": "short", id_field: "upstream"}
@@ -144,9 +120,13 @@ def test_provider_status_marks_redacted_urls_without_exposing_components(registr
     assert "private" not in json.dumps(row)
 
 
-def test_composite_image_reroute_mode_is_preserved(registry):
+def test_removed_composite_entries_are_unavailable(registry):
     registry["models"] = [
-        {"name": "text"}, {"name": "vision", "vision": True},
-        {"name": "combo", "composite": {"text_model": "text", "vision_model": "vision", "image_handling": "reroute"}},
+        {"name": "text", "provider": "omlx"},
+        {"name": "combo", "provider": "omlx", "vision": True,
+         "composite": {"text_model": "text", "vision_model": "text"}},
     ]
-    assert status_by_name()["combo"]["composite"]["image_handling"] == "reroute"
+    availability = providers.model_availability("combo")
+    assert availability["available"] is False
+    assert availability["reason"] == "unsupported_composite"
+    assert providers.resolve("combo") is None

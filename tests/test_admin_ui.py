@@ -71,7 +71,6 @@ def test_admin_model_status_exposes_scoped_image_policy_without_probes(monkeypat
         {"name": "cloud", "locality": "cloud", "vision": False},
         {"name": "native", "locality": "cloud", "vision": True},
         {"name": "mixed", "locality": "mixed", "vision": False},
-        {"name": "composite", "locality": None, "composite": {"text_model": "local", "vision_model": "native"}},
     ]
     monkeypatch.setattr(admin, "model_status", lambda: rows)
     monkeypatch.setenv("GATEWAY_VISION_FALLBACK_LOCAL", "local-helper")

@@ -41,7 +41,6 @@ const model = (name, provider, extra = {}) => ({
   desc: "Fixture model",
   locality: provider === "omlx" ? "local" : "cloud",
   tools: null,
-  composite: null,
   fallback_model: null,
   vision_route: null,
   provider_model_id: "upstream-" + name,

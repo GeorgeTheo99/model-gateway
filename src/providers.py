@@ -10,7 +10,7 @@ import re
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -71,16 +71,6 @@ _DEFAULT_OMLX_BASE_URL = os.environ.get("MODEL_GATEWAY_OMLX_BASE_URL", "http://l
 _DEFAULT_OMLX_API_KEY = os.environ.get("MODEL_GATEWAY_OMLX_API_KEY", "omlx")
 
 
-@dataclass(frozen=True)
-class CompositeRoute:
-    """Gateway-owned local text+vision composition policy."""
-
-    text_model: str
-    vision_model: str
-    image_handling: str = "extract_then_answer"
-    max_images: int = 4
-
-
 @dataclass
 class ProviderInfo:
     provider: str
@@ -111,10 +101,6 @@ class ProviderInfo:
     system_instruction: str = ""
     vision: bool = False  # authoritative: True if the model can natively handle image inputs
     pricing: dict = None  # $/Mtok: input, output, cache_read?, cache_write?, cache_write_1h?, reasoning?
-    # Logical composites deliberately keep ``vision=False`` here because the
-    # resolved upstream is the text model. The public catalog entry remains
-    # ``vision: true`` so clients preserve image blocks for gateway staging.
-    composite: CompositeRoute | None = None
 
 
 _config: dict | None = None
@@ -759,32 +745,6 @@ def _configured_pool_members(entry: dict, config: dict) -> list[str]:
     return members
 
 
-def _parse_composite_route(entry: dict) -> CompositeRoute | None:
-    raw = entry.get("composite")
-    if raw is None:
-        return None
-    if not isinstance(raw, dict):
-        raise ValueError("composite must be an object")
-    text_model = str(raw.get("text_model") or "").strip()
-    vision_model = str(raw.get("vision_model") or "").strip()
-    image_handling = str(raw.get("image_handling") or "extract_then_answer").strip().lower()
-    max_images = raw.get("max_images", 4)
-    if not text_model or not vision_model:
-        raise ValueError("composite requires text_model and vision_model")
-    if text_model == vision_model:
-        raise ValueError("composite text_model and vision_model must differ")
-    if image_handling not in {"extract_then_answer", "reroute"}:
-        raise ValueError("composite image_handling must be extract_then_answer or reroute")
-    if isinstance(max_images, bool) or not isinstance(max_images, int) or not 1 <= max_images <= 8:
-        raise ValueError("composite max_images must be an integer from 1 through 8")
-    return CompositeRoute(
-        text_model=text_model,
-        vision_model=vision_model,
-        image_handling=image_handling,
-        max_images=max_images,
-    )
-
-
 def _availability_for_entry(model_id: str, entry: dict | None) -> dict:
     if not entry:
         return {
@@ -804,77 +764,16 @@ def _availability_for_entry(model_id: str, entry: dict | None) -> dict:
             "message": f"Model {name!r} is disabled by runtime model_overrides",
         }
 
-    try:
-        composite = _parse_composite_route(entry)
-    except ValueError as exc:
+    if entry.get("composite") is not None:
         return {
             "available": False,
-            "reason": "invalid_composite",
+            "reason": "unsupported_composite",
             "model": name,
             "provider": provider,
-            "message": f"Composite model {name!r} is invalid: {exc}",
-        }
-    if composite is not None:
-        models = _load_models()
-        dependencies = (
-            ("text_model", composite.text_model, False),
-            ("vision_model", composite.vision_model, True),
-        )
-        dependency_provider = ""
-        for role, dependency_id, requires_vision in dependencies:
-            dependency = models.get(dependency_id)
-            if dependency is entry or (dependency and dependency.get("composite") is not None):
-                return {
-                    "available": False,
-                    "reason": "invalid_composite",
-                    "model": name,
-                    "provider": provider,
-                    "message": f"Composite model {name!r} cannot contain nested or cyclic composites",
-                }
-            dependency_members = _pool_members(dependency, _load_config()) if dependency else []
-            if not dependency_members or any(_canonical_provider(member) != "omlx" for member in dependency_members):
-                return {
-                    "available": False,
-                    "reason": "invalid_composite",
-                    "model": name,
-                    "provider": dependency_members[0] if dependency_members else provider,
-                    "message": f"Composite model {name!r} dependencies must use only local oMLX providers",
-                }
-            availability = _availability_for_entry(dependency_id, dependency)
-            if not availability.get("available"):
-                return {
-                    "available": False,
-                    "reason": f"composite_{role}_unavailable",
-                    "model": name,
-                    "provider": availability.get("provider") or provider,
-                    "message": (
-                        f"Composite model {name!r} dependency {dependency_id!r} is unavailable: "
-                        f"{availability.get('message', availability.get('reason', 'unknown error'))}"
-                    ),
-                }
-            dependency_provider = availability.get("provider") or dependency_provider
-            if _canonical_provider(dependency_provider) != "omlx":
-                return {
-                    "available": False,
-                    "reason": "invalid_composite",
-                    "model": name,
-                    "provider": dependency_provider,
-                    "message": f"Composite model {name!r} dependencies must use local oMLX",
-                }
-            if requires_vision and not bool(dependency.get("vision", False)):
-                return {
-                    "available": False,
-                    "reason": "invalid_composite",
-                    "model": name,
-                    "provider": dependency_provider,
-                    "message": f"Composite vision dependency {dependency_id!r} is not vision-capable",
-                }
-        return {
-            "available": True,
-            "reason": "",
-            "model": name,
-            "provider": "omlx",
-            "message": "",
+            "message": (
+                f"Model {name!r} uses the removed composite route; use a native vision model "
+                "or GATEWAY_VISION_FALLBACK_LOCAL/GATEWAY_VISION_FALLBACK_CLOUD"
+            ),
         }
 
     config = _load_config()
@@ -982,7 +881,7 @@ def preview_pool_member(
                 continue
             name = entry["name"]
             candidate = resolve(name, provider_override=member)
-            if candidate is None or candidate.composite is not None:
+            if candidate is None:
                 raise ValueError(f"{name}: workspace {member!r} is not routable")
             for existing in _configured_pool_members(entry, config):
                 info = resolve(name, provider_override=existing)
@@ -1012,23 +911,6 @@ def resolve(model_id: str, provider_override: str | None = None) -> ProviderInfo
             return None
         log.info("Model %r unavailable: %s", model_id, availability["message"])
         return None
-
-    try:
-        composite = _parse_composite_route(entry)
-    except ValueError:
-        return None
-    if composite is not None:
-        text_info = resolve(composite.text_model, provider_override=provider_override)
-        vision_info = resolve(composite.vision_model)
-        if (
-            not text_info
-            or not vision_info
-            or text_info.provider != "omlx"
-            or vision_info.provider != "omlx"
-            or not vision_info.vision
-        ):
-            return None
-        return replace(text_info, vision=False, composite=composite)
 
     config = _load_config()
     candidates = _configured_pool_members(entry, config)
@@ -1353,23 +1235,9 @@ def model_status() -> list[dict]:
             _canonical_provider(member) for member in model.get("declared_providers", [])
         ]
         localities = {"local" if member == "omlx" else "cloud" for member in declared_providers}
-        raw_composite = model.get("composite")
-        composite = None
-        if isinstance(raw_composite, dict):
-            composite = {
-                key: raw_composite[key]
-                for key in ("text_model", "vision_model")
-                if isinstance(raw_composite.get(key), str)
-            }
-            mode = raw_composite.get("image_handling") or "extract_then_answer"
-            composite["image_handling"] = mode if isinstance(mode, str) and mode in {"extract_then_answer", "reroute"} else None
-        # Composite branches are separate routes; the wrapper's provider pool
-        # cannot establish their locality or their upstream fallback target.
-        locality = None if raw_composite is not None else (
-            next(iter(localities)) if len(localities) == 1 else "mixed" if localities else None
-        )
+        locality = next(iter(localities)) if len(localities) == 1 else "mixed" if localities else None
         provider_model_id = model.get("provider_model_id") or model.get("omlx_id") or model.get("name", "")
-        fallback = fallback_map.get(provider_model_id) if raw_composite is None else None
+        fallback = fallback_map.get(provider_model_id)
         result.append({
             "id": model.get("id"),
             "name": model.get("name", ""),
@@ -1382,7 +1250,6 @@ def model_status() -> list[dict]:
             "desc": model.get("desc") if isinstance(model.get("desc"), str) else "",
             "tools": model.get("tools") if isinstance(model.get("tools"), bool) else None,
             "locality": locality,
-            "composite": composite,
             # model_fallbacks is keyed by upstream ID, not logical name/alias.
             "fallback_model": fallback if isinstance(fallback, str) and fallback else None,
             "candidate_providers": [

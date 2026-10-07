@@ -254,16 +254,6 @@ def _apply_assisted_vision_policy(
             f"model {entry.get('name')!r} pi.image_input must be "
             f"'{PI_IMAGE_INPUT_ASSISTED}' or '{PI_IMAGE_INPUT_DISABLED}'"
         )
-    if entry.get("composite") is not None:
-        if entry.get("vision") is not True:
-            raise ValueError(
-                f"composite model {entry.get('name')!r} must declare vision: true"
-            )
-        if image_input is not None:
-            raise ValueError(
-                f"composite model {entry.get('name')!r} cannot set pi.image_input"
-            )
-        return
     if entry.get("vision") is True:
         if image_input is not None:
             raise ValueError(

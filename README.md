@@ -49,7 +49,8 @@ translation between them.
 - **Federation** — explicitly configured gateway-to-gateway routes.
 - **Consumer profiles** — authenticated, namespace-scoped, immutable routing
   snapshots with enforced gateway-local or gateway-managed cloud execution.
-  Consumer repositories own composite/default policy; the gateway catalog does not.
+  Consumer repositories own text/vision route and default policy; the gateway
+  catalog does not.
 
 ## Requirements
 

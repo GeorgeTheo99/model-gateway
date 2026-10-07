@@ -1040,204 +1040,6 @@ def test_chat_completions_image_request_extracts_then_answers_with_opt_in_fallba
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
-def test_chat_completions_composite_defaults_to_scoped_local_extraction(client, monkeypatch):
-    text_info = _info("glm-chat-template", provider="omlx", provider_model_id="glm-upstream")
-    text_info.composite = providers.CompositeRoute(
-        text_model="glm-local",
-        vision_model="gemma-local",
-        image_handling="extract_then_answer",
-        max_images=4,
-    )
-    vision_info = _info("", thinking="", provider="omlx", provider_model_id="gemma-upstream", vision=True)
-    resolved = []
-
-    def fake_resolve(model):
-        resolved.append(model)
-        if model == "best-local":
-            return text_info
-        if model == "gemma-local":
-            return vision_info
-        if model == "cloud-trap":
-            raise AssertionError("composite must not use the global cloud fallback")
-        return None
-
-    async def fake_extract(request, body, fallback_model, fallback, error_factory, **kwargs):
-        assert fallback_model == "gemma-local"
-        assert fallback is vision_info
-        assert kwargs == {"max_images": 4}
-        return ["Dense Gemma sees a terminal window."]
-
-    async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
-        assert body["model"] == "glm-upstream"
-        assert not server_module._payload_has_image(body)
-        assert "Dense Gemma sees a terminal window." in str(body["messages"])
-        return server_module.JSONResponse(status_code=200, content={"ok": True})
-
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "cloud-trap")
-    monkeypatch.setattr(server_module, "resolve", fake_resolve)
-    monkeypatch.setattr(server_module, "_extract_image_observations", fake_extract)
-    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough_sync)
-
-    resp = client.post("/v1/chat/completions", json={
-        "model": "best-local",
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": "What is shown?"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
-        ]}],
-    })
-
-    assert resp.status_code == 200
-    assert resp.json() == {"ok": True}
-    assert resolved == ["best-local", "gemma-local"]
-
-
-@pytest.mark.parametrize("endpoint", ["/v1/chat/completions", "/v1/responses", "/v1/messages"])
-def test_composite_staging_is_consistent_across_api_translations(monkeypatch, endpoint):
-    from src.responses import responses_to_chat
-    from src.translator import anthropic_to_openai
-
-    text_info = _info("glm-chat-template", provider="omlx", provider_model_id="glm-upstream")
-    text_info.composite = providers.CompositeRoute(
-        text_model="glm-local",
-        vision_model="gemma-local",
-        image_handling="extract_then_answer",
-        max_images=4,
-    )
-    vision_info = _info("", thinking="", provider="omlx", provider_model_id="gemma-upstream", vision=True)
-    image_url = "data:image/png;base64,AAAA"
-    if endpoint == "/v1/responses":
-        chat_body = responses_to_chat({"model": "best-local", "input": [{
-            "type": "message", "role": "user", "content": [
-                {"type": "input_text", "text": "inspect"},
-                {"type": "input_image", "image_url": image_url},
-            ],
-        }]})
-    elif endpoint == "/v1/messages":
-        chat_body = anthropic_to_openai({"model": "best-local", "messages": [{
-            "role": "user", "content": [
-                {"type": "text", "text": "inspect"},
-                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
-            ],
-        }]})
-    else:
-        chat_body = {"model": "best-local", "messages": [{"role": "user", "content": [
-            {"type": "text", "text": "inspect"},
-            {"type": "image_url", "image_url": {"url": image_url}},
-        ]}]}
-
-    async def fake_extract(request, body, fallback_model, fallback, error_factory, **kwargs):
-        assert fallback_model == "gemma-local"
-        assert fallback is vision_info
-        return ["visible terminal"]
-
-    monkeypatch.setattr(server_module, "resolve", lambda model: vision_info if model == "gemma-local" else None)
-    monkeypatch.setattr(server_module, "_extract_image_observations", fake_extract)
-    request = SimpleNamespace(headers={}, state=SimpleNamespace())
-
-    rewritten, served_model, served_info, error = asyncio.run(
-        server_module._apply_chat_vision_fallback(
-            request, chat_body, "best-local", text_info, endpoint,
-            server_module._error if endpoint == "/v1/messages" else server_module._error_openai,
-        )
-    )
-
-    assert error is None
-    assert served_model == "best-local"
-    assert served_info is text_info
-    assert not server_module._payload_has_image(rewritten)
-    assert "visible terminal" in str(rewritten["messages"])
-
-
-@pytest.mark.parametrize(
-    ("headers", "controls"),
-    [
-        ({"x-gateway-image-handling": "reroute"}, {}),
-        ({}, {"gateway_image_handling": "reroute"}),
-        ({}, {"model_gateway": {"image_handling": "reroute"}}),
-    ],
-)
-def test_composite_rejects_client_image_handling_override(headers, controls):
-    text_info = _info("glm-chat-template", provider="omlx", provider_model_id="glm-upstream")
-    text_info.composite = providers.CompositeRoute(
-        text_model="glm-local",
-        vision_model="gemma-local",
-        image_handling="extract_then_answer",
-        max_images=4,
-    )
-    body = {
-        "model": "best-local",
-        "messages": [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
-        ]}],
-        **controls,
-    }
-    request = SimpleNamespace(headers=headers, state=SimpleNamespace())
-
-    rewritten, served_model, served_info, error = asyncio.run(
-        server_module._apply_chat_vision_fallback(
-            request, body, "best-local", text_info, "/v1/chat/completions",
-        )
-    )
-
-    assert error.status_code == 400
-    assert b"client overrides are not allowed" in error.body
-    assert served_model == "best-local"
-    assert served_info is text_info
-    assert "gateway_image_handling" not in rewritten
-    assert "model_gateway" not in rewritten
-
-
-@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
-@pytest.mark.parametrize("endpoint", ["/v1/chat/completions", "/v1/responses", "/v1/messages"])
-@pytest.mark.parametrize("control", ["header", "body", "nested"])
-def test_composite_override_is_rejected_across_api_routes(
-    client, monkeypatch, endpoint, control,
-):
-    text_info = _info("glm-chat-template", provider="omlx", provider_model_id="glm-upstream")
-    text_info.composite = providers.CompositeRoute(
-        text_model="glm-local",
-        vision_model="gemma-local",
-        image_handling="extract_then_answer",
-        max_images=4,
-    )
-    monkeypatch.setattr(server_module, "resolve", lambda model: text_info)
-
-    headers = {}
-    if endpoint == "/v1/responses":
-        payload = {"model": "best-local", "input": [{
-            "type": "message", "role": "user", "content": [
-                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
-            ],
-        }]}
-    elif endpoint == "/v1/messages":
-        payload = {"model": "best-local", "max_tokens": 32, "messages": [{
-            "role": "user", "content": [{
-                "type": "image",
-                "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"},
-            }],
-        }]}
-    else:
-        payload = {"model": "best-local", "messages": [{
-            "role": "user", "content": [{
-                "type": "image_url",
-                "image_url": {"url": "data:image/png;base64,AAAA"},
-            }],
-        }]}
-
-    if control == "header":
-        headers["x-gateway-image-handling"] = "reroute"
-    elif control == "body":
-        payload["gateway_image_handling"] = "reroute"
-    else:
-        payload["model_gateway"] = {"image_handling": "reroute"}
-
-    response = client.post(endpoint, headers=headers, json=payload)
-
-    assert response.status_code == 400
-    assert "client overrides are not allowed" in response.json()["error"]["message"]
-
-
-@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
 @pytest.mark.parametrize("control", ["body", "nested", "nested-extra", "nondict"])
 @pytest.mark.parametrize("with_image", [False, True], ids=["text", "native-vision"])
 def test_native_anthropic_body_controls_do_not_trigger_staging_or_forward(
@@ -1850,23 +1652,6 @@ def test_request_revalidates_opt_in_fallback_policy(monkeypatch):
     assert b"Vision fallback policy is invalid: mixed locality" in error.body
 
 
-def test_startup_rejects_composite_as_global_vision_fallback(monkeypatch):
-    composite_info = _info("none", provider="omlx", vision=True)
-    composite_info.composite = providers.CompositeRoute(
-        text_model="text-local",
-        vision_model="vision-local",
-        image_handling="extract_then_answer",
-        max_images=4,
-    )
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "best-local")
-    monkeypatch.setattr(
-        server_module, "resolve", lambda model, provider_override=None: composite_info,
-    )
-
-    with pytest.raises(RuntimeError, match="not a composite"):
-        server_module._validate_vision_fallback_policy()
-
-
 @pytest.mark.parametrize(
     ("provider", "cloud_egress", "level"),
     [("omlx", "false", logging.INFO), ("fireworks", "true", logging.WARNING)],
@@ -2315,7 +2100,7 @@ def test_all_extract_then_answer_modes_reject_remote_images_before_upstream(monk
         (["data:image/png;base64,%%%"], 4, 400, "malformed base64"),
     ],
 )
-def test_local_composite_rejects_invalid_image_batches_before_upstream(
+def test_extraction_rejects_invalid_image_batches_before_upstream(
     monkeypatch, urls, max_images, expected_status, message,
 ):
     class ForbiddenClient:
@@ -2370,7 +2155,7 @@ def test_all_extraction_modes_enforce_inline_per_image_and_total_byte_limits(mon
 
 
 @pytest.mark.parametrize("finish_reason", ["length", None, ""])
-def test_local_composite_rejects_nonterminal_observations(monkeypatch, finish_reason):
+def test_extraction_rejects_nonterminal_observations(monkeypatch, finish_reason):
     calls = 0
 
     class FakeResponse:
@@ -2422,7 +2207,7 @@ def test_local_composite_rejects_nonterminal_observations(monkeypatch, finish_re
     [{"type": "image_url", "image_url": {"url": "x"}}],
     [{"type": "text", "text": "partial"}, {"type": "image_url", "image_url": {"url": "x"}}],
 ])
-def test_local_composite_rejects_nontext_observations(monkeypatch, content):
+def test_extraction_rejects_nontext_observations(monkeypatch, content):
     class FakeResponse:
         status_code = 200
 
@@ -2889,21 +2674,22 @@ def test_debug_thinking_zai_max_reachable(client, monkeypatch):
     assert zai["max_reachable"] is True
 
 
-def test_composite_inline_image_bytes_never_appear_in_gateway_logs(monkeypatch, caplog):
+def test_scoped_extraction_inline_image_bytes_never_appear_in_gateway_logs(monkeypatch, caplog):
     encoded = base64.b64encode(b"private image sentinel" * 100).decode("ascii")
     text_info = _info("glm-chat-template", provider="omlx", provider_model_id="glm-upstream")
-    text_info.composite = providers.CompositeRoute(
-        text_model="glm-local",
-        vision_model="gemma-local",
-        image_handling="extract_then_answer",
-        max_images=4,
-    )
     vision_info = _info("", thinking="", provider="omlx", provider_model_id="gemma-upstream", vision=True)
 
     async def fake_extract(*args, **kwargs):
         return ["visible wall"]
 
-    monkeypatch.setattr(server_module, "resolve", lambda model: vision_info if model == "gemma-local" else None)
+    monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
+    monkeypatch.delenv("GATEWAY_VISION_FALLBACK_MODE", raising=False)
+    monkeypatch.delenv("GATEWAY_VISION_FALLBACK_CLOUD", raising=False)
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_LOCAL", "gemma-local")
+    monkeypatch.setattr(
+        server_module, "resolve",
+        lambda model, provider_override=None: vision_info if model == "gemma-local" else text_info,
+    )
     monkeypatch.setattr(server_module, "_extract_image_observations", fake_extract)
     request = SimpleNamespace(headers={}, state=SimpleNamespace())
     body = {"model": "auto-local", "messages": [{"role": "user", "content": [{

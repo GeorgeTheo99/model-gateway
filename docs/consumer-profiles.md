@@ -62,7 +62,7 @@ Registration replaces one consumer namespace atomically.
       "protocols": ["openai_chat", "openai_responses", "anthropic_messages"],
       "routes": {
         "text": "glm-5.2-4.5bit",
-        "vision": "best-local"
+        "vision": "gemma4-31b"
       },
       "defaults": {
         "temperature": 0.2,
@@ -78,7 +78,7 @@ Registration replaces one consumer namespace atomically.
 
 - Root: `schema_version`, `namespace`, `source_revision`, `profiles`.
 - Profile: `id`, `locality`, `credential_policy`, `protocols`, `routes`.
-- `routes.text` is required. `routes.vision` is optional; image requests fail closed when absent.
+- `routes.text` is required. `routes.vision` is optional and must name a native vision model (`vision: true`); image requests fail closed when absent.
 
 ### Allowed values
 
@@ -178,7 +178,7 @@ All endpoints require an identity-aware consumer credential and namespace author
       "credential_policy": "gateway_local",
       "executable": true,
       "protocols": ["openai_chat", "openai_responses", "anthropic_messages"],
-      "routes": {"text": "glm-5.2-4.5bit", "vision": "best-local"},
+      "routes": {"text": "glm-5.2-4.5bit", "vision": "gemma4-31b"},
       "defaults": {}
     }
   ]

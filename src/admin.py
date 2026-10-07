@@ -154,7 +154,7 @@ def _admin_model_status() -> list[dict]:
     rows = model_status()
     for row in rows:
         row["vision_route"] = None
-        if not row.get("vision") and not row.get("composite") and row.get("locality") in {"local", "cloud"}:
+        if not row.get("vision") and row.get("locality") in {"local", "cloud"}:
             helper = _configured_vision_fallback_model(row["locality"])
             if helper:
                 row["vision_route"] = {
@@ -2216,7 +2216,6 @@ _ADMIN_HTML = r"""
                   <option value="local">Local</option>
                   <option value="cloud">Cloud</option>
                   <option value="mixed">Mixed</option>
-                  <option value="composite">Composite</option>
                 </select></label
               ><label for="modelProviderFilter"
                 >Connection<select id="modelProviderFilter">
@@ -3092,7 +3091,6 @@ _ADMIN_HTML = r"""
         const modelPools = (m) =>
           pools().filter((p) => (p.models || []).includes(modelName(m)));
         function locality(m) {
-          if (m.composite) return "composite";
           if (m.locality) return m.locality;
           const ids = m.declared_providers || [
             m.configured_provider || m.provider,
@@ -4832,17 +4830,6 @@ _ADMIN_HTML = r"""
             .setAttribute("data-mgmt", "");
         }
         function visionRouting(m) {
-          if (m.composite)
-            return (
-              "Composite: text " +
-              modelLink(m.composite.text_model) +
-              "; images " +
-              modelLink(m.composite.vision_model) +
-              ". " +
-              (m.composite.image_handling === "reroute"
-                ? "The vision model answers image requests."
-                : "The vision model extracts observations; the text model answers.")
-            );
           if (m.vision) return "Native image input; no helper needed.";
           if (!m.vision_route)
             return "No image helper configured for this route.";

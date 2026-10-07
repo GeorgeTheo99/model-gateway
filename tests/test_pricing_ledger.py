@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.providers import CompositeRoute, ProviderInfo, pricing_for, pricing_status_for
+from src.providers import ProviderInfo, pricing_for, pricing_status_for
 import src.server as server_module
 from src.server import app
 from src import ledger
@@ -337,14 +337,8 @@ def test_native_anthropic_stream_records_split_cache_usage(tmp_ledger, monkeypat
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
-def test_semantic_composite_request_records_requested_and_resolved_model_ids(tmp_ledger, monkeypatch):
+def test_semantic_request_records_requested_and_resolved_model_ids(tmp_ledger, monkeypatch):
     info = _info(provider="omlx", provider_model_id="GLM-5.2-MLX-4.5bit")
-    info.composite = CompositeRoute(
-        text_model="glm-5.2-4.5bit",
-        vision_model="gemma4-26b",
-        image_handling="extract_then_answer",
-        max_images=4,
-    )
     import src.providers as providers
     monkeypatch.setattr(providers, "_models", {
         "auto-local": {
@@ -375,14 +369,8 @@ def test_semantic_composite_request_records_requested_and_resolved_model_ids(tmp
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
-def test_composite_validation_error_keeps_resolution_receipt(tmp_ledger, monkeypatch):
+def test_vision_validation_error_keeps_resolution_receipt(tmp_ledger, monkeypatch):
     info = _info(provider="omlx", provider_model_id="GLM-5.2-MLX-4.5bit")
-    info.composite = CompositeRoute(
-        text_model="glm-5.2-4.5bit",
-        vision_model="gemma4-26b",
-        image_handling="extract_then_answer",
-        max_images=4,
-    )
     vision = _info(provider="omlx", provider_model_id="gemma4-26b-upstream", vision=True)
     import src.providers as providers
     monkeypatch.setattr(providers, "_models", {
@@ -393,10 +381,16 @@ def test_composite_validation_error_keeps_resolution_receipt(tmp_ledger, monkeyp
             "pricing_status": "unmetered",
         },
     })
+    monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
+    monkeypatch.delenv("GATEWAY_VISION_FALLBACK_MODE", raising=False)
+    monkeypatch.delenv("GATEWAY_VISION_FALLBACK_CLOUD", raising=False)
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_LOCAL", "gemma4-26b")
     monkeypatch.setattr(
         server_module,
         "resolve",
-        lambda model: info if model == "auto-local" else vision if model == "gemma4-26b" else None,
+        lambda model, provider_override=None: (
+            info if model == "auto-local" else vision if model == "gemma4-26b" else None
+        ),
     )
 
     with TestClient(app) as client:

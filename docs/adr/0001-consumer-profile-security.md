@@ -1,6 +1,6 @@
 # ADR 0001: Consumer-Owned Profiles as a Gateway Security Boundary
 
-- **Status:** Accepted
+- **Status:** Accepted (amended 2026-10-06: gateway catalog composites were removed; profile vision routes must name native vision models)
 - **Date:** 2026-08-27
 
 ## Context
@@ -43,9 +43,9 @@ The gateway executes `local_only` + `gateway_local` and `cloud_explicit` + `gate
 
 Locality is derived from the authenticated principal and registered profile. Request headers and body fields cannot weaken it.
 
-For a local-only profile, the gateway validates the complete route closure: selected text/vision models, provider pools, composite dependencies, and configured model fallbacks. Every reachable provider must be local oMLX. Runtime checks remain in force after registration. Global vision fallback is disabled for profile execution; a profile must name a native vision model or an explicitly local composite.
+For a local-only profile, the gateway validates the complete route closure: selected text/vision models, provider pools, and configured model fallbacks. Every reachable provider must be local oMLX. Runtime checks remain in force after registration. Global vision fallback is disabled for profile execution; a profile must name a native vision model.
 
-Ordinary retries may repeat an already-authorized route. A retry, pool transition, model fallback, vision route, or composite leg may not change locality or credential class. Cross-model fallback remains disabled for profile requests rather than allowing an unproven transition. Same-route pool failover is permitted only when every candidate remains within the profile's validated locality and credential class.
+Ordinary retries may repeat an already-authorized route. A retry, pool transition, model fallback, or vision route may not change locality or credential class. Cross-model fallback remains disabled for profile requests rather than allowing an unproven transition. Same-route pool failover is permitted only when every candidate remains within the profile's validated locality and credential class.
 
 ### Versioning and degraded reads
 

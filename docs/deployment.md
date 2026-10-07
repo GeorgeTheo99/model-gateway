@@ -425,13 +425,10 @@ Databricks is optional and disabled/unconfigured on this machine. A work machine
 ## Vision routing policy
 
 Image input to a raw text-only model fails closed by default. Use a native vision
-model or an explicit gateway composite when images are expected. On machines
-that install the standard local preset contract, callers send `auto-local` for
-the canonical Local Best route; the gateway expands it to GLM-5.2 text plus
-Gemma 4 26B vision using `extract_then_answer`. The legacy `best-local` ID stays
-distinct during migration and shares the explicit `detail-local` route backed by
-Gemma 4 31B vision. Composite models always use their declared image-handling
-mode and cannot be redirected by client headers or request fields.
+model when images are expected, or configure the locality-scoped helpers below.
+Consumer profiles choose image handling with `routes.vision`, which must name a
+native vision model. Catalog `composite` entries are no longer supported; any
+remaining entry is reported unavailable with reason `unsupported_composite`.
 
 For compatibility clients, an operator may configure locality-scoped helpers:
 
@@ -462,7 +459,7 @@ can enforce byte bounds without performing server-side URL fetches. It accepts
 up to 4 images per request by default; operators can adjust the limit with
 `GATEWAY_VISION_FALLBACK_MAX_IMAGES=<1-32>` (validated at startup with the other
 fallback policy checks). Inline images retain the existing 20 MB per-image and
-32 MB aggregate decoded-byte bounds in both composite and process-wide fallback
+32 MB aggregate decoded-byte bounds in both fallback
 modes. Gateway API request bodies are streamed into a bounded 64 MB buffer;
 vision-helper responses are streamed with a 1 MB cap before JSON parsing.
 Observation text is capped per image and per request, and the complete
@@ -564,4 +561,4 @@ pi:
   image_input: disabled
 ```
 
-Native models continue to use `vision: true`, and explicit composites continue to advertise their own public vision capability. The automatic capability is deployment-derived: changing fallback policy requires a gateway restart (to regenerate aliases) followed by `pi-regen`.
+Native models continue to use `vision: true`. The automatic capability is deployment-derived: changing fallback policy requires a gateway restart (to regenerate aliases) followed by `pi-regen`.

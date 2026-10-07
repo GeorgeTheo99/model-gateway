@@ -297,20 +297,6 @@ def _route_closure(model: str, *, locality: str, inventory: dict[str, dict], sta
         "provider_model_id": entry.get("provider_model_id") or entry.get("omlx_id") or entry.get("name"),
         "vision": bool(entry.get("vision")),
     }
-    composite = entry.get("composite")
-    if composite is not None:
-        if not isinstance(composite, dict):
-            raise ProfileError(422, "invalid_profile_route", f"Composite route '{model}' is invalid")
-        text_model = composite.get("text_model")
-        vision_model = composite.get("vision_model")
-        if not isinstance(text_model, str) or not isinstance(vision_model, str):
-            raise ProfileError(422, "invalid_profile_route", f"Composite route '{model}' is invalid")
-        result["composite"] = {
-            "image_handling": composite.get("image_handling", "extract_then_answer"),
-            "max_images": composite.get("max_images", 4),
-            "text": _route_closure(text_model, locality=locality, inventory=inventory, stack=(*stack, model)),
-            "vision": _route_closure(vision_model, locality=locality, inventory=inventory, stack=(*stack, model)),
-        }
     fallback = _fallback_target(entry, inventory)
     if fallback:
         result["fallback"] = _route_closure(fallback, locality=locality, inventory=inventory, stack=(*stack, model))
@@ -371,7 +357,7 @@ def _binding_for(profile: dict, inventory: dict[str, dict]) -> str:
     vision_model = profile["routes"].get("vision")
     if vision_model:
         vision_entry = inventory[vision_model]
-        if not vision_entry.get("vision") and not isinstance(vision_entry.get("composite"), dict):
+        if not vision_entry.get("vision"):
             raise ProfileError(422, "invalid_profile_route", f"Vision route '{vision_model}' is not vision-capable")
     _validate_defaults_for_routes(profile, inventory)
     return hashlib.sha256(_canonical_bytes(closure)).hexdigest()

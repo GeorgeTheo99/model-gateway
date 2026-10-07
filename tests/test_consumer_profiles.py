@@ -217,15 +217,8 @@ def test_local_profile_rejects_non_loopback_omlx_endpoint(monkeypatch):
     assert "trusted loopback" in response.text
 
 
-def test_local_profile_rejects_cloud_composite_dependency(monkeypatch):
+def test_profile_rejects_removed_composite_route(monkeypatch):
     models = [
-        {
-            "name": "cloud-vision",
-            "provider": "cloud-test",
-            "provider_model_id": "cloud-vision-native",
-            "vision": True,
-            "pricing": {"input": 1.0, "output": 2.0},
-        },
         {
             "name": "local-composite",
             "provider": "omlx",
@@ -234,16 +227,12 @@ def test_local_profile_rejects_cloud_composite_dependency(monkeypatch):
             "pricing_status": "unmetered",
             "composite": {
                 "text_model": "test-local",
-                "vision_model": "cloud-vision",
+                "vision_model": "test-local",
                 "image_handling": "extract_then_answer",
             },
         },
     ]
-    _configure(
-        monkeypatch,
-        models=models,
-        extra={"providers": {"cloud-test": {"base_url": "https://cloud.invalid/v1", "api_key": "secret"}}},
-    )
+    _configure(monkeypatch, models=models)
     response = _register(_manifest(route="local-composite", vision="local-composite"))
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "invalid_profile_route"

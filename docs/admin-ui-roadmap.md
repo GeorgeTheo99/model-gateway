@@ -45,7 +45,7 @@ Legacy links remain supported: `#providers[/name]`, `#pools`, `#presets`,
   An all-open pool means no immediately ready member, not proof that recovery cannot run.
 - Model metadata is explicitly whitelisted. Tools support is unknown unless explicitly
   recorded; a tool-parser setting is not evidence of model support. Configured model
-  fallback, composite targets, and scoped image routing are not execution traces.
+  fallback and scoped image routing are not execution traces.
 - Provider inventory checks read the upstream model list, not inference. Their results
   are session-local, not a persistent verification history.
 - Requests contain the recorded route, not a guaranteed final failover workspace or
