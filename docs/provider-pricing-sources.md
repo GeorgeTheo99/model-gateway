@@ -123,7 +123,7 @@ Use this to know which source to read for each model. Regenerate with:
 | claude-sonnet-4.6 | anthropic | claude-sonnet-4-6 | anthropic |
 | gpt-5.4 | openai | gpt-5.4 | openai |
 | gpt-5.4-mini | openai | gpt-5.4-mini | openai |
-| deepseek-v4-pro-fw | fireworks | accounts/fireworks/models/deepseek-v4-pro | fireworks |
+| deepseek-v4.1-flash-fw | fireworks | accounts/fireworks/models/deepseek-v4p1-flash | fireworks |
 | glm-5.3-fw | fireworks | accounts/fireworks/models/glm-5p3 | fireworks |
 | glm-5.3-flash-fw | fireworks | accounts/fireworks/models/glm-5p3-flash | fireworks |
 | kimi-k3 | fireworks | accounts/fireworks/models/kimi-k3 | fireworks |
