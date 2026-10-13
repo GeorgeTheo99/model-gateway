@@ -444,6 +444,12 @@ Supported reusable request quirks are:
   GLM-5.3's native `low|high|max`, send the required
   `thinking: {type: enabled}` shape, preserve `clear_thinking`, and default
   unspecified or unknown effort to `max`
+- `gemini_tool_schema` — strip JSON Schema keywords Gemini function
+  declarations reject (`patternProperties`, `exclusiveMinimum`/`Maximum`,
+  `multipleOf`, `$schema`/`$id`/`$comment`) from tool parameters
+- `gemini_thought_signatures` — cache per-call `thoughtSignature` values from
+  Gemini chat responses and replay them on assistant `tool_calls` that clients
+  return without one (falling back to Google's `skip_thought_signature_validator`)
 
 Provider-specific request code should only be added when the upstream cannot
 be described by these generic compatibility flags.

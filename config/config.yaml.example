@@ -139,6 +139,8 @@ providers:
   #   #   named_tool_choice_as_required -> keep only the named tool, then require a tool call
   #   #   inline_image_urls_only       -> reject public HTTP(S) image URLs
   #   #   anthropic_tool_result_blocks -> use Anthropic image tags inside OpenAI tool results
+  #   #   gemini_tool_schema           -> strip tool-schema keywords Gemini rejects
+  #   #   gemini_thought_signatures    -> replay Gemini tool-call thoughtSignature values
   #   quirks:
   #     - no_stream_options
   #     - no_reasoning_params

@@ -1045,3 +1045,72 @@ def test_anthropic_bearer_auth_quirk(tmp_path, monkeypatch):
     assert h2["x-api-key"] == "sekret"
     assert "Authorization" not in h2
     providers.reload()
+
+
+def test_gemini_tool_schema_strips_unsupported_keywords_both_tool_shapes():
+    info = SimpleNamespace(quirks=frozenset({"gemini_tool_schema"}))
+    params = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            # A property literally named like a keyword must survive.
+            "patternProperties": {"type": "string"},
+            "count": {"type": "integer", "exclusiveMinimum": 0},
+            "limit": {"type": "number", "minimum": 1, "exclusiveMaximum": 9},
+            "meta": {"type": "object", "patternProperties": {"^.*$": {}}},
+            "items": {"type": "array", "items": {"anyOf": [{"type": "number", "multipleOf": 2}]}},
+        },
+        "required": ["count"],
+    }
+    req = {"tools": [
+        {"type": "function", "function": {"name": "chat_shape", "parameters": params}},
+        {"type": "function", "name": "responses_shape", "parameters": params},
+    ]}
+    assert _apply_openai_request_quirks(req, info) is None
+    for out in (req["tools"][0]["function"]["parameters"], req["tools"][1]["parameters"]):
+        assert "$schema" not in out
+        props = out["properties"]
+        assert props["patternProperties"] == {"type": "string"}
+        assert props["count"] == {"type": "integer", "minimum": 0}
+        assert props["limit"] == {"type": "number", "minimum": 1, "maximum": 9}
+        assert props["meta"] == {"type": "object"}
+        assert props["items"]["items"] == {"anyOf": [{"type": "number"}]}
+        assert out["required"] == ["count"]
+    assert params["properties"]["count"]["exclusiveMinimum"] == 0  # input not mutated
+
+
+def test_gemini_tool_schema_is_opt_in():
+    req = {"tools": [{"type": "function", "function": {"name": "t", "parameters": {
+        "type": "object", "properties": {"n": {"type": "integer", "exclusiveMinimum": 0}}}}}]}
+    assert _apply_openai_request_quirks(req, SimpleNamespace(quirks=frozenset())) is None
+    assert req["tools"][0]["function"]["parameters"]["properties"]["n"]["exclusiveMinimum"] == 0
+
+
+def test_gemini_thought_signatures_capture_and_replay():
+    from src import server
+    sig_call = {"id": "echo_tool", "type": "function", "thoughtSignature": "SIG-1",
+                "function": {"name": "echo_tool", "arguments": '{"b": 2, "a": 1}'}}
+    server._capture_gemini_thought_signatures({"tool_calls": [sig_call]})
+    info = SimpleNamespace(quirks=frozenset({"gemini_thought_signatures"}))
+    req = {"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            # Client rewrote the id and re-serialized arguments.
+            {"id": "call_1", "type": "function", "function": {"name": "echo_tool", "arguments": '{"a":1,"b":2}'}},
+            {"id": "call_2", "type": "function", "function": {"name": "other", "arguments": "{}"}},
+            {"id": "call_3", "type": "function", "thoughtSignature": "KEEP",
+             "function": {"name": "x", "arguments": "{}"}},
+        ]},
+    ]}
+    assert _apply_openai_request_quirks(req, info) is None
+    calls = req["messages"][1]["tool_calls"]
+    assert [c["thoughtSignature"] for c in calls] == ["SIG-1", "skip_thought_signature_validator", "KEEP"]
+
+
+def test_gemini_stream_tool_call_deltas_merge():
+    from src import server
+    calls = {}
+    server._merge_stream_tool_calls('data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"t","thoughtSignature":"S","function":{"name":"t","arguments":"{\\"x\\""}}]}}]}', calls)
+    server._merge_stream_tool_calls('data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":":1}"}}]}}]}', calls)
+    server._merge_stream_tool_calls("data: [DONE]", calls)
+    assert calls[(0, 0)] == {"id": "t", "thoughtSignature": "S", "function": {"name": "t", "arguments": '{"x":1}'}}

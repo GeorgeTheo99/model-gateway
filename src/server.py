@@ -42,7 +42,7 @@ from src.responses import chat_to_responses, responses_result_events, responses_
 from src.signature_cache import store_from_extra_content
 from src.streaming import _flatten_list_content, translate_stream
 from src.translator import anthropic_to_openai, anthropic_to_openai_chat, openai_chat_to_anthropic, openai_to_anthropic
-from src import catalog, config_io, discovery, federation, ledger, profiles, providers
+from src import catalog, config_io, signature_cache, discovery, federation, ledger, profiles, providers
 from src.usage import (
     anthropic_usage_to_openai_chat as convert_anthropic_usage_to_openai_chat,
     anthropic_usage_to_responses,
@@ -933,7 +933,92 @@ def _apply_openai_request_quirks(req: dict, info) -> str | None:
                     else:
                         source = {"type": "url", "url": url}
                     content[index] = {"type": "image", "source": source}
+
+    if "gemini_thought_signatures" in quirks:
+        _replay_gemini_thought_signatures(req)
+
+    if "gemini_tool_schema" in quirks:
+        tools = req.get("tools")
+        if isinstance(tools, list):
+            for tool in tools:
+                if not isinstance(tool, dict):
+                    continue
+                # Chat Completions nests under "function"; Responses is flat.
+                target = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+                if isinstance(target.get("parameters"), dict):
+                    target["parameters"] = _gemini_schema(target["parameters"])
     return None
+
+
+# Google's documented sentinel for replayed function calls whose signature is
+# unavailable (e.g. history from another model or a gateway restart).
+_GEMINI_SKIP_SIGNATURE = "skip_thought_signature_validator"
+
+
+def _gemini_signature_key(tool_call: dict) -> str:
+    # Databricks reuses the function name as tool_call.id and clients may rewrite
+    # ids, so key on the function name plus canonicalized arguments.
+    fn = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+    args = fn.get("arguments")
+    try:
+        args = json.dumps(json.loads(args), sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        pass
+    return "gemini:" + json.dumps([fn.get("name"), args])
+
+
+def _capture_gemini_thought_signatures(message: dict) -> None:
+    """Cache per-call ``thoughtSignature`` values Databricks returns for Gemini."""
+    for tool_call in message.get("tool_calls") or ():
+        if isinstance(tool_call, dict) and isinstance(tool_call.get("thoughtSignature"), str):
+            signature_cache.store(_gemini_signature_key(tool_call), tool_call["thoughtSignature"])
+
+
+def _replay_gemini_thought_signatures(req: dict) -> None:
+    """Restore signatures that OpenAI-compatible clients drop from tool_calls."""
+    for message in req.get("messages") or ():
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for tool_call in message.get("tool_calls") or ():
+            if isinstance(tool_call, dict) and not tool_call.get("thoughtSignature"):
+                tool_call["thoughtSignature"] = (
+                    signature_cache.lookup(_gemini_signature_key(tool_call)) or _GEMINI_SKIP_SIGNATURE
+                )
+
+
+# JSON Schema keywords Gemini's function-declaration Schema rejects with
+# "Unknown name ... Cannot find field" (observed via Databricks AI Gateway).
+_GEMINI_UNSUPPORTED_SCHEMA_KEYS = frozenset({
+    "$schema", "$id", "$comment", "patternProperties", "multipleOf",
+    "exclusiveMinimum", "exclusiveMaximum",
+})
+
+
+def _gemini_schema(schema):
+    """Return a copy of a tool JSON Schema without Gemini-unsupported keywords.
+
+    Numeric exclusive bounds become inclusive bounds (slightly looser) unless an
+    inclusive bound already exists. Property names are never treated as keywords.
+    """
+    if isinstance(schema, list):
+        return [_gemini_schema(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+    result = {}
+    for key, value in schema.items():
+        if key in _GEMINI_UNSUPPORTED_SCHEMA_KEYS:
+            continue
+        if key in {"properties", "$defs", "definitions"} and isinstance(value, dict):
+            result[key] = {name: _gemini_schema(sub) for name, sub in value.items()}
+        elif key in {"items", "additionalProperties", "anyOf", "oneOf", "allOf", "not", "prefixItems"}:
+            result[key] = _gemini_schema(value)
+        else:
+            result[key] = value
+    for exclusive, inclusive in (("exclusiveMinimum", "minimum"), ("exclusiveMaximum", "maximum")):
+        bound = schema.get(exclusive)
+        if isinstance(bound, (int, float)) and not isinstance(bound, bool) and inclusive not in result:
+            result[inclusive] = bound
+    return result
 
 
 def _env_int(name: str, default: int) -> int:
@@ -3340,10 +3425,13 @@ async def chat_completions(request: Request):
 
     log.info("OpenAI %s -> %s (stream=%s, thinking=%s)", model, info.provider, is_stream, thinking_enabled)
 
+    capture = "gemini_thought_signatures" in info.quirks
     if is_stream:
         _maybe_stream_options(body, info)
-        return await _passthrough_stream(endpoint, body, fwd, provider=info.provider, request=request)
-    return await _passthrough_sync(endpoint, body, fwd, provider=info.provider, request=request)
+        return await _passthrough_stream(endpoint, body, fwd, provider=info.provider, request=request,
+                                         capture_thought_signatures=capture)
+    return await _passthrough_sync(endpoint, body, fwd, provider=info.provider, request=request,
+                                   capture_thought_signatures=capture)
 
 
 async def _handle_chat_anthropic(body: dict, info, model: str, request: Request, is_stream: bool):
@@ -3506,7 +3594,8 @@ async def _anthropic_sse_to_openai_chat(byte_iter, model: str):
     yield _stream_error_event("Anthropic stream ended before message_stop").encode()
 
 
-async def _passthrough_sync(endpoint: str, body: dict, headers: dict, provider: str = "", request: Request | None = None) -> JSONResponse:
+async def _passthrough_sync(endpoint: str, body: dict, headers: dict, provider: str = "", request: Request | None = None,
+                            capture_thought_signatures: bool = False) -> JSONResponse:
     async with httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS) as client:
         try:
             resp = await _retry_post_with_model_fallback(
@@ -3526,10 +3615,16 @@ async def _passthrough_sync(endpoint: str, body: dict, headers: dict, provider: 
 
     if resp.status_code != 200:
         return upstream_error_openai(resp, resp.text, "Provider")
-    return JSONResponse(status_code=resp.status_code, content=resp.json())
+    content = resp.json()
+    if capture_thought_signatures and isinstance(content, dict):
+        for choice in content.get("choices") or ():
+            if isinstance(choice, dict) and isinstance(choice.get("message"), dict):
+                _capture_gemini_thought_signatures(choice["message"])
+    return JSONResponse(status_code=resp.status_code, content=content)
 
 
-async def _passthrough_stream(endpoint: str, body: dict, headers: dict, provider: str = "", request: Request | None = None):
+async def _passthrough_stream(endpoint: str, body: dict, headers: dict, provider: str = "", request: Request | None = None,
+                              capture_thought_signatures: bool = False):
     client = httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS)
     try:
         resp = await _retry_send_stream_with_model_fallback(
@@ -3557,8 +3652,13 @@ async def _passthrough_stream(endpoint: str, body: dict, headers: dict, provider
 
     async def stream_generator():
         try:
+            calls: dict[tuple[int, int], dict] = {}  # (choice, tool index) -> merged call
             async for line in resp.aiter_lines():
+                if capture_thought_signatures and line.startswith("data:"):
+                    _merge_stream_tool_calls(line, calls)
                 yield (line + "\n").encode()
+            for call in calls.values():
+                _capture_gemini_thought_signatures({"tool_calls": [call]})
         except httpx.TimeoutException as exc:
             log.warning("OpenAI passthrough stream timed out: %s", exc)
             yield _stream_error_event("Provider stream timed out before completing")
@@ -3574,6 +3674,28 @@ async def _passthrough_stream(endpoint: str, body: dict, headers: dict, provider
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
+
+
+def _merge_stream_tool_calls(line: str, calls: dict) -> None:
+    """Accumulate streamed tool-call deltas (id, name, arguments, signature)."""
+    try:
+        data = json.loads(line[5:].strip())
+    except ValueError:
+        return
+    for choice in data.get("choices") or () if isinstance(data, dict) else ():
+        delta = choice.get("delta") if isinstance(choice, dict) else None
+        for tc in (delta or {}).get("tool_calls") or ():
+            if not isinstance(tc, dict):
+                continue
+            call = calls.setdefault((choice.get("index", 0), tc.get("index", 0)),
+                                    {"function": {"name": "", "arguments": ""}})
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            if tc.get("id"):
+                call["id"] = tc["id"]
+            if tc.get("thoughtSignature"):
+                call["thoughtSignature"] = tc["thoughtSignature"]
+            call["function"]["name"] += fn.get("name") or ""
+            call["function"]["arguments"] += fn.get("arguments") or ""
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────

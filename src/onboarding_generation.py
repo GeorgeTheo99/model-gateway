@@ -49,6 +49,8 @@ ALLOWED_QUIRKS = {
     "inline_image_urls_only",
     "anthropic_tool_result_blocks",
     "zai_glm53_thinking",
+    "gemini_tool_schema",
+    "gemini_thought_signatures",
 }
 ALLOWED_PRICING_FIELDS = {
     "input", "output", "cache_read", "cache_write", "cache_write_1h", "reasoning",
