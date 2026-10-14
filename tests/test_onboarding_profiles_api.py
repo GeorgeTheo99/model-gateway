@@ -273,6 +273,11 @@ def test_a_turned_off_provider_or_model_is_refused_not_applied(client, cfg, upst
     _edit(cfg, lambda config: config.update({"model_overrides": {"glm-5.3-fw": {"enabled": False}}}))
     response = client.post(URL, headers=MANAGER, json={"api_key": "fw-key"})
     assert response.status_code == 409 and response.json()["code"] == "model_disabled"
+    # A profile model not added yet but already turned off is refused too.
+    _seed_models(cfg)
+    _edit(cfg, lambda config: config.update({"model_overrides": {"glm-5.3-flash-fw": {"enabled": False}}}))
+    response = client.post(URL, headers=MANAGER, json={"api_key": "fw-key"})
+    assert response.status_code == 409 and response.json()["code"] == "model_disabled"
 
 
 # ── refusals write nothing ───────────────────────────────────────────────────
@@ -348,7 +353,33 @@ def test_the_completion_check_uses_the_candidate_key_on_the_profiles_model(monke
         onboarding.validate_upstream_completion(profile, "candidate")
     assert sent == [(FIREWORKS + "/chat/completions", GLM_MODELS["glm-5.3-fw"], "Bearer candidate")]
     monkeypatch.setattr(onboarding.httpx, "post", lambda url, **_: httpx.Response(200, json={"choices": []}))
+    with pytest.raises(onboarding.OnboardingError, match="no reply"):
+        onboarding.validate_upstream_completion(profile, "candidate")
+    reply = {"choices": [{"message": {"role": "assistant", "content": None}}]}
+    monkeypatch.setattr(onboarding.httpx, "post", lambda url, **_: httpx.Response(200, json=reply))
     onboarding.validate_upstream_completion(profile, "candidate")
+
+
+def test_the_completion_check_applies_the_models_request_quirks(monkeypatch):
+    bodies = []
+
+    def post(url, *, json, headers, timeout):
+        bodies.append(json)
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "OK"}}]})
+
+    monkeypatch.setattr(onboarding.httpx, "post", post)
+    onboarding.validate_upstream_completion(onboarding.packaged_profiles()["moonshot-kimi-k3-rollback"], "candidate")
+    assert "max_tokens" not in bodies[0] and bodies[0]["max_completion_tokens"] == 16
+    assert bodies[0]["reasoning_effort"] == "max"
+
+
+def test_a_key_in_a_provider_error_is_redacted_before_it_is_shortened(monkeypatch):
+    key = "k" * 300
+    monkeypatch.setattr(onboarding.httpx, "post", lambda url, **_: httpx.Response(
+        401, json={"error": {"message": f"bad key {key}"}}))
+    with pytest.raises(onboarding.OnboardingError) as raised:
+        onboarding.validate_upstream_completion(onboarding.packaged_profiles()["fireworks-glm-5.3"], key)
+    assert "kkkk" not in str(raised.value) and "[redacted]" in str(raised.value)
 
 
 def test_writes_disabled_refuses(client, cfg, upstream, monkeypatch):

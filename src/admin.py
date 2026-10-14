@@ -971,7 +971,7 @@ def _plan_profile_apply(profile: dict, api_key: str | None) -> dict:
         profile, config_io.load_model_info(), config.get("models"),
     )
     overrides = config.get("model_overrides") or {}
-    for name in present:
+    for name in [model["name"] for model in profile["models"]]:
         if isinstance(overrides.get(name), dict) and overrides[name].get("enabled") is False:
             raise onboarding.OnboardingConflict(
                 "model_disabled", f"model {name!r} is turned off; only a full admin can turn it on",

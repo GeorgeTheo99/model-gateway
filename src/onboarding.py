@@ -311,32 +311,45 @@ def validate_upstream_completion(profile: dict, api_key: str) -> None:
 
     A provider may list its models for a key that cannot run them (no credit, a
     restricted account), so a key that will replace a working one must answer.
-    Only OpenAI-compatible profiles are checked; others pass.
+    The probe applies the model's request quirks that live routing would.
     """
+    from src.request_options import normalize_token_limit
+
     provider = profile["provider"]
     if provider.get("protocol", "openai") != "openai":
-        return
-    url = f"{str(provider['base_url']).rstrip('/')}/chat/completions"
+        raise OnboardingError("a test completion is only supported for OpenAI-compatible providers")
+    model = profile["models"][0]
+    quirks = frozenset(model.get("quirks") or ()) | frozenset(provider.get("quirks") or ())
     body = {
-        "model": profile["models"][0]["provider_model_id"],
+        "model": model["provider_model_id"],
         "messages": [{"role": "user", "content": "Reply with OK."}],
         "max_tokens": 16,
         "stream": False,
     }
+    if "force_reasoning_effort_max" in quirks:
+        body["reasoning_effort"] = "max"
+    normalize_token_limit(body, quirks)
+    url = f"{str(provider['base_url']).rstrip('/')}/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "User-Agent": "model-gateway-onboard/1"}
     try:
         response = httpx.post(url, json=body, headers=headers, timeout=60)
     except httpx.HTTPError as exc:
         raise OnboardingError(f"provider test completion failed: {type(exc).__name__}") from exc
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
     if response.status_code != 200:
-        detail = ""
-        try:
-            error = response.json().get("error")
-            message = error.get("message") if isinstance(error, dict) else error
-            detail = f": {str(message)[:200]}" if message else ""
-        except (ValueError, AttributeError):
-            pass
+        error = payload.get("error") if isinstance(payload, dict) else None
+        message = error.get("message") if isinstance(error, dict) else error
+        # Redact before shortening, so a key cut at the boundary can't leak in part.
+        detail = f": {str(message).replace(api_key, '[redacted]')[:200]}" if message else ""
         raise OnboardingError(f"provider refused a test completion (HTTP {response.status_code}){detail}")
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    # Thinking models capped at a few tokens may return no content; a message is enough.
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict) \
+            or not isinstance(choices[0].get("message"), dict):
+        raise OnboardingError("provider test completion returned no reply")
 
 
 def _build_candidates(profile: dict, config: dict, model_doc: dict, *, secret_file: Path) -> tuple[dict, dict, dict]:
