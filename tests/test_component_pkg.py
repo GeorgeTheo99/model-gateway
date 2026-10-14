@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from src import onboarding
 from src.version import CAPABILITIES, VERSION
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -110,6 +111,8 @@ def test_dry_run_stages_only_runtime_files_with_bound_release_metadata(staged):
     gateway = support / "package" / "gateway"
     assert sorted(path.name for path in gateway.iterdir()) == RUNTIME_TOP
     assert [path.name for path in (gateway / "bin").iterdir()] == ["model-gateway"]
+    # Products apply these reviewed profiles through the admin API.
+    assert "fireworks-glm-5.3" in onboarding.packaged_profiles(gateway / "config" / "onboarding")
     assert sorted(path.name for path in support.iterdir()) == ["bin", "manifest.sha256", "package"]
     assert [path.name for path in (support / "bin").iterdir()] == ["model-gateway-install-from-pkg"]
     assert [path.name for path in (staged / "scripts").iterdir()] == ["postinstall"]

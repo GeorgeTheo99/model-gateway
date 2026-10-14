@@ -21,7 +21,7 @@ from src.auth import (
     require_admin_or_scope,
     require_admin_writes,
 )
-from src.catalog import canonical_provider
+from src.catalog import canonical_provider, entry_routable_ids
 from src.config_lock import config_write_lock
 from src.providers import (
     MODEL_INFO_PATH,
@@ -36,7 +36,7 @@ from src.providers import (
     routable_ids,
     snapshot_registry as snapshot_provider_registry,
 )
-from src import bundle, config_io, discovery, federation, ledger, local_runtime, profiles
+from src import bundle, config_io, discovery, federation, ledger, local_runtime, onboarding, profiles
 from src.version import CAPABILITIES, VERSION
 
 router = APIRouter()
@@ -896,6 +896,212 @@ async def admin_disable_model(model_name: str, request: Request):
     if reload_error is not None:
         return _bad_request(f"Provider registry update rejected: {reload_error}")
     return result
+
+
+# ── Packaged onboarding profiles (additive) ─────────────────────────────────
+
+_ONBOARDING_SCOPES = ("providers:manage", "models:register")
+
+
+def _require_onboarding_access(request: Request):
+    """A full admin, or a scoped credential holding both management grants."""
+    principal = require_admin_or_scope(request, *_ONBOARDING_SCOPES)
+    if principal is not None and not principal.permissions.issuperset(_ONBOARDING_SCOPES):
+        raise HTTPException(status_code=403, detail="Consumer credential is not authorized for this admin action")
+    return principal
+
+
+def _onboarding_refusal(status: int, code: str, message: str) -> JSONResponse:
+    return JSONResponse(status_code=status, content={"detail": message, "code": code})
+
+
+def _profile_endpoint_state(profile: dict, config: dict) -> tuple[dict, bool]:
+    """The provider's effective config and whether it is the profile's endpoint."""
+    import src.providers as providers
+
+    wanted = profile["provider"]
+    effective = providers._effective_provider_config(config, canonical_provider(wanted["id"]))
+    current_url = str(effective.get("base_url") or "").rstrip("/")
+    matches = (
+        current_url == str(wanted["base_url"]).rstrip("/")
+        and (effective.get("protocol") or "openai") == wanted.get("protocol", "openai")
+    )
+    return effective, matches
+
+
+def _plan_profile_apply(profile: dict, api_key: str | None) -> dict:
+    """Decide an additive apply from fresh files; raise OnboardingConflict to refuse.
+
+    A provider may be defined only when it is missing, and only with the
+    reviewed profile's endpoint. Existing providers and models are never moved.
+    """
+    import src.providers as providers
+
+    provider_id = str(profile["provider"]["id"])
+    config = config_io.load_config_full()
+    location = providers._find_provider_location(config, canonical_provider(provider_id))
+    if location is not None and (
+        location[:2] != ("providers", provider_id)
+        or not isinstance(location[2], dict)
+        or location[2].get("managed_by") == config_io.LOCAL_AI_MANAGED
+    ):
+        raise onboarding.OnboardingConflict(
+            "provider_conflict",
+            f"provider {provider_id!r} is defined in a way only a full admin can change",
+        )
+    effective, matches = _profile_endpoint_state(profile, config)
+    if (effective.get("base_url") or effective.get("protocol")) and not matches:
+        raise onboarding.OnboardingConflict(
+            "provider_conflict",
+            f"provider {provider_id!r} is configured with a different endpoint or protocol than this profile",
+        )
+    define = None
+    if not effective.get("base_url"):
+        define = {
+            "base_url": str(profile["provider"]["base_url"]).rstrip("/"),
+            "protocol": profile["provider"].get("protocol", "openai"),
+        }
+        if location is None:
+            define["enabled"] = True
+    to_add, present = onboarding.plan_additive_models(
+        profile, config_io.load_model_info(), config.get("models"),
+    )
+    # A federation peer's namespace is reserved, as for create-only registration.
+    peers = getattr(federation.manager().config, "peers", None) or {}
+    for model in to_add:
+        if any(rid.split("/", 1)[0] in peers for rid in entry_routable_ids(model) if "/" in rid):
+            raise onboarding.OnboardingConflict(
+                "model_conflict", f"model {model['name']!r} uses an identifier reserved by a federation peer",
+            )
+    current_key = str(effective.get("api_key") or "").strip()
+    return {
+        "provider": provider_id,
+        "define": define,
+        "key": api_key if api_key is not None else current_key,
+        "store_key": api_key if api_key is not None and api_key != current_key else None,
+        "to_add": to_add,
+        "present": present,
+    }
+
+
+@router.get("/admin/api/onboarding/profiles")
+async def admin_onboarding_profiles(request: Request):
+    """Reviewed onboarding profiles packaged with this release (no secrets or paths).
+
+    A scoped credential sees only profiles for its allowlisted providers.
+    """
+    principal = _require_onboarding_access(request)
+    import src.providers as providers
+
+    config = providers._load_config()
+    models = providers._load_models()
+    allowed = None if principal is None else {canonical_provider(p) for p in principal.providers}
+    rows = []
+    for profile_id, profile in onboarding.packaged_profiles().items():
+        provider_id = str(profile["provider"]["id"])
+        if allowed is not None and canonical_provider(provider_id) not in allowed:
+            continue
+        effective, matches = _profile_endpoint_state(profile, config)
+        applied = True
+        for model in profile["models"]:
+            entry = models.get(model["name"])
+            if (
+                entry is None
+                or entry.get("name") != model["name"]
+                or canonical_provider(entry.get("provider")) != canonical_provider(model["provider"])
+                or entry.get("provider_model_id") != model["provider_model_id"]
+            ):
+                applied = False
+        rows.append({
+            "id": profile_id,
+            "provider": provider_id,
+            "models": [model["name"] for model in profile["models"]],
+            "provider_defined": matches,
+            "has_api_key": bool(effective.get("api_key")),
+            "applied": applied,
+        })
+    return {"profiles": rows}
+
+
+@router.post("/admin/api/onboarding/profiles/{profile_id}")
+async def admin_apply_onboarding_profile(profile_id: str, request: Request):
+    """Apply a packaged profile additively: define its provider if missing,
+    store a new key, and add models that are not yet registered.
+
+    Body: {api_key?: string|null}; null or omitted keeps the provider's key.
+    Never retires or replaces models and never moves an existing provider:
+    such conflicts are 409 with nothing written. The key is checked against the
+    provider's /models before any write.
+    """
+    principal = _require_onboarding_access(request)
+    profile = onboarding.packaged_profiles().get(profile_id)
+    if profile is None:
+        return _onboarding_refusal(404, "profile_not_found", f"unknown onboarding profile {profile_id!r}")
+    _require_provider_scope(principal, profile["provider"]["id"])
+    require_admin_writes()
+    raw = await request.body()
+    try:
+        body = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        return _onboarding_refusal(400, "invalid_body", "Invalid JSON body")
+    if not isinstance(body, dict):
+        return _onboarding_refusal(400, "invalid_body", "Invalid JSON body")
+    api_key = body.get("api_key")
+    if api_key is not None and (not isinstance(api_key, str) or not api_key.strip()):
+        return _onboarding_refusal(400, "invalid_body", "api_key must be a non-empty string or null")
+    api_key = api_key.strip() if api_key is not None else None
+
+    try:
+        plan = _plan_profile_apply(profile, api_key)
+    except onboarding.OnboardingConflict as exc:
+        return _onboarding_refusal(409, exc.code, str(exc))
+    except (onboarding.OnboardingError, OSError, yaml.YAMLError) as exc:
+        return _onboarding_refusal(400, "invalid_state", str(exc))
+    if not plan["key"]:
+        return _onboarding_refusal(
+            400, "api_key_required", f"an API key is required: provider {plan['provider']!r} has none configured",
+        )
+    validated_key = plan["key"]
+    try:
+        await asyncio.to_thread(onboarding.validate_upstream_models, profile, validated_key)
+    except onboarding.OnboardingError as exc:
+        return _onboarding_refusal(400, "upstream_rejected", str(exc).replace(validated_key, "[redacted]"))
+
+    def precondition():
+        # Re-plan under the write lock: another writer may have changed the files.
+        nonlocal plan
+        plan = _plan_profile_apply(profile, api_key)
+        if plan["key"] != validated_key:
+            raise onboarding.OnboardingConflict(
+                "provider_conflict", "the provider's key changed during the apply; retry",
+            )
+
+    try:
+        _result, reload_error = _apply_registry_mutation(
+            lambda: config_io.add_onboarded_models(
+                plan["provider"], define=plan["define"], api_key=plan["store_key"], models=plan["to_add"],
+            ),
+            extra_paths=lambda: [
+                path for path in [config_io.api_key_file_target(plan["provider"])] if path and api_key is not None
+            ],
+            precondition=precondition,
+        )
+    except onboarding.OnboardingConflict as exc:
+        return _onboarding_refusal(409, exc.code, str(exc))
+    except (onboarding.OnboardingError, ValueError, OSError, yaml.YAMLError) as exc:
+        return _onboarding_refusal(400, "write_failed", str(exc))
+    if reload_error is not None:
+        return _onboarding_refusal(400, "reload_rejected", f"Provider registry update rejected: {reload_error}")
+    await _regenerate_catalogs()
+    discovery.refresh()
+    return {
+        "profile": profile_id,
+        "provider": plan["provider"],
+        "added_models": [model["name"] for model in plan["to_add"]],
+        "already_present": plan["present"],
+        "key_updated": plan["store_key"] is not None,
+        "reloaded": True,
+    }
 
 
 # ── Consumers, profiles, backups, and bundles ────────────────────────────────

@@ -9,6 +9,7 @@ any write fails.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -21,17 +22,107 @@ from urllib.parse import urlsplit
 import httpx
 import yaml
 
-from src.catalog import entry_routable_ids, normalize_thinking_capabilities, validate_pricing_policy
+from src.catalog import (
+    canonical_provider,
+    entry_routable_ids,
+    normalize_thinking_capabilities,
+    validate_pricing_policy,
+)
 from src.config_lock import config_write_lock
 from src.secret_files import read_api_key_file, resolve_api_key_file, secret_dir
+
+log = logging.getLogger("model-gateway")
+
+# Reviewed profiles ship with each release beside src/. Drafts live under the
+# runtime config directory, and generated profiles carry provenance.
+PACKAGED_PROFILE_DIR = Path(__file__).resolve().parents[1] / "config" / "onboarding"
 
 
 class OnboardingError(ValueError):
     """A profile or onboarding operation is unsafe or invalid."""
 
 
+class OnboardingConflict(OnboardingError):
+    """An additive apply would change a provider or model that already exists."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
 def load_profile(path: Path) -> dict:
     return validate_profile(yaml.safe_load(path.read_text()) or {})
+
+
+def packaged_profiles(directory: Path | None = None) -> dict[str, dict]:
+    """Valid reviewed profiles shipped in this release, keyed by file stem.
+
+    Only top-level files count, so a drafts directory is never offered, and a
+    generated profile (one with ``provenance``) is never offered either.
+    """
+    found: dict[str, dict] = {}
+    for path in sorted((directory or PACKAGED_PROFILE_DIR).glob("*.yaml")):
+        try:
+            profile = load_profile(path)
+        except (OSError, yaml.YAMLError, OnboardingError) as exc:
+            log.warning("skipping packaged onboarding profile %s: %s", path.name, exc)
+            continue
+        if profile.get("provenance") is not None:
+            continue
+        if str(profile.get("id", path.stem)) != path.stem:
+            log.warning("skipping packaged onboarding profile %s: id does not match its file name", path.name)
+            continue
+        found[path.stem] = profile
+    return found
+
+
+def plan_additive_models(profile: dict, model_doc: dict, overlay: object) -> tuple[list[dict], list[str]]:
+    """Split a profile's models into new entries and names already present.
+
+    Nothing is replaced or retired: a same-named model with another provider or
+    upstream id, or a new model whose identifiers another model already uses,
+    raises ``OnboardingConflict("model_conflict")``.
+    """
+    llm = model_doc.get("llm") or []
+    if not isinstance(llm, list):
+        raise OnboardingError("model-info.json llm must be a list")
+    overlay_rows = [row for row in overlay if isinstance(row, dict)] if isinstance(overlay, list) else []
+    rows = [row for row in llm if isinstance(row, dict)] + overlay_rows
+    to_add: list[dict] = []
+    present: list[str] = []
+    for model in profile["models"]:
+        name = model["name"]
+        # An overlay row overrides the catalog row's fields, as at load time.
+        merged: dict = {}
+        for row in rows:
+            if row.get("name") == name:
+                merged.update(row)
+        if not merged:
+            to_add.append(dict(model))
+        elif (
+            canonical_provider(merged.get("provider")) == canonical_provider(model["provider"])
+            and merged.get("provider_model_id") == model["provider_model_id"]
+        ):
+            present.append(name)
+        else:
+            raise OnboardingConflict(
+                "model_conflict",
+                f"model {name!r} already exists with a different provider or upstream model",
+            )
+    for model in to_add:
+        identifiers = set(entry_routable_ids(model))
+        for row in rows:
+            try:
+                shared = identifiers.intersection(entry_routable_ids(row))
+            except ValueError:
+                continue
+            if shared:
+                raise OnboardingConflict(
+                    "model_conflict",
+                    f"model {model['name']!r} identifier {sorted(shared)[0]!r} "
+                    f"is already used by model {row.get('name')!r}",
+                )
+    return to_add, present
 
 
 def validate_profile(data: object) -> dict:

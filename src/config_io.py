@@ -1261,6 +1261,44 @@ def set_model_enabled(name: str, enabled: bool) -> dict:
     return {"name": name, "enabled": bool(enabled), "written_to": [str(CONFIG_PATH)]}
 
 
+@_write_transaction
+def add_onboarded_models(
+    provider_id: str,
+    *,
+    define: dict | None,
+    api_key: str | None,
+    models: list[dict],
+) -> list[str]:
+    """Additively apply a reviewed onboarding profile; return the paths written.
+
+    ``define`` fills fields a missing or endpoint-less provider block lacks and
+    never overrides one that is set. ``api_key`` (None keeps the current key)
+    goes to the provider's mode-0600 key file, as in :func:`upsert_provider`.
+    ``models`` are appended to the catalog; existing entries are untouched.
+    """
+    written: list[str] = []
+    if define is not None or api_key is not None:
+        config = load_config_full()
+        providers = config.setdefault("providers", {}) or {}
+        _refuse_local_ai_provider(providers, provider_id)
+        existing = providers.get(provider_id)
+        block: dict = dict(existing) if isinstance(existing, dict) else {}
+        for field, value in (define or {}).items():
+            block.setdefault(field, value)
+        if api_key is not None:
+            _store_api_key(config, provider_id, block, api_key)
+        providers[provider_id] = block
+        config["providers"] = providers
+        _backup(CONFIG_PATH)
+        _atomic_write(CONFIG_PATH, yaml.safe_dump(config, sort_keys=False, default_flow_style=False))
+        written.append(str(CONFIG_PATH))
+    if models:
+        doc = load_model_info()
+        doc["llm"] = [*(doc.get("llm") or []), *models]
+        written.extend(_write_model_info(doc))
+    return written
+
+
 def _model_summary(entry: dict) -> dict:
     """Mask-free summary of a model entry (models carry no secrets)."""
     return {

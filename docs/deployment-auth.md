@@ -83,6 +83,7 @@ own providers through the admin API without a full admin key. Its
 |---|---|
 | `providers:manage` | `GET /admin/api/status` (reduced body), `GET /admin/api/providers` (filtered), `POST /admin/api/providers/{id}/validate`, and `POST /admin/api/providers/{id}` to set or clear the key of a provider the owner has already defined |
 | `models:register` | Create-only `PUT`/`POST /admin/api/models/{name}` with `If-None-Match: *` |
+| Both | `GET /admin/api/onboarding/profiles` (filtered) and `POST /admin/api/onboarding/profiles/{id}` to apply a reviewed profile packaged with the gateway, additively |
 
 ```yaml
 auth:
@@ -99,7 +100,16 @@ A provider already defined anywhere (config, a synonym or `workspaces` key,
 environment overrides, or built-in defaults) counts as existing: a manager must
 use its canonical id, may omit `base_url`/`protocol` (the effective values are
 kept), and may only change its key. Create-only registration also refuses
-identifiers in a federation peer's namespace (409). Adding a provider, changing
+identifiers in a federation peer's namespace (409).
+
+Applying a packaged onboarding profile is the one reviewed path that may define
+a missing allowlisted provider, and only with the profile's own `base_url` and
+`protocol`. It adds only models that are not yet registered, never retires or
+replaces one, and refuses (409, nothing written) when the provider already has
+a different endpoint or a model name or identifier belongs to another model.
+See [provider-onboarding.md](provider-onboarding.md#apply-a-packaged-profile-over-the-admin-api).
+
+Otherwise, adding a provider, changing
 an existing provider's `base_url`, `protocol`, or `default_headers`,
 updating or deleting models, deleting providers, reload, and consumer
 credential management still require a full admin key. The admin write gate

@@ -34,6 +34,58 @@ The check reads current files while holding the same configuration lock as the
 write, so concurrent competing creates cannot overwrite each other. Preview is
 advisory, not a reservation; importers must send the header on the final PUT.
 
+## Apply a packaged profile over the admin API
+
+Products that should not carry model specs apply a reviewed profile shipped
+with the gateway instead (capability `onboarding_profiles.v1`). Both routes take
+a full admin key or a scoped credential holding **both** `providers:manage` and
+`models:register` (the `manager` role); anything else is 403. A scoped
+credential sees and applies only profiles for its allowlisted providers.
+
+`GET /admin/api/onboarding/profiles` lists the valid top-level
+`config/onboarding/*.yaml` files of the running release. Drafts, generated
+profiles (with `provenance`), and invalid files are never listed:
+
+```json
+{"profiles": [{"id": "fireworks-glm-5.3", "provider": "fireworks",
+  "models": ["glm-5.3-fw", "glm-5.3-flash-fw"], "provider_defined": true,
+  "has_api_key": false, "applied": false}]}
+```
+
+`provider_defined` means the provider's effective endpoint and protocol are the
+profile's; `has_api_key` reflects the provider's effective key; `applied` means
+every profile model is in the live catalog with the same provider and upstream
+id.
+
+`POST /admin/api/onboarding/profiles/{id}` with `{"api_key": "..."}` (or
+`null`/no body to keep the provider's key) applies it **additively**, also
+subject to the admin write gate:
+
+- The profile's `retire` block is ignored; retirements stay with the CLI.
+- A profile model already registered with the same provider and upstream id is
+  left untouched and reported in `already_present`.
+- A missing provider is defined with the profile's `base_url` and `protocol`.
+  An existing provider is never moved; only a supplied key replaces its key.
+- The key is checked against the provider's `/models` before any write.
+- Files, the in-process registry, the alias catalog, and the discovery file are
+  updated under the admin write lock; a rejected reload restores every file.
+
+Success returns `{"profile", "provider", "added_models", "already_present",
+"key_updated", "reloaded": true}`. Errors are `{"detail": message, "code": code}`
+with nothing written:
+
+| Status | `code` | Meaning |
+|---|---|---|
+| 400 | `api_key_required` | No key supplied and the provider has none |
+| 400 | `upstream_rejected` | The provider refused the key or does not list a profile model |
+| 400 | `invalid_body` | Body is not an object, or `api_key` is not a non-empty string or null |
+| 404 | `profile_not_found` | No packaged profile has that id |
+| 409 | `provider_conflict` | The provider has another endpoint or protocol, or is defined outside `providers.<id>` |
+| 409 | `model_conflict` | A profile model name or identifier is already used by a different model |
+| 400 | `invalid_state`, `write_failed`, `reload_rejected` | The current files are unreadable, a write failed, or the new registry did not load; every file is restored |
+
+Authorization, allowlist, and write-gate refusals are 401/403 with `detail` only.
+
 ## Generate a draft
 
 For a simple OpenAI-compatible provider, start with only the provider, HTTPS
