@@ -306,6 +306,39 @@ def validate_upstream_models(profile: dict, api_key: str) -> list[str]:
     return sorted(ids)
 
 
+def validate_upstream_completion(profile: dict, api_key: str) -> None:
+    """Require a real completion from the profile's first model with this key.
+
+    A provider may list its models for a key that cannot run them (no credit, a
+    restricted account), so a key that will replace a working one must answer.
+    Only OpenAI-compatible profiles are checked; others pass.
+    """
+    provider = profile["provider"]
+    if provider.get("protocol", "openai") != "openai":
+        return
+    url = f"{str(provider['base_url']).rstrip('/')}/chat/completions"
+    body = {
+        "model": profile["models"][0]["provider_model_id"],
+        "messages": [{"role": "user", "content": "Reply with OK."}],
+        "max_tokens": 16,
+        "stream": False,
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "User-Agent": "model-gateway-onboard/1"}
+    try:
+        response = httpx.post(url, json=body, headers=headers, timeout=60)
+    except httpx.HTTPError as exc:
+        raise OnboardingError(f"provider test completion failed: {type(exc).__name__}") from exc
+    if response.status_code != 200:
+        detail = ""
+        try:
+            error = response.json().get("error")
+            message = error.get("message") if isinstance(error, dict) else error
+            detail = f": {str(message)[:200]}" if message else ""
+        except (ValueError, AttributeError):
+            pass
+        raise OnboardingError(f"provider refused a test completion (HTTP {response.status_code}){detail}")
+
+
 def _build_candidates(profile: dict, config: dict, model_doc: dict, *, secret_file: Path) -> tuple[dict, dict, dict]:
     provider = profile["provider"]
     provider_id = str(provider["id"]).strip().lower()

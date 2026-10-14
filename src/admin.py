@@ -940,6 +940,10 @@ def _plan_profile_apply(profile: dict, api_key: str | None) -> dict:
     provider_id = str(profile["provider"]["id"])
     config = config_io.load_config_full()
     location = providers._find_provider_location(config, canonical_provider(provider_id))
+    if location is not None and isinstance(location[2], dict) and location[2].get("enabled") is False:
+        raise onboarding.OnboardingConflict(
+            "provider_disabled", f"provider {provider_id!r} is turned off; only a full admin can turn it on",
+        )
     if location is not None and (
         location[:2] != ("providers", provider_id)
         or not isinstance(location[2], dict)
@@ -966,6 +970,12 @@ def _plan_profile_apply(profile: dict, api_key: str | None) -> dict:
     to_add, present = onboarding.plan_additive_models(
         profile, config_io.load_model_info(), config.get("models"),
     )
+    overrides = config.get("model_overrides") or {}
+    for name in present:
+        if isinstance(overrides.get(name), dict) and overrides[name].get("enabled") is False:
+            raise onboarding.OnboardingConflict(
+                "model_disabled", f"model {name!r} is turned off; only a full admin can turn it on",
+            )
     # A federation peer's namespace is reserved, as for create-only registration.
     peers = getattr(federation.manager().config, "peers", None) or {}
     for model in to_add:
@@ -1050,6 +1060,10 @@ async def admin_apply_onboarding_profile(profile_id: str, request: Request):
     if api_key is not None and (not isinstance(api_key, str) or not api_key.strip()):
         return _onboarding_refusal(400, "invalid_body", "api_key must be a non-empty string or null")
     api_key = api_key.strip() if api_key is not None else None
+    # Keys travel in an HTTP header; anything else would fail there and could echo the key.
+    if api_key is not None and (len(api_key) > 512 or not api_key.isascii() or not api_key.isprintable()
+                                or " " in api_key):
+        return _onboarding_refusal(400, "invalid_body", "api_key must be printable ASCII without spaces")
 
     try:
         plan = _plan_profile_apply(profile, api_key)
@@ -1063,7 +1077,9 @@ async def admin_apply_onboarding_profile(profile_id: str, request: Request):
         )
     validated_key = plan["key"]
     try:
+        # The models must be listed and actually answer, before the key replaces a working one.
         await asyncio.to_thread(onboarding.validate_upstream_models, profile, validated_key)
+        await asyncio.to_thread(onboarding.validate_upstream_completion, profile, validated_key)
     except onboarding.OnboardingError as exc:
         return _onboarding_refusal(400, "upstream_rejected", str(exc).replace(validated_key, "[redacted]"))
 

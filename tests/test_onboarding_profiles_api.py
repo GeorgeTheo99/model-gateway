@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+import httpx
 import pytest
 import yaml
 from fastapi.testclient import TestClient
@@ -73,7 +74,12 @@ def upstream(monkeypatch):
             raise onboarding.OnboardingError("provider model discovery failed: 401 Unauthorized")
         return sorted(model["provider_model_id"] for model in profile["models"])
 
+    def completion(profile, key):
+        if key == "no-credit-key":
+            raise onboarding.OnboardingError("provider refused a test completion (HTTP 402): no credit")
+
     monkeypatch.setattr(onboarding, "validate_upstream_models", validator)
+    monkeypatch.setattr(onboarding, "validate_upstream_completion", completion)
     return calls
 
 
@@ -231,7 +237,7 @@ def test_a_new_key_replaces_the_providers_key(client, cfg, upstream):
     assert config_io.api_key_file_target("fireworks").read_text() == "new-key\n"
 
 
-@pytest.mark.parametrize("api_key", ["", "  ", 5, ["k"]])
+@pytest.mark.parametrize("api_key", ["", "  ", 5, ["k"], "fw\x00secret", "fw secret", "fw\x7f", "ключ", "k" * 513])
 def test_invalid_api_key_values_are_rejected(client, cfg, upstream, api_key):
     before = _state(cfg)
     assert client.post(URL, headers=MANAGER, json={"api_key": api_key}).status_code == 400
@@ -249,11 +255,24 @@ def test_missing_provider_is_defined_only_with_the_reviewed_endpoint(client, cfg
 
 
 def test_existing_provider_block_keeps_its_owner_settings(client, cfg, upstream):
-    # Protocol-less and disabled, like an owner-written block: only the key changes.
-    _edit(cfg, lambda config: config["providers"].update({"fireworks": {"base_url": FIREWORKS + "/", "enabled": False}}))
+    # Protocol-less, like an owner-written block: only the key changes.
+    _edit(cfg, lambda config: config["providers"].update({"fireworks": {"base_url": FIREWORKS + "/"}}))
     assert client.post(URL, headers=MANAGER, json={"api_key": "fw-key"}).status_code == 200
     block = yaml.safe_load(cfg.read_text())["providers"]["fireworks"]
-    assert block["base_url"] == FIREWORKS + "/" and block["enabled"] is False and "protocol" not in block
+    assert block["base_url"] == FIREWORKS + "/" and "enabled" not in block and "protocol" not in block
+
+
+def test_a_turned_off_provider_or_model_is_refused_not_applied(client, cfg, upstream):
+    _edit(cfg, lambda config: config["providers"]["fireworks"].update({"enabled": False}))
+    before = _state(cfg)
+    response = client.post(URL, headers=MANAGER, json={"api_key": "fw-key"})
+    assert response.status_code == 409 and response.json()["code"] == "provider_disabled"
+    assert _state(cfg) == before and upstream == []
+    _edit(cfg, lambda config: config["providers"]["fireworks"].update({"enabled": True}))
+    _seed_models(cfg, {"name": "glm-5.3-fw", "provider": "fireworks", "provider_model_id": GLM_MODELS["glm-5.3-fw"]})
+    _edit(cfg, lambda config: config.update({"model_overrides": {"glm-5.3-fw": {"enabled": False}}}))
+    response = client.post(URL, headers=MANAGER, json={"api_key": "fw-key"})
+    assert response.status_code == 409 and response.json()["code"] == "model_disabled"
 
 
 # ── refusals write nothing ───────────────────────────────────────────────────
@@ -304,6 +323,32 @@ def test_upstream_rejection_writes_nothing(client, cfg, upstream):
     assert response.json()["code"] == "upstream_rejected"
     assert "401" in response.json()["detail"] and "bad-key" not in response.text
     assert _state(cfg) == before
+
+
+def test_a_key_that_cannot_answer_never_replaces_a_working_one(client, cfg, upstream):
+    assert client.post(URL, headers=MANAGER, json={"api_key": "fw-key"}).status_code == 200
+    before = _state(cfg)
+    response = client.post(URL, headers=MANAGER, json={"api_key": "no-credit-key"})
+    assert response.status_code == 400 and response.json()["code"] == "upstream_rejected"
+    assert "402" in response.json()["detail"] and "no-credit-key" not in response.text
+    assert _state(cfg) == before
+    assert config_io.api_key_file_target("fireworks").read_text() == "fw-key\n"
+
+
+def test_the_completion_check_uses_the_candidate_key_on_the_profiles_model(monkeypatch):
+    sent = []
+
+    def post(url, *, json, headers, timeout):
+        sent.append((url, json["model"], headers["Authorization"]))
+        return httpx.Response(402, json={"error": {"message": "insufficient credit"}}, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(onboarding.httpx, "post", post)
+    profile = onboarding.packaged_profiles()["fireworks-glm-5.3"]
+    with pytest.raises(onboarding.OnboardingError, match="HTTP 402.*insufficient credit"):
+        onboarding.validate_upstream_completion(profile, "candidate")
+    assert sent == [(FIREWORKS + "/chat/completions", GLM_MODELS["glm-5.3-fw"], "Bearer candidate")]
+    monkeypatch.setattr(onboarding.httpx, "post", lambda url, **_: httpx.Response(200, json={"choices": []}))
+    onboarding.validate_upstream_completion(profile, "candidate")
 
 
 def test_writes_disabled_refuses(client, cfg, upstream, monkeypatch):

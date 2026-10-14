@@ -66,7 +66,10 @@ subject to the admin write gate:
   left untouched and reported in `already_present`.
 - A missing provider is defined with the profile's `base_url` and `protocol`.
   An existing provider is never moved; only a supplied key replaces its key.
-- The key is checked against the provider's `/models` before any write.
+- Before any write, the key must list every profile model (`/models`) and answer a
+  short real completion on the first one (OpenAI-compatible profiles), so a key
+  without credit never replaces a working one.
+- A turned-off provider or profile model is refused, not applied.
 - Files, the in-process registry, the alias catalog, and the discovery file are
   updated under the admin write lock; a rejected reload restores every file.
 
@@ -77,11 +80,12 @@ with nothing written:
 | Status | `code` | Meaning |
 |---|---|---|
 | 400 | `api_key_required` | No key supplied and the provider has none |
-| 400 | `upstream_rejected` | The provider refused the key or does not list a profile model |
-| 400 | `invalid_body` | Body is not an object, or `api_key` is not a non-empty string or null |
+| 400 | `upstream_rejected` | The provider refused the key, does not list a profile model, or did not answer the test completion |
+| 400 | `invalid_body` | Body is not an object, or `api_key` is not null or a printable-ASCII string of at most 512 characters without spaces |
 | 404 | `profile_not_found` | No packaged profile has that id |
 | 409 | `provider_conflict` | The provider has another endpoint or protocol, or is defined outside `providers.<id>` |
 | 409 | `model_conflict` | A profile model name or identifier is already used by a different model |
+| 409 | `provider_disabled`, `model_disabled` | The owner turned the provider or a profile model off; only a full admin turns it on |
 | 400 | `invalid_state`, `write_failed`, `reload_rejected` | The current files are unreadable, a write failed, or the new registry did not load; every file is restored |
 
 Authorization, allowlist, and write-gate refusals are 401/403 with `detail` only.
