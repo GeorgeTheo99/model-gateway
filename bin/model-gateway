@@ -62,6 +62,9 @@ if [ -n "$PACKAGE_MANAGER" ]; then
   PACKAGE_COMPONENT_ROOT="$(package_value COMPONENT_ROOT)"
 fi
 is_packaged() { [ -n "$PACKAGE_MANAGER" ]; }
+# The CLI's own helpers run on the packaged environment's Python: a Mac without developer tools
+# has no working python3 (/usr/bin/python3 only offers to install them).
+if is_packaged && [ -x "${PACKAGE_PYTHON:-}" ]; then PYTHON3="$PACKAGE_PYTHON"; else PYTHON3=python3; fi
 
 LABEL="${MODEL_GATEWAY_LAUNCHD_LABEL:-com.local.model-gateway}"
 PLIST_DIR="${MODEL_GATEWAY_PLIST_DIR:-$HOME/Library/LaunchAgents}"
@@ -235,12 +238,12 @@ check_macos() {
 check_prereqs() {
   check_macos
   require_cmd curl
-  require_cmd python3
   require_cmd launchctl
   if is_packaged; then
     [ -x "$PACKAGE_PYTHON" ] || die "packaged Python environment is missing: ${PACKAGE_PYTHON:-unset} (reinstall model-gateway)"
     return 0
   fi
+  require_cmd python3
   require_cmd git
   require_cmd uv
   UV_BIN="${UV_BIN:-$(command -v uv)}"
@@ -263,7 +266,7 @@ ensure_config() {
   if [ -f "$CONFIG_PATH" ]; then
     log "Config exists: $CONFIG_PATH"
     local real_config mode
-    real_config="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$CONFIG_PATH")"
+    real_config="$("$PYTHON3" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$CONFIG_PATH")"
     mode="$(stat -f '%Lp' "$real_config" 2>/dev/null || stat -c '%a' "$real_config" 2>/dev/null || echo '')"
     if [ -n "$mode" ] && [ "$mode" != "600" ]; then
       chmod 600 "$real_config"
@@ -274,7 +277,7 @@ ensure_config() {
   mkdir -p "$(dirname "$CONFIG_PATH")"
   ( umask 077; : >"$CONFIG_PATH" )
   local admin_key
-  admin_key="mg-admin-$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+  admin_key="mg-admin-$("$PYTHON3" -c 'import secrets; print(secrets.token_urlsafe(32))')"
   cat >"$CONFIG_PATH" <<EOF
 # model-gateway runtime config.
 # Created by bin/model-gateway install. See config/config.yaml.example for the
@@ -408,7 +411,7 @@ plist_env_value() {
 }
 
 canonical_path() {
-  python3 - "$1" <<'PY'
+  "$PYTHON3" - "$1" <<'PY'
 import os, sys
 print(os.path.realpath(os.path.expanduser(sys.argv[1])))
 PY
@@ -631,7 +634,7 @@ remove_plist() {
 health_url() { printf 'http://127.0.0.1:%s/health' "$PORT"; }
 
 health_ok() {
-  python3 -c 'import json,sys
+  "$PYTHON3" -c 'import json,sys
 try:
     data=json.load(sys.stdin)
 except json.JSONDecodeError:
@@ -681,7 +684,7 @@ cmd_version() {
     "") sed -n 's/^VERSION = "\(.*\)"$/\1/p' "$ROOT_DIR/src/version.py" ;;
     --json)
       # No service or project environment needed: works while the gateway is stopped.
-      /usr/bin/python3 - "$ROOT_DIR/src/version.py" <<'PY'
+      "$PYTHON3" - "$ROOT_DIR/src/version.py" <<'PY'
 import ast, json, sys
 values = {node.targets[0].id: ast.literal_eval(node.value)
           for node in ast.parse(open(sys.argv[1]).read()).body
