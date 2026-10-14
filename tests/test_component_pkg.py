@@ -555,7 +555,7 @@ def test_a_mac_without_developer_tools_uses_a_uv_managed_python(machine, staged)
     result = machine.run(staged / SUPPORT, MODEL_GATEWAY_PYTHON3_CANDIDATES="")
     assert result.returncode == 0, result.stdout + result.stderr
     calls = (machine.state / "uv.log").read_text().splitlines()
-    assert "UV_PYTHON_PREFERENCE=only-managed python install --quiet 3" in calls
+    assert "UV_PYTHON_PREFERENCE=only-managed python install --quiet --no-bin 3" in calls
     assert f"Model Gateway {VERSION} installed and verified" in result.stdout
 
 

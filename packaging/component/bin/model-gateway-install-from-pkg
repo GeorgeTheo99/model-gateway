@@ -85,7 +85,8 @@ managed_python() {
   uv="$(resolve_uv)" || return 1
   candidate="$(UV_PYTHON_PREFERENCE=only-managed UV_NO_CONFIG=1 "$uv" python find 3 2>/dev/null || true)"
   if ! functional_python "$candidate"; then
-    UV_PYTHON_PREFERENCE=only-managed UV_NO_CONFIG=1 "$uv" python install --quiet 3 >&2 || return 1
+    # --no-bin: never link a python3 into the owner's ~/.local/bin.
+    UV_PYTHON_PREFERENCE=only-managed UV_NO_CONFIG=1 "$uv" python install --quiet --no-bin 3 >&2 || return 1
     candidate="$(UV_PYTHON_PREFERENCE=only-managed UV_NO_CONFIG=1 "$uv" python find 3)" || return 1
   fi
   functional_python "$candidate" && printf '%s\n' "$candidate"
