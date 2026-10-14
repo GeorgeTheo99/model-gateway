@@ -492,6 +492,12 @@ FAKE_UV = """#!/bin/bash
 # Fake uv: a venv whose python is this test run's interpreter.
 printf 'UV_PYTHON_PREFERENCE=%s %s\\n' "${UV_PYTHON_PREFERENCE:-}" "$*" >> "$HOME/.fake/uv.log"
 [ ! -e "$HOME/.fake/uv-fail" ] || exit 1
+if [ "$1" = python ]; then
+  case "$2" in
+    find) [ -e "$HOME/.fake/managed-python" ] && printf '%s\n' "$FAKE_PYTHON" && exit 0; exit 2 ;;
+    install) touch "$HOME/.fake/managed-python"; exit 0 ;;
+  esac
+fi
 [ "$1" = sync ] || exit 2
 mkdir -p "$UV_PROJECT_ENVIRONMENT/bin"
 printf '#!/bin/sh\\nexec "%s" "$@"\\n' "$FAKE_PYTHON" > "$UV_PROJECT_ENVIRONMENT/bin/python"
@@ -543,6 +549,22 @@ def installed(machine: Machine, staged: Path) -> subprocess.CompletedProcess:
 
 def release_name(support: Path) -> str:
     return plistlib.loads((support / "package/release.plist").read_bytes())["release_name"]
+
+
+def test_a_mac_without_developer_tools_uses_a_uv_managed_python(machine, staged):
+    result = machine.run(staged / SUPPORT, MODEL_GATEWAY_PYTHON3_CANDIDATES="")
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = (machine.state / "uv.log").read_text().splitlines()
+    assert "UV_PYTHON_PREFERENCE=only-managed python install --quiet 3" in calls
+    assert f"Model Gateway {VERSION} installed and verified" in result.stdout
+
+
+def test_without_python_or_uv_the_install_explains_what_is_missing(machine, staged):
+    result = machine.run(staged / SUPPORT, MODEL_GATEWAY_PYTHON3_CANDIDATES="",
+                         MODEL_GATEWAY_UV_BIN=str(machine.base / "no-uv"))
+    assert result.returncode != 0
+    assert "missing a functional Python 3 interpreter; install uv" in result.stderr
+    assert not machine.app.exists()
 
 
 def test_fresh_install_creates_a_component_owned_gateway(machine, staged):

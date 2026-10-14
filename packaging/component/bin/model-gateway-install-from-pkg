@@ -58,17 +58,37 @@ fail_with() { # code message
   exit "$1"
 }
 
+functional_python() { # candidate
+  [ -n "$1" ] && [ -x "$1" ] && "$1" -c 'import hashlib,json,plistlib,socket' >/dev/null 2>&1
+}
+
 resolve_python() {
-  local candidate
-  for candidate in "$(command -v python3 2>/dev/null || true)" /opt/homebrew/bin/python3 \
-    /usr/local/bin/python3 /usr/bin/python3; do
-    [ -x "$candidate" ] || continue
-    if "$candidate" -c 'import hashlib,json,plistlib,socket' >/dev/null 2>&1; then
+  local candidate candidates=("$(command -v python3 2>/dev/null || true)" /opt/homebrew/bin/python3
+    /usr/local/bin/python3 /usr/bin/python3)
+  # Test-only override of the system candidates (space-separated; empty for none).
+  if [ -n "${MODEL_GATEWAY_PYTHON3_CANDIDATES+set}" ]; then
+    read -r -a candidates <<<"$MODEL_GATEWAY_PYTHON3_CANDIDATES"
+  fi
+  for candidate in ${candidates[@]+"${candidates[@]}"}; do
+    if functional_python "$candidate"; then
       printf '%s\n' "$candidate"
       return 0
     fi
   done
   return 1
+}
+
+# A Mac without developer tools has no working python3 (/usr/bin/python3 only offers to install
+# them). The gateway itself runs on a uv-managed Python, so the installer can use one too.
+managed_python() {
+  local uv candidate
+  uv="$(resolve_uv)" || return 1
+  candidate="$(UV_PYTHON_PREFERENCE=only-managed UV_NO_CONFIG=1 "$uv" python find 3 2>/dev/null || true)"
+  if ! functional_python "$candidate"; then
+    UV_PYTHON_PREFERENCE=only-managed UV_NO_CONFIG=1 "$uv" python install --quiet 3 >&2 || return 1
+    candidate="$(UV_PYTHON_PREFERENCE=only-managed UV_NO_CONFIG=1 "$uv" python find 3)" || return 1
+  fi
+  functional_python "$candidate" && printf '%s\n' "$candidate"
 }
 
 resolve_uv() {
@@ -650,7 +670,8 @@ esac
 for tool in curl launchctl plutil shasum /usr/libexec/PlistBuddy; do
   command -v "$tool" >/dev/null 2>&1 || fail "missing prerequisite: $tool"
 done
-PYTHON3="$(resolve_python)" || fail "missing a functional Python 3 interpreter"
+PYTHON3="$(resolve_python || managed_python)" || \
+  fail "missing a functional Python 3 interpreter; install uv (or Apple's Command Line Tools) and re-run the installer"
 verify_package
 
 say "== Model Gateway package $VERSION ($RELEASE_NAME) for $(id -un) =="
