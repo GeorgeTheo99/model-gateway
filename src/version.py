@@ -14,6 +14,7 @@ CAPABILITIES = (
     "endpoint_file.v1",
     "legacy_home_server_import.v1",
     "local_runtime.v1",
+    "onboarding_auto_add.v1",
     "onboarding_profiles.v1",
     "profiles.v1",
     "scoped_manager.v1",

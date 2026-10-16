@@ -1,10 +1,13 @@
 schema_version: 1
 id: fireworks-glm-5.3
+# Part of the curated list: installs with this provider's key get these models automatically.
+auto_add: true
 
 provider:
   id: fireworks
   base_url: https://api.fireworks.ai/inference/v1
   protocol: openai
+  display_name: Fireworks
   secret_name: fireworks.api-key
 
 models:
@@ -13,6 +16,7 @@ models:
     provider: fireworks
     provider_model_id: accounts/fireworks/models/glm-5p3
     alias: glm53fw
+    display_name: GLM 5.3 (Fireworks)
     alternate_ids:
       - glm-5.3
     context: 1048576
@@ -34,6 +38,7 @@ models:
     provider: fireworks
     provider_model_id: accounts/fireworks/models/glm-5p3-flash
     alias: glm53flashfw
+    display_name: GLM 5.3 Flash (Fireworks)
     alternate_ids:
       - glm-5.3-flash
     context: 1048576

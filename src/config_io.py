@@ -1301,6 +1301,29 @@ def add_onboarded_models(
     return written
 
 
+def auto_add_state_path() -> Path:
+    """Names of auto_add profile models already offered to this install (see admin.sync_auto_add_models)."""
+    return CONFIG_PATH.parent / "auto-added-models.json"
+
+
+def load_offered_models() -> set[str]:
+    path = auto_add_state_path()
+    if not path.exists():
+        return set()
+    with open(path) as f:
+        doc = json.load(f)
+    names = doc.get("models") if isinstance(doc, dict) else None
+    if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
+        raise ValueError(f"{path} must hold {{\"models\": [names]}}")
+    return set(names)
+
+
+def save_offered_models(names: set[str]) -> str:
+    path = auto_add_state_path()
+    _atomic_write(path, json.dumps({"version": 1, "models": sorted(names)}, indent=2) + "\n")
+    return str(path)
+
+
 def _model_summary(entry: dict) -> dict:
     """Mask-free summary of a model entry (models carry no secrets)."""
     return {

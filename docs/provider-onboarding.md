@@ -34,6 +34,25 @@ The check reads current files while holding the same configuration lock as the
 write, so concurrent competing creates cannot overwrite each other. Preview is
 advisory, not a reservation; importers must send the header on the final PUT.
 
+## Curated profiles (auto-add)
+
+A packaged profile with top-level `auto_add: true` is part of the curated model
+list (capability `onboarding_auto_add.v1`). Its `provider.display_name` and each
+model's `display_name` and `zdr` are what products show. Rollback profiles leave
+`auto_add` unset.
+
+When the gateway starts (so after every update), after a profile is applied, and
+after a provider key is saved, it adds each curated model it has not offered
+before, for every provider that is turned on, has a key, and uses the profile's
+endpoint. It records offered names in `auto-added-models.json` beside
+`config.yaml`, so a model the owner deletes is not added again. It never retires,
+replaces, or moves anything; a model whose name or identifier is taken is
+skipped and offered again later. Nothing happens while admin writes are off.
+
+To ship a new model, add or extend a curated profile and release the gateway:
+installs that already have that provider's key get the model on their next
+update, with no further steps.
+
 ## Apply a packaged profile over the admin API
 
 Products that should not carry model specs apply a reviewed profile shipped
@@ -48,8 +67,11 @@ profiles (with `provenance`), and invalid files are never listed:
 
 ```json
 {"profiles": [{"id": "fireworks-glm-5.3", "provider": "fireworks",
-  "models": ["glm-5.3-fw", "glm-5.3-flash-fw"], "provider_defined": true,
-  "has_api_key": false, "applied": false}]}
+  "provider_display_name": "Fireworks", "auto_add": true,
+  "models": ["glm-5.3-fw", "glm-5.3-flash-fw"],
+  "model_details": [{"name": "glm-5.3-fw", "display_name": "GLM 5.3 (Fireworks)",
+                     "zero_data_retention": true}, ...],
+  "provider_defined": true, "has_api_key": false, "applied": false}]}
 ```
 
 `provider_defined` means the provider's effective endpoint and protocol are the
@@ -73,8 +95,8 @@ subject to the admin write gate:
 - Files, the in-process registry, the alias catalog, and the discovery file are
   updated under the admin write lock; a rejected reload restores every file.
 
-Success returns `{"profile", "provider", "added_models", "already_present",
-"key_updated", "reloaded": true}`. Errors are `{"detail": message, "code": code}`
+Success returns `{"profile", "provider", "added_models", "auto_added_models",
+"already_present", "key_updated", "reloaded": true}`. Errors are `{"detail": message, "code": code}`
 with nothing written:
 
 | Status | `code` | Meaning |

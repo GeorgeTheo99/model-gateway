@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
 import time
@@ -38,6 +39,8 @@ from src.providers import (
 )
 from src import bundle, config_io, discovery, federation, ledger, local_runtime, onboarding, profiles
 from src.version import CAPABILITIES, VERSION
+
+log = logging.getLogger("model-gateway")
 
 router = APIRouter()
 _STARTED_AT = time.time()
@@ -550,6 +553,8 @@ async def admin_upsert_provider(provider_id: str, request: Request):
         return _bad_request(f"Provider registry update rejected: {reload_error}")
     result["reloaded"] = True
     result["catalogs"] = await _regenerate_catalogs()
+    # A new key unlocks the provider's curated models.
+    result["auto_added_models"] = await sync_auto_add_models()
     return result
 
 
@@ -998,6 +1003,83 @@ def _plan_profile_apply(profile: dict, api_key: str | None) -> dict:
     }
 
 
+def _auto_add_candidates(offered: set[str]) -> tuple[dict[str, list[dict]], set[str]]:
+    """New models of auto_add profiles whose provider already has a key, and every name now offered.
+
+    A provider counts only when it is turned on, has a key, and uses the profile's endpoint. A model
+    already in the catalog is marked offered without change; one that conflicts is skipped for now.
+    """
+    import src.providers as providers
+
+    config = config_io.load_config_full()
+    catalog = list(config_io.load_model_info().get("llm") or [])
+    peers = getattr(federation.manager().config, "peers", None) or {}
+    additions: dict[str, list[dict]] = {}
+    seen: set[str] = set()
+    for profile in onboarding.packaged_profiles().values():
+        if not profile.get("auto_add"):
+            continue
+        provider_id = str(profile["provider"]["id"])
+        location = providers._find_provider_location(config, canonical_provider(provider_id))
+        effective, matches = _profile_endpoint_state(profile, config)
+        if (location is not None and isinstance(location[2], dict) and location[2].get("enabled") is False) \
+                or not matches or not str(effective.get("api_key") or "").strip():
+            continue
+        for model in profile["models"]:
+            name = model["name"]
+            if name in offered or name in seen:
+                continue
+            if any(rid.split("/", 1)[0] in peers for rid in entry_routable_ids(model) if "/" in rid):
+                log.warning("auto-add skipped %s: identifier reserved by a federation peer", name)
+                continue
+            try:
+                to_add, _present = onboarding.plan_additive_models(
+                    {**profile, "models": [model]}, {"llm": catalog}, config.get("models"),
+                )
+            except onboarding.OnboardingConflict as exc:
+                log.warning("auto-add skipped %s: %s", name, exc)
+                continue
+            seen.add(name)
+            catalog.extend(to_add)
+            if to_add:
+                additions.setdefault(provider_id, []).extend(to_add)
+    return additions, seen
+
+
+async def sync_auto_add_models() -> list[str]:
+    """Add auto_add profile models this install was never offered, for providers it has a key for.
+
+    Runs at startup, so an update brings its new models, and after a key is added. A model is
+    offered once, so deleting it sticks; nothing is retired or replaced. Returns the added names.
+    """
+    if not auth_mode().writes_enabled:
+        return []
+    if not _auto_add_candidates(config_io.load_offered_models())[1]:
+        return []
+    added: list[str] = []
+
+    def mutate():
+        # Re-plan under the write lock: another writer may have changed the files.
+        offered = config_io.load_offered_models()
+        additions, seen = _auto_add_candidates(offered)
+        for provider_id, models in additions.items():
+            config_io.add_onboarded_models(provider_id, define=None, api_key=None, models=models)
+            added.extend(model["name"] for model in models)
+        config_io.save_offered_models(offered | seen)
+
+    _result, reload_error = _apply_registry_mutation(
+        mutate, extra_paths=lambda: [config_io.auto_add_state_path()],
+    )
+    if reload_error is not None:
+        log.warning("auto-add rolled back: %s", reload_error)
+        return []
+    if added:
+        log.info("auto-added models: %s", ", ".join(added))
+        await _regenerate_catalogs()
+        discovery.refresh()
+    return added
+
+
 @router.get("/admin/api/onboarding/profiles")
 async def admin_onboarding_profiles(request: Request):
     """Reviewed onboarding profiles packaged with this release (no secrets or paths).
@@ -1029,7 +1111,14 @@ async def admin_onboarding_profiles(request: Request):
         rows.append({
             "id": profile_id,
             "provider": provider_id,
+            "provider_display_name": str(profile["provider"].get("display_name") or provider_id),
+            "auto_add": bool(profile.get("auto_add")),
             "models": [model["name"] for model in profile["models"]],
+            "model_details": [
+                {"name": model["name"], "display_name": str(model.get("display_name") or model["name"]),
+                 "zero_data_retention": model.get("zdr") is True}
+                for model in profile["models"]
+            ],
             "provider_defined": matches,
             "has_api_key": bool(effective.get("api_key")),
             "applied": applied,
@@ -1114,10 +1203,13 @@ async def admin_apply_onboarding_profile(profile_id: str, request: Request):
         return _onboarding_refusal(400, "reload_rejected", f"Provider registry update rejected: {reload_error}")
     await _regenerate_catalogs()
     discovery.refresh()
+    # The provider's key now unlocks the curated models of its other profiles too.
+    auto_added = await sync_auto_add_models()
     return {
         "profile": profile_id,
         "provider": plan["provider"],
         "added_models": [model["name"] for model in plan["to_add"]],
+        "auto_added_models": auto_added,
         "already_present": plan["present"],
         "key_updated": plan["store_key"] is not None,
         "reloaded": True,

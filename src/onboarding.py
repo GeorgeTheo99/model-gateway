@@ -151,6 +151,14 @@ def validate_profile(data: object) -> dict:
         raise OnboardingError(
             "provider base_url must be an HTTPS URL without credentials, query, or fragment"
         )
+    display_name = provider.get("display_name")
+    if display_name is not None and (
+        not isinstance(display_name, str) or not display_name.strip()
+        or len(display_name) > 80 or not display_name.isprintable()
+    ):
+        raise OnboardingError("provider display_name must be printable text of 1-80 characters")
+    if not isinstance(data.get("auto_add", False), bool):
+        raise OnboardingError("profile auto_add must be true or false")
     if not isinstance(models, list) or not models:
         raise OnboardingError("profile requires at least one model")
     names: set[str] = set()

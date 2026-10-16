@@ -1,10 +1,13 @@
 schema_version: 1
 id: openrouter-gemini-4
+# Part of the curated list: installs with this provider's key get these models automatically.
+auto_add: true
 
 provider:
   id: openrouter
   base_url: https://openrouter.ai/api/v1
   protocol: openai
+  display_name: OpenRouter
   secret_name: openrouter.api-key
 
 models:

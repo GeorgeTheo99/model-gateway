@@ -44,7 +44,7 @@ def test_document_lists_urls_paths_and_consumers_without_keys(cfg, tmp_path, mon
     assert doc["consumers"] == {"myai-runtime": {
         "consumer": "myai", "namespaces": ["myai"],
         "permissions": ["profiles:read", "profiles:invoke"],
-        "allow_direct_models": True, "key_file": str(key_file),
+        "allow_direct_models": True, "providers": [], "key_file": str(key_file),
     }}
     assert key_file.read_text().strip() not in json.dumps(doc)
     assert "client-token" not in json.dumps(doc)

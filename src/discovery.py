@@ -56,6 +56,7 @@ def endpoint_document() -> dict:
                 "namespaces": list(entry.get("namespaces") or []),
                 "permissions": list(entry.get("permissions") or []),
                 "allow_direct_models": bool(entry.get("allow_direct_models", False)),
+                "providers": list(entry.get("providers") or []),
                 "key_file": str(resolve_api_key_file(entry["key_file"], providers.CONFIG_PATH)),
             }
     client_key_file = os.environ.get("MODEL_GATEWAY_CLIENT_KEYS_FILE", "").strip()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
@@ -125,8 +126,15 @@ def test_lists_packaged_profiles_filtered_by_allowlist(client):
     }
     rows = _rows(client)
     assert set(rows) == {"fireworks-glm-5.3", "fireworks-kimi-k3"}
-    assert rows[GLM] == {"id": GLM, "provider": "fireworks", "models": list(GLM_MODELS),
-                         "provider_defined": True, "has_api_key": False, "applied": False}
+    assert rows[GLM] == {
+        "id": GLM, "provider": "fireworks", "provider_display_name": "Fireworks", "auto_add": True,
+        "models": list(GLM_MODELS),
+        "model_details": [
+            {"name": "glm-5.3-fw", "display_name": "GLM 5.3 (Fireworks)", "zero_data_retention": True},
+            {"name": "glm-5.3-flash-fw", "display_name": "GLM 5.3 Flash (Fireworks)", "zero_data_retention": True},
+        ],
+        "provider_defined": True, "has_api_key": False, "applied": False,
+    }
 
 
 def test_listing_offers_only_valid_reviewed_top_level_profiles(client, tmp_path, monkeypatch):
@@ -176,19 +184,21 @@ def test_fresh_gateway_applies_profile_and_ignores_retirements(client, cfg, upst
     # The profile retires glm-5.2-fw and two z.ai models; none exist here.
     response = client.post(URL, headers=MANAGER, json={"api_key": "fw-key"})
     assert response.status_code == 200, response.text
+    # The key also unlocks the provider's other curated profile.
     assert response.json() == {"profile": GLM, "provider": "fireworks", "added_models": list(GLM_MODELS),
+                               "auto_added_models": ["kimi-k3"],
                                "already_present": [], "key_updated": True, "reloaded": True}
     assert upstream == ["fw-key"]
     assert "fw-key" not in cfg.read_text() and "fw-key" not in response.text
     assert config_io.api_key_file_target("fireworks").read_text() == "fw-key\n"
-    assert {row["name"]: row["provider_model_id"] for row in _catalog(cfg)} == GLM_MODELS
+    assert {row["name"]: row["provider_model_id"] for row in _catalog(cfg)} == {
+        **GLM_MODELS, "kimi-k3": "accounts/fireworks/models/kimi-k3"}
     # Reloaded in-process: the models route now.
     loaded = providers._load_models()
     assert loaded["glm-5.3"]["name"] == "glm-5.3-fw"
     assert loaded["glm53flashfw"]["name"] == "glm-5.3-flash-fw"
-    assert _rows(client)[GLM] | {"models": None} == {
-        "id": GLM, "provider": "fireworks", "models": None,
-        "provider_defined": True, "has_api_key": True, "applied": True}
+    row = _rows(client)[GLM]
+    assert (row["provider_defined"], row["has_api_key"], row["applied"]) == (True, True, True)
 
 
 def test_second_apply_is_idempotent(client, cfg, upstream):
@@ -417,3 +427,94 @@ def test_rejected_reload_rolls_back_every_file(client, cfg, upstream, monkeypatc
     response = client.post(URL, headers=MANAGER, json={"api_key": "fw-key"})
     assert response.status_code == 400 and response.json()["code"] == "reload_rejected"
     assert _state(cfg) == before
+
+
+# ── curated auto-add ────────────────────────────────────────────────────────
+
+
+def _sync() -> list[str]:
+    return asyncio.run(admin.sync_auto_add_models())
+
+
+def _names(cfg) -> list[str]:
+    return [row["name"] for row in _catalog(cfg)]
+
+
+def test_auto_add_brings_curated_models_only_for_keyed_providers(cfg, monkeypatch):
+    assert _sync() == []  # no keys yet: nothing offered, nothing recorded
+    assert not config_io.auto_add_state_path().exists()
+
+    monkeypatch.setenv("MODEL_GATEWAY_PROVIDER_FIREWORKS_API_KEY", "fw-key")
+    providers.reload()
+    assert _sync() == ["glm-5.3-fw", "glm-5.3-flash-fw", "kimi-k3"]
+    # The Moonshot rollback profile is not curated, and OpenRouter has no key.
+    assert _names(cfg) == ["glm-5.3-fw", "glm-5.3-flash-fw", "kimi-k3"]
+    assert providers._load_models()["kimi3"]["name"] == "kimi-k3"
+    assert config_io.load_offered_models() == {"glm-5.3-fw", "glm-5.3-flash-fw", "kimi-k3"}
+    assert _sync() == []
+
+
+def test_a_deleted_curated_model_is_not_added_again(cfg, monkeypatch):
+    monkeypatch.setenv("MODEL_GATEWAY_PROVIDER_FIREWORKS_API_KEY", "fw-key")
+    providers.reload()
+    _sync()
+    config_io.delete_model("kimi-k3")
+    providers.reload()
+    assert _sync() == []
+    assert "kimi-k3" not in _names(cfg)
+
+
+def test_models_already_present_are_recorded_without_change(cfg, monkeypatch):
+    _seed_models(cfg, {"name": "kimi-k3", "provider": "fireworks",
+                       "provider_model_id": "accounts/fireworks/models/kimi-k3", "desc": "owner's"})
+    monkeypatch.setenv("MODEL_GATEWAY_PROVIDER_FIREWORKS_API_KEY", "fw-key")
+    providers.reload()
+    assert _sync() == ["glm-5.3-fw", "glm-5.3-flash-fw"]
+    assert next(row for row in _catalog(cfg) if row["name"] == "kimi-k3")["desc"] == "owner's"
+    assert "kimi-k3" in config_io.load_offered_models()
+
+
+def test_a_conflicting_model_is_skipped_and_offered_again_later(cfg, monkeypatch):
+    _seed_models(cfg, {"name": "other", "provider": "fireworks", "provider_model_id": "x/other", "alias": "kimi3"})
+    monkeypatch.setenv("MODEL_GATEWAY_PROVIDER_FIREWORKS_API_KEY", "fw-key")
+    providers.reload()
+    assert "kimi-k3" not in _sync()
+    assert "kimi-k3" not in config_io.load_offered_models()
+
+
+def test_auto_add_skips_providers_on_another_endpoint_or_turned_off(cfg, monkeypatch):
+    monkeypatch.setenv("MODEL_GATEWAY_PROVIDER_FIREWORKS_API_KEY", "fw-key")
+    _edit(cfg, lambda config: config["providers"]["fireworks"].update(base_url="https://proxy.example/v1"))
+    assert _sync() == []
+    _edit(cfg, lambda config: config["providers"]["fireworks"].update(base_url=FIREWORKS, enabled=False))
+    assert _sync() == []
+
+
+def test_auto_add_does_nothing_when_writes_are_off(cfg, monkeypatch):
+    monkeypatch.setenv("MODEL_GATEWAY_PROVIDER_FIREWORKS_API_KEY", "fw-key")
+    monkeypatch.setenv("MODEL_GATEWAY_ADMIN_WRITES", "false")
+    providers.reload()
+    assert _sync() == []
+    assert _catalog(cfg) == []
+
+
+def test_adding_a_provider_key_brings_its_curated_models(client, cfg, upstream):
+    response = client.post("/admin/api/providers/fireworks", headers=ADMIN, json={"base_url": FIREWORKS, "api_key": "fw-key"})
+    assert response.status_code == 200, response.text
+    assert response.json()["auto_added_models"] == ["glm-5.3-fw", "glm-5.3-flash-fw", "kimi-k3"]
+
+
+def test_startup_auto_adds(cfg, monkeypatch):
+    monkeypatch.setenv("MODEL_GATEWAY_PROVIDER_FIREWORKS_API_KEY", "fw-key")
+    providers.reload()
+    with TestClient(app):
+        pass
+    assert _names(cfg) == ["glm-5.3-fw", "glm-5.3-flash-fw", "kimi-k3"]
+
+
+def test_profiles_reject_invalid_curation_fields():
+    profile = onboarding.packaged_profiles()["openrouter-gemini-4"]
+    with pytest.raises(onboarding.OnboardingError, match="auto_add"):
+        onboarding.validate_profile({**profile, "auto_add": "yes"})
+    with pytest.raises(onboarding.OnboardingError, match="display_name"):
+        onboarding.validate_profile({**profile, "provider": {**profile["provider"], "display_name": ""}})
