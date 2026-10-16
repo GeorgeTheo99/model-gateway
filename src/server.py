@@ -862,6 +862,11 @@ def _apply_openai_request_quirks(req: dict, info) -> str | None:
 
     normalize_token_limit(req, quirks)
 
+    if "openrouter_zdr" in quirks:
+        # OpenRouter provider routing: only zero-data-retention endpoints may serve this model.
+        routing = req.get("provider")
+        req["provider"] = {**routing, "zdr": True} if isinstance(routing, dict) else {"zdr": True}
+
     if "drop_fixed_sampling_fields" in quirks:
         for key in ("temperature", "top_p", "n", "presence_penalty", "frequency_penalty"):
             req.pop(key, None)
@@ -2604,7 +2609,20 @@ def _nonnegative_catalog_int(value: object) -> int:
         return 0
 
 
-def _canonical_model_rows(inventory: list[dict]) -> list[dict]:
+# Optional row fields a client asks for with ``?include=``; older clients keep exact rows.
+CANONICAL_OPTIONAL_FIELDS = ("display_name", "zero_data_retention")
+
+
+def _canonical_includes(request: Request) -> frozenset[str]:
+    requested = {
+        field.strip()
+        for value in request.query_params.getlist("include")
+        for field in value.split(",")
+    }
+    return frozenset(requested.intersection(CANONICAL_OPTIONAL_FIELDS))
+
+
+def _canonical_model_rows(inventory: list[dict], include: frozenset[str] = frozenset()) -> list[dict]:
     """Project one safe client row per named logical model, without aliases."""
     rows = []
     for model in inventory:
@@ -2624,7 +2642,7 @@ def _canonical_model_rows(inventory: list[dict]) -> list[dict]:
         scope = "local" if candidates == {"omlx"} else "cloud"
         owner = effective_provider if len(candidates) <= 1 else "model_gateway"
         caps = _thinking_capabilities(model)
-        rows.append({
+        row = {
             "id": model_id,
             "object": "model",
             "created": 0,
@@ -2645,7 +2663,13 @@ def _canonical_model_rows(inventory: list[dict]) -> list[dict]:
             "off_supported": caps["off_supported"],
             "default_enabled_level": caps["default_enabled_level"],
             "vision": bool(model.get("vision")),
-        })
+        }
+        if "display_name" in include:
+            row["display_name"] = _bounded_catalog_string(model.get("display_name"), limit=80)
+        if "zero_data_retention" in include:
+            # Local models never leave this machine; cloud routes must declare zdr.
+            row["zero_data_retention"] = scope == "local" or model.get("zdr") is True
+        rows.append(row)
     return rows
 
 
@@ -2871,7 +2895,7 @@ async def list_canonical_models(request: Request):
     """Return one authenticated, safe row per logical gateway model."""
     require_client_auth(request)
     inventory = effective_model_inventory()
-    rows = _canonical_model_rows(inventory)
+    rows = _canonical_model_rows(inventory, _canonical_includes(request))
     auto_models, model_presets = _canonical_cloud_policy(inventory, rows)
     return {
         "object": "list",

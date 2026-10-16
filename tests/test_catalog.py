@@ -434,3 +434,31 @@ def test_load_model_info_document(tmp_path):
     assert doc["routing_profiles"] == {"x": 1}
     assert doc["model_presets"] == {"y": 2}
     assert catalog.load_model_info_document(tmp_path / "missing.json") == {}
+
+
+@pytest.mark.parametrize(
+    ("fields", "message"),
+    [
+        ({"display_name": ""}, "display_name must be printable"),
+        ({"display_name": "x" * 81}, "display_name must be printable"),
+        ({"display_name": "bad\nname"}, "display_name must be printable"),
+        ({"zdr": "yes"}, "zdr must be true or false"),
+        ({"quirks": ["openrouter_zdr"]}, "requires zdr: true"),
+        ({"quirks": ["openrouter_zdr"], "zdr": False}, "requires zdr: true"),
+    ],
+)
+def test_catalog_rejects_invalid_client_metadata(tmp_path, fields, message):
+    mi = tmp_path / "model-info.json"
+    _write_model_info(mi, [{"name": "m", "provider": "openrouter", "provider_model_id": "x/m", **fields}])
+    with pytest.raises(ValueError, match=message):
+        catalog.load_catalog_entries(mi)
+
+
+def test_catalog_accepts_client_metadata(tmp_path):
+    mi = tmp_path / "model-info.json"
+    _write_model_info(mi, [{
+        "name": "m", "provider": "openrouter", "provider_model_id": "x/m",
+        "display_name": "Model M", "zdr": True, "quirks": ["openrouter_zdr"],
+    }])
+    [entry] = catalog.load_catalog_entries(mi)
+    assert entry["display_name"] == "Model M" and entry["zdr"] is True

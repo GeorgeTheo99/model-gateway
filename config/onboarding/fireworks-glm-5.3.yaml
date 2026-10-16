@@ -25,6 +25,7 @@ models:
       input: 1.4
       output: 4.4
       cache_read: 0.26
+    zdr: true
     desc: GLM 5.3 743B MoE on Fireworks, text and tools, 1M context / 128K max output
 
   - name: glm-5.3-flash-fw
@@ -47,6 +48,7 @@ models:
       cache_read: 0.029
     pi:
       aliases: [glm53flash]
+    zdr: true
     desc: GLM 5.3 Flash 320B/18B-active multimodal model on Fireworks, 1M context / 128K max output
 
 retire:

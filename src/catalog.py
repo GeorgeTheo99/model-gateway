@@ -176,6 +176,37 @@ def validate_pricing_policy(entry: dict) -> str:
     return "unmetered"
 
 
+_DISPLAY_NAME_MAX = 80
+
+
+def validate_client_metadata(entry: dict) -> None:
+    """Validate the optional fields consumers may show: ``display_name`` and ``zdr``.
+
+    ``zdr: true`` declares that the route keeps zero data retention upstream.
+    The ``openrouter_zdr`` quirk enforces it on OpenRouter, so it requires the
+    declaration.
+    """
+    name = entry.get("name")
+    display_name = entry.get("display_name")
+    if display_name is not None and (
+        not isinstance(display_name, str)
+        or not display_name.strip()
+        or len(display_name) > _DISPLAY_NAME_MAX
+        or not display_name.isprintable()
+    ):
+        raise ValueError(
+            f"model {name!r} display_name must be printable text of 1-{_DISPLAY_NAME_MAX} characters"
+        )
+    zdr = entry.get("zdr")
+    if zdr is not None and not isinstance(zdr, bool):
+        raise ValueError(f"model {name!r} zdr must be true or false")
+    quirks = entry.get("quirks") or []
+    if isinstance(quirks, str):
+        quirks = [quirk.strip() for quirk in quirks.split(",")]
+    if "openrouter_zdr" in quirks and zdr is not True:
+        raise ValueError(f"model {name!r} openrouter_zdr quirk requires zdr: true")
+
+
 def entry_routable_ids(entry: dict) -> list[str]:
     """Return every gateway-facing identifier for a catalog entry.
 
@@ -309,6 +340,7 @@ def load_catalog_entries(
         normalized = dict(entry)
         normalized["provider"] = provider
         validate_pricing_policy(normalized)
+        validate_client_metadata(normalized)
         normalized = normalize_thinking_capabilities(normalized)
         routable = entry_routable_ids(normalized)
         if not routable:
@@ -366,6 +398,7 @@ def load_catalog_entries(
             continue
         normalized["provider"] = provider
         validate_pricing_policy(normalized)
+        validate_client_metadata(normalized)
         normalized = normalize_thinking_capabilities(normalized)
         ids = entry_routable_ids(normalized)
         if not ids:

@@ -200,6 +200,12 @@ and exposes only canonical IDs, safe capabilities, and cloud preset metadata.
 It never returns provider-native IDs, filesystem paths, pricing, credentials, or
 federated imports.
 
+Rows have a fixed set of keys. A client that wants more asks for them with
+`?include=display_name,zero_data_retention` (unknown names are ignored, so
+older gateways simply omit them): `display_name` is the catalog's friendly
+label or `""`, and `zero_data_retention` is `true` for local models and for
+cloud models whose catalog entry declares `zdr: true`.
+
 ## Federation peer auth
 
 Federation authentication is separate from ordinary client/admin auth and is

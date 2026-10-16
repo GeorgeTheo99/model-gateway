@@ -1114,3 +1114,14 @@ def test_gemini_stream_tool_call_deltas_merge():
     server._merge_stream_tool_calls('data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":":1}"}}]}}]}', calls)
     server._merge_stream_tool_calls("data: [DONE]", calls)
     assert calls[(0, 0)] == {"id": "t", "thoughtSignature": "S", "function": {"name": "t", "arguments": '{"x":1}'}}
+
+
+def test_openrouter_zdr_restricts_routing_and_keeps_other_preferences():
+    info = SimpleNamespace(quirks=frozenset({"openrouter_zdr"}))
+    req = {"messages": [{"role": "user", "content": "hi"}]}
+    assert _apply_openai_request_quirks(req, info) is None
+    assert req["provider"] == {"zdr": True}
+
+    req = {"messages": [], "provider": {"sort": "price", "zdr": False}}
+    assert _apply_openai_request_quirks(req, info) is None
+    assert req["provider"] == {"sort": "price", "zdr": True}

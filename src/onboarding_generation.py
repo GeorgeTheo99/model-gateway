@@ -51,6 +51,7 @@ ALLOWED_QUIRKS = {
     "zai_glm53_thinking",
     "gemini_tool_schema",
     "gemini_thought_signatures",
+    "openrouter_zdr",
 }
 ALLOWED_PRICING_FIELDS = {
     "input", "output", "cache_read", "cache_write", "cache_write_1h", "reasoning",

@@ -296,3 +296,29 @@ def test_canonical_models_use_client_auth(monkeypatch):
         headers={"Authorization": "Bearer canonical-key"},
     )
     assert response.status_code == 200
+
+
+def test_canonical_models_add_client_metadata_only_when_included(monkeypatch, tmp_path):
+    model_info = tmp_path / "model-info.json"
+    model_info.write_text("{}")
+    monkeypatch.setattr(providers, "MODEL_INFO_PATH", model_info)
+    monkeypatch.setattr(server, "effective_model_inventory", lambda: [
+        {"name": "zdr-cloud", "provider": "openrouter", "effective_provider": "openrouter",
+         "available": True, "display_name": "ZDR Cloud", "zdr": True},
+        {"name": "retaining-cloud", "provider": "openrouter", "effective_provider": "openrouter",
+         "available": True},
+        {"name": "local-model", "provider": "omlx", "effective_provider": "omlx", "available": True},
+    ])
+
+    exact = client.get("/v1/models/canonical").json()["data"]
+    assert all("display_name" not in row and "zero_data_retention" not in row for row in exact)
+
+    rows = client.get(
+        "/v1/models/canonical", params={"include": "display_name,zero_data_retention,unknown"},
+    ).json()["data"]
+    assert [(row["display_name"], row["zero_data_retention"]) for row in rows] == [
+        ("ZDR Cloud", True), ("", False), ("", True),
+    ]
+
+    names_only = client.get("/v1/models/canonical", params={"include": "display_name"}).json()["data"]
+    assert names_only[0]["display_name"] == "ZDR Cloud" and "zero_data_retention" not in names_only[0]

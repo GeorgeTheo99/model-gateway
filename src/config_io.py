@@ -31,7 +31,7 @@ from typing import Any
 
 import yaml
 
-from src.catalog import normalize_thinking_capabilities, validate_pricing_policy
+from src.catalog import normalize_thinking_capabilities, validate_client_metadata, validate_pricing_policy
 from src.config_lock import config_write_lock
 from src.providers import CONFIG_PATH, MODEL_INFO_PATH, MODEL_INFO_SOURCE_PATH
 from src.secret_files import default_api_key_path, resolve_api_key_file, write_api_key_file
@@ -1091,7 +1091,7 @@ def _write_model_info(doc: dict) -> list[str]:
 _MODEL_FIELDS = [
     "name", "provider", "provider_model_id", "omlx_id", "alias", "context",
     "max_output_tokens", "thinking", "thinking_levels", "thinking_format", "vision", "quirks",
-    "system_instruction", "pricing", "pricing_status", "desc",
+    "system_instruction", "pricing", "pricing_status", "desc", "display_name", "zdr",
 ]
 _PRICING_RATE_FIELDS = {
     "input", "output", "cache_read", "cache_write", "cache_write_1h", "reasoning",
@@ -1196,11 +1196,13 @@ def upsert_model(name: str, **fields) -> dict:
         # fallback for that new mode rather than retaining stale capabilities.
         entry.pop("thinking_levels", None)
     for f in ("alias", "context", "max_output_tokens", "thinking",
-              "thinking_levels", "thinking_format", "quirks", "system_instruction", "desc"):
+              "thinking_levels", "thinking_format", "quirks", "system_instruction", "desc",
+              "display_name", "zdr"):
         if f in fields and fields[f] is not None:
             entry[f] = fields[f]
     _apply_pricing_update(entry, fields, provider)
     validate_pricing_policy(entry)
+    validate_client_metadata(entry)
     entry.update(normalize_thinking_capabilities(entry))
     if "vision" in fields and fields["vision"] is not None:
         entry["vision"] = bool(fields["vision"])

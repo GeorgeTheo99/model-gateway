@@ -676,6 +676,7 @@ async def admin_preview_model(model_name: str, request: Request):
     from src.catalog import (
         entry_routable_ids,
         normalize_thinking_capabilities,
+        validate_client_metadata,
         validate_pricing_policy,
     )
     import src.providers as providers
@@ -697,7 +698,7 @@ async def admin_preview_model(model_name: str, request: Request):
         entry["provider"] = provider
     for field in ("provider_model_id", "omlx_id", "alias", "context",
                   "max_output_tokens", "thinking", "thinking_levels",
-                  "thinking_format", "desc", "pool"):
+                  "thinking_format", "desc", "pool", "quirks", "display_name"):
         value = body.get(field)
         if value is not None and value != "":
             entry[field] = value
@@ -714,9 +715,12 @@ async def admin_preview_model(model_name: str, request: Request):
         entry["pricing"] = body["pricing"]
     if body.get("vision") is not None:
         entry["vision"] = bool(body["vision"])
+    if body.get("zdr") is not None:
+        entry["zdr"] = body["zdr"]
 
     try:
         validate_pricing_policy(entry)
+        validate_client_metadata(entry)
         entry.update(normalize_thinking_capabilities(entry))
     except ValueError as exc:
         issues.append(str(exc))
@@ -800,7 +804,7 @@ async def admin_upsert_model(model_name: str, request: Request):
 
     Body fields: provider, provider_model_id (or omlx_id for local/oMLX),
     alias, context, max_output_tokens, thinking, thinking_levels, thinking_format, vision,
-    system_instruction, pricing, pricing_status, desc, enabled.
+    quirks, system_instruction, pricing, pricing_status, desc, display_name, zdr, enabled.
     Writes the live catalog and optional machine-local mirror; reloads registry.
     If-None-Match: * requires all candidate identifiers to be unused (412 on
     collision). Other If-None-Match values are unsupported (400); omission is upsert

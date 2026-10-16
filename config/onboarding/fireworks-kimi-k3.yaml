@@ -26,4 +26,5 @@ models:
       - force_reasoning_effort_max
     pi:
       id: kimi-k3
+    zdr: true
     desc: Kimi K3 on Fireworks; always-thinking multimodal and tool-capable model with a 1M-token context

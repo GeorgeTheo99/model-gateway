@@ -120,7 +120,9 @@ def _rows(client, headers=MANAGER) -> dict[str, dict]:
 
 
 def test_lists_packaged_profiles_filtered_by_allowlist(client):
-    assert set(_rows(client, ADMIN)) == {"fireworks-glm-5.3", "fireworks-kimi-k3", "moonshot-kimi-k3-rollback"}
+    assert set(_rows(client, ADMIN)) == {
+        "fireworks-glm-5.3", "fireworks-kimi-k3", "moonshot-kimi-k3-rollback", "openrouter-gemini-4",
+    }
     rows = _rows(client)
     assert set(rows) == {"fireworks-glm-5.3", "fireworks-kimi-k3"}
     assert rows[GLM] == {"id": GLM, "provider": "fireworks", "models": list(GLM_MODELS),
@@ -371,6 +373,25 @@ def test_the_completion_check_applies_the_models_request_quirks(monkeypatch):
     onboarding.validate_upstream_completion(onboarding.packaged_profiles()["moonshot-kimi-k3-rollback"], "candidate")
     assert "max_tokens" not in bodies[0] and bodies[0]["max_completion_tokens"] == 16
     assert bodies[0]["reasoning_effort"] == "max"
+
+
+def test_the_completion_check_routes_zdr_profiles_to_zdr_endpoints(monkeypatch):
+    bodies = []
+
+    def post(url, *, json, headers, timeout):
+        bodies.append(json)
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "OK"}}]})
+
+    monkeypatch.setattr(onboarding.httpx, "post", post)
+    onboarding.validate_upstream_completion(onboarding.packaged_profiles()["openrouter-gemini-4"], "candidate")
+    assert bodies[0]["model"] == "google/gemini-4-argon" and bodies[0]["provider"] == {"zdr": True}
+
+
+def test_profiles_reject_invalid_client_metadata():
+    profile = onboarding.packaged_profiles()["openrouter-gemini-4"]
+    profile["models"][0]["zdr"] = False
+    with pytest.raises(onboarding.OnboardingError, match="requires zdr: true"):
+        onboarding.validate_profile(profile)
 
 
 def test_a_key_in_a_provider_error_is_redacted_before_it_is_shortened(monkeypatch):

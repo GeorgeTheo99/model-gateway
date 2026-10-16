@@ -1,0 +1,30 @@
+schema_version: 1
+id: openrouter-gemini-4
+
+provider:
+  id: openrouter
+  base_url: https://openrouter.ai/api/v1
+  protocol: openai
+  secret_name: openrouter.api-key
+
+models:
+  - name: gemini-4-argon
+    provider: openrouter
+    provider_model_id: google/gemini-4-argon
+    alias: gemini4
+    display_name: Gemini 4 Argon (OpenRouter)
+    context: 1048576
+    # Google Vertex's cap; OpenRouter's AI Studio endpoints allow more but keep data.
+    max_output_tokens: 65536
+    thinking: always
+    thinking_format: openrouter
+    vision: true
+    # Google Vertex global rates, the zero-data-retention endpoints openrouter_zdr routes to.
+    pricing:
+      input: 2.0
+      output: 10.0
+      cache_read: 0.2
+    quirks:
+      - openrouter_zdr
+    zdr: true
+    desc: Gemini 4 Argon via OpenRouter, Google Vertex zero-data-retention endpoints only, 1M context / 64K max output

@@ -506,6 +506,17 @@ Supported reusable request quirks are:
 - `gemini_thought_signatures` — cache per-call `thoughtSignature` values from
   Gemini chat responses and replay them on assistant `tool_calls` that clients
   return without one (falling back to Google's `skip_thought_signature_validator`)
+- `openrouter_zdr` — send OpenRouter's `provider: {zdr: true}` routing
+  preference so only zero-data-retention endpoints serve the model; requires
+  `zdr: true`
+
+Two optional model fields are for consumers to show:
+
+- `display_name` — a friendly label (1–80 printable characters), e.g.
+  `Gemini 4 Argon (OpenRouter)`.
+- `zdr` — `true` declares the route keeps zero data retention upstream (for
+  example Fireworks serverless open models, or OpenRouter with
+  `openrouter_zdr`). Leave it unset when the provider may retain prompts.
 
 Provider-specific request code should only be added when the upstream cannot
 be described by these generic compatibility flags.

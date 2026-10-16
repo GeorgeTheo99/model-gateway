@@ -855,6 +855,21 @@ def test_upsert_model_rejects_invalid_pricing_policy(tmp_config, monkeypatch):
         )
 
 
+def test_upsert_model_stores_and_validates_client_metadata(tmp_config, monkeypatch):
+    config_io.log_dir = tmp_config / "logs"
+    result = config_io.upsert_model(
+        "zdr-test", provider="openrouter", provider_model_id="x/zdr-test",
+        display_name="ZDR Test", zdr=True, quirks=["openrouter_zdr"],
+    )
+    assert result["entry"]["display_name"] == "ZDR Test" and result["entry"]["zdr"] is True
+    with pytest.raises(ValueError, match="requires zdr: true"):
+        config_io.upsert_model(
+            "unsafe-zdr", provider="openrouter", provider_model_id="x/unsafe", quirks=["openrouter_zdr"],
+        )
+    doc = json.loads((tmp_config / "model-info.json").read_text())
+    assert "unsafe-zdr" not in [e["name"] for e in doc["llm"]]
+
+
 def test_set_model_enabled_writes_config_yaml(tmp_config, monkeypatch):
     """enabled state lives in config.yaml model_overrides, not model-info.json."""
     config_io.log_dir = tmp_config / "logs"

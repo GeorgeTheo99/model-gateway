@@ -26,6 +26,7 @@ from src.catalog import (
     canonical_provider,
     entry_routable_ids,
     normalize_thinking_capabilities,
+    validate_client_metadata,
     validate_pricing_policy,
 )
 from src.config_lock import config_write_lock
@@ -209,6 +210,7 @@ def validate_profile(data: object) -> dict:
                 raise OnboardingError(f"model {model['name']!r} pricing values must be finite non-negative numbers")
         try:
             validate_pricing_policy(model)
+            validate_client_metadata(model)
             model.update(normalize_thinking_capabilities(model))
         except ValueError as exc:
             raise OnboardingError(str(exc)) from exc
@@ -328,6 +330,8 @@ def validate_upstream_completion(profile: dict, api_key: str) -> None:
     }
     if "force_reasoning_effort_max" in quirks:
         body["reasoning_effort"] = "max"
+    if "openrouter_zdr" in quirks:
+        body["provider"] = {"zdr": True}
     normalize_token_limit(body, quirks)
     url = f"{str(provider['base_url']).rstrip('/')}/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "User-Agent": "model-gateway-onboard/1"}
@@ -359,6 +363,7 @@ def _build_candidates(profile: dict, config: dict, model_doc: dict, *, secret_fi
     for model in models:
         try:
             validate_pricing_policy(model)
+            validate_client_metadata(model)
             model.update(normalize_thinking_capabilities(model))
         except ValueError as exc:
             raise OnboardingError(str(exc)) from exc
