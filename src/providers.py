@@ -734,13 +734,17 @@ async def ensure_fresh_oauth_token(
 
 
 def _configured_pool_members(entry: dict, config: dict) -> list[str]:
-    """Pool members that have usable local config (base_url + api_key, enabled)."""
+    """Pool members that have usable local config (base_url + api_key, enabled).
+
+    An owner-added provider (``managed_by: custom``) may be a local server that takes no key.
+    """
     members = []
     for member in _pool_members(entry, config):
         provider_config = _effective_provider_config(config, member)
         if provider_config.get("enabled") is False:
             continue
-        if provider_config.get("base_url") and provider_config.get("api_key"):
+        keyless = provider_config.get("managed_by") == "custom"
+        if provider_config.get("base_url") and (provider_config.get("api_key") or keyless):
             members.append(member)
     return members
 

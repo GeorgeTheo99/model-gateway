@@ -1223,7 +1223,6 @@ def upsert_model(name: str, **fields) -> dict:
 
 
 @_write_transaction
-@_write_transaction
 def delete_custom_provider(provider_id: str) -> list[str]:
     """Remove an owner-added provider with its catalog models, their overrides, and its own key file.
 
@@ -1248,6 +1247,12 @@ def delete_custom_provider(provider_id: str) -> list[str]:
             retired += _managed_key_files(provider_id, providers[key])
             del providers[key]
     config["providers"] = providers
+    overlay = config.get("models")
+    if isinstance(overlay, list):
+        config["models"] = [
+            row for row in overlay
+            if not (isinstance(row, dict) and canonical_provider(row.get("provider")) == provider_id)
+        ]
     overrides = config.get("model_overrides")
     if isinstance(overrides, dict):
         for name in names:
@@ -1258,6 +1263,7 @@ def delete_custom_provider(provider_id: str) -> list[str]:
     return [*written, str(CONFIG_PATH)]
 
 
+@_write_transaction
 def delete_model(name: str) -> dict:
     """Remove a model entry by name. Also clears any runtime override."""
     name = (name or "").strip()

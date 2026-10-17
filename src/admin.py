@@ -1269,7 +1269,7 @@ def _custom_destination(body: dict) -> tuple[str, bool]:
     allow_lan = body.get("allow_lan", False)
     if not isinstance(allow_lan, bool):
         raise custom_providers.CustomProviderError("invalid_body", "allow_lan must be true or false")
-    url, _host, _port = custom_providers.normalize_url(body.get("base_url"))
+    url, _scheme, _host, _port = custom_providers.normalize_url(body.get("base_url"))
     return url, allow_lan
 
 
@@ -1304,12 +1304,28 @@ async def _custom_check_upstream(url: str, allow_lan: bool, key: str, models: li
     return network
 
 
-def _custom_entries(provider_id: str, provider_name: str, models: list[str]) -> list[dict]:
-    """Catalog entries for ``models`` with names no other model routes by (call under the write lock)."""
+def _catalog_rows() -> list[dict]:
     doc = config_io.load_model_info()
     overlay = config_io.load_config_full().get("models")
-    rows = [row for row in [*(doc.get("llm") or []), *(overlay if isinstance(overlay, list) else [])]
+    return [row for row in [*(doc.get("llm") or []), *(overlay if isinstance(overlay, list) else [])]
             if isinstance(row, dict)]
+
+
+def _provider_id_in_use(config: dict, rows: list[dict]):
+    """Whether a provider id is defined anywhere (providers, workspaces, env) or used by a model."""
+    import src.providers as providers
+
+    used = {canonical_provider(row.get("provider")) for row in rows}
+    return lambda candidate: (
+        candidate in used
+        or providers._find_provider_location(config, candidate) is not None
+        or bool(providers._provider_env_config(candidate))
+    )
+
+
+def _custom_entries(provider_id: str, provider_name: str, models: list[str]) -> list[dict]:
+    """Catalog entries for ``models`` with names no other model routes by (call under the write lock)."""
+    rows = _catalog_rows()
     taken: set[str] = set()
     for row in rows:
         try:
@@ -1405,8 +1421,7 @@ async def admin_add_custom_provider(request: Request):
             raise custom_providers.CustomProviderError(
                 "too_many", f"This gateway already has {custom_providers.MAX_PROVIDERS} added providers", status=409,
             )
-        taken = {str(provider).lower() for provider in (config.get("providers") or {})}
-        plan["id"] = custom_providers.provider_id_for(name, taken)
+        plan["id"] = custom_providers.provider_id_for(name, _provider_id_in_use(config, _catalog_rows()))
         plan["entries"] = _custom_entries(plan["id"], name, models)
 
     def mutate():
@@ -1430,11 +1445,29 @@ async def admin_add_custom_provider(request: Request):
     return await _custom_saved(plan["id"])
 
 
+def _custom_stored_key(provider_id: str) -> str:
+    import src.providers as providers
+
+    return str(providers._effective_provider_config(providers._load_config(), provider_id).get("api_key") or "")
+
+
+@router.get("/admin/api/custom-providers/{provider_id}/available")
+async def admin_custom_provider_available(provider_id: str, request: Request):
+    """The models a saved owner-added provider lists now, with its saved key. Returns {models}."""
+    principal = require_admin_or_scope(request, "providers:custom")
+    try:
+        block = _owned_custom_block(principal, provider_id, config_io.load_config_full())
+        url = str(block.get("base_url") or "")
+        await asyncio.to_thread(custom_providers.check_destination, url, bool(block.get("allow_lan")))
+        models = await asyncio.to_thread(custom_providers.discover, url, _custom_stored_key(provider_id))
+    except custom_providers.CustomProviderError as exc:
+        return _custom_refusal(exc)
+    return {"models": models}
+
+
 @router.post("/admin/api/custom-providers/{provider_id}/models")
 async def admin_add_custom_provider_models(provider_id: str, request: Request):
     """Add more of an owner-added provider's models. Body: {models: [upstream id, ...]}."""
-    import src.providers as providers
-
     principal = require_admin_or_scope(request, "providers:custom")
     require_admin_writes()
     try:
@@ -1447,8 +1480,7 @@ async def admin_add_custom_provider_models(provider_id: str, request: Request):
         models = [model for model in models if model not in present]
         if models:
             url = str(block.get("base_url") or "")
-            await _custom_check_upstream(url, bool(block.get("allow_lan")), str(
-                providers._effective_provider_config(providers._load_config(), provider_id).get("api_key") or ""), models)
+            await _custom_check_upstream(url, bool(block.get("allow_lan")), _custom_stored_key(provider_id), models)
     except custom_providers.CustomProviderError as exc:
         return _custom_refusal(exc)
     if not models:
@@ -1456,9 +1488,16 @@ async def admin_add_custom_provider_models(provider_id: str, request: Request):
     plan: dict = {}
 
     def precondition():
+        # Re-read under the lock: a concurrent add may have taken some of these models.
         config = config_io.load_config_full()
         block = _owned_custom_block(principal, provider_id, config)
-        plan["entries"] = _custom_entries(provider_id, str(block.get("display_name") or provider_id), models)
+        saved = _custom_row(provider_id, block, config_io.load_model_info().get("llm") or [])["models"]
+        new = [model for model in models if model not in {row["upstream_id"] for row in saved}]
+        if len(saved) + len(new) > custom_providers.MAX_MODELS:
+            raise custom_providers.CustomProviderError(
+                "too_many", f"A provider can have at most {custom_providers.MAX_MODELS} models", status=409,
+            )
+        plan["entries"] = _custom_entries(provider_id, str(block.get("display_name") or provider_id), new)
 
     try:
         _result, reload_error = _apply_registry_mutation(

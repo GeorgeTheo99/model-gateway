@@ -86,23 +86,37 @@ created (a full admin sees and changes all of them).
 | `GET /admin/api/custom-providers` | Lists this credential's providers and their models |
 | `POST /admin/api/custom-providers/discover` | `{base_url, api_key?, allow_lan?}`: checks the address and returns `{base_url, network, models}`, writing nothing |
 | `POST /admin/api/custom-providers` | `{name, base_url, api_key?, allow_lan?, models}`: adds the provider and models once it lists them all and answers a test completion on the first |
+| `GET /admin/api/custom-providers/{id}/available` | Lists the models it offers now, with its saved key |
 | `POST /admin/api/custom-providers/{id}/models` | `{models}`: adds more of its models, after the same checks |
 | `POST /admin/api/custom-providers/{id}/key` | `{api_key}`: replaces (`""` removes) the key once the provider answers with it |
 | `DELETE /admin/api/custom-providers/{id}` | Removes the provider, its models, and its key file |
 
 Writes need `MODEL_GATEWAY_ADMIN_WRITES`; refusals are `{"detail", "code"}` with
-nothing written. The gateway connects to a public host only over https, to
-plain http only on loopback or, with `allow_lan: true`, an address on the
-owner's network (private ranges, unique-local IPv6 and `100.64.0.0/10`
-tailnets), and never to link-local, multicast, unspecified or other
-non-routable addresses (cloud metadata endpoints among them). A host with any
-such address is refused. The check runs when a provider is saved and again
-before requests to it (answers are kept for 30 seconds); redirects are not
-followed. Providers speak the OpenAI protocol with a bearer key, without custom
-headers, and declare no zero data retention, so clients show retention as
-unknown. Their models route only by their gateway names
-(`custom-<slug>-<upstream id>`), never by upstream id, so they cannot take over
-another route's identifier. A gateway holds at most 20 such providers.
+nothing written. Destinations:
+
+- A host name must use https; plain http is allowed only to an IP address or
+  `localhost`. TLS, not a DNS answer that could change after the check, then
+  decides what the gateway talks to.
+- Loopback is always allowed. An address on the owner's network (private
+  ranges, unique-local IPv6, `100.64.0.0/10` tailnets) needs `allow_lan: true`.
+- Link-local, multicast, unspecified and other non-routable addresses, and
+  cloud metadata services (including `fd00:ec2::254` and `100.100.100.200`),
+  are never allowed; a host name with any such address is refused.
+- The address is checked with DNS when saved, and again, without DNS, before
+  each request. Redirects are not followed, and a model list over 2 MB is
+  refused.
+
+`allow_lan` records the owner's consent in the client; the credential holding
+`providers:custom` is the security boundary, since whoever holds it can also
+set the flag. Providers speak the OpenAI protocol with a bearer key (none for a
+server added without one), without custom headers, and declare no zero data
+retention, so clients show retention as unknown. Their models route only by
+their gateway names (`custom-<slug>-<upstream id>`), never by upstream id, so
+they cannot take over another route's identifier. `custom-` provider ids are
+reserved for this: a hand-configured `custom-` provider's upstream ids do not
+route either. A gateway holds at most 20 such providers of up to 50 models
+each. For OpenAI itself, use the curated `openai-gpt` profile: only the
+`openai` provider gets OpenAI's `max_completion_tokens` handling.
 
 ## Scoped management credentials
 

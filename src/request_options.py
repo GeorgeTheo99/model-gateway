@@ -4,7 +4,8 @@ from __future__ import annotations
 
 def upstream_auth_headers(api_key: str, protocol: str, quirks=()) -> dict[str, str]:
     if protocol != "anthropic":
-        return {"Authorization": f"Bearer {api_key}"}
+        # An owner-added local server may take no key; an empty bearer could be refused.
+        return {"Authorization": f"Bearer {api_key}"} if api_key else {}
     headers = {"anthropic-version": "2023-06-01", "content-type": "application/json"}
     if "anthropic_bearer_auth" in quirks:
         headers["Authorization"] = f"Bearer {api_key}"

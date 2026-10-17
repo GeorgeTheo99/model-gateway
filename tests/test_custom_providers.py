@@ -20,7 +20,7 @@ OTHER = {"Authorization": "Bearer other-token"}
 MANAGER = {"Authorization": "Bearer manager-token"}
 URL = "/admin/api/custom-providers"
 BOX = "https://llm.example.com/v1"
-ADDRESSES = {"llm.example.com": {"93.184.216.34"}}
+ADDRESSES = {"llm.example.com": {"93.184.216.34"}, "lan.example.com": {"192.168.1.9"}}
 
 
 @pytest.fixture
@@ -73,7 +73,6 @@ def addresses(monkeypatch):
             raise custom_providers.CustomProviderError("unreachable", f"Can't find {host}") from None
 
     monkeypatch.setattr(custom_providers, "_resolve", resolve)
-    custom_providers._checked.clear()
     return table
 
 
@@ -118,12 +117,15 @@ def _add(client, headers=CUSTOM, **fields):
 
 @pytest.mark.parametrize(("url", "allow_lan", "network"), [
     ("https://llm.example.com/v1", False, "public"),
+    ("HTTPS://LLM.Example.com/v1/", False, "public"),
     ("http://localhost:11434/v1", False, "loopback"),
     ("http://127.0.0.1:1234/v1/", False, "loopback"),
+    ("http://[::1]:1234/v1", False, "loopback"),
     ("http://192.168.1.20:11434/v1", True, "lan"),
     ("https://10.0.0.5/v1", True, "lan"),
     ("http://100.101.102.103:8080/v1", True, "lan"),
     ("http://[fd12::1]:8080/v1", True, "lan"),
+    ("https://lan.example.com/v1", True, "lan"),
 ])
 def test_allowed_destinations(addresses, url, allow_lan, network):
     assert custom_providers.check_destination(url, allow_lan) == network
@@ -131,6 +133,15 @@ def test_allowed_destinations(addresses, url, allow_lan, network):
 
 @pytest.mark.parametrize(("url", "allow_lan", "code"), [
     ("http://llm.example.com/v1", False, "https_required"),
+    ("HTTP://llm.example.com/v1", False, "https_required"),
+    ("http://93.184.216.34/v1", False, "https_required"),
+    # A host name gets plain http nowhere, so a DNS answer that changes later can't redirect it.
+    ("http://lan.example.com/v1", True, "https_required"),
+    ("https://lan.example.com/v1", False, "lan_not_allowed"),
+    ("http://[fd00:ec2::254]/latest", True, "blocked_address"),
+    ("http://100.100.100.200/latest", True, "blocked_address"),
+    ("https://llm.exa mple.com/v1", False, "invalid_url"),
+    ("https://exämple.com/v1", False, "invalid_url"),
     ("http://192.168.1.20:11434/v1", False, "lan_not_allowed"),
     ("http://100.101.102.103/v1", False, "lan_not_allowed"),
     ("http://169.254.169.254/latest", True, "blocked_address"),
@@ -157,19 +168,22 @@ def test_a_host_with_any_blocked_address_is_refused(addresses):
         custom_providers.check_destination("https://mixed.example.com/v1", True)
 
 
-def test_requests_recheck_the_destination(cfg, addresses):
-    block = {"base_url": BOX, "managed_by": "custom", "allow_lan": False}
-    info = SimpleNamespace(provider="custom-box", base_url=BOX, endpoint_suffix=None)
-    config = yaml.safe_load(cfg.read_text())
-    config["providers"]["custom-box"] = block
-    cfg.write_text(yaml.safe_dump(config))
-    providers.reload()
+def test_requests_recheck_the_saved_address_without_dns(cfg, monkeypatch):
+    monkeypatch.setattr(custom_providers, "_resolve", lambda *_: pytest.fail("requests must not resolve"))
+
+    def save(base_url):
+        config = yaml.safe_load(cfg.read_text())
+        config["providers"]["custom-box"] = {"base_url": base_url, "managed_by": "custom", "allow_lan": False}
+        cfg.write_text(yaml.safe_dump(config))
+        providers.reload()
+        return SimpleNamespace(provider="custom-box", base_url=base_url, endpoint_suffix=None)
+
+    info = save(BOX)
     assert server._upstream_endpoint(info, "/chat/completions") == f"{BOX}/chat/completions"
-    addresses["llm.example.com"] = {"169.254.169.254"}
-    custom_providers._checked.clear()
-    with pytest.raises(HTTPException) as raised:
-        server._upstream_endpoint(info, "/chat/completions")
-    assert raised.value.status_code == 502 and "custom-box" in raised.value.detail
+    for edited in ("http://169.254.169.254/v1", "http://192.168.1.20/v1", "http://llm.example.com/v1"):
+        with pytest.raises(HTTPException) as raised:
+            server._upstream_endpoint(save(edited), "/chat/completions")
+        assert raised.value.status_code == 502 and "custom-box" in raised.value.detail
 
 
 # ── credentials ──────────────────────────────────────────────────────────────
@@ -224,10 +238,15 @@ def test_an_upstream_id_never_takes_over_another_route(client, upstream, cfg):
     assert routes["custom-my-box-gpt-6-luna"]["provider"] == "custom-my-box"
 
 
-def test_a_keyless_local_server_needs_no_key(client, upstream, cfg):
+def test_a_keyless_local_server_needs_no_key_and_routes(client, upstream, cfg):
+    from src.request_options import upstream_auth_headers
+
     response = _add(client, base_url="http://localhost:11434/v1", api_key=None, name="Ollama")
     assert response.status_code == 200, response.text
     assert response.json()["has_api_key"] is False and upstream[-1][-1] == ""
+    info = providers.resolve("custom-ollama-llama-4-70b")
+    assert (info.provider, info.base_url, info.api_key) == ("custom-ollama", "http://localhost:11434/v1", "")
+    assert upstream_auth_headers(info.api_key, info.protocol) == {}
 
 
 def test_refusals_write_nothing(client, upstream, cfg):
@@ -281,12 +300,32 @@ def test_only_the_creator_or_a_full_admin_sees_and_changes_it(client, upstream, 
     assert _state(cfg) == before
 
 
+def test_new_ids_avoid_every_provider_in_use(client, upstream, cfg, monkeypatch):
+    monkeypatch.setenv("MODEL_GATEWAY_PROVIDER_CUSTOM_MY_BOX_BASE_URL", "https://elsewhere.example/v1")
+    assert _add(client).json()["id"] == "custom-my-box-2"
+
+
+def test_a_provider_has_a_model_cap(client, upstream, cfg, monkeypatch):
+    assert _add(client).status_code == 200
+    monkeypatch.setattr(custom_providers, "MAX_MODELS", 1)
+    response = client.post(f"{URL}/custom-my-box/models", headers=CUSTOM, json={"models": ["gpt-6-luna"]})
+    assert (response.status_code, response.json()["code"]) == (409, "too_many")
+
+
 def test_add_models_adds_only_new_ones(client, upstream, cfg):
     assert _add(client).status_code == 200
     response = client.post(f"{URL}/custom-my-box/models", headers=CUSTOM, json={"models": ["llama-4-70b", "gpt-6-luna"]})
     assert response.status_code == 200, response.text
     assert [row["upstream_id"] for row in response.json()["models"]] == ["llama-4-70b", "gpt-6-luna"]
     assert upstream[-1] == ("completion", BOX, "gpt-6-luna", "box-key")
+
+
+def test_available_lists_models_with_the_saved_key(client, upstream, cfg):
+    assert _add(client).status_code == 200
+    response = client.get(f"{URL}/custom-my-box/available", headers=CUSTOM)
+    assert response.status_code == 200 and response.json() == {"models": ["llama-4-70b", "gpt-6-luna"]}
+    assert upstream[-1] == ("models", BOX, "box-key")
+    assert client.get(f"{URL}/custom-my-box/available", headers=OTHER).status_code == 404
 
 
 def test_key_changes_only_after_the_new_key_answers(client, upstream, cfg):
@@ -311,26 +350,35 @@ def test_delete_removes_models_provider_and_key(client, upstream, cfg):
 # ── upstream calls ───────────────────────────────────────────────────────────
 
 
+def _stream(monkeypatch, response, sent=None):
+    from contextlib import contextmanager
+
+    @contextmanager
+    def stream(method, url, *, headers, timeout):
+        if sent is not None:
+            sent.append((method, url, dict(headers)))
+        yield response
+
+    monkeypatch.setattr(custom_providers.httpx, "stream", stream)
+
+
 def test_discover_reads_the_model_list_without_following_redirects(monkeypatch):
     import httpx
 
     sent = []
-
-    def get(url, *, headers, timeout):
-        sent.append((url, dict(headers)))
-        return httpx.Response(200, json={"data": [{"id": "a"}, {"id": "a"}, {"id": "bad id"}, {"id": 3}, {"id": "b"}]})
-
-    monkeypatch.setattr(custom_providers.httpx, "get", get)
+    listing = {"data": [{"id": "a"}, {"id": "a"}, {"id": "bad id"}, {"id": 3}, {"id": "b"}]}
+    _stream(monkeypatch, httpx.Response(200, json=listing), sent)
     assert custom_providers.discover(BOX, "") == ["a", "b"]
-    assert sent[0][0] == f"{BOX}/models" and "Authorization" not in sent[0][1]
-    assert custom_providers.discover(BOX, "k") == ["a", "b"] and sent[1][1]["Authorization"] == "Bearer k"
+    assert sent[0][:2] == ("GET", f"{BOX}/models") and "Authorization" not in sent[0][2]
+    assert custom_providers.discover(BOX, "k") == ["a", "b"] and sent[1][2]["Authorization"] == "Bearer k"
     for response, code in (
         (httpx.Response(401), "key_rejected"),
         (httpx.Response(302, headers={"Location": "http://169.254.169.254/"}), "not_openai_compatible"),
         (httpx.Response(200, text="<html>"), "not_openai_compatible"),
         (httpx.Response(200, json={"data": []}), "no_models"),
+        (httpx.Response(200, content=b"x" * 2_000_001), "not_openai_compatible"),
     ):
-        monkeypatch.setattr(custom_providers.httpx, "get", lambda url, response=response, **_: response)
+        _stream(monkeypatch, response)
         with pytest.raises(custom_providers.CustomProviderError) as raised:
             custom_providers.discover(BOX, "k")
         assert raised.value.code == code
