@@ -27,7 +27,10 @@ _PROFILE_PERMISSIONS = {"profiles:read", "profiles:write", "profiles:invoke"}
 MANAGEMENT_PERMISSIONS = frozenset({"providers:manage", "models:register"})
 # Add, cancel, and read the gateway-owned local AI runtime; no provider allowlist.
 LOCAL_AI_PERMISSION = "local_ai:manage"
-ADMIN_SCOPES = MANAGEMENT_PERMISSIONS | {LOCAL_AI_PERMISSION}
+# Add and manage owner-defined OpenAI-compatible providers (src.custom_providers):
+# only ones this credential created, under reserved ids; no provider allowlist.
+CUSTOM_PROVIDERS_PERMISSION = "providers:custom"
+ADMIN_SCOPES = MANAGEMENT_PERMISSIONS | {LOCAL_AI_PERMISSION, CUSTOM_PROVIDERS_PERMISSION}
 _CONSUMER_PERMISSIONS = _PROFILE_PERMISSIONS | ADMIN_SCOPES
 _PROVIDER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 _client_auth_required_latched = False

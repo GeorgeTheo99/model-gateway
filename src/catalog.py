@@ -223,14 +223,17 @@ def entry_routable_ids(entry: dict) -> list[str]:
     """Return every gateway-facing identifier for a catalog entry.
 
     Mirrors ``src.providers._entry_routable_ids`` so the merge keys the same way
-    the router does.
+    the router does. An owner-added (``custom-``) provider's upstream id is not
+    one: it could otherwise claim another route's identifier.
     """
     ids = []
+    custom = canonical_provider(entry.get("provider")).startswith("custom-")
     for field in ("name", "alias", "provider_model_id", "omlx_id"):
         value = entry.get(field)
         if value is not None and not isinstance(value, str):
             raise ValueError(f"model {entry.get('name')!r} {field} must be a string")
-        ids.append(value)
+        if not (custom and field == "provider_model_id"):
+            ids.append(value)
     extra_ids = entry.get("alternate_ids")
     if extra_ids is None:
         extra_ids = []

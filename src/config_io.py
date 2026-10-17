@@ -31,7 +31,12 @@ from typing import Any
 
 import yaml
 
-from src.catalog import normalize_thinking_capabilities, validate_client_metadata, validate_pricing_policy
+from src.catalog import (
+    canonical_provider,
+    normalize_thinking_capabilities,
+    validate_client_metadata,
+    validate_pricing_policy,
+)
 from src.config_lock import config_write_lock
 from src.providers import CONFIG_PATH, MODEL_INFO_PATH, MODEL_INFO_SOURCE_PATH
 from src.secret_files import default_api_key_path, resolve_api_key_file, write_api_key_file
@@ -865,6 +870,7 @@ def add_consumer_credential(
     allow_direct_models: bool = False,
     providers: list[str] | None = None,
     local_ai: bool = False,
+    custom_providers: bool = False,
     reveal_key: bool = False,
 ) -> dict:
     """Create credential ``<consumer>-<role>`` with a generated mode-0600 key file.
@@ -875,7 +881,8 @@ def add_consumer_credential(
     Returns the non-secret summary plus ``status`` (``created``/``repaired``/
     ``unchanged``) and ``enables_client_auth`` when ``/v1`` was open before.
     ``providers`` is required for, and only accepted by, the manager role.
-    ``local_ai`` adds ``local_ai:manage`` (the local AI admin API) to any role.
+    ``local_ai`` adds ``local_ai:manage`` (the local AI admin API) to any role,
+    and ``custom_providers`` adds ``providers:custom`` (owner-defined providers).
     ``reveal_key`` adds ``key`` only when this call generated it, for the
     admin UI's one-time display; an adopted or unchanged key is never read.
     """
@@ -898,7 +905,8 @@ def add_consumer_credential(
         "consumer": consumer,
         "key_file": str(target),
         "namespaces": namespaces,
-        "permissions": list(CONSUMER_ROLES[role]) + (["local_ai:manage"] if local_ai else []),
+        "permissions": list(CONSUMER_ROLES[role]) + (["local_ai:manage"] if local_ai else [])
+        + (["providers:custom"] if custom_providers else []),
         "allow_direct_models": bool(allow_direct_models),
     }
     if role == "manager":
@@ -1215,6 +1223,41 @@ def upsert_model(name: str, **fields) -> dict:
 
 
 @_write_transaction
+@_write_transaction
+def delete_custom_provider(provider_id: str) -> list[str]:
+    """Remove an owner-added provider with its catalog models, their overrides, and its own key file.
+
+    Unlike :func:`delete_provider` it removes the dependent models itself, in the
+    same transaction. Returns the paths written.
+    """
+    doc = load_model_info()
+    llm = doc.get("llm") or []
+    names = {
+        entry.get("name") for entry in llm
+        if isinstance(entry, dict) and canonical_provider(entry.get("provider")) == provider_id
+    }
+    written = []
+    if names:
+        doc["llm"] = [entry for entry in llm if not (isinstance(entry, dict) and entry.get("name") in names)]
+        written = _write_model_info(doc)
+    config = load_config_full()
+    providers = config.get("providers") or {}
+    retired: list[Path] = []
+    for key in list(providers):
+        if str(key).lower() == provider_id:
+            retired += _managed_key_files(provider_id, providers[key])
+            del providers[key]
+    config["providers"] = providers
+    overrides = config.get("model_overrides")
+    if isinstance(overrides, dict):
+        for name in names:
+            overrides.pop(name, None)
+    _backup(CONFIG_PATH)
+    _atomic_write(CONFIG_PATH, yaml.safe_dump(config, sort_keys=False, default_flow_style=False))
+    _delete_unreferenced_key_files(config, retired)
+    return [*written, str(CONFIG_PATH)]
+
+
 def delete_model(name: str) -> dict:
     """Remove a model entry by name. Also clears any runtime override."""
     name = (name or "").strip()

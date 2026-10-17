@@ -42,7 +42,7 @@ from src.responses import chat_to_responses, responses_result_events, responses_
 from src.signature_cache import store_from_extra_content
 from src.streaming import _flatten_list_content, translate_stream
 from src.translator import anthropic_to_openai, anthropic_to_openai_chat, openai_chat_to_anthropic, openai_to_anthropic
-from src import catalog, config_io, signature_cache, discovery, federation, ledger, profiles, providers
+from src import catalog, config_io, custom_providers, signature_cache, discovery, federation, ledger, profiles, providers
 from src.usage import (
     anthropic_usage_to_openai_chat as convert_anthropic_usage_to_openai_chat,
     anthropic_usage_to_responses,
@@ -731,6 +731,15 @@ def _upstream_endpoint(info, default_suffix: str) -> str:
     suffix = getattr(info, "endpoint_suffix", None)
     if suffix is None:
         suffix = default_suffix
+    provider = getattr(info, "provider", "")
+    if custom_providers.is_custom(provider):
+        # An owner-added destination is re-checked, so DNS can't later point it inward.
+        block = providers._effective_provider_config(providers._load_config(), provider)
+        if custom_providers.is_managed(block):
+            try:
+                custom_providers.recheck(provider, block)
+            except custom_providers.CustomProviderError as exc:
+                raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
     return f"{info.base_url}{suffix}"
 
 

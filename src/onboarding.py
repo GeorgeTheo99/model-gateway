@@ -353,8 +353,9 @@ def validate_upstream_completion(profile: dict, api_key: str) -> None:
             body["max_completion_tokens"] = body.pop("max_tokens")
     path = "/messages" if anthropic else "/chat/completions"
     url = f"{str(provider['base_url']).rstrip('/')}{path}"
+    # A local server may take no key (an owner-added provider); send none then.
     headers = {
-        **upstream_auth_headers(api_key, "anthropic" if anthropic else "openai", quirks),
+        **(upstream_auth_headers(api_key, "anthropic" if anthropic else "openai", quirks) if api_key else {}),
         "User-Agent": "model-gateway-onboard/1",
     }
     try:
@@ -369,7 +370,8 @@ def validate_upstream_completion(profile: dict, api_key: str) -> None:
         error = payload.get("error") if isinstance(payload, dict) else None
         message = error.get("message") if isinstance(error, dict) else error
         # Redact before shortening, so a key cut at the boundary can't leak in part.
-        detail = f": {str(message).replace(api_key, '[redacted]')[:200]}" if message else ""
+        text = str(message).replace(api_key, "[redacted]") if api_key else str(message)
+        detail = f": {text[:200]}" if message else ""
         raise OnboardingError(f"provider refused a test completion (HTTP {response.status_code}){detail}")
     if anthropic:
         # A Messages reply always carries a content list, even when empty.

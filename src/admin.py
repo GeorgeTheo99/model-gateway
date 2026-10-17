@@ -37,7 +37,7 @@ from src.providers import (
     routable_ids,
     snapshot_registry as snapshot_provider_registry,
 )
-from src import bundle, config_io, discovery, federation, ledger, local_runtime, onboarding, profiles
+from src import bundle, config_io, custom_providers, discovery, federation, ledger, local_runtime, onboarding, profiles
 from src.version import CAPABILITIES, VERSION
 
 log = logging.getLogger("model-gateway")
@@ -1218,6 +1218,327 @@ async def admin_apply_onboarding_profile(profile_id: str, request: Request):
     }
 
 
+# ── Owner-added OpenAI-compatible providers ──────────────────────────────────
+
+def _custom_refusal(exc: custom_providers.CustomProviderError) -> JSONResponse:
+    return _onboarding_refusal(exc.status, exc.code, str(exc))
+
+
+def _custom_blocks(config: dict) -> dict[str, dict]:
+    return {
+        str(key).lower(): block
+        for key, block in (config.get("providers") or {}).items()
+        if custom_providers.is_custom(str(key).lower()) and custom_providers.is_managed(block)
+    }
+
+
+def _owned_custom_block(principal, provider_id: str, config: dict) -> dict:
+    """The provider, if it is an owner-added one this credential (or any, for a full admin) created."""
+    block = _custom_blocks(config).get(provider_id)
+    if block is None or (principal is not None and block.get("owner") != principal.credential_id):
+        raise custom_providers.CustomProviderError(
+            "not_found", f"No provider {provider_id!r} that this credential added", status=404,
+        )
+    return block
+
+
+async def _custom_body(request: Request) -> dict:
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = None
+    if not isinstance(body, dict):
+        raise custom_providers.CustomProviderError("invalid_body", "Invalid JSON body")
+    return body
+
+
+def _custom_key(body: dict) -> str:
+    """The optional key ("" for a server that takes none); it travels in an HTTP header."""
+    key = body.get("api_key")
+    if key is None:
+        return ""
+    if not isinstance(key, str):
+        raise custom_providers.CustomProviderError("invalid_key", "api_key must be a string")
+    key = key.strip()
+    if len(key) > 512 or not key.isascii() or not key.isprintable() or " " in key:
+        raise custom_providers.CustomProviderError("invalid_key", "Paste the whole API key, with no spaces")
+    return key
+
+
+def _custom_destination(body: dict) -> tuple[str, bool]:
+    allow_lan = body.get("allow_lan", False)
+    if not isinstance(allow_lan, bool):
+        raise custom_providers.CustomProviderError("invalid_body", "allow_lan must be true or false")
+    url, _host, _port = custom_providers.normalize_url(body.get("base_url"))
+    return url, allow_lan
+
+
+def _custom_selection(body: dict) -> list[str]:
+    models = body.get("models")
+    if (
+        not isinstance(models, list) or not models or len(models) > custom_providers.MAX_MODELS
+        or any(not isinstance(model, str) or not model for model in models) or len(set(models)) != len(models)
+    ):
+        raise custom_providers.CustomProviderError(
+            "invalid_models", f"Choose 1-{custom_providers.MAX_MODELS} different models",
+        )
+    return models
+
+
+async def _custom_check_upstream(url: str, allow_lan: bool, key: str, models: list[str]) -> str:
+    """Check the destination, that it lists ``models``, and that the first answers; return its network."""
+    network = await asyncio.to_thread(custom_providers.check_destination, url, allow_lan)
+    listed = await asyncio.to_thread(custom_providers.discover, url, key)
+    missing = [model for model in models if model not in listed]
+    if missing:
+        raise custom_providers.CustomProviderError(
+            "model_not_listed", "The provider doesn't list: " + ", ".join(missing[:5]),
+        )
+    probe = {"provider": {"id": "custom-probe", "base_url": url, "protocol": "openai"},
+             "models": [{"provider_model_id": models[0]}]}
+    try:
+        await asyncio.to_thread(onboarding.validate_upstream_completion, probe, key)
+    except onboarding.OnboardingError as exc:
+        message = str(exc).replace(key, "[redacted]") if key else str(exc)
+        raise custom_providers.CustomProviderError("upstream_rejected", message) from exc
+    return network
+
+
+def _custom_entries(provider_id: str, provider_name: str, models: list[str]) -> list[dict]:
+    """Catalog entries for ``models`` with names no other model routes by (call under the write lock)."""
+    doc = config_io.load_model_info()
+    overlay = config_io.load_config_full().get("models")
+    rows = [row for row in [*(doc.get("llm") or []), *(overlay if isinstance(overlay, list) else [])]
+            if isinstance(row, dict)]
+    taken: set[str] = set()
+    for row in rows:
+        try:
+            taken.update(entry_routable_ids(row))
+        except ValueError:
+            continue
+    entries = []
+    for upstream_id in models:
+        name = custom_providers.model_name_for(provider_id, upstream_id, taken)
+        taken.add(name)
+        entries.append(custom_providers.catalog_entry(name, provider_id, provider_name, upstream_id))
+    return entries
+
+
+def _custom_row(provider_id: str, block: dict, catalog_rows: list) -> dict:
+    return {
+        "id": provider_id,
+        "display_name": str(block.get("display_name") or provider_id),
+        "base_url": str(block.get("base_url") or ""),
+        "allow_lan": bool(block.get("allow_lan")),
+        "has_api_key": bool(block.get("api_key_file") or block.get("api_key")),
+        "models": [
+            {"name": row.get("name"), "upstream_id": row.get("provider_model_id")}
+            for row in catalog_rows
+            if isinstance(row, dict) and canonical_provider(row.get("provider")) == provider_id
+        ],
+    }
+
+
+async def _custom_saved(provider_id: str) -> dict:
+    await _regenerate_catalogs()
+    discovery.refresh()
+    config = config_io.load_config_full()
+    return _custom_row(provider_id, _custom_blocks(config)[provider_id], config_io.load_model_info().get("llm") or [])
+
+
+@router.get("/admin/api/custom-providers")
+async def admin_custom_providers(request: Request):
+    """The owner-added providers this credential created (all of them, for a full admin)."""
+    principal = require_admin_or_scope(request, "providers:custom")
+    config = config_io.load_config_full()
+    rows = config_io.load_model_info().get("llm") or []
+    return {"providers": [
+        _custom_row(provider_id, block, rows)
+        for provider_id, block in sorted(_custom_blocks(config).items())
+        if principal is None or block.get("owner") == principal.credential_id
+    ]}
+
+
+@router.post("/admin/api/custom-providers/discover")
+async def admin_custom_provider_discover(request: Request):
+    """Check an address and list its models, writing nothing.
+
+    Body: {base_url, api_key?, allow_lan?}. Returns {base_url, network, models}.
+    """
+    require_admin_or_scope(request, "providers:custom")
+    try:
+        body = await _custom_body(request)
+        url, allow_lan = _custom_destination(body)
+        key = _custom_key(body)
+        network = await asyncio.to_thread(custom_providers.check_destination, url, allow_lan)
+        models = await asyncio.to_thread(custom_providers.discover, url, key)
+    except custom_providers.CustomProviderError as exc:
+        return _custom_refusal(exc)
+    return {"base_url": url, "network": network, "models": models}
+
+
+@router.post("/admin/api/custom-providers")
+async def admin_add_custom_provider(request: Request):
+    """Add an OpenAI-compatible provider at an owner-entered address, with chosen models.
+
+    Body: {name, base_url, api_key?, allow_lan?, models: [upstream id, ...]}. The
+    provider must list every model and answer a test completion on the first
+    before anything is written. Returns the saved provider.
+    """
+    principal = require_admin_or_scope(request, "providers:custom")
+    require_admin_writes()
+    try:
+        body = await _custom_body(request)
+        name = custom_providers.display_name(body.get("name"))
+        url, allow_lan = _custom_destination(body)
+        key = _custom_key(body)
+        models = _custom_selection(body)
+        await _custom_check_upstream(url, allow_lan, key, models)
+    except custom_providers.CustomProviderError as exc:
+        return _custom_refusal(exc)
+    owner = "admin" if principal is None else principal.credential_id
+    plan: dict = {}
+
+    def precondition():
+        config = config_io.load_config_full()
+        if len(_custom_blocks(config)) >= custom_providers.MAX_PROVIDERS:
+            raise custom_providers.CustomProviderError(
+                "too_many", f"This gateway already has {custom_providers.MAX_PROVIDERS} added providers", status=409,
+            )
+        taken = {str(provider).lower() for provider in (config.get("providers") or {})}
+        plan["id"] = custom_providers.provider_id_for(name, taken)
+        plan["entries"] = _custom_entries(plan["id"], name, models)
+
+    def mutate():
+        define = {
+            "base_url": url, "protocol": "openai", "enabled": True, "managed_by": custom_providers.MANAGED,
+            "owner": owner, "display_name": name, "allow_lan": allow_lan,
+        }
+        return config_io.add_onboarded_models(plan["id"], define=define, api_key=key or None, models=plan["entries"])
+
+    try:
+        _result, reload_error = _apply_registry_mutation(
+            mutate, extra_paths=lambda: [path for path in [config_io.api_key_file_target(plan["id"])] if path and key],
+            precondition=precondition,
+        )
+    except custom_providers.CustomProviderError as exc:
+        return _custom_refusal(exc)
+    except (ValueError, OSError, yaml.YAMLError) as exc:
+        return _onboarding_refusal(400, "write_failed", str(exc))
+    if reload_error is not None:
+        return _onboarding_refusal(400, "reload_rejected", f"Provider registry update rejected: {reload_error}")
+    return await _custom_saved(plan["id"])
+
+
+@router.post("/admin/api/custom-providers/{provider_id}/models")
+async def admin_add_custom_provider_models(provider_id: str, request: Request):
+    """Add more of an owner-added provider's models. Body: {models: [upstream id, ...]}."""
+    import src.providers as providers
+
+    principal = require_admin_or_scope(request, "providers:custom")
+    require_admin_writes()
+    try:
+        body = await _custom_body(request)
+        models = _custom_selection(body)
+        config = config_io.load_config_full()
+        block = _owned_custom_block(principal, provider_id, config)
+        present = {row["upstream_id"] for row in _custom_row(
+            provider_id, block, config_io.load_model_info().get("llm") or [])["models"]}
+        models = [model for model in models if model not in present]
+        if models:
+            url = str(block.get("base_url") or "")
+            await _custom_check_upstream(url, bool(block.get("allow_lan")), str(
+                providers._effective_provider_config(providers._load_config(), provider_id).get("api_key") or ""), models)
+    except custom_providers.CustomProviderError as exc:
+        return _custom_refusal(exc)
+    if not models:
+        return await _custom_saved(provider_id)
+    plan: dict = {}
+
+    def precondition():
+        config = config_io.load_config_full()
+        block = _owned_custom_block(principal, provider_id, config)
+        plan["entries"] = _custom_entries(provider_id, str(block.get("display_name") or provider_id), models)
+
+    try:
+        _result, reload_error = _apply_registry_mutation(
+            lambda: config_io.add_onboarded_models(provider_id, define=None, api_key=None, models=plan["entries"]),
+            precondition=precondition,
+        )
+    except custom_providers.CustomProviderError as exc:
+        return _custom_refusal(exc)
+    except (ValueError, OSError) as exc:
+        return _onboarding_refusal(400, "write_failed", str(exc))
+    if reload_error is not None:
+        return _onboarding_refusal(400, "reload_rejected", f"Provider registry update rejected: {reload_error}")
+    return await _custom_saved(provider_id)
+
+
+@router.post("/admin/api/custom-providers/{provider_id}/key")
+async def admin_set_custom_provider_key(provider_id: str, request: Request):
+    """Replace (or, with "", remove) an owner-added provider's key, once it answers with the new one."""
+    principal = require_admin_or_scope(request, "providers:custom")
+    require_admin_writes()
+    try:
+        body = await _custom_body(request)
+        key = _custom_key(body)
+        config = config_io.load_config_full()
+        block = _owned_custom_block(principal, provider_id, config)
+        url = str(block.get("base_url") or "")
+        models = [row["upstream_id"] for row in _custom_row(
+            provider_id, block, config_io.load_model_info().get("llm") or [])["models"] if row["upstream_id"]]
+        if not models:
+            raise custom_providers.CustomProviderError("no_models", "Add a model before changing the key")
+        await _custom_check_upstream(url, bool(block.get("allow_lan")), key, models[:1])
+    except custom_providers.CustomProviderError as exc:
+        return _custom_refusal(exc)
+
+    def precondition():
+        current = _owned_custom_block(principal, provider_id, config_io.load_config_full())
+        if str(current.get("base_url") or "") != url:
+            raise custom_providers.CustomProviderError("conflict", "The provider changed; try again", status=409)
+
+    try:
+        _result, reload_error = _apply_registry_mutation(
+            lambda: config_io.upsert_provider(provider_id, base_url=url, api_key=key),
+            extra_paths=lambda: [path for path in [config_io.api_key_file_target(provider_id)] if path]
+            + config_io.managed_key_files(provider_id),
+            precondition=precondition,
+        )
+    except custom_providers.CustomProviderError as exc:
+        return _custom_refusal(exc)
+    except (ValueError, OSError) as exc:
+        return _onboarding_refusal(400, "write_failed", str(exc))
+    if reload_error is not None:
+        return _onboarding_refusal(400, "reload_rejected", f"Provider registry update rejected: {reload_error}")
+    return await _custom_saved(provider_id)
+
+
+@router.delete("/admin/api/custom-providers/{provider_id}")
+async def admin_delete_custom_provider(provider_id: str, request: Request):
+    """Remove an owner-added provider, its models, and its key."""
+    principal = require_admin_or_scope(request, "providers:custom")
+    require_admin_writes()
+
+    def precondition():
+        _owned_custom_block(principal, provider_id, config_io.load_config_full())
+
+    try:
+        _result, reload_error = _apply_registry_mutation(
+            lambda: config_io.delete_custom_provider(provider_id),
+            extra_paths=lambda: config_io.managed_key_files(provider_id), precondition=precondition,
+        )
+    except custom_providers.CustomProviderError as exc:
+        return _custom_refusal(exc)
+    except (ValueError, OSError) as exc:
+        return _onboarding_refusal(400, "write_failed", str(exc))
+    if reload_error is not None:
+        return _onboarding_refusal(400, "reload_rejected", f"Provider registry update rejected: {reload_error}")
+    await _regenerate_catalogs()
+    discovery.refresh()
+    return {"id": provider_id, "deleted": True}
+
+
 # ── Consumers, profiles, backups, and bundles ────────────────────────────────
 
 # Responses that may carry a newly generated key must never be cached.
@@ -1271,9 +1592,9 @@ async def admin_consumers(request: Request):
 async def admin_add_consumer(request: Request):
     """Create ``<consumer>-<role>``. A generated key is returned once, uncached.
 
-    Body: {consumer, role, namespaces?, allow_direct_models?, providers?, local_ai?}.
+    Body: {consumer, role, namespaces?, allow_direct_models?, providers?, local_ai?, custom_providers?}.
     ``providers`` is the allowlist a ``manager`` credential may administer;
-    ``local_ai`` also grants ``local_ai:manage``.
+    ``local_ai`` also grants ``local_ai:manage`` and ``custom_providers`` ``providers:custom``.
     """
     require_admin_auth(request)
     require_admin_writes()
@@ -1288,6 +1609,7 @@ async def admin_add_consumer(request: Request):
     allow_direct = body.get("allow_direct_models", False)
     managed = body.get("providers")
     local_ai = body.get("local_ai", False)
+    custom = body.get("custom_providers", False)
     try:
         credential_id = config_io.consumer_credential_id(consumer, role)
     except ValueError as exc:
@@ -1298,15 +1620,15 @@ async def admin_add_consumer(request: Request):
         return _bad_request("namespaces must be a list of strings")
     if not isinstance(allow_direct, bool):
         return _bad_request("allow_direct_models must be a boolean")
-    if not isinstance(local_ai, bool):
-        return _bad_request("local_ai must be a boolean")
+    if not isinstance(local_ai, bool) or not isinstance(custom, bool):
+        return _bad_request("local_ai and custom_providers must be booleans")
     if managed is not None and (
         not isinstance(managed, list) or any(not isinstance(value, str) for value in managed)
     ):
         return _bad_request("providers must be a list of strings")
     result, error = _consumer_mutation(credential_id, lambda: config_io.add_consumer_credential(
         consumer, role, namespaces=namespaces, allow_direct_models=allow_direct,
-        providers=managed, local_ai=local_ai, reveal_key=True,
+        providers=managed, local_ai=local_ai, custom_providers=custom, reveal_key=True,
     ))
     if error is not None:
         return error

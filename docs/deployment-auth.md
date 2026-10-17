@@ -73,6 +73,37 @@ registry, ETag, and execution contract.
 (status, add, cancel; writes need `MODEL_GATEWAY_ADMIN_WRITES`). It needs no
 `providers` allowlist and grants nothing else; removing local AI needs the CLI.
 
+## Owner-added provider credentials
+
+`providers:custom` (`model-gateway consumer add ... --custom-providers`) lets an
+application add OpenAI-compatible providers at any address its owner enters.
+It needs no `providers` allowlist: such providers get reserved
+`custom-<slug>` ids, and the credential can see and change only the ones it
+created (a full admin sees and changes all of them).
+
+| Endpoint | Does |
+|---|---|
+| `GET /admin/api/custom-providers` | Lists this credential's providers and their models |
+| `POST /admin/api/custom-providers/discover` | `{base_url, api_key?, allow_lan?}`: checks the address and returns `{base_url, network, models}`, writing nothing |
+| `POST /admin/api/custom-providers` | `{name, base_url, api_key?, allow_lan?, models}`: adds the provider and models once it lists them all and answers a test completion on the first |
+| `POST /admin/api/custom-providers/{id}/models` | `{models}`: adds more of its models, after the same checks |
+| `POST /admin/api/custom-providers/{id}/key` | `{api_key}`: replaces (`""` removes) the key once the provider answers with it |
+| `DELETE /admin/api/custom-providers/{id}` | Removes the provider, its models, and its key file |
+
+Writes need `MODEL_GATEWAY_ADMIN_WRITES`; refusals are `{"detail", "code"}` with
+nothing written. The gateway connects to a public host only over https, to
+plain http only on loopback or, with `allow_lan: true`, an address on the
+owner's network (private ranges, unique-local IPv6 and `100.64.0.0/10`
+tailnets), and never to link-local, multicast, unspecified or other
+non-routable addresses (cloud metadata endpoints among them). A host with any
+such address is refused. The check runs when a provider is saved and again
+before requests to it (answers are kept for 30 seconds); redirects are not
+followed. Providers speak the OpenAI protocol with a bearer key, without custom
+headers, and declare no zero data retention, so clients show retention as
+unknown. Their models route only by their gateway names
+(`custom-<slug>-<upstream id>`), never by upstream id, so they cannot take over
+another route's identifier. A gateway holds at most 20 such providers.
+
 ## Scoped management credentials
 
 A consumer credential with the `manager` role lets an application manage its

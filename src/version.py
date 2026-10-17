@@ -11,6 +11,7 @@ VERSION = "0.6.0"
 CAPABILITIES = (
     "consumer_credentials.v1",
     "create_only_model_registration",
+    "custom_providers.v1",
     "endpoint_file.v1",
     "legacy_home_server_import.v1",
     "local_runtime.v1",

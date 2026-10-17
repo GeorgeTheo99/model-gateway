@@ -35,6 +35,8 @@ def main() -> int:
                      help="provider a manager may administer (repeatable; required for --role manager)")
     add.add_argument("--local-ai", action="store_true",
                      help="also allow adding and cancelling the gateway-owned local AI (local_ai:manage)")
+    add.add_argument("--custom-providers", action="store_true",
+                     help="also allow adding OpenAI-compatible providers at any address (providers:custom)")
 
     listing = commands.add_parser("list", help="show credentials without key values")
     listing.add_argument("--json", action="store_true")
@@ -66,7 +68,7 @@ def main() -> int:
             row = config_io.add_consumer_credential(
                 args.consumer, args.role, namespaces=args.namespaces,
                 allow_direct_models=args.allow_direct_models, providers=args.providers,
-                local_ai=args.local_ai)
+                local_ai=args.local_ai, custom_providers=args.custom_providers)
             print(f"{row['status']} {row['id']} -> {row['key_file']}")
             if row["enables_client_auth"]:
                 print("warning: /v1 previously accepted requests without a key; it now requires "
