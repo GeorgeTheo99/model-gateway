@@ -1,6 +1,6 @@
 # Provider onboarding
 
-OpenAI-compatible providers and replacement models can be added with a
+OpenAI-compatible and Anthropic-protocol providers and replacement models can be added with a
 secret-free YAML profile instead of hand-editing runtime files. Profiles may be
 written by hand or generated as reviewable drafts.
 
@@ -89,7 +89,8 @@ subject to the admin write gate:
 - A missing provider is defined with the profile's `base_url` and `protocol`.
   An existing provider is never moved; only a supplied key replaces its key.
 - Before any write, the key must list every profile model (`/models`) and answer a
-  short real completion on the first one (OpenAI-compatible profiles), so a key
+  short real completion on the first one (Chat Completions, or Messages for
+  `protocol: anthropic`), so a key
   without credit never replaces a working one.
 - A turned-off provider or profile model is refused, not applied.
 - Files, the in-process registry, the alias catalog, and the discovery file are
@@ -539,6 +540,12 @@ Two optional model fields are for consumers to show:
 - `zdr` — `true` declares the route keeps zero data retention upstream (for
   example Fireworks serverless open models, or OpenRouter with
   `openrouter_zdr`). Leave it unset when the provider may retain prompts.
+- `base_model` and `family` (set together; lowercase letters, digits, dots, or
+  hyphens) — `base_model` names the upstream model independently of the route,
+  so `claude-opus-5.5` (Anthropic) and `claude-opus-5.5-or` (OpenRouter) both
+  carry `base_model: claude-opus-5.5`; `family` (for example `claude`) groups
+  the models a client offers one provider choice for. Clients show one row per
+  `base_model` and route it through the provider chosen for its family.
 
 Provider-specific request code should only be added when the upstream cannot
 be described by these generic compatibility flags.

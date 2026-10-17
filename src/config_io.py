@@ -1092,6 +1092,7 @@ _MODEL_FIELDS = [
     "name", "provider", "provider_model_id", "omlx_id", "alias", "context",
     "max_output_tokens", "thinking", "thinking_levels", "thinking_format", "vision", "quirks",
     "system_instruction", "pricing", "pricing_status", "desc", "display_name", "zdr",
+    "family", "base_model",
 ]
 _PRICING_RATE_FIELDS = {
     "input", "output", "cache_read", "cache_write", "cache_write_1h", "reasoning",
@@ -1197,7 +1198,7 @@ def upsert_model(name: str, **fields) -> dict:
         entry.pop("thinking_levels", None)
     for f in ("alias", "context", "max_output_tokens", "thinking",
               "thinking_levels", "thinking_format", "quirks", "system_instruction", "desc",
-              "display_name", "zdr"):
+              "display_name", "zdr", "family", "base_model"):
         if f in fields and fields[f] is not None:
             entry[f] = fields[f]
     _apply_pricing_update(entry, fields, provider)

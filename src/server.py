@@ -2615,7 +2615,7 @@ def _nonnegative_catalog_int(value: object) -> int:
 
 
 # Optional row fields a client asks for with ``?include=``; older clients keep exact rows.
-CANONICAL_OPTIONAL_FIELDS = ("display_name", "zero_data_retention")
+CANONICAL_OPTIONAL_FIELDS = ("display_name", "zero_data_retention", "family", "base_model")
 
 
 def _canonical_includes(request: Request) -> frozenset[str]:
@@ -2674,6 +2674,10 @@ def _canonical_model_rows(inventory: list[dict], include: frozenset[str] = froze
         if "zero_data_retention" in include:
             # Local models never leave this machine; cloud routes must declare zdr.
             row["zero_data_retention"] = scope == "local" or model.get("zdr") is True
+        # Routes to one upstream model share a base_model; "" when the catalog has none.
+        for field in ("family", "base_model"):
+            if field in include:
+                row[field] = _bounded_catalog_string(model.get(field), limit=64)
         rows.append(row)
     return rows
 

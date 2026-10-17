@@ -445,6 +445,11 @@ def test_load_model_info_document(tmp_path):
         ({"zdr": "yes"}, "zdr must be true or false"),
         ({"quirks": ["openrouter_zdr"]}, "requires zdr: true"),
         ({"quirks": ["openrouter_zdr"], "zdr": False}, "requires zdr: true"),
+        ({"family": "claude"}, "family and base_model must be set together"),
+        ({"base_model": "claude-opus-5.5"}, "family and base_model must be set together"),
+        ({"family": "Claude", "base_model": "claude-opus-5.5"}, "family must be 1-64 lowercase"),
+        ({"family": "claude", "base_model": "claude opus"}, "base_model must be 1-64 lowercase"),
+        ({"family": "claude", "base_model": 5}, "base_model must be 1-64 lowercase"),
     ],
 )
 def test_catalog_rejects_invalid_client_metadata(tmp_path, fields, message):
@@ -462,3 +467,13 @@ def test_catalog_accepts_client_metadata(tmp_path):
     }])
     [entry] = catalog.load_catalog_entries(mi)
     assert entry["display_name"] == "Model M" and entry["zdr"] is True
+
+
+def test_catalog_accepts_route_grouping(tmp_path):
+    mi = tmp_path / "model-info.json"
+    _write_model_info(mi, [{
+        "name": "m-or", "provider": "openrouter", "provider_model_id": "x/m",
+        "family": "claude", "base_model": "claude-opus-5.5",
+    }])
+    [entry] = catalog.load_catalog_entries(mi)
+    assert (entry["family"], entry["base_model"]) == ("claude", "claude-opus-5.5")

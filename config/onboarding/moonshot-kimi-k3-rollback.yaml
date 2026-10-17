@@ -11,6 +11,8 @@ models:
   - name: kimi-k3
     provider: moonshot
     provider_model_id: kimi-k3
+    family: kimi
+    base_model: kimi-k3
     alias: kimi3
     context: 1048576
     max_output_tokens: 131072

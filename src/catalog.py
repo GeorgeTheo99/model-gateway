@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -177,14 +178,17 @@ def validate_pricing_policy(entry: dict) -> str:
 
 
 _DISPLAY_NAME_MAX = 80
+_ROUTE_GROUP_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{0,63}$")
 
 
 def validate_client_metadata(entry: dict) -> None:
-    """Validate the optional fields consumers may show: ``display_name`` and ``zdr``.
+    """Validate the optional fields consumers may show or group by.
 
     ``zdr: true`` declares that the route keeps zero data retention upstream.
     The ``openrouter_zdr`` quirk enforces it on OpenRouter, so it requires the
-    declaration.
+    declaration. ``base_model`` names the upstream model independently of the
+    route (every provider's route to it shares the key), and ``family`` groups
+    models a consumer offers one provider choice for; they come together.
     """
     name = entry.get("name")
     display_name = entry.get("display_name")
@@ -205,6 +209,14 @@ def validate_client_metadata(entry: dict) -> None:
         quirks = [quirk.strip() for quirk in quirks.split(",")]
     if "openrouter_zdr" in quirks and zdr is not True:
         raise ValueError(f"model {name!r} openrouter_zdr quirk requires zdr: true")
+    for field in ("family", "base_model"):
+        value = entry.get(field)
+        if value is not None and (not isinstance(value, str) or not _ROUTE_GROUP_RE.fullmatch(value)):
+            raise ValueError(
+                f"model {name!r} {field} must be 1-64 lowercase letters, digits, dots, or hyphens"
+            )
+    if (entry.get("family") is None) != (entry.get("base_model") is None):
+        raise ValueError(f"model {name!r} family and base_model must be set together")
 
 
 def entry_routable_ids(entry: dict) -> list[str]:

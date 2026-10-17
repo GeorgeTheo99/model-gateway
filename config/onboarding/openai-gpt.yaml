@@ -1,0 +1,67 @@
+schema_version: 1
+id: openai-gpt
+# Part of the curated list: installs with this provider's key get these models automatically.
+auto_add: true
+
+provider:
+  id: openai
+  base_url: https://api.openai.com/v1
+  protocol: openai
+  display_name: OpenAI
+  secret_name: openai.api-key
+
+# List prices as of 2026-10-17. The key check runs a completion on the first
+# (cheapest) model. OpenAI's API keeps prompts unless the account has a
+# zero-data-retention agreement, so no route declares zdr.
+models:
+  - name: gpt-6-luna
+    provider: openai
+    provider_model_id: gpt-6-luna
+    display_name: GPT-6 Luna
+    family: gpt
+    base_model: gpt-6-luna
+    context: 1050000
+    max_output_tokens: 128000
+    thinking: optional
+    thinking_levels: ["off", low, medium, high, xhigh]
+    vision: true
+    pricing:
+      input: 0.1
+      output: 0.5
+      cache_read: 0.01
+    desc: GPT-6 Luna on the OpenAI API, 1.05M context / 128K max output
+
+  - name: gpt-6.1-sol
+    provider: openai
+    provider_model_id: gpt-6.1-sol
+    display_name: GPT-6.1 Sol
+    family: gpt
+    base_model: gpt-6.1-sol
+    context: 1050000
+    max_output_tokens: 128000
+    # reasoning_effort has no "none" for this model.
+    thinking: always
+    thinking_levels: [low, medium, high, xhigh]
+    vision: true
+    pricing:
+      input: 2.0
+      output: 10.0
+      cache_read: 0.1
+    desc: GPT-6.1 Sol on the OpenAI API, 1.05M context / 128K max output
+
+  - name: gpt-6-astra
+    provider: openai
+    provider_model_id: gpt-6-astra
+    display_name: GPT-6 Astra
+    family: gpt
+    base_model: gpt-6-astra
+    context: 1050000
+    max_output_tokens: 128000
+    thinking: always
+    thinking_levels: [low, medium, high, xhigh]
+    vision: true
+    pricing:
+      input: 10.0
+      output: 50.0
+      cache_read: 1.0
+    desc: GPT-6 Astra on the OpenAI API, 1.05M context / 128K max output

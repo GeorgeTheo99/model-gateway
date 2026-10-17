@@ -322,3 +322,25 @@ def test_canonical_models_add_client_metadata_only_when_included(monkeypatch, tm
 
     names_only = client.get("/v1/models/canonical", params={"include": "display_name"}).json()["data"]
     assert names_only[0]["display_name"] == "ZDR Cloud" and "zero_data_retention" not in names_only[0]
+
+
+def test_canonical_models_add_route_grouping_only_when_included(monkeypatch, tmp_path):
+    model_info = tmp_path / "model-info.json"
+    model_info.write_text("{}")
+    monkeypatch.setattr(providers, "MODEL_INFO_PATH", model_info)
+    monkeypatch.setattr(server, "effective_model_inventory", lambda: [
+        {"name": "claude-opus-5.5", "provider": "anthropic", "effective_provider": "anthropic",
+         "available": True, "family": "claude", "base_model": "claude-opus-5.5"},
+        {"name": "claude-opus-5.5-or", "provider": "openrouter", "effective_provider": "openrouter",
+         "available": True, "family": "claude", "base_model": "claude-opus-5.5"},
+        {"name": "solo", "provider": "openrouter", "effective_provider": "openrouter", "available": True},
+    ])
+
+    exact = client.get("/v1/models/canonical").json()["data"]
+    assert all("family" not in row and "base_model" not in row for row in exact)
+    rows = client.get("/v1/models/canonical", params={"include": "family,base_model"}).json()["data"]
+    assert [(row["id"], row["owned_by"], row["family"], row["base_model"]) for row in rows] == [
+        ("claude-opus-5.5", "anthropic", "claude", "claude-opus-5.5"),
+        ("claude-opus-5.5-or", "openrouter", "claude", "claude-opus-5.5"),
+        ("solo", "openrouter", "", ""),
+    ]

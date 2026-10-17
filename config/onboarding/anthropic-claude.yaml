@@ -1,0 +1,88 @@
+schema_version: 1
+id: anthropic-claude
+# Part of the curated list: installs with this provider's key get these models automatically.
+auto_add: true
+
+provider:
+  id: anthropic
+  base_url: https://api.anthropic.com/v1
+  protocol: anthropic
+  display_name: Anthropic
+  secret_name: anthropic.api-key
+
+# List prices as of 2026-10-17. The key check runs a completion on the first
+# (cheapest) model. Anthropic's API keeps prompts unless the account has a
+# zero-data-retention agreement, so no route declares zdr.
+models:
+  - name: claude-haiku-5.5
+    provider: anthropic
+    provider_model_id: claude-haiku-5-5
+    display_name: Claude Haiku 5.5
+    family: claude
+    base_model: claude-haiku-5.5
+    context: 1000000
+    max_output_tokens: 128000
+    thinking: optional
+    thinking_levels: ["off", low, medium, high]
+    vision: true
+    pricing:
+      input: 0.1
+      output: 0.5
+      cache_read: 0.01
+      cache_write: 0.125
+    desc: Claude Haiku 5.5 on the Anthropic API, 1M context / 128K max output
+
+  - name: claude-sonnet-5.5
+    provider: anthropic
+    provider_model_id: claude-sonnet-5-5
+    display_name: Claude Sonnet 5.5
+    family: claude
+    base_model: claude-sonnet-5.5
+    context: 1000000
+    max_output_tokens: 128000
+    # Adaptive thinking cannot be disabled; effort sets its depth.
+    thinking: always
+    thinking_levels: [low, medium, high, xhigh, max]
+    vision: true
+    pricing:
+      input: 2.0
+      output: 10.0
+      cache_read: 0.1
+      cache_write: 2.5
+    desc: Claude Sonnet 5.5 on the Anthropic API, 1M context / 128K max output
+
+  - name: claude-opus-5.5
+    provider: anthropic
+    provider_model_id: claude-opus-5-5
+    display_name: Claude Opus 5.5
+    family: claude
+    base_model: claude-opus-5.5
+    context: 1000000
+    max_output_tokens: 128000
+    thinking: always
+    thinking_levels: [low, medium, high, xhigh, max]
+    vision: true
+    pricing:
+      input: 4.0
+      output: 20.0
+      cache_read: 0.2
+      cache_write: 5.0
+    desc: Claude Opus 5.5 on the Anthropic API, 1M context / 128K max output
+
+  - name: claude-fable-5.1
+    provider: anthropic
+    provider_model_id: claude-fable-5-1
+    display_name: Claude Fable 5.1
+    family: claude
+    base_model: claude-fable-5.1
+    context: 1000000
+    max_output_tokens: 128000
+    thinking: always
+    thinking_levels: [low, medium, high, xhigh, max]
+    vision: true
+    pricing:
+      input: 10.0
+      output: 50.0
+      cache_read: 0.25
+      cache_write: 12.5
+    desc: Claude Fable 5.1 on the Anthropic API, 1M context / 128K max output

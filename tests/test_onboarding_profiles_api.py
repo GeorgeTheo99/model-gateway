@@ -122,7 +122,8 @@ def _rows(client, headers=MANAGER) -> dict[str, dict]:
 
 def test_lists_packaged_profiles_filtered_by_allowlist(client):
     assert set(_rows(client, ADMIN)) == {
-        "fireworks-glm-5.3", "fireworks-kimi-k3", "moonshot-kimi-k3-rollback", "openrouter-gemini-4",
+        "anthropic-claude", "fireworks-glm-5.3", "fireworks-kimi-k3", "moonshot-kimi-k3-rollback",
+        "openai-gpt", "openrouter-claude", "openrouter-gemini-4", "openrouter-gpt",
     }
     rows = _rows(client)
     assert set(rows) == {"fireworks-glm-5.3", "fireworks-kimi-k3"}
@@ -395,6 +396,92 @@ def test_the_completion_check_routes_zdr_profiles_to_zdr_endpoints(monkeypatch):
     monkeypatch.setattr(onboarding.httpx, "post", post)
     onboarding.validate_upstream_completion(onboarding.packaged_profiles()["openrouter-gemini-4"], "candidate")
     assert bodies[0]["model"] == "google/gemini-4-argon" and bodies[0]["provider"] == {"zdr": True}
+
+
+def _anthropic_profile():
+    return onboarding.validate_profile({
+        "schema_version": 1,
+        "provider": {"id": "anthropic", "base_url": "https://api.anthropic.com/v1", "protocol": "anthropic"},
+        "models": [{"name": "claude-test", "provider": "anthropic", "provider_model_id": "claude-test-1"}],
+    })
+
+
+def test_anthropic_profiles_check_the_key_with_the_messages_api(monkeypatch):
+    calls = []
+
+    def get(url, *, headers, params, timeout):
+        calls.append(("GET", url, headers, params))
+        return httpx.Response(200, json={"data": [{"id": "claude-test-1"}]}, request=httpx.Request("GET", url))
+
+    def post(url, *, json, headers, timeout):
+        calls.append(("POST", url, headers, json))
+        return httpx.Response(200, json={"type": "message", "role": "assistant", "content": []})
+
+    monkeypatch.setattr(onboarding.httpx, "get", get)
+    monkeypatch.setattr(onboarding.httpx, "post", post)
+    profile = _anthropic_profile()
+    assert onboarding.validate_upstream_models(profile, "candidate") == ["claude-test-1"]
+    onboarding.validate_upstream_completion(profile, "candidate")
+    (_, models_url, models_headers, params), (_, url, headers, body) = calls
+    assert models_url == "https://api.anthropic.com/v1/models" and params == {"limit": 1000}
+    assert url == "https://api.anthropic.com/v1/messages"
+    for sent in (models_headers, headers):
+        assert sent["x-api-key"] == "candidate" and sent["anthropic-version"] == "2023-06-01"
+        assert "Authorization" not in sent
+    assert body == {
+        "model": "claude-test-1", "messages": [{"role": "user", "content": "Reply with OK."}],
+        "max_tokens": 16, "stream": False,
+    }
+
+
+def test_an_anthropic_key_that_cannot_answer_is_refused(monkeypatch):
+    key = "sk-ant-" + "k" * 40
+    error = {"type": "error", "error": {"type": "authentication_error", "message": f"invalid x-api-key {key}"}}
+    monkeypatch.setattr(onboarding.httpx, "post", lambda url, **_: httpx.Response(401, json=error))
+    with pytest.raises(onboarding.OnboardingError, match="HTTP 401.*invalid x-api-key") as raised:
+        onboarding.validate_upstream_completion(_anthropic_profile(), key)
+    assert key not in str(raised.value)
+    monkeypatch.setattr(onboarding.httpx, "post", lambda url, **_: httpx.Response(200, json={"choices": []}))
+    with pytest.raises(onboarding.OnboardingError, match="no reply"):
+        onboarding.validate_upstream_completion(_anthropic_profile(), "candidate")
+
+
+def test_the_completion_check_sends_max_completion_tokens_to_openai(monkeypatch):
+    bodies = []
+
+    def post(url, *, json, headers, timeout):
+        bodies.append((url, json))
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "OK"}}]})
+
+    monkeypatch.setattr(onboarding.httpx, "post", post)
+    onboarding.validate_upstream_completion(onboarding.packaged_profiles()["openai-gpt"], "candidate")
+    [(url, body)] = bodies
+    assert url == "https://api.openai.com/v1/chat/completions"
+    assert body["model"] == "gpt-6-luna" and body["max_completion_tokens"] == 16 and "max_tokens" not in body
+
+
+def test_packaged_routes_to_one_model_agree_on_its_family():
+    families: dict[str, str] = {}
+    routes: dict[str, set[str]] = {}
+    for profile in onboarding.packaged_profiles().values():
+        for model in profile["models"]:
+            if "base_model" not in model:
+                continue
+            assert families.setdefault(model["base_model"], model["family"]) == model["family"]
+            if profile.get("auto_add"):
+                provider = model["provider"]
+                assert provider not in routes.setdefault(model["base_model"], set()), model["base_model"]
+                routes[model["base_model"]].add(provider)
+    assert routes["claude-opus-5.5"] == {"anthropic", "openrouter"}
+    assert routes["gpt-6-astra"] == {"openai", "openrouter"}
+    assert routes["claude-fable-5.1"] == {"anthropic"}
+
+
+def test_profiles_reject_an_unknown_protocol():
+    profile = onboarding.packaged_profiles()["fireworks-glm-5.3"]
+    profile["provider"]["protocol"] = "gemini"
+    with pytest.raises(onboarding.OnboardingError, match="protocol must be openai or anthropic"):
+        onboarding.validate_profile(profile)
 
 
 def test_profiles_reject_invalid_client_metadata():

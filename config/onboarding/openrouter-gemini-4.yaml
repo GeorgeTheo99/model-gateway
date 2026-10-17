@@ -16,6 +16,8 @@ models:
     provider_model_id: google/gemini-4-argon
     alias: gemini4
     display_name: Gemini 4 Argon (OpenRouter)
+    family: gemini
+    base_model: gemini-4-argon
     context: 1048576
     # Google Vertex's cap; OpenRouter's AI Studio endpoints allow more but keep data.
     max_output_tokens: 65536

@@ -1,4 +1,4 @@
-"""Transactional onboarding for OpenAI-compatible providers and models.
+"""Transactional onboarding for OpenAI- and Anthropic-protocol providers and models.
 
 Profiles are tracked, secret-free YAML files. Applying one validates the
 upstream model list, writes a provider secret to a mode-0600 file, updates the
@@ -151,6 +151,8 @@ def validate_profile(data: object) -> dict:
         raise OnboardingError(
             "provider base_url must be an HTTPS URL without credentials, query, or fragment"
         )
+    if provider.get("protocol", "openai") not in ("openai", "anthropic"):
+        raise OnboardingError("provider protocol must be openai or anthropic")
     display_name = provider.get("display_name")
     if display_name is not None and (
         not isinstance(display_name, str) or not display_name.strip()
@@ -289,15 +291,20 @@ def _load_existing_secret(
 
 def validate_upstream_models(profile: dict, api_key: str) -> list[str]:
     """Require every profile model to appear in the provider's /models list."""
+    from src.request_options import upstream_auth_headers
+
     provider = profile["provider"]
+    protocol = provider.get("protocol", "openai")
     url = f"{str(provider['base_url']).rstrip('/')}/models"
     headers = {
-        "Authorization": f"Bearer {api_key}",
+        **upstream_auth_headers(api_key, protocol, provider.get("quirks") or ()),
         "Accept": "application/json",
         "User-Agent": "model-gateway-onboard/1",
     }
+    # Anthropic pages its model list (20 by default); one page of 1000 covers it.
+    params = {"limit": 1000} if protocol == "anthropic" else None
     try:
-        response = httpx.get(url, headers=headers, timeout=30)
+        response = httpx.get(url, headers=headers, params=params, timeout=30)
         response.raise_for_status()
         payload = response.json()
     except (httpx.HTTPError, ValueError) as exc:
@@ -323,11 +330,10 @@ def validate_upstream_completion(profile: dict, api_key: str) -> None:
     restricted account), so a key that will replace a working one must answer.
     The probe applies the model's request quirks that live routing would.
     """
-    from src.request_options import normalize_token_limit
+    from src.request_options import normalize_token_limit, upstream_auth_headers
 
     provider = profile["provider"]
-    if provider.get("protocol", "openai") != "openai":
-        raise OnboardingError("a test completion is only supported for OpenAI-compatible providers")
+    anthropic = provider.get("protocol", "openai") == "anthropic"
     model = profile["models"][0]
     quirks = frozenset(model.get("quirks") or ()) | frozenset(provider.get("quirks") or ())
     body = {
@@ -336,13 +342,21 @@ def validate_upstream_completion(profile: dict, api_key: str) -> None:
         "max_tokens": 16,
         "stream": False,
     }
-    if "force_reasoning_effort_max" in quirks:
-        body["reasoning_effort"] = "max"
-    if "openrouter_zdr" in quirks:
-        body["provider"] = {"zdr": True}
-    normalize_token_limit(body, quirks)
-    url = f"{str(provider['base_url']).rstrip('/')}/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "User-Agent": "model-gateway-onboard/1"}
+    if not anthropic:
+        if "force_reasoning_effort_max" in quirks:
+            body["reasoning_effort"] = "max"
+        if "openrouter_zdr" in quirks:
+            body["provider"] = {"zdr": True}
+        normalize_token_limit(body, quirks)
+        # As live routing does: OpenAI's current models reject max_tokens.
+        if canonical_provider(provider["id"]) == "openai" and "max_tokens" in body:
+            body["max_completion_tokens"] = body.pop("max_tokens")
+    path = "/messages" if anthropic else "/chat/completions"
+    url = f"{str(provider['base_url']).rstrip('/')}{path}"
+    headers = {
+        **upstream_auth_headers(api_key, "anthropic" if anthropic else "openai", quirks),
+        "User-Agent": "model-gateway-onboard/1",
+    }
     try:
         response = httpx.post(url, json=body, headers=headers, timeout=60)
     except httpx.HTTPError as exc:
@@ -357,6 +371,12 @@ def validate_upstream_completion(profile: dict, api_key: str) -> None:
         # Redact before shortening, so a key cut at the boundary can't leak in part.
         detail = f": {str(message).replace(api_key, '[redacted]')[:200]}" if message else ""
         raise OnboardingError(f"provider refused a test completion (HTTP {response.status_code}){detail}")
+    if anthropic:
+        # A Messages reply always carries a content list, even when empty.
+        if not isinstance(payload, dict) or payload.get("type") != "message" \
+                or not isinstance(payload.get("content"), list):
+            raise OnboardingError("provider test completion returned no reply")
+        return
     choices = payload.get("choices") if isinstance(payload, dict) else None
     # Thinking models capped at a few tokens may return no content; a message is enough.
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict) \

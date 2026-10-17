@@ -204,7 +204,10 @@ Rows have a fixed set of keys. A client that wants more asks for them with
 `?include=display_name,zero_data_retention` (unknown names are ignored, so
 older gateways simply omit them): `display_name` is the catalog's friendly
 label or `""`, and `zero_data_retention` is `true` for local models and for
-cloud models whose catalog entry declares `zdr: true`.
+cloud models whose catalog entry declares `zdr: true`. `family` and
+`base_model` (both `""` when unset) group the routes to one upstream model;
+with `owned_by` (the route's provider) a client can show one row per model
+and let the user pick the provider.
 
 ## Federation peer auth
 

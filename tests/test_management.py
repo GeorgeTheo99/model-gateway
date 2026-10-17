@@ -237,22 +237,22 @@ def test_admin_key_removal_deletes_the_file_and_a_rejected_reload_restores_it(tm
     if TestClient is None:
         pytest.skip("fastapi test client unavailable")
     monkeypatch.setenv("MODEL_GATEWAY_ADMIN_WRITES", "true")
-    key_file = tmp_config / "secrets" / "openai.api-key"
+    key_file = tmp_config / "secrets" / "mistral.api-key"
     admin_headers = {"Authorization": "Bearer admin"}
 
     def remove(client):
         if operation == "clear":
-            return client.post("/admin/api/providers/openai", headers=admin_headers,
-                               json={"base_url": "https://api.openai.com/v1", "api_key": ""})
-        return client.delete("/admin/api/providers/openai", headers=admin_headers)
+            return client.post("/admin/api/providers/mistral", headers=admin_headers,
+                               json={"base_url": "https://api.mistral.ai/v1", "api_key": ""})
+        return client.delete("/admin/api/providers/mistral", headers=admin_headers)
 
-    config_io.upsert_provider("openai", base_url="https://api.openai.com/v1", api_key="sk-original")
+    config_io.upsert_provider("mistral", base_url="https://api.mistral.ai/v1", api_key="sk-original")
     providers.reload()
     with TestClient(app) as client:
         assert remove(client).status_code == 200
     assert not key_file.exists()
 
-    config_io.upsert_provider("openai", base_url="https://api.openai.com/v1", api_key="sk-original")
+    config_io.upsert_provider("mistral", base_url="https://api.mistral.ai/v1", api_key="sk-original")
     providers.reload()
     seen = []
 
@@ -1629,15 +1629,15 @@ def test_admin_writes_report_skipped_and_failed_exports_without_failing(client, 
     headers = {"Authorization": "Bearer admin"}
 
     # No aliased model: an unmarked catalog refuses to export, but the save stands.
-    response = client.post("/admin/api/providers/openai", headers=headers,
-                           json={"base_url": "https://api.openai.com/v1", "api_key": "sk-test"})
+    response = client.post("/admin/api/providers/mistral", headers=headers,
+                           json={"base_url": "https://api.mistral.ai/v1", "api_key": "sk-test"})
     assert response.status_code == 200
     assert response.json()["catalogs"].startswith("failed: ")
-    assert "openai" in config_io.load_config_full()["providers"]
+    assert "mistral" in config_io.load_config_full()["providers"]
 
     doc = json.loads(mi.read_text())
     mi.write_text(json.dumps({**doc, "allow_empty": True}))
-    response = client.delete("/admin/api/providers/openai", headers=headers)
+    response = client.delete("/admin/api/providers/mistral", headers=headers)
     assert response.status_code == 200
     assert response.json()["catalogs"] == "skipped (no exportable models)"
     assert not (tmp_config / "aliases.json").exists()
