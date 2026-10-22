@@ -2877,6 +2877,79 @@ async def register_profile_snapshot(namespace: str, request: Request):
     )
 
 
+def _pack_status(pack: dict) -> dict:
+    """The pack as registered, with the requirements this gateway cannot serve now."""
+    return {**pack, "unmet_requires": [name for name in pack.get("requires") or [] if resolve(name) is None]}
+
+
+@app.put("/v1/catalog/packs/{namespace}")
+async def register_catalog_pack(namespace: str, request: Request):
+    """Register a consumer's catalog pack (docs/adr/0002-layered-model-catalog.md); replaces the namespace's pack."""
+    _principal, auth_error = _authorize_profile_api(request, namespace, "profiles:write")
+    if auth_error is not None:
+        return auth_error
+    try:
+        body = await request.json()
+    except ValueError:
+        return _profile_api_error(400, "invalid_pack", "Invalid JSON body")
+    from src import admin, config_io, packs, shipped
+
+    def mutate():
+        registered = packs.load()
+        others = {ns: pack for ns, pack in registered.items() if ns != namespace}
+        layer = shipped.layer(config_io.load_config_full(), include_packs=False)
+        registered[namespace] = packs.validate(namespace, body, shipped_rows=layer.entries, other_packs=others)
+        packs.write(registered)
+        return registered[namespace]
+
+    try:
+        pack, reload_error = admin._apply_registry_mutation(mutate, extra_paths=lambda: [packs.path()])
+    except packs.PackError as exc:
+        return _profile_api_error(exc.status, exc.code, str(exc))
+    if reload_error is not None:
+        return _profile_api_error(422, "invalid_pack", f"Catalog rejected the pack: {reload_error}")
+    await admin._regenerate_catalogs()
+    discovery.refresh()
+    return JSONResponse(content=_pack_status(pack), headers={"Cache-Control": "no-store"})
+
+
+@app.get("/v1/catalog/packs/{namespace}")
+async def get_catalog_pack(namespace: str, request: Request):
+    _principal, auth_error = _authorize_profile_api(request, namespace, "profiles:read")
+    if auth_error is not None:
+        return auth_error
+    from src import packs
+
+    pack = packs.load().get(namespace)
+    if pack is None:
+        return _profile_api_error(404, "pack_not_found", "No catalog pack is registered for this namespace")
+    return JSONResponse(content=_pack_status(pack), headers={"Cache-Control": "no-store"})
+
+
+@app.delete("/v1/catalog/packs/{namespace}")
+async def delete_catalog_pack(namespace: str, request: Request):
+    _principal, auth_error = _authorize_profile_api(request, namespace, "profiles:write")
+    if auth_error is not None:
+        return auth_error
+    from src import admin, packs
+
+    def mutate():
+        registered = packs.load()
+        if registered.pop(namespace, None) is None:
+            raise packs.PackError(404, "pack_not_found", "No catalog pack is registered for this namespace")
+        packs.write(registered)
+
+    try:
+        _result, reload_error = admin._apply_registry_mutation(mutate, extra_paths=lambda: [packs.path()])
+    except packs.PackError as exc:
+        return _profile_api_error(exc.status, exc.code, str(exc))
+    if reload_error is not None:
+        return _profile_api_error(422, "invalid_pack", f"Catalog rejected the change: {reload_error}")
+    await admin._regenerate_catalogs()
+    discovery.refresh()
+    return Response(status_code=204)
+
+
 @app.get("/v1/profiles/{namespace}/snapshot")
 async def get_latest_profile_snapshot(namespace: str, request: Request):
     _principal, auth_error = _authorize_profile_api(request, namespace, "profiles:read")

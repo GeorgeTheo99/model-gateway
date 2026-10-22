@@ -94,11 +94,15 @@ gateway resolves it to an available route, preferring the owner's
 ### Consumer packs
 
 A pack is a per-namespace snapshot (`schema_version`, `namespace`,
-`source_revision`, `models`, `requires`) registered by a credential with
-`catalog:write` on that namespace. Pack models are owned by the pack and cannot
-override shipped rows; the owner can override pack rows. `requires` lists shipped
-models or base models the pack's profiles need; unmet requirements are reported
-by status APIs, never forced on — the owner still wins.
+`source_revision`, `models`, `requires`) registered with
+`PUT /v1/catalog/packs/{namespace}` by a consumer credential holding
+`profiles:write` on that namespace (a product's routing policy and the models it
+needs ship together). It is stored in `catalog-packs.json` beside `config.yaml`
+and replaced whole on each registration. Pack models cannot take a shipped or
+another pack's identifier (409); the owner can override or hide pack models like
+shipped ones. `requires` lists shipped models or base models the pack's profiles
+need; unmet requirements are reported (`unmet_requires` on the pack and in admin
+status), never forced on — the owner still wins.
 
 ### Failure handling (R7)
 

@@ -11,6 +11,7 @@ VERSION = "0.7.0"
 CAPABILITIES = (
     "consumer_credentials.v1",
     "create_only_model_registration",
+    "catalog_packs.v1",
     "custom_providers.v1",
     "endpoint_file.v1",
     "layered_catalog.v1",

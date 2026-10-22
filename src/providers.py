@@ -351,7 +351,8 @@ def catalog_status() -> dict:
     try:
         entries = {id(v): v for v in _load_models().values()}.values()
     except Exception as exc:  # noqa: BLE001
-        return {"load_error": str(exc), "review": [], "stale_overrides": {}, "override_errors": {}, "retired": {}}
+        return {"load_error": str(exc), "review": [], "stale_overrides": {}, "override_errors": {}, "retired": {},
+                "packs": {}}
     origins = {entry["name"]: entry.get("origin") or {} for entry in entries}
     return {
         "load_error": _load_error,
@@ -361,6 +362,24 @@ def catalog_status() -> dict:
         "override_errors": {name: origin["override_error"] for name, origin in origins.items()
                             if origin.get("override_error")},
         "retired": dict(_retired),
+        "packs": _pack_summary(),
+    }
+
+
+def _pack_summary() -> dict:
+    from src import packs
+
+    try:
+        registered = packs.load()
+    except (OSError, ValueError) as exc:
+        return {"error": str(exc)}
+    return {
+        namespace: {
+            "source_revision": pack.get("source_revision"),
+            "models": [model.get("name") for model in pack.get("models") or []],
+            "unmet_requires": [name for name in pack.get("requires") or [] if resolve(name) is None],
+        }
+        for namespace, pack in registered.items()
     }
 
 

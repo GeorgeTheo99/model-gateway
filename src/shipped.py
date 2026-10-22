@@ -88,13 +88,20 @@ def _packaged() -> dict[str, dict]:
     return packaged_profiles()
 
 
+def _registered_packs() -> dict[str, dict]:
+    from src import packs
+
+    return packs.load()
+
+
 def layer(
     config: dict,
     *,
     profiles: dict[str, dict] | None = None,
     ready: Callable[[dict, dict], bool] = provider_ready,
+    include_packs: bool = True,
 ) -> ShippedLayer:
-    """Compute the shipped rows, names and retirements for one config."""
+    """Compute the rows beneath the owner's catalog: shipped, then consumer packs (src.packs)."""
     if profiles is None:
         profiles = _packaged()
     selection, hidden, pinned = settings(config)
@@ -122,4 +129,9 @@ def layer(
         )
     # A name another profile still ships is alive, whatever an older profile retired.
     retired = {name: successor for name, successor in retired.items() if name not in names}
+    if include_packs:
+        for namespace, pack in sorted(_registered_packs().items()):
+            for model in pack.get("models") or []:
+                names.add(model["name"])
+                entries.append({**model, "origin": {"layer": "pack", "namespace": namespace}})
     return ShippedLayer(entries, frozenset(names), retired, hidden)

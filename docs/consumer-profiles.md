@@ -226,3 +226,29 @@ Errors use the existing OpenAI or Anthropic envelope for inference endpoints and
 ## Consumer stale-cache behavior
 
 Consumers cache only authenticated snapshot responses, keyed by namespace and ETag. On discovery failure they may use a validated last-known-good snapshot for at most the advertised `stale-if-error` window. A stale snapshot may populate selectors/default labels, but it cannot authorize or execute a route without model-gateway. Consumers must never fall back to reading `model-info.json` or inventing concrete model policy.
+
+## Catalog packs
+
+A product can also register the models it needs that no release ships, such as
+a package-owned local model (capability `catalog_packs.v1`;
+[ADR 0002](adr/0002-layered-model-catalog.md)):
+
+```http
+PUT /v1/catalog/packs/ha
+Authorization: Bearer <ha-deployer key>
+
+{"schema_version": 1, "namespace": "ha", "source_revision": "home-server@<sha>",
+ "models": [{"name": "qwen3.8-27b", "provider": "omlx", "omlx_id": "qwen3.8-27b-8bit-30gb",
+             "pricing_status": "unmetered"}],
+ "requires": ["glm-5.3-flash"]}
+```
+
+- The credential needs `profiles:write` on the namespace; `GET` needs `profiles:read`.
+- Each `PUT` replaces the namespace's pack; `DELETE` removes it.
+- Pack models load between the shipped catalog and the owner's catalog: they
+  cannot reuse a shipped or another pack's identifier (`409 pack_conflict`), and
+  the owner can override or hide them.
+- `requires` names shipped models or base models the product's profiles need;
+  the response's `unmet_requires` lists those this gateway cannot serve now.
+- Profile routes may name a base model; registration binds the route available then.
+

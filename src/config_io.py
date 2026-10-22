@@ -542,8 +542,8 @@ def delete_provider(provider_id: str) -> dict:
     canonical = _canonical_provider(provider_id)
     dependents = []
     for entry in {id(v): v for v in _load_models().values()}.values():
-        # Shipped models stop loading with their provider; only owner rows depend on it.
-        if (entry.get("origin") or {}).get("layer") == "shipped":
+        # Shipped and pack models stop loading with their provider; only owner rows depend on it.
+        if (entry.get("origin") or {}).get("layer") in ("shipped", "pack"):
             continue
         if _canonical_provider(entry.get("provider")) == canonical and _is_model_enabled(entry.get("name")):
             dependents.append(entry.get("name", ""))
