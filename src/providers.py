@@ -963,6 +963,31 @@ def retirement_redirect(model_id: str) -> str | None:
     return successor if _availability_for_entry(successor, models[successor])["available"] else None
 
 
+@_registry_locked
+def resolve_base_model(model_id: str, *, locality: str | None = None) -> str | None:
+    """The available route for a base-model reference (docs/adr/0002-layered-model-catalog.md R1).
+
+    Routes sharing ``base_model`` are tried in the owner's
+    ``catalog.provider_preference`` order, then catalog order. ``locality``
+    (``local_only``/``cloud_explicit``) keeps only local or only cloud routes.
+    """
+    models = _load_models()
+    preference = shipped.provider_preference(_load_config())
+    entries = [entry for entry in {id(v): v for v in models.values()}.values() if entry.get("base_model") == model_id]
+    if locality is not None:
+        entries = [entry for entry in entries
+                   if (_canonical_provider(entry.get("provider")) == "omlx") == (locality == "local_only")]
+
+    def rank(entry: dict) -> int:
+        provider = _canonical_provider(entry.get("provider"))
+        return preference.index(provider) if provider in preference else len(preference)
+
+    for entry in sorted(entries, key=rank):
+        if _availability_for_entry(entry["name"], entry)["available"]:
+            return entry["name"]
+    return None
+
+
 def resolve(model_id: str, provider_override: str | None = None) -> ProviderInfo | None:
     """Resolve a model name/alias/id to provider info.
 
@@ -975,6 +1000,14 @@ def resolve(model_id: str, provider_override: str | None = None) -> ProviderInfo
     entry = models.get(model_id)
     availability = _availability_for_entry(model_id, entry)
     if not availability["available"]:
+        # A base-model reference is served by an available route of that base model. A
+        # provider-specific route name is not rerouted (that could change retention or
+        # cost), nor is a model the owner turned off.
+        if availability["reason"] != "model_disabled" and provider_override is None:
+            is_base = entry is None or entry.get("base_model") == model_id
+            route = resolve_base_model(model_id) if is_base else None
+            if route is not None and route != model_id:
+                return resolve(route)
         if availability["reason"] == "model_not_found":
             return None
         log.info("Model %r unavailable: %s", model_id, availability["message"])

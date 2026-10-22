@@ -234,3 +234,59 @@ def test_review_keep_or_discard(tmp_path, monkeypatch):
         assert client.get("/admin/api/status", headers=headers).json()["catalog"]["review"] == []
     assert json.loads(info.read_text())["llm"] == [{"name": "m1", "desc": "mine", "shipped_base": {"desc": None}}]
     assert providers._load_models()["m1"]["desc"] == "mine"
+
+
+def test_base_model_references_resolve_to_an_available_route(tmp_path, monkeypatch):
+    profile = _profile([
+        {"name": "astra", "family": "gpt", "base_model": "astra"},
+        {"name": "astra-or", "family": "gpt", "base_model": "astra", "provider_model_id": "or/astra"},
+        {"name": "glm-fw", "family": "glm", "base_model": "glm"},
+    ])
+    _registry_with(tmp_path, monkeypatch, [], profile)
+    assert providers.resolve("glm").provider_model_id == "up/glm-fw"  # a pure base-model name
+    assert providers.resolve("astra").provider_model_id == "up/astra"
+    assert providers.resolve_base_model("glm", locality="local_only") is None
+    providers.CONFIG_PATH.write_text(yaml.safe_dump({
+        "providers": {"example": {"base_url": BASE_URL, "api_key": "k"}},
+        "model_overrides": {"astra": {"enabled": False}, "glm-fw": {"enabled": False}},
+    }))
+    providers.reload()
+    assert providers.resolve("astra") is None  # the owner turned that route off
+    assert providers.resolve_base_model("astra") == "astra-or"
+    assert providers.resolve("glm") is None
+
+
+def test_provider_preference_orders_base_model_routes(tmp_path, monkeypatch):
+    first = _profile([{"name": "m-a", "family": "m", "base_model": "m"}], profile_id="a")
+    second = onboarding.validate_profile({**first, "id": "b", "provider": {**first["provider"], "id": "other",
+                                          "base_url": "https://other.test/v1"},
+                                          "models": [{**first["models"][0], "name": "m-b", "provider": "other",
+                                                      "provider_model_id": "up/m-b"}]})
+    monkeypatch.setattr(shipped, "_packaged", lambda: {"a": first, "b": second})
+    info = tmp_path / "model-info.json"
+    info.write_text(json.dumps({"llm": [], "allow_empty": True}))
+    monkeypatch.setattr(providers, "MODEL_INFO_PATH", info)
+    config = {"providers": {"example": {"base_url": BASE_URL, "api_key": "k"},
+                            "other": {"base_url": "https://other.test/v1", "api_key": "k"}}}
+    providers.CONFIG_PATH.write_text(yaml.safe_dump(config))
+    providers.reload()
+    assert providers.resolve_base_model("m") == "m-a"
+    providers.CONFIG_PATH.write_text(yaml.safe_dump({**config, "catalog": {"provider_preference": ["other"]}}))
+    providers.reload()
+    assert providers.resolve_base_model("m") == "m-b"
+
+
+def test_profile_routes_may_name_a_base_model(tmp_path, monkeypatch):
+    from src import profiles
+
+    _registry_with(tmp_path, monkeypatch, [], _profile([{"name": "glm-fw", "family": "glm", "base_model": "glm"}]))
+
+    def manifest(locality, policy):
+        return {"schema_version": 1, "namespace": "ha", "source_revision": "r", "profiles": [{
+            "id": "ha/p", "locality": locality, "credential_policy": policy,
+            "protocols": ["openai_chat"], "routes": {"text": "glm"}}]}
+
+    registered, _bindings = profiles.validate_manifest(manifest("cloud_explicit", "gateway_managed"))
+    assert registered["profiles"][0]["routes"] == {"text": "glm-fw"}  # bound to the route available now
+    with pytest.raises(profiles.ProfileError):
+        profiles.validate_manifest(manifest("local_only", "gateway_local"))  # no local route of glm

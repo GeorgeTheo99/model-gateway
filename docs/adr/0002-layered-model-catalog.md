@@ -82,6 +82,15 @@ contracts. Consumers reference a `base_model` (`glm-5.3`, `gpt-6-astra`); the
 gateway resolves it to an available route, preferring the owner's
 `catalog.provider_preference` order, then catalog order.
 
+- A route name is never rerouted to another provider (that could change
+  retention or cost); only a base-model name is, including a route named after
+  its base model when that route is unavailable. A model the owner turned off is
+  not rerouted.
+- A consumer profile route may name a base model. Registration binds it to the
+  route available then, within the profile's locality, and stores that route, so
+  ADR 0001's snapshot binding is unchanged; re-registering picks up a new
+  preference.
+
 ### Consumer packs
 
 A pack is a per-namespace snapshot (`schema_version`, `namespace`,

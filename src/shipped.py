@@ -11,6 +11,7 @@ The owner's choices live in the config ``catalog:`` block::
       shipped: all            # or none, or a list of profile ids / model names
       hidden: [model-name]    # deleted shipped models; never loaded
       pinned: [model-name]    # kept even when a release retires them
+      provider_preference: [provider-id]  # route order for base-model references
 """
 
 from __future__ import annotations
@@ -37,6 +38,12 @@ def _names(settings: dict, key: str) -> frozenset[str]:
     return frozenset(value)
 
 
+def provider_preference(config: dict) -> list[str]:
+    """The owner's provider order for resolving a base-model reference (ADR 0002 R1)."""
+    settings(config)
+    return list((config.get("catalog") or {}).get("provider_preference") or [])
+
+
 def settings(config: dict) -> tuple[str | frozenset[str], frozenset[str], frozenset[str]]:
     """Validated ``(selection, hidden, pinned)`` from the config ``catalog:`` block."""
     raw = config.get("catalog")
@@ -44,7 +51,7 @@ def settings(config: dict) -> tuple[str | frozenset[str], frozenset[str], frozen
         raw = {}
     if not isinstance(raw, dict):
         raise ValueError("config catalog must be an object")
-    unknown = set(raw) - {"shipped", "hidden", "pinned"}
+    unknown = set(raw) - {"shipped", "hidden", "pinned", "provider_preference"}
     if unknown:
         raise ValueError("config catalog has unknown field(s): " + ", ".join(sorted(unknown)))
     selection = raw.get("shipped", "all")
@@ -54,6 +61,7 @@ def settings(config: dict) -> tuple[str | frozenset[str], frozenset[str], frozen
         selection = frozenset(selection)
     elif selection not in ("all", "none"):
         raise ValueError("config catalog.shipped must be all, none, or a list")
+    _names(raw, "provider_preference")
     return selection, _names(raw, "hidden"), _names(raw, "pinned")
 
 

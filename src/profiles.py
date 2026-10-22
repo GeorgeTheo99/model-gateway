@@ -466,6 +466,15 @@ def validate_manifest(raw: object) -> tuple[dict, dict[str, str]]:
         manifest["default_profile"] = default_profile
 
     inventory = _inventory_by_name()
+    for profile in normalized_profiles:
+        for role, model in profile["routes"].items():
+            entry = inventory.get(model)
+            if entry is None or (entry.get("base_model") == model and not providers.model_availability(model)["available"]):
+                # A base-model reference binds to the route available now, within the
+                # profile's locality (docs/adr/0002-layered-model-catalog.md R1).
+                route = providers.resolve_base_model(model, locality=profile["locality"])
+                if route is not None:
+                    profile["routes"][role] = route
     bindings = {profile["id"]: _binding_for(profile, inventory) for profile in normalized_profiles}
     return manifest, bindings
 
