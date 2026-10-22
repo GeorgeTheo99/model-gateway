@@ -1108,7 +1108,7 @@ async def admin_onboarding_profiles(request: Request):
             "models": [model["name"] for model in profile["models"]],
             "model_details": [
                 {"name": model["name"], "display_name": str(model.get("display_name") or model["name"]),
-                 "zero_data_retention": model.get("zdr") is True}
+                 "zero_data_retention": model.get("zdr") is True, "base_model": model.get("base_model")}
                 for model in profile["models"]
             ],
             "provider_defined": matches,

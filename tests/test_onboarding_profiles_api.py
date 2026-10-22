@@ -136,8 +136,10 @@ def test_lists_packaged_profiles_filtered_by_allowlist(client):
         "id": GLM, "provider": "fireworks", "provider_display_name": "Fireworks", "auto_add": True,
         "models": list(GLM_MODELS),
         "model_details": [
-            {"name": "glm-5.3-fw", "display_name": "GLM 5.3 (Fireworks)", "zero_data_retention": True},
-            {"name": "glm-5.3-flash-fw", "display_name": "GLM 5.3 Flash (Fireworks)", "zero_data_retention": True},
+            {"name": "glm-5.3-fw", "display_name": "GLM 5.3 (Fireworks)", "zero_data_retention": True,
+             "base_model": "glm-5.3"},
+            {"name": "glm-5.3-flash-fw", "display_name": "GLM 5.3 Flash (Fireworks)", "zero_data_retention": True,
+             "base_model": "glm-5.3-flash"},
         ],
         "provider_defined": True, "has_api_key": False, "applied": False,
     }

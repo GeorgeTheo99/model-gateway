@@ -88,7 +88,7 @@ profiles (with `provenance`), and invalid files are never listed:
   "provider_display_name": "Fireworks", "auto_add": true,
   "models": ["glm-5.3-fw", "glm-5.3-flash-fw"],
   "model_details": [{"name": "glm-5.3-fw", "display_name": "GLM 5.3 (Fireworks)",
-                     "zero_data_retention": true}, ...],
+                     "zero_data_retention": true, "base_model": "glm-5.3"}, ...],
   "provider_defined": true, "has_api_key": false, "applied": false}]}
 ```
 
