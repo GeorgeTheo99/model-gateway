@@ -324,7 +324,7 @@ def test_download_is_rate_limited(progress, sleeps, monkeypatch):
     # Fake sleeps take no time, so the limiter asks for the whole budget: 21000 bytes at 1000 B/s.
     assert sleeps and 20 < sleeps[-1] <= len(BODY) / 1000
     sleeps.clear()
-    monkeypatch.setattr(lr, "DOWNLOAD_BYTES_PER_SECOND", 25_000_000)
+    monkeypatch.setattr(lr, "DOWNLOAD_BYTES_PER_SECOND", 18_750_000)
     download(progress, FakeOpener(BODY), lr.runtime_root() / "partial/other.safetensors")
     assert all(delay < 0.01 for delay in sleeps)
 

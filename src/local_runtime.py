@@ -96,8 +96,8 @@ DEFAULT_PORT = 9110
 MIN_MEMORY_BYTES = 48 * 1024**3
 # Beyond the remaining download: the oMLX environment plus the bounded 8 GB KV cache.
 DISK_MARGIN = 12 * 1024**3
-# The documented aggregate download budget for this network.
-DOWNLOAD_BYTES_PER_SECOND = 25_000_000
+# 150 Mbit/s, so a model download never saturates the owner's network.
+DOWNLOAD_BYTES_PER_SECOND = 18_750_000
 DOWNLOAD_ATTEMPTS = 5
 HEARTBEAT_SECONDS = 5
 # An active state whose heartbeat is older than this, with no running job, was interrupted.
