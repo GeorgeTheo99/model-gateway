@@ -301,11 +301,74 @@ def _load_overlay(config_path: Path) -> list[dict]:
     return overlay
 
 
+# Owner-row bookkeeping (ADR 0002). ``origin`` is computed, never trusted from a file.
+OWNER_META_FIELDS = frozenset({"shipped_base", "review", "origin"})
+
+
+def _fold_shipped(shipped: list[dict], owner: list[dict], shipped_names: frozenset[str]) -> list[dict]:
+    """Merge owner rows over the shipped layer: the owner wins per field and per identifier.
+
+    An owner row named after a loaded shipped model overrides only the fields it
+    sets. A sparse override (one recording ``shipped_base``/``review``, or with no
+    provider) of a shipped model that is not loaded here is ignored rather than
+    promoted to a model. An owner identifier that is a shipped row's alias or
+    alternate id moves to the owner; one that is its name or upstream id shadows
+    that shipped row.
+    """
+    by_name = {row["name"]: row for row in shipped}
+    folded: list[dict] = []
+    overridden: set[str] = set()
+    for row in owner:
+        name = row.get("name")
+        fields = {k: v for k, v in row.items() if k not in OWNER_META_FIELDS}
+        base = by_name.get(name) if isinstance(name, str) else None
+        if base is None:
+            sparse = "shipped_base" in row or "review" in row or not row.get("provider")
+            if name in shipped_names and sparse:
+                continue
+            folded.append({**fields, "origin": {"layer": "owner"}})
+            continue
+        overridden.add(name)
+        merged = {**base, **fields}
+        if "thinking" in fields and fields["thinking"] != base.get("thinking") and "thinking_levels" not in fields:
+            merged.pop("thinking_levels", None)
+        changed = sorted(k for k in fields if k != "name" and base.get(k) != fields[k])
+        recorded = row.get("shipped_base") if isinstance(row.get("shipped_base"), dict) else {}
+        origin = {**base["origin"], "overridden": changed,
+                  "stale_overrides": sorted(k for k in changed if k in recorded and recorded[k] != base.get(k))}
+        if row.get("review") is True:
+            origin["review"] = True
+        merged["origin"] = origin
+        folded.append(merged)
+    claimed: set[str] = set()
+    for row in folded:
+        claimed.update(entry_routable_ids(row))
+    kept: list[dict] = []
+    for row in shipped:
+        if row["name"] in overridden:
+            continue
+        alternates = row.get("alternate_ids") or []
+        alternates = [alternates] if isinstance(alternates, str) else list(alternates)
+        movable = {str(row.get("alias") or ""), *alternates}
+        if any(model_id in claimed for model_id in entry_routable_ids(row) if model_id not in movable):
+            continue
+        row = dict(row)
+        if row.get("alias") in claimed:
+            row.pop("alias")
+        if alternates:
+            row["alternate_ids"] = [value for value in alternates if value not in claimed]
+        kept.append(row)
+    return kept + folded
+
+
 def load_catalog_entries(
     model_info_path: Path | str,
     config_path: Path | str | None = None,
     *,
     overlay: list[dict] | None = None,
+    shipped: list[dict] | None = None,
+    shipped_names: frozenset[str] = frozenset(),
+    excluded: frozenset[str] = frozenset(),
     include_retired: bool = False,
     require_nonempty: bool = False,
 ) -> list[dict]:
@@ -326,6 +389,11 @@ def load_catalog_entries(
     ``config_path``; pass it directly when the caller already has the loaded
     config (e.g. the gateway router reads via its cached config object).
 
+    ``shipped`` rows (see :mod:`src.shipped`) load beneath the owner's catalog,
+    which wins per field and per identifier (:func:`_fold_shipped`).
+    ``shipped_names`` lists every shipped name, loaded or not. Names in
+    ``excluded`` (hidden or retired) are dropped from the result.
+
     ``include_retired`` defaults to False, skipping GGUF/llama.cpp entries to
     match the gateway router. Generators that want the full raw catalog
     (e.g. for reporting) may pass True. ``require_nonempty`` is enabled by the
@@ -335,6 +403,8 @@ def load_catalog_entries(
     model_info_path = Path(model_info_path)
 
     catalog_entries = _load_model_info(model_info_path)
+    if shipped is not None:
+        catalog_entries = _fold_shipped(list(shipped), catalog_entries, shipped_names)
     if overlay is None:
         config_path = Path(config_path) if config_path else None
         overlay_entries = _load_overlay(config_path) if config_path else []
@@ -400,7 +470,8 @@ def load_catalog_entries(
                 f"multiple catalog models: {sorted(collided_primaries)}"
             )
         base = by_id.get(base_primary) if base_primary else None
-        normalized = {**base, **entry} if base else dict(entry)
+        fields = {k: v for k, v in entry.items() if k != "origin"}
+        normalized = {**base, **fields} if base else {**fields, "origin": {"layer": "owner"}}
         if (
             base
             and "thinking" in entry
@@ -436,7 +507,7 @@ def load_catalog_entries(
         if primary is not None and primary not in order:
             order.append(primary)
 
-    result = [by_id[primary] for primary in order]
+    result = [by_id[primary] for primary in order if by_id[primary].get("name") not in excluded]
     if require_nonempty and not result and not allows_empty(model_info_path):
         raise ValueError("effective model catalog is empty")
     return result

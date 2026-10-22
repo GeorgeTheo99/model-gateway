@@ -119,12 +119,12 @@ async def _lifespan(_app: FastAPI):
     # Best-effort catalog regeneration (no-op unless config.yaml has exports:).
     # In-process so it runs on every deploy layout, not just launchers that
     # call scripts/export_catalogs.py themselves.
-    from src.admin import _regenerate_catalogs, sync_auto_add_models
+    from src.admin import _regenerate_catalogs, migrate_catalog
     try:
-        # An update may ship new curated models for providers that already have a key.
-        await sync_auto_add_models()
-    except Exception as exc:  # noqa: BLE001 — a failed auto-add must not stop the gateway
-        log.warning("auto-add failed: %s", exc)
+        # Curated models load by reference; retire copies older releases made.
+        migrate_catalog()
+    except Exception as exc:  # noqa: BLE001 — a failed migration must not stop the gateway
+        log.warning("catalog migration failed: %s", exc)
     log.info("catalog exports: %s", await _regenerate_catalogs())
     discovery.refresh()
     await federation.start()

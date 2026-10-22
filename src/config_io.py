@@ -32,6 +32,7 @@ from typing import Any
 import yaml
 
 from src.catalog import (
+    OWNER_META_FIELDS,
     canonical_provider,
     normalize_thinking_capabilities,
     validate_client_metadata,
@@ -541,6 +542,9 @@ def delete_provider(provider_id: str) -> dict:
     canonical = _canonical_provider(provider_id)
     dependents = []
     for entry in {id(v): v for v in _load_models().values()}.values():
+        # Shipped models stop loading with their provider; only owner rows depend on it.
+        if (entry.get("origin") or {}).get("layer") == "shipped":
+            continue
         if _canonical_provider(entry.get("provider")) == canonical and _is_model_enabled(entry.get("name")):
             dependents.append(entry.get("name", ""))
     if dependents:
@@ -1158,6 +1162,52 @@ def _apply_pricing_update(entry: dict, fields: dict, provider: str) -> None:
         entry.pop("pricing_status", None)
 
 
+def _shipped_state():
+    """The shipped layer for the config on disk (callers hold the write lock)."""
+    from src import shipped
+
+    return shipped.layer(load_config_full())
+
+
+def _loaded_shipped_row(layer, name: str) -> dict | None:
+    return next(
+        ({k: v for k, v in row.items() if k != "origin"} for row in layer.entries if row["name"] == name), None,
+    )
+
+
+def loaded_shipped_rows() -> list[dict]:
+    """Shipped rows the config on disk loads, without hidden or retired names (call under the write lock)."""
+    layer = _shipped_state()
+    excluded = layer.hidden | set(layer.retired)
+    return [
+        {k: v for k, v in row.items() if k != "origin"} for row in layer.entries if row["name"] not in excluded
+    ]
+
+
+def _update_catalog_names(add: dict[str, str] | None = None, remove: dict[str, str] | None = None) -> bool:
+    """Add/remove names in config ``catalog.hidden``/``catalog.pinned`` (``{name: list}``); True if written."""
+    config = load_config_full()
+    block = dict(config.get("catalog") or {})
+    changed = False
+    for name, key in (add or {}).items():
+        if name not in (block.get(key) or []):
+            block[key] = sorted({*(block.get(key) or []), name})
+            changed = True
+    for name, key in (remove or {}).items():
+        if name in (block.get(key) or []):
+            block[key] = [value for value in block[key] if value != name] or None
+            changed = True
+    if changed:
+        block = {key: value for key, value in block.items() if value is not None}
+        if block:
+            config["catalog"] = block
+        else:
+            config.pop("catalog", None)
+        _backup(CONFIG_PATH)
+        _atomic_write(CONFIG_PATH, yaml.safe_dump(config, sort_keys=False, default_flow_style=False))
+    return changed
+
+
 @_write_transaction
 def upsert_model(name: str, **fields) -> dict:
     """Create or update a model entry in model-info.json.
@@ -1165,6 +1215,12 @@ def upsert_model(name: str, **fields) -> dict:
     ``name`` is the gateway-facing model id and the dict key. Returns the
     written entry (masked: no secrets; models carry none). Writes the live
     catalog and optional machine-local mirror.
+
+    For a shipped model this install loads, only the fields that differ from
+    the shipped row are stored, with the shipped values they replaced
+    (``shipped_base``), so unchanged fields keep receiving shipped updates
+    (docs/adr/0002-layered-model-catalog.md). Saving a hidden or retired name
+    is the owner choosing it: it is unhidden and pinned.
     """
     name = (name or "").strip()
     if not name:
@@ -1182,11 +1238,18 @@ def upsert_model(name: str, **fields) -> dict:
 
     doc = load_model_info()
     llm = doc.get("llm", [])
-    entry = next((e for e in llm if e.get("name") == name), None)
-    if entry is None:
-        entry = {"name": name}
-        llm.append(entry)
-        doc["llm"] = llm
+    layer = _shipped_state()
+    shipped_row = _loaded_shipped_row(layer, name)
+    row = next((e for e in llm if e.get("name") == name), None)
+    if shipped_row is not None:
+        owned = {k: v for k, v in (row or {}).items() if k not in OWNER_META_FIELDS}
+        entry = {**shipped_row, **owned}
+    else:
+        entry = row
+        if entry is None:
+            entry = {"name": name}
+            llm.append(entry)
+            doc["llm"] = llm
 
     entry["name"] = name
     entry["provider"] = provider
@@ -1218,7 +1281,24 @@ def upsert_model(name: str, **fields) -> dict:
     # "enabled" is handled by set_model_enabled() writing config.yaml
     # model_overrides; it is never written to the model catalog.
 
+    if shipped_row is not None:
+        differing = sorted(
+            field for field in {*entry, *shipped_row}
+            if field != "name" and entry.get(field) != shipped_row.get(field)
+        )
+        llm = [e for e in llm if e.get("name") != name]
+        if differing:
+            llm.append({
+                "name": name,
+                # A field the owner removed is stored as null so the shipped value stays out.
+                **{field: entry.get(field) for field in differing},
+                "shipped_base": {field: shipped_row.get(field) for field in differing},
+            })
+        doc["llm"] = llm
     paths = _write_model_info(doc)
+    add = {name: "pinned"} if name in layer.retired else {}
+    if _update_catalog_names(add=add, remove={name: "hidden"}):
+        paths.append(str(CONFIG_PATH))
     return {"name": name, "entry": _model_summary(entry), "written_to": paths}
 
 
@@ -1265,16 +1345,26 @@ def delete_custom_provider(provider_id: str) -> list[str]:
 
 @_write_transaction
 def delete_model(name: str) -> dict:
-    """Remove a model entry by name. Also clears any runtime override."""
+    """Remove a model entry by name. Also clears any runtime override.
+
+    A shipped model cannot leave the release, so deleting one also hides it
+    (config ``catalog.hidden``) and drops any owner override of it.
+    """
     name = (name or "").strip()
     doc = load_model_info()
     llm = doc.get("llm", [])
     before = len(llm)
     llm = [e for e in llm if e.get("name") != name]
-    if len(llm) == before:
+    layer = _shipped_state()
+    loaded = _loaded_shipped_row(layer, name) is not None
+    if len(llm) == before and not loaded:
         raise KeyError(f"model {name!r} not found")
-    doc["llm"] = llm
-    paths = _write_model_info(doc)
+    paths = []
+    if len(llm) != before:
+        doc["llm"] = llm
+        paths = _write_model_info(doc)
+    if name in layer.names and _update_catalog_names(add={name: "hidden"}, remove={name: "pinned"}):
+        paths.append(str(CONFIG_PATH))
     # Clean up any stale runtime override for the deleted model.
     config = load_config_full()
     overrides = config.get("model_overrides") or {}
@@ -1301,7 +1391,7 @@ def set_model_enabled(name: str, enabled: bool) -> dict:
         raise ValueError("model name is required")
     # Verify the model exists in the catalog before recording an override.
     doc = load_model_info()
-    if not any(e.get("name") == name for e in doc.get("llm", [])):
+    if not any(e.get("name") == name for e in doc.get("llm", [])) and _loaded_shipped_row(_shipped_state(), name) is None:
         raise KeyError(f"model {name!r} not found")
 
     config = load_config_full()
@@ -1352,7 +1442,7 @@ def add_onboarded_models(
 
 
 def auto_add_state_path() -> Path:
-    """Names of auto_add profile models already offered to this install (see admin.sync_auto_add_models)."""
+    """Legacy ledger of curated models once copied into the catalog; read only by the migration."""
     return CONFIG_PATH.parent / "auto-added-models.json"
 
 
@@ -1368,10 +1458,67 @@ def load_offered_models() -> set[str]:
     return set(names)
 
 
-def save_offered_models(names: set[str]) -> str:
-    path = auto_add_state_path()
-    _atomic_write(path, json.dumps({"version": 1, "models": sorted(names)}, indent=2) + "\n")
-    return str(path)
+def shipped_migration_pending(loaded: dict[str, dict]) -> bool:
+    """Whether :func:`migrate_to_shipped_layer` has anything to do (a read-only check)."""
+    return auto_add_state_path().exists() or any(
+        isinstance(row, dict) and row.get("name") in loaded and "shipped_base" not in row and "review" not in row
+        for row in load_model_info().get("llm") or []
+    )
+
+
+@_write_transaction
+def migrate_to_shipped_layer(loaded: dict[str, dict], shipped_names: frozenset[str]) -> dict:
+    """Move from copied curated rows to the shipped layer (docs/adr/0002-layered-model-catalog.md).
+
+    ``loaded`` maps each shipped model this install loads to its shipped row.
+    Copies identical to it are dropped; differing copies keep only the differing
+    fields as a sparse override recording the shipped values (``shipped_base``)
+    and flagged ``review``, since nothing says whether the owner made them.
+    Ledger names the owner deleted become ``catalog.hidden``, and the ledger is
+    retired. Rows of shipped models not loaded here stay whole. Idempotent;
+    returns what changed (empty when nothing did).
+    """
+    ledger = auto_add_state_path()
+    offered = load_offered_models()
+    doc = load_model_info()
+    rows = doc.get("llm") or []
+    present = {row.get("name") for row in rows if isinstance(row, dict)}
+    kept: list = []
+    dropped: list[str] = []
+    review: list[str] = []
+    for row in rows:
+        base = loaded.get(row.get("name")) if isinstance(row, dict) else None
+        if base is None or "shipped_base" in row or "review" in row:
+            kept.append(row)
+            continue
+        differing = [field for field in row if field != "name" and row[field] != base.get(field)]
+        if not differing:
+            dropped.append(row["name"])
+            continue
+        kept.append({
+            "name": row["name"],
+            **{field: row[field] for field in differing},
+            "shipped_base": {field: base.get(field) for field in differing},
+            "review": True,
+        })
+        review.append(row["name"])
+    hidden = sorted((offered - present) & shipped_names)
+    if dropped or review:
+        doc["llm"] = kept
+        _write_model_info(doc)
+    if hidden:
+        config = load_config_full()
+        block = config.get("catalog") or {}
+        block["hidden"] = sorted(set(block.get("hidden") or []) | set(hidden))
+        config["catalog"] = block
+        _backup(CONFIG_PATH)
+        _atomic_write(CONFIG_PATH, yaml.safe_dump(config, sort_keys=False, default_flow_style=False))
+    if ledger.exists():
+        _backup(ledger)
+        ledger.unlink()
+    elif not (dropped or review or hidden):
+        return {}
+    return {"dropped": dropped, "review": review, "hidden": hidden}
 
 
 def _model_summary(entry: dict) -> dict:

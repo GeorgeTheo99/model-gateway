@@ -13,6 +13,7 @@ CAPABILITIES = (
     "create_only_model_registration",
     "custom_providers.v1",
     "endpoint_file.v1",
+    "layered_catalog.v1",
     "legacy_home_server_import.v1",
     "local_runtime.v1",
     "onboarding_auto_add.v1",

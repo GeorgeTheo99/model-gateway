@@ -235,6 +235,12 @@ def validate_profile(data: object) -> dict:
         raise OnboardingError("retire.models contains duplicates")
     if set(retired) & names:
         raise OnboardingError("a model cannot be both added and retired")
+    replaced_by = retire.get("replaced_by") or {}
+    if not isinstance(replaced_by, dict) or any(
+        old not in retired or not isinstance(new, str) or not new.strip() or new in retired
+        for old, new in replaced_by.items()
+    ):
+        raise OnboardingError("retire.replaced_by must map retired model names to non-retired model names")
     if provenance is not None:
         from src.onboarding_generation import generated_safety
 

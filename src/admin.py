@@ -37,7 +37,7 @@ from src.providers import (
     routable_ids,
     snapshot_registry as snapshot_provider_registry,
 )
-from src import bundle, config_io, custom_providers, discovery, federation, ledger, local_runtime, onboarding, profiles
+from src import bundle, config_io, custom_providers, discovery, federation, ledger, local_runtime, onboarding, profiles, shipped
 from src.version import CAPABILITIES, VERSION
 
 log = logging.getLogger("model-gateway")
@@ -534,6 +534,7 @@ async def admin_upsert_provider(provider_id: str, request: Request):
         # Write back only what is already effective, never request values.
         base_url, protocol = current_url, None
 
+    names_before = set(_catalog_names())
     try:
         result, reload_error = _apply_registry_mutation(lambda: config_io.upsert_provider(
             provider_id,
@@ -554,7 +555,7 @@ async def admin_upsert_provider(provider_id: str, request: Request):
     result["reloaded"] = True
     result["catalogs"] = await _regenerate_catalogs()
     # A new key unlocks the provider's curated models.
-    result["auto_added_models"] = await sync_auto_add_models()
+    result["auto_added_models"] = [n for n in _catalog_names(shipped_only=True) if n not in names_before]
     return result
 
 
@@ -797,6 +798,7 @@ def _require_model_absent(model_name: str, body: dict) -> None:
     entries = [
         *config_io.load_model_info().get("llm", []),
         *config_io.load_config_full().get("models", []),
+        *config_io.loaded_shipped_rows(),
     ]
     for entry in entries:
         if candidate_ids.intersection(entry_routable_ids(entry)):
@@ -978,8 +980,10 @@ def _plan_profile_apply(profile: dict, api_key: str | None) -> dict:
         }
         if location is None:
             define["enabled"] = True
-    to_add, present = onboarding.plan_additive_models(
-        profile, config_io.load_model_info(), config.get("models"),
+    # A curated profile's models are never copied: they load by reference (ADR 0002).
+    to_add, present = ([], []) if profile.get("auto_add") else onboarding.plan_additive_models(
+        profile, {"llm": [*config_io.load_model_info().get("llm", []), *config_io.loaded_shipped_rows()]},
+        config.get("models"),
     )
     overrides = config.get("model_overrides") or {}
     for name in [model["name"] for model in profile["models"]]:
@@ -1005,81 +1009,38 @@ def _plan_profile_apply(profile: dict, api_key: str | None) -> dict:
     }
 
 
-def _auto_add_candidates(offered: set[str]) -> tuple[dict[str, list[dict]], set[str]]:
-    """New models of auto_add profiles whose provider already has a key, and every name now offered.
+def _catalog_names(*, shipped_only: bool = False) -> list[str]:
+    """Model names the live registry loads, in catalog order (optionally only shipped ones)."""
+    import src.providers as providers
 
-    A provider counts only when it is turned on, has a key, and uses the profile's endpoint. A model
-    already in the catalog is marked offered without change; one that conflicts is skipped for now.
+    return [
+        entry["name"] for entry in {id(v): v for v in providers._load_models().values()}.values()
+        if not shipped_only or (entry.get("origin") or {}).get("layer") == "shipped"
+    ]
+
+
+def migrate_catalog() -> dict:
+    """Retire copied curated rows in favour of the shipped layer (ADR 0002); runs at startup.
+
+    This is the gateway's own upgrade, not an admin write, so it runs with admin
+    writes off too; files are backed up and a rejected reload restores them.
     """
     import src.providers as providers
 
-    config = config_io.load_config_full()
-    catalog = list(config_io.load_model_info().get("llm") or [])
-    peers = getattr(federation.manager().config, "peers", None) or {}
-    additions: dict[str, list[dict]] = {}
-    seen: set[str] = set()
-    for profile in onboarding.packaged_profiles().values():
-        if not profile.get("auto_add"):
-            continue
-        provider_id = str(profile["provider"]["id"])
-        location = providers._find_provider_location(config, canonical_provider(provider_id))
-        effective, matches = _profile_endpoint_state(profile, config)
-        if (location is not None and isinstance(location[2], dict) and location[2].get("enabled") is False) \
-                or not matches or not str(effective.get("api_key") or "").strip():
-            continue
-        for model in profile["models"]:
-            name = model["name"]
-            if name in offered or name in seen:
-                continue
-            if any(rid.split("/", 1)[0] in peers for rid in entry_routable_ids(model) if "/" in rid):
-                log.warning("auto-add skipped %s: identifier reserved by a federation peer", name)
-                continue
-            try:
-                to_add, _present = onboarding.plan_additive_models(
-                    {**profile, "models": [model]}, {"llm": catalog}, config.get("models"),
-                )
-            except onboarding.OnboardingConflict as exc:
-                log.warning("auto-add skipped %s: %s", name, exc)
-                continue
-            seen.add(name)
-            catalog.extend(to_add)
-            if to_add:
-                additions.setdefault(provider_id, []).extend(to_add)
-    return additions, seen
-
-
-async def sync_auto_add_models() -> list[str]:
-    """Add auto_add profile models this install was never offered, for providers it has a key for.
-
-    Runs at startup, so an update brings its new models, and after a key is added. A model is
-    offered once, so deleting it sticks; nothing is retired or replaced. Returns the added names.
-    """
-    if not auth_mode().writes_enabled:
-        return []
-    if not _auto_add_candidates(config_io.load_offered_models())[1]:
-        return []
-    added: list[str] = []
-
-    def mutate():
-        # Re-plan under the write lock: another writer may have changed the files.
-        offered = config_io.load_offered_models()
-        additions, seen = _auto_add_candidates(offered)
-        for provider_id, models in additions.items():
-            config_io.add_onboarded_models(provider_id, define=None, api_key=None, models=models)
-            added.extend(model["name"] for model in models)
-        config_io.save_offered_models(offered | seen)
-
-    _result, reload_error = _apply_registry_mutation(
-        mutate, extra_paths=lambda: [config_io.auto_add_state_path()],
+    layer = shipped.layer(providers._load_config())
+    loaded = {row["name"]: {k: v for k, v in row.items() if k != "origin"} for row in layer.entries}
+    if not config_io.shipped_migration_pending(loaded):
+        return {}
+    result, reload_error = _apply_registry_mutation(
+        lambda: config_io.migrate_to_shipped_layer(loaded, layer.names),
+        extra_paths=lambda: [config_io.auto_add_state_path()],
     )
     if reload_error is not None:
-        log.warning("auto-add rolled back: %s", reload_error)
-        return []
-    if added:
-        log.info("auto-added models: %s", ", ".join(added))
-        await _regenerate_catalogs()
-        discovery.refresh()
-    return added
+        log.warning("catalog migration rolled back: %s", reload_error)
+        return {}
+    if result:
+        log.info("catalog migrated to the shipped layer: %s", result)
+    return result
 
 
 @router.get("/admin/api/onboarding/profiles")
@@ -1187,6 +1148,7 @@ async def admin_apply_onboarding_profile(profile_id: str, request: Request):
                 "provider_conflict", "the provider's key changed during the apply; retry",
             )
 
+    names_before = set(_catalog_names())
     try:
         _result, reload_error = _apply_registry_mutation(
             lambda: config_io.add_onboarded_models(
@@ -1205,14 +1167,16 @@ async def admin_apply_onboarding_profile(profile_id: str, request: Request):
         return _onboarding_refusal(400, "reload_rejected", f"Provider registry update rejected: {reload_error}")
     await _regenerate_catalogs()
     discovery.refresh()
-    # The provider's key now unlocks the curated models of its other profiles too.
-    auto_added = await sync_auto_add_models()
+    # A curated profile's models load by reference once its provider has a key,
+    # and the key also unlocks the curated models of the provider's other profiles.
+    names = [model["name"] for model in profile["models"]]
+    newly_loaded = [n for n in _catalog_names(shipped_only=True) if n not in names_before]
     return {
         "profile": profile_id,
         "provider": plan["provider"],
-        "added_models": [model["name"] for model in plan["to_add"]],
-        "auto_added_models": auto_added,
-        "already_present": plan["present"],
+        "added_models": [model["name"] for model in plan["to_add"]] + [n for n in names if n in newly_loaded],
+        "auto_added_models": [n for n in newly_loaded if n not in names],
+        "already_present": plan["present"] + [n for n in names if n in names_before and n not in plan["present"]],
         "key_updated": plan["store_key"] is not None,
         "reloaded": True,
     }
@@ -1307,7 +1271,8 @@ async def _custom_check_upstream(url: str, allow_lan: bool, key: str, models: li
 def _catalog_rows() -> list[dict]:
     doc = config_io.load_model_info()
     overlay = config_io.load_config_full().get("models")
-    return [row for row in [*(doc.get("llm") or []), *(overlay if isinstance(overlay, list) else [])]
+    return [row for row in [*(doc.get("llm") or []), *(overlay if isinstance(overlay, list) else []),
+                            *config_io.loaded_shipped_rows()]
             if isinstance(row, dict)]
 
 
@@ -2727,8 +2692,7 @@ _ADMIN_HTML = r"""
               role="tab"
               data-tab="connections"
               aria-controls="panel-connections"
-              aria-selected="false"
-              tabindex="-1"
+     tabindex="-1"
             >
               Connections</button
             ><button

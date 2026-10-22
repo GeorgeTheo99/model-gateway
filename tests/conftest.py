@@ -55,6 +55,15 @@ def _isolate_local_runtime(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_shipped_layer(monkeypatch):
+    """Released curated profiles load only in tests that opt in (patch ``shipped._packaged``)."""
+    from src import shipped
+
+    monkeypatch.setattr(shipped, "_packaged", lambda: {})
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_ledger(tmp_path, monkeypatch):
     monkeypatch.setenv("MODEL_GATEWAY_LEDGER_PATH", str(tmp_path / "test-ledger.db"))
     yield

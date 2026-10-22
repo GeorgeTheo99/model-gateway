@@ -62,9 +62,11 @@ if str(_REPO_ROOT) not in sys.path:
 
 try:
     from src import catalog as catalog_mod
+    from src import shipped as shipped_mod
     from src.secret_files import read_api_key_file
 except ImportError:  # bare python3 outside the repo / without the venv
     catalog_mod = None  # type: ignore[assignment]
+    shipped_mod = None  # type: ignore[assignment]
     read_api_key_file = None  # type: ignore[assignment]
 
 HOME = Path.home()
@@ -105,7 +107,7 @@ def _export_targets(config: dict, args) -> dict[str, Path | None]:
 
 
 def _merged_entries(model_info_path: Path, config: dict) -> list[dict]:
-    """Return the merged catalog (model-info.json + config.yaml models: overlay).
+    """Return the merged catalog (shipped layer + model-info.json + config.yaml models: overlay).
 
     Uses the same merge as the gateway router (``src.catalog``). Falls back to
     reading the overlay alone if ``src.catalog`` is not importable (rare: bare
@@ -115,7 +117,11 @@ def _merged_entries(model_info_path: Path, config: dict) -> list[dict]:
     if not isinstance(overlay, list):
         raise ValueError("config models overlay must be a list")
     if catalog_mod is not None:
-        return catalog_mod.load_catalog_entries(model_info_path, overlay=overlay)
+        layer = shipped_mod.layer(config)
+        return catalog_mod.load_catalog_entries(
+            model_info_path, overlay=overlay, shipped=layer.entries, shipped_names=layer.names,
+            excluded=layer.hidden | frozenset(layer.retired),
+        )
     # Fallback: overlay only (no merge with the machine catalog).
     return [
         {**e, "provider": e.get("provider", "local")} for e in overlay if isinstance(e, dict)

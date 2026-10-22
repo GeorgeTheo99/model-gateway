@@ -235,7 +235,7 @@ that predate 0.2 keep their checkout-local `config/config.yaml` and
 | Layer | File | Contents |
 |---|---|---|
 | Providers | `config.yaml` | Base URLs, credentials (or 0600 key-file refs), protocol, headers, quirks, pools, auth keys, consumer principals |
-| Model catalog | `model-info.json` (+ optional `models:` overlay in config) | Gateway model IDs, aliases, upstream IDs, context/output limits, capabilities, pricing, fallbacks |
+| Model catalog | Curated models shipped with each release, then `model-info.json` (+ optional `models:` overlay and `catalog:` choices in config) | Gateway model IDs, aliases, upstream IDs, context/output limits, capabilities, pricing, fallbacks. Your rows win field by field; updates never touch them ([ADR 0002](docs/adr/0002-layered-model-catalog.md)) |
 
 A model is exposed only when its referenced provider is configured and
 usable. Both files are managed for you by the onboarding flow and the admin

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 
 import httpx
@@ -10,7 +9,7 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
-from src import admin, config_io, onboarding
+from src import admin, config_io, onboarding, shipped
 import src.providers as providers
 from src.server import app
 
@@ -26,6 +25,12 @@ GLM_MODELS = {
     "glm-5.3-fw": "accounts/fireworks/models/glm-5p3",
     "glm-5.3-flash-fw": "accounts/fireworks/models/glm-5p3-flash",
 }
+
+
+@pytest.fixture(autouse=True)
+def _released_profiles(monkeypatch):
+    """This module exercises the curated profiles a release ships."""
+    monkeypatch.setattr(shipped, "_packaged", lambda: onboarding.packaged_profiles())
 
 
 @pytest.fixture
@@ -181,7 +186,7 @@ def test_unknown_profile_is_404(client, upstream):
 # ── applying ─────────────────────────────────────────────────────────────────
 
 
-def test_fresh_gateway_applies_profile_and_ignores_retirements(client, cfg, upstream):
+def test_fresh_gateway_applies_profile_by_reference(client, cfg, upstream):
     # The profile retires glm-5.2-fw and two z.ai models; none exist here.
     response = client.post(URL, headers=MANAGER, json={"api_key": "fw-key"})
     assert response.status_code == 200, response.text
@@ -192,12 +197,12 @@ def test_fresh_gateway_applies_profile_and_ignores_retirements(client, cfg, upst
     assert upstream == ["fw-key"]
     assert "fw-key" not in cfg.read_text() and "fw-key" not in response.text
     assert config_io.api_key_file_target("fireworks").read_text() == "fw-key\n"
-    assert {row["name"]: row["provider_model_id"] for row in _catalog(cfg)} == {
-        **GLM_MODELS, "kimi-k3": "accounts/fireworks/models/kimi-k3"}
-    # Reloaded in-process: the models route now.
+    # Curated models load from the release; nothing is copied into the owner's catalog.
+    assert _catalog(cfg) == []
     loaded = providers._load_models()
     assert loaded["glm-5.3"]["name"] == "glm-5.3-fw"
     assert loaded["glm53flashfw"]["name"] == "glm-5.3-flash-fw"
+    assert loaded["kimi-k3"]["origin"] == {"layer": "shipped", "profile": "fireworks-kimi-k3"}
     row = _rows(client)[GLM]
     assert (row["provider_defined"], row["has_api_key"], row["applied"]) == (True, True, True)
 
@@ -217,17 +222,18 @@ def test_second_apply_is_idempotent(client, cfg, upstream):
     assert _state(cfg) == before
 
 
-def test_existing_models_are_left_untouched_and_never_retired(client, cfg, upstream):
+def test_owner_rows_are_left_untouched(client, cfg, upstream):
     present = {"name": "glm-5.3-fw", "provider": "fireworks", "provider_model_id": GLM_MODELS["glm-5.3-fw"],
                "context": 1000, "desc": "owner edited"}
-    retired = {"name": "glm-5.2-fw", "provider": "fireworks", "provider_model_id": "accounts/fireworks/models/glm-5p2"}
-    _seed_models(cfg, present, retired)
+    _seed_models(cfg, present)
     response = client.post(URL, headers=ADMIN, json={"api_key": "fw-key"})
     assert response.status_code == 200, response.text
     assert response.json()["added_models"] == ["glm-5.3-flash-fw"]
     assert response.json()["already_present"] == ["glm-5.3-fw"]
-    rows = {row["name"]: row for row in _catalog(cfg)}
-    assert rows["glm-5.3-fw"] == present and rows["glm-5.2-fw"] == retired
+    assert _catalog(cfg) == [present]
+    entry = providers._load_models()["glm-5.3-fw"]
+    assert (entry["context"], entry["desc"]) == (1000, "owner edited")  # the owner wins per field
+    assert entry["display_name"] == "GLM 5.3 (Fireworks)"  # other fields still come from the release
 
 
 def test_key_is_optional_when_the_provider_has_one(client, cfg, upstream):
@@ -322,16 +328,21 @@ def test_provider_defined_outside_its_own_block_is_a_conflict(client, cfg, upstr
 @pytest.mark.parametrize("existing", [
     {"name": "glm-5.3-fw", "provider": "fireworks", "provider_model_id": "accounts/fireworks/models/other"},
     {"name": "glm-5.3-fw", "provider": "anthropic", "provider_model_id": GLM_MODELS["glm-5.3-fw"]},
-    {"name": "glm-5.3-zai", "provider": "zai", "provider_model_id": "glm-5.3", "alias": "glm53"},
 ])
-def test_model_conflict_writes_nothing(client, cfg, upstream, existing):
+def test_an_owner_route_under_a_curated_name_wins(client, cfg, upstream, existing):
     _seed_models(cfg, existing)
-    before = _state(cfg)
     response = client.post(URL, headers=MANAGER, json={"api_key": "fw-key"})
-    assert response.status_code == 409, response.text
-    assert response.json()["code"] == "model_conflict"
-    assert existing["name"] in response.json()["detail"] or "glm-5.3" in response.json()["detail"]
-    assert _state(cfg) == before and upstream == []
+    assert response.status_code == 200, response.text
+    assert _catalog(cfg) == [existing]
+    entry = providers._load_models()["glm-5.3-fw"]
+    assert (entry["provider"], entry["provider_model_id"]) == (existing["provider"], existing["provider_model_id"])
+
+
+def test_a_retired_name_is_hidden_unless_pinned(cfg):
+    _seed_models(cfg, {"name": "glm-5.3-zai", "provider": "zai", "provider_model_id": "glm-5.3", "alias": "glm53"})
+    assert "glm-5.3-zai" not in providers._load_models()
+    _edit(cfg, lambda config: config.update(catalog={"pinned": ["glm-5.3-zai"]}))
+    assert providers._load_models()["glm53"]["name"] == "glm-5.3-zai"
 
 
 def test_upstream_rejection_writes_nothing(client, cfg, upstream):
@@ -516,72 +527,67 @@ def test_rejected_reload_rolls_back_every_file(client, cfg, upstream, monkeypatc
     assert _state(cfg) == before
 
 
-# ── curated auto-add ────────────────────────────────────────────────────────
-
-
-def _sync() -> list[str]:
-    return asyncio.run(admin.sync_auto_add_models())
+# ── curated models by reference (docs/adr/0002-layered-model-catalog.md) ────
 
 
 def _names(cfg) -> list[str]:
     return [row["name"] for row in _catalog(cfg)]
 
 
-def test_auto_add_brings_curated_models_only_for_keyed_providers(cfg, monkeypatch):
-    assert _sync() == []  # no keys yet: nothing offered, nothing recorded
-    assert not config_io.auto_add_state_path().exists()
+def _loaded() -> list[str]:
+    return admin._catalog_names(shipped_only=True)
 
+
+def test_curated_models_load_only_for_keyed_providers(cfg, monkeypatch):
+    assert _loaded() == []
     monkeypatch.setenv("MODEL_GATEWAY_PROVIDER_FIREWORKS_API_KEY", "fw-key")
     providers.reload()
-    assert _sync() == ["glm-5.3-fw", "glm-5.3-flash-fw", "kimi-k3"]
     # The Moonshot rollback profile is not curated, and OpenRouter has no key.
-    assert _names(cfg) == ["glm-5.3-fw", "glm-5.3-flash-fw", "kimi-k3"]
+    assert _loaded() == ["glm-5.3-fw", "glm-5.3-flash-fw", "kimi-k3"]
     assert providers._load_models()["kimi3"]["name"] == "kimi-k3"
-    assert config_io.load_offered_models() == {"glm-5.3-fw", "glm-5.3-flash-fw", "kimi-k3"}
-    assert _sync() == []
+    assert _catalog(cfg) == []
 
 
-def test_a_deleted_curated_model_is_not_added_again(cfg, monkeypatch):
+def test_a_deleted_curated_model_stays_hidden_until_saved_again(cfg, monkeypatch):
     monkeypatch.setenv("MODEL_GATEWAY_PROVIDER_FIREWORKS_API_KEY", "fw-key")
     providers.reload()
-    _sync()
     config_io.delete_model("kimi-k3")
     providers.reload()
-    assert _sync() == []
-    assert "kimi-k3" not in _names(cfg)
-
-
-def test_models_already_present_are_recorded_without_change(cfg, monkeypatch):
-    _seed_models(cfg, {"name": "kimi-k3", "provider": "fireworks",
-                       "provider_model_id": "accounts/fireworks/models/kimi-k3", "desc": "owner's"})
-    monkeypatch.setenv("MODEL_GATEWAY_PROVIDER_FIREWORKS_API_KEY", "fw-key")
+    assert "kimi-k3" not in _loaded()
+    assert yaml.safe_load(cfg.read_text())["catalog"] == {"hidden": ["kimi-k3"]}
+    config_io.upsert_model("kimi-k3", provider="fireworks",
+                           provider_model_id="accounts/fireworks/models/kimi-k3", desc="mine")
     providers.reload()
-    assert _sync() == ["glm-5.3-fw", "glm-5.3-flash-fw"]
-    assert next(row for row in _catalog(cfg) if row["name"] == "kimi-k3")["desc"] == "owner's"
-    assert "kimi-k3" in config_io.load_offered_models()
+    assert providers._load_models()["kimi-k3"]["desc"] == "mine"
+    assert "catalog" not in yaml.safe_load(cfg.read_text())
+    assert _catalog(cfg) == [{"name": "kimi-k3", "desc": "mine",
+                              "shipped_base": {"desc": next(
+                                  m for m in onboarding.packaged_profiles()["fireworks-kimi-k3"]["models"]
+                              )["desc"]}}]
 
 
-def test_a_conflicting_model_is_skipped_and_offered_again_later(cfg, monkeypatch):
+def test_an_owner_identifier_moves_from_the_curated_model(cfg, monkeypatch):
     _seed_models(cfg, {"name": "other", "provider": "fireworks", "provider_model_id": "x/other", "alias": "kimi3"})
     monkeypatch.setenv("MODEL_GATEWAY_PROVIDER_FIREWORKS_API_KEY", "fw-key")
     providers.reload()
-    assert "kimi-k3" not in _sync()
-    assert "kimi-k3" not in config_io.load_offered_models()
+    models = providers._load_models()
+    assert models["kimi3"]["name"] == "other"
+    assert "alias" not in models["kimi-k3"]
 
 
-def test_auto_add_skips_providers_on_another_endpoint_or_turned_off(cfg, monkeypatch):
+def test_curated_models_need_the_profile_endpoint_and_an_enabled_provider(cfg, monkeypatch):
     monkeypatch.setenv("MODEL_GATEWAY_PROVIDER_FIREWORKS_API_KEY", "fw-key")
     _edit(cfg, lambda config: config["providers"]["fireworks"].update(base_url="https://proxy.example/v1"))
-    assert _sync() == []
+    assert _loaded() == []
     _edit(cfg, lambda config: config["providers"]["fireworks"].update(base_url=FIREWORKS, enabled=False))
-    assert _sync() == []
+    assert _loaded() == []
 
 
-def test_auto_add_does_nothing_when_writes_are_off(cfg, monkeypatch):
+def test_curated_models_load_with_admin_writes_off(cfg, monkeypatch):
     monkeypatch.setenv("MODEL_GATEWAY_PROVIDER_FIREWORKS_API_KEY", "fw-key")
     monkeypatch.setenv("MODEL_GATEWAY_ADMIN_WRITES", "false")
     providers.reload()
-    assert _sync() == []
+    assert _loaded() == ["glm-5.3-fw", "glm-5.3-flash-fw", "kimi-k3"]
     assert _catalog(cfg) == []
 
 
@@ -591,12 +597,27 @@ def test_adding_a_provider_key_brings_its_curated_models(client, cfg, upstream):
     assert response.json()["auto_added_models"] == ["glm-5.3-fw", "glm-5.3-flash-fw", "kimi-k3"]
 
 
-def test_startup_auto_adds(cfg, monkeypatch):
+def test_startup_migrates_copied_curated_rows(cfg, monkeypatch):
+    curated = {m["name"]: m for m in onboarding.packaged_profiles()[GLM]["models"]}
+    drifted = {**curated["glm-5.3-flash-fw"], "desc": "owner's"}
+    _seed_models(cfg, dict(curated["glm-5.3-fw"]), drifted)
+    config_io.auto_add_state_path().write_text(json.dumps(
+        {"version": 1, "models": ["glm-5.3-fw", "glm-5.3-flash-fw", "kimi-k3"]}))
     monkeypatch.setenv("MODEL_GATEWAY_PROVIDER_FIREWORKS_API_KEY", "fw-key")
+    monkeypatch.setenv("MODEL_GATEWAY_ADMIN_WRITES", "false")  # the migration is not an admin write
     providers.reload()
     with TestClient(app):
         pass
-    assert _names(cfg) == ["glm-5.3-fw", "glm-5.3-flash-fw", "kimi-k3"]
+    assert _catalog(cfg) == [{"name": "glm-5.3-flash-fw", "desc": "owner's",
+                              "shipped_base": {"desc": curated["glm-5.3-flash-fw"]["desc"]}, "review": True}]
+    assert yaml.safe_load(cfg.read_text())["catalog"] == {"hidden": ["kimi-k3"]}  # the owner deleted it
+    assert not config_io.auto_add_state_path().exists()
+    models = providers._load_models()
+    assert models["glm-5.3-flash-fw"]["origin"]["review"] is True
+    assert "kimi-k3" not in models
+    with TestClient(app):  # idempotent
+        pass
+    assert len(_catalog(cfg)) == 1
 
 
 def test_profiles_reject_invalid_curation_fields():

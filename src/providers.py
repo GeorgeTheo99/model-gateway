@@ -17,7 +17,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 import yaml
 
-from src import catalog
+from src import catalog, shipped
 from src.config_lock import config_write_lock
 from src.secret_files import read_api_key_file
 
@@ -105,6 +105,7 @@ class ProviderInfo:
 
 _config: dict | None = None
 _models: dict[str, dict] | None = None
+_retired: dict[str, str | None] = {}  # retired name -> replacement, loaded with _models
 
 # OAuth token auto-refresh via an external CLI token cache (opt-in per provider
 # with `auth_refresh:` in config.yaml). See refresh_oauth_token().
@@ -298,13 +299,18 @@ def _load_models() -> dict[str, dict]:
     if _models is not None:
         return _models
 
+    global _retired
     config = _load_config()
     overlay = config.get("models", [])
     if not isinstance(overlay, list):
         raise ValueError("config models overlay must be a list")
+    layer = shipped.layer(config)
     entries = catalog.load_catalog_entries(
         MODEL_INFO_PATH,
         overlay=overlay,
+        shipped=layer.entries,
+        shipped_names=layer.names,
+        excluded=layer.hidden | frozenset(layer.retired),
         require_nonempty=True,
     )
     loaded: dict[str, dict] = {}
@@ -313,7 +319,8 @@ def _load_models() -> dict[str, dict]:
             loaded[model_id] = entry
 
     _models = loaded
-    log.info("Loaded %d routable model keys (catalog + config overlay)", len(_models))
+    _retired = dict(layer.retired)
+    log.info("Loaded %d routable model keys (shipped + catalog + config overlay)", len(_models))
     return _models
 
 
@@ -394,24 +401,25 @@ def _is_model_enabled(name: str | None) -> bool:
 
 
 @_registry_locked
-def snapshot_registry() -> tuple[dict, dict[str, dict]]:
+def snapshot_registry() -> tuple[dict, dict[str, dict], dict[str, str | None]]:
     """Capture the loaded registry so a rejected admin reload can roll back."""
-    return _load_config(), _load_models()
+    return _load_config(), _load_models(), _retired
 
 
 @_registry_locked
-def restore_registry(snapshot: tuple[dict, dict[str, dict]]) -> None:
+def restore_registry(snapshot: tuple[dict, dict[str, dict], dict[str, str | None]]) -> None:
     """Restore a snapshot returned by :func:`snapshot_registry`."""
-    global _config, _models
-    _config, _models = snapshot
+    global _config, _models, _retired
+    _config, _models, _retired = snapshot
 
 
 @_registry_locked
 def reload():
     """Force reload of config and models (e.g. after config change)."""
-    global _config, _models
+    global _config, _models, _retired
     _config = None
     _models = None
+    _retired = {}
 
 
 def _databricks_cli() -> str:
@@ -842,14 +850,14 @@ def _preview_snapshot(config: dict, config_path: Path, model_info_path: Path):
     Callers hold the registry lock, which hides the snapshot from concurrent
     readers. No auth refresh, network calls, or config writes occur here.
     """
-    global _config, _models, CONFIG_PATH, MODEL_INFO_PATH
-    saved = _config, _models, CONFIG_PATH, MODEL_INFO_PATH
+    global _config, _models, _retired, CONFIG_PATH, MODEL_INFO_PATH
+    saved = _config, _models, _retired, CONFIG_PATH, MODEL_INFO_PATH
     try:
-        _config, _models = config, None
+        _config, _models, _retired = config, None, {}
         CONFIG_PATH, MODEL_INFO_PATH = config_path.resolve(), model_info_path.resolve()
         yield
     finally:
-        _config, _models, CONFIG_PATH, MODEL_INFO_PATH = saved
+        _config, _models, _retired, CONFIG_PATH, MODEL_INFO_PATH = saved
 
 
 @_registry_locked

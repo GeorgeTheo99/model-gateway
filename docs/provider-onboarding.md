@@ -34,24 +34,42 @@ The check reads current files while holding the same configuration lock as the
 write, so concurrent competing creates cannot overwrite each other. Preview is
 advisory, not a reservation; importers must send the header on the final PUT.
 
-## Curated profiles (auto-add)
+## Curated profiles (shipped by reference)
 
 A packaged profile with top-level `auto_add: true` is part of the curated model
-list (capability `onboarding_auto_add.v1`). Its `provider.display_name` and each
-model's `display_name` and `zdr` are what products show. Rollback profiles leave
-`auto_add` unset.
+list (capabilities `onboarding_auto_add.v1`, `layered_catalog.v1`). Its
+`provider.display_name` and each model's `display_name` and `zdr` are what
+products show. Rollback profiles leave `auto_add` unset.
 
-When the gateway starts (so after every update), after a profile is applied, and
-after a provider key is saved, it adds each curated model it has not offered
-before, for every provider that is turned on, has a key, and uses the profile's
-endpoint. It records offered names in `auto-added-models.json` beside
-`config.yaml`, so a model the owner deletes is not added again. It never retires,
-replaces, or moves anything; a model whose name or identifier is taken is
-skipped and offered again later. Nothing happens while admin writes are off.
+Curated models are the **shipped layer** of the catalog
+([ADR 0002](adr/0002-layered-model-catalog.md)). They are read from the release
+on every load, never copied into `model-info.json`. A curated model loads for a
+provider that is turned on, has a key, and uses the profile's endpoint and
+protocol, so a release's new models, fixes and retirements reach every install
+on its next update, with admin writes on or off.
 
-To ship a new model, add or extend a curated profile and release the gateway:
-installs that already have that provider's key get the model on their next
-update, with no further steps.
+The owner always wins:
+
+- Saving a curated model stores only the fields that differ from the release,
+  with the release values they replaced (`shipped_base`); other fields keep
+  updating. The effective entry's `origin` lists `overridden` and
+  `stale_overrides` (the release changed a field the owner overrides).
+- An owner model may take a curated model's alias or alternate id; one using
+  its name or upstream id replaces it.
+- Deleting a curated model hides it (`catalog.hidden` in `config.yaml`); saving
+  it again brings it back.
+- `retire.models` hides retired names in every layer, unless the owner lists
+  them in `catalog.pinned`; saving a retired name pins it.
+  `retire.replaced_by: {old: new}` names a successor.
+- `catalog.shipped: none` (or a list of profile ids and model names) loads only
+  what is named; new curated models are then not enabled automatically.
+
+At startup the gateway migrates copies older releases made: identical rows are
+removed, differing rows keep only their differing fields flagged `review` (the
+gateway cannot tell an owner edit from a stale copy), names the owner deleted are
+hidden, and the old `auto-added-models.json` ledger is retired. Backups are kept.
+
+To ship a new model, add or extend a curated profile and release the gateway.
 
 ## Apply a packaged profile over the admin API
 
@@ -83,9 +101,14 @@ id.
 `null`/no body to keep the provider's key) applies it **additively**, also
 subject to the admin write gate:
 
-- The profile's `retire` block is ignored; retirements stay with the CLI.
-- A profile model already registered with the same provider and upstream id is
-  left untouched and reported in `already_present`.
+- A curated profile's models load by reference once its provider has a key; they
+  are reported in `added_models`, and other curated models the key unlocks in
+  `auto_added_models`. Models already in the catalog (including owner rows under
+  a curated name, which win) are reported in `already_present`.
+- A non-curated profile's models are copied into the owner's catalog; one
+  already registered with the same provider and upstream id is left untouched
+  and reported in `already_present`. Its `retire` block is ignored here;
+  retirements of non-curated profiles stay with the CLI.
 - A missing provider is defined with the profile's `base_url` and `protocol`.
   An existing provider is never moved; only a supplied key replaces its key.
 - Before any write, the key must list every profile model (`/models`) and answer a

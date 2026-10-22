@@ -518,3 +518,19 @@ def test_export_protocol_keeps_model_override_on_ai_gateway_provider(tmp_path):
     )
     aliases = _aliases(tmp_path, cfg)
     assert aliases["cloud:databricks-claude-sonnet-4-6"]["protocol"] == "anthropic"
+
+
+def test_curated_models_are_exported_by_reference(tmp_path, monkeypatch):
+    """The alias catalog consumers read includes the shipped layer (docs/adr/0002-layered-model-catalog.md)."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(json.dumps({"providers": {"fireworks": {
+        "base_url": "https://api.fireworks.ai/inference/v1", "protocol": "openai", "api_key": "fw-key"}}}))
+    mi = tmp_path / "model-info.json"
+    _write_model_info(mi, [], allow_empty=True)
+    out = tmp_path / "aliases.json"
+    monkeypatch.delenv("MODEL_GATEWAY_PROVIDER_FIREWORKS_API_KEY", raising=False)
+    result = _run(cfg, mi, "--aliases-out", str(out))
+    assert result.returncode == 0, result.stdout + result.stderr
+    aliases = json.loads(out.read_text())
+    assert aliases["cloud:accounts/fireworks/models/glm-5p3"]["name"] == "glm-5.3-fw"
+    assert json.loads(mi.read_text())["llm"] == []
