@@ -1378,6 +1378,23 @@ def delete_model(name: str) -> dict:
 
 
 @_write_transaction
+def resolve_override_review(name: str, *, keep: bool) -> dict:
+    """Keep (clear ``review``) or discard a migrated override of a shipped model."""
+    name = (name or "").strip()
+    doc = load_model_info()
+    llm = doc.get("llm", [])
+    row = next((e for e in llm if isinstance(e, dict) and e.get("name") == name and e.get("review") is True), None)
+    if row is None:
+        raise KeyError(f"model {name!r} has no override to review")
+    if keep:
+        row.pop("review")
+    else:
+        llm.remove(row)
+    doc["llm"] = llm
+    return {"name": name, "kept": keep, "written_to": _write_model_info(doc)}
+
+
+@_write_transaction
 def set_model_enabled(name: str, enabled: bool) -> dict:
     """Toggle a model's runtime enabled state in config.yaml model_overrides.
 

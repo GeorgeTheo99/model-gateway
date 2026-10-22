@@ -28,7 +28,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from src.admin import router as admin_router
 from src.auth import require_client_auth, require_consumer_auth, validate_credential_separation
 from src.errors import upstream_error, upstream_error_openai
-from src.providers import effective_model_inventory, list_available_models, list_models as list_routable_models, model_availability, pool_candidates, pricing_for, pricing_status_for, provider_quirks, resolve, snapshot_registry as snapshot_provider_registry
+from src.providers import effective_model_inventory, list_available_models, list_models as list_routable_models, model_availability, pool_candidates, pricing_for, pricing_status_for, provider_quirks, resolve, retirement_redirect, snapshot_registry as snapshot_provider_registry
 from src.upstream import (
     PoolContext,
     _retry_post,
@@ -2331,6 +2331,22 @@ def _enable_openrouter_gemini_prompt_cache(req: dict) -> None:
 _LEDGER_PATHS = {"/v1/chat/completions", "/v1/messages", "/v1/responses"}
 
 
+def _redirect_retired_model(request: Request, body: dict) -> str:
+    """Serve a retired model name through its successor, noted for the response headers.
+
+    Profile executions route by their registered bindings and are never redirected.
+    """
+    model = body.get("model", "")
+    if not isinstance(model, str) or getattr(request.state, "profile_execution", None) is not None:
+        return model
+    successor = retirement_redirect(model)
+    if successor is None:
+        return model
+    request.state.model_redirect = (model, successor)
+    body["model"] = successor
+    return successor
+
+
 def _set_ledger_ctx(request: Request, model: str, info, is_stream: bool = False) -> None:
     """Stash served-model context for the ledger middleware.
 
@@ -2470,6 +2486,10 @@ async def ledger_middleware(request: Request, call_next):
         return await call_next(request)
     start = time.time()
     response = await call_next(request)
+    redirect = getattr(request.state, "model_redirect", None)
+    if redirect is not None:
+        response.headers["Deprecation"] = "true"
+        response.headers["X-Model-Gateway-Model-Redirect"] = f"{redirect[0]} -> {redirect[1]}"
     latency_ms = int((time.time() - start) * 1000)
     ctx = getattr(request.state, "ledger_ctx", None) or {}
     model = ctx.get("model")
@@ -3012,7 +3032,7 @@ async def create_response(request: Request):
     )
     if profile_error is not None:
         return profile_error
-    model = body.get("model", "")
+    model = _redirect_retired_model(request, body)
     is_stream = body.get("stream", False)
 
     inbound_source = getattr(request.state, "federation_source", None)
@@ -3401,7 +3421,7 @@ async def chat_completions(request: Request):
     )
     if profile_error is not None:
         return profile_error
-    model = body.get("model", "")
+    model = _redirect_retired_model(request, body)
     inbound_source = getattr(request.state, "federation_source", None)
     if inbound_source:
         model_error = _validate_inbound_peer_model(request, "/v1/chat/completions", model)
@@ -3870,7 +3890,7 @@ async def messages(request: Request):
     )
     if profile_error is not None:
         return profile_error
-    model = body.get("model", "")
+    model = _redirect_retired_model(request, body)
     is_stream = body.get("stream", False)
     has_tools = bool(body.get("tools"))
 

@@ -106,6 +106,9 @@ class ProviderInfo:
 _config: dict | None = None
 _models: dict[str, dict] | None = None
 _retired: dict[str, str | None] = {}  # retired name -> replacement, loaded with _models
+# The registry last loaded successfully, served when a lazy reload fails (ADR 0002 R7).
+_last_good: tuple[dict, dict[str, dict], dict[str, str | None]] | None = None
+_load_error: str | None = None
 
 # OAuth token auto-refresh via an external CLI token cache (opt-in per provider
 # with `auth_refresh:` in config.yaml). See refresh_oauth_token().
@@ -288,18 +291,34 @@ def _entry_routable_ids(entry: dict) -> list[str]:
 
 
 @_registry_locked
-def _load_models() -> dict[str, dict]:
+def _load_models(*, strict: bool = False) -> dict[str, dict]:
     """Load routable models from model-info.json (keyed by name/alias/id).
 
     The catalog + config.yaml ``models:`` overlay merge lives in
     :func:`src.catalog.load_catalog_entries` and is shared with the downstream
     catalog generator so the router and the generator can never drift.
+
+    A failed load keeps serving the last good registry and records the error
+    (:func:`catalog_status`), unless ``strict`` validation asked for the error.
     """
-    global _models
+    global _config, _models, _retired, _last_good, _load_error
     if _models is not None:
         return _models
+    try:
+        _build_models()
+    except Exception as exc:
+        if strict or _last_good is None:
+            raise
+        _config, _models, _retired = _last_good
+        _load_error = str(exc)
+        log.error("model catalog failed to load; serving the last good catalog: %s", exc)
+        return _models
+    _last_good, _load_error = (_config, _models, _retired), None
+    return _models
 
-    global _retired
+
+def _build_models() -> None:
+    global _models, _retired
     config = _load_config()
     overlay = config.get("models", [])
     if not isinstance(overlay, list):
@@ -321,7 +340,28 @@ def _load_models() -> dict[str, dict]:
     _models = loaded
     _retired = dict(layer.retired)
     log.info("Loaded %d routable model keys (shipped + catalog + config overlay)", len(_models))
-    return _models
+
+
+@_registry_locked
+def catalog_status() -> dict:
+    """Owner-facing catalog state: load error, overrides to review or reconcile, retirements.
+
+    Never raises: admin status must stay available to recover a broken config.
+    """
+    try:
+        entries = {id(v): v for v in _load_models().values()}.values()
+    except Exception as exc:  # noqa: BLE001
+        return {"load_error": str(exc), "review": [], "stale_overrides": {}, "override_errors": {}, "retired": {}}
+    origins = {entry["name"]: entry.get("origin") or {} for entry in entries}
+    return {
+        "load_error": _load_error,
+        "review": sorted(name for name, origin in origins.items() if origin.get("review")),
+        "stale_overrides": {name: origin["stale_overrides"] for name, origin in origins.items()
+                            if origin.get("stale_overrides")},
+        "override_errors": {name: origin["override_error"] for name, origin in origins.items()
+                            if origin.get("override_error")},
+        "retired": dict(_retired),
+    }
 
 
 @_registry_locked
@@ -402,8 +442,8 @@ def _is_model_enabled(name: str | None) -> bool:
 
 @_registry_locked
 def snapshot_registry() -> tuple[dict, dict[str, dict], dict[str, str | None]]:
-    """Capture the loaded registry so a rejected admin reload can roll back."""
-    return _load_config(), _load_models(), _retired
+    """Validate and capture the loaded registry so a rejected admin reload can roll back."""
+    return _load_config(), _load_models(strict=True), _retired
 
 
 @_registry_locked
@@ -850,14 +890,15 @@ def _preview_snapshot(config: dict, config_path: Path, model_info_path: Path):
     Callers hold the registry lock, which hides the snapshot from concurrent
     readers. No auth refresh, network calls, or config writes occur here.
     """
-    global _config, _models, _retired, CONFIG_PATH, MODEL_INFO_PATH
-    saved = _config, _models, _retired, CONFIG_PATH, MODEL_INFO_PATH
+    global _config, _models, _retired, _last_good, _load_error, CONFIG_PATH, MODEL_INFO_PATH
+    saved = _config, _models, _retired, _last_good, _load_error, CONFIG_PATH, MODEL_INFO_PATH
     try:
-        _config, _models, _retired = config, None, {}
+        # A staged config that fails to load must fail the preview, not borrow the live registry.
+        _config, _models, _retired, _last_good = config, None, {}, None
         CONFIG_PATH, MODEL_INFO_PATH = config_path.resolve(), model_info_path.resolve()
         yield
     finally:
-        _config, _models, _retired, CONFIG_PATH, MODEL_INFO_PATH = saved
+        _config, _models, _retired, _last_good, _load_error, CONFIG_PATH, MODEL_INFO_PATH = saved
 
 
 @_registry_locked
@@ -907,6 +948,21 @@ def preview_pool_member(
 
 
 @_registry_locked
+@_registry_locked
+def retirement_redirect(model_id: str) -> str | None:
+    """The available successor a retired, unpinned name is served by (docs/adr/0002-layered-model-catalog.md)."""
+    models = _load_models()
+    if model_id in models:
+        return None
+    successor, seen = _retired.get(model_id), {model_id}
+    while successor in _retired and successor not in models and successor not in seen:
+        seen.add(successor)
+        successor = _retired[successor]
+    if successor is None or successor not in models:
+        return None
+    return successor if _availability_for_entry(successor, models[successor])["available"] else None
+
+
 def resolve(model_id: str, provider_override: str | None = None) -> ProviderInfo | None:
     """Resolve a model name/alias/id to provider info.
 

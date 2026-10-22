@@ -146,3 +146,91 @@ def test_registry_loads_shipped_models_for_a_ready_provider(tmp_path, monkeypatc
             {"providers": {"example": {**config["providers"]["example"], **change}}}))
         providers.reload()
         assert "m1" not in providers._load_models()
+
+
+def test_a_retired_name_is_served_by_its_successor(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import src.server as server_module
+
+    profile = _profile([{"name": "new"}], retire={"models": ["old", "gone"], "replaced_by": {"old": "new"}})
+    monkeypatch.setattr(shipped, "_packaged", lambda: {"p": profile})
+    info = tmp_path / "model-info.json"
+    info.write_text(json.dumps({"llm": [], "allow_empty": True}))
+    monkeypatch.setattr(providers, "MODEL_INFO_PATH", info)
+    providers.CONFIG_PATH.write_text(yaml.safe_dump({"providers": {"example": {"base_url": BASE_URL, "api_key": "k"}}}))
+    providers.reload()
+    sent = []
+
+    async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
+        sent.append(body["model"])
+        return server_module.JSONResponse(status_code=200, content={
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+
+    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough_sync)
+    with TestClient(server_module.app) as client:
+        response = client.post("/v1/chat/completions", json={"model": "old", "messages": [{"role": "user", "content": "hi"}]})
+        assert response.status_code == 200, response.text
+        assert response.headers["Deprecation"] == "true"
+        assert response.headers["X-Model-Gateway-Model-Redirect"] == "old -> new"
+        assert sent == ["up/new"]
+        assert client.post("/v1/chat/completions", json={
+            "model": "gone", "messages": [{"role": "user", "content": "hi"}]}).status_code == 404
+        listed = {row["id"] for row in client.get("/v1/models").json()["data"]}
+        assert "new" in listed and "old" not in listed
+
+
+def _registry_with(tmp_path, monkeypatch, owner_rows, profile):
+    monkeypatch.setattr(shipped, "_packaged", lambda: {"p": profile})
+    info = tmp_path / "model-info.json"
+    info.write_text(json.dumps({"llm": owner_rows, "allow_empty": True}))
+    monkeypatch.setattr(providers, "MODEL_INFO_PATH", info)
+    from src import config_io
+    monkeypatch.setattr(config_io, "MODEL_INFO_PATH", info)
+    monkeypatch.setattr(config_io, "MODEL_INFO_SOURCE_PATH", None)
+    providers.CONFIG_PATH.write_text(yaml.safe_dump({"providers": {"example": {"base_url": BASE_URL, "api_key": "k"}}}))
+    providers.reload()
+    return info
+
+
+def test_an_override_a_release_invalidates_falls_back_to_the_shipped_row(tmp_path, monkeypatch):
+    # Valid when saved against an optional-thinking row; the release made thinking always-on.
+    profile = _profile([{"name": "m1", "thinking": "always", "thinking_levels": ["low", "high"]}])
+    _registry_with(tmp_path, monkeypatch, [{"name": "m1", "thinking_levels": ["off", "low"], "shipped_base": {}}], profile)
+    entry = providers._load_models()["m1"]
+    assert entry["thinking_levels"] == ["low", "high"]
+    assert "off" in entry["origin"]["override_error"]
+    assert "m1" in providers.catalog_status()["override_errors"]
+
+
+def test_a_failed_lazy_reload_serves_the_last_good_catalog(tmp_path, monkeypatch):
+    info = _registry_with(tmp_path, monkeypatch, [], _profile([{"name": "m1"}]))
+    assert "m1" in providers._load_models()
+    info.write_text("{broken")
+    providers.reload()
+    assert "m1" in providers._load_models()  # request path keeps serving
+    assert providers.catalog_status()["load_error"]
+    with pytest.raises(ValueError):
+        providers.reload()
+        providers.snapshot_registry()  # validation still sees the error
+
+
+def test_review_keep_or_discard(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import src.server as server_module
+
+    monkeypatch.setenv("MODEL_GATEWAY_ADMIN_KEY", "admin")
+    monkeypatch.setenv("MODEL_GATEWAY_ADMIN_WRITES", "true")
+    flagged = {"name": "m1", "desc": "mine", "shipped_base": {"desc": None}, "review": True}
+    info = _registry_with(tmp_path, monkeypatch, [dict(flagged), {**flagged, "name": "m2"}],
+                          _profile([{"name": "m1"}, {"name": "m2"}]))
+    headers = {"Authorization": "Bearer admin"}
+    with TestClient(server_module.app) as client:
+        assert client.get("/admin/api/status", headers=headers).json()["catalog"]["review"] == ["m1", "m2"]
+        assert client.post("/admin/api/models/m1/review", headers=headers, json={"keep": True}).status_code == 200
+        assert client.post("/admin/api/models/m2/review", headers=headers, json={"keep": False}).status_code == 200
+        assert client.post("/admin/api/models/m2/review", headers=headers, json={"keep": False}).status_code == 404
+        assert client.get("/admin/api/status", headers=headers).json()["catalog"]["review"] == []
+    assert json.loads(info.read_text())["llm"] == [{"name": "m1", "desc": "mine", "shipped_base": {"desc": None}}]
+    assert providers._load_models()["m1"]["desc"] == "mine"

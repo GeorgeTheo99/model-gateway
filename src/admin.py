@@ -26,6 +26,7 @@ from src.catalog import canonical_provider, entry_routable_ids
 from src.config_lock import config_write_lock
 from src.providers import (
     MODEL_INFO_PATH,
+    catalog_status,
     config_validation,
     model_status,
     provider_status,
@@ -83,6 +84,7 @@ async def admin_status(request: Request):
         "writes_enabled": mode.writes_enabled,
         "version": VERSION,
         "capabilities": dict.fromkeys(CAPABILITIES, True),
+        "catalog": catalog_status(),
         "auth": {
             "client_auth_enabled": mode.client_auth_enabled,
             "admin_auth_enabled": mode.admin_auth_enabled,
@@ -872,6 +874,33 @@ async def admin_delete_model(model_name: str, request: Request):
     try:
         result, reload_error = _apply_registry_mutation(
             lambda: config_io.delete_model(model_name)
+        )
+    except KeyError as exc:
+        return _bad_request(str(exc), status=404)
+    if reload_error is not None:
+        return _bad_request(f"Provider registry update rejected: {reload_error}")
+    result["catalogs"] = await _regenerate_catalogs()
+    return result
+
+
+@router.post("/admin/api/models/{model_name}/review")
+async def admin_review_model_override(model_name: str, request: Request):
+    """Resolve a migrated override flagged for review (ADR 0002 R5).
+
+    Body: {"keep": true} keeps the owner's differing fields as an override;
+    {"keep": false} discards them so the shipped values apply.
+    """
+    require_admin_auth(request)
+    require_admin_writes()
+    try:
+        body = await request.json()
+    except Exception:
+        return _bad_request("Invalid JSON body")
+    if not isinstance(body, dict) or not isinstance(body.get("keep"), bool):
+        return _bad_request('Body must be {"keep": true} or {"keep": false}')
+    try:
+        result, reload_error = _apply_registry_mutation(
+            lambda: config_io.resolve_override_review(model_name, keep=body["keep"])
         )
     except KeyError as exc:
         return _bad_request(str(exc), status=404)

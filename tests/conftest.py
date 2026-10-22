@@ -86,6 +86,8 @@ def _isolate_runtime_config(tmp_path, monkeypatch):
     monkeypatch.setattr(providers, "CONFIG_PATH", cfg)
     monkeypatch.setattr(config_io, "CONFIG_PATH", cfg)
     monkeypatch.setattr(auth, "_client_auth_required_latched", False)
+    monkeypatch.setattr(providers, "_last_good", None)
+    monkeypatch.setattr(providers, "_load_error", None)
     providers.reload()
     yield
     providers.reload()

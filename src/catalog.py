@@ -338,7 +338,15 @@ def _fold_shipped(shipped: list[dict], owner: list[dict], shipped_names: frozens
                   "stale_overrides": sorted(k for k in changed if k in recorded and recorded[k] != base.get(k))}
         if row.get("review") is True:
             origin["review"] = True
-        merged["origin"] = origin
+        try:
+            # A release can change the row under a once-valid override; keep the shipped row then.
+            validate_pricing_policy(merged)
+            validate_client_metadata(merged)
+            normalize_thinking_capabilities(merged)
+        except ValueError as exc:
+            merged = {**base, "origin": {**base["origin"], "override_error": str(exc)}}
+        else:
+            merged["origin"] = origin
         folded.append(merged)
     claimed: set[str] = set()
     for row in folded:

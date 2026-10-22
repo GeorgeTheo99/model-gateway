@@ -93,9 +93,19 @@ by status APIs, never forced on — the owner still wins.
 
 ### Failure handling (R7)
 
-An invalid owner layer never silently falls back to shipped-only. Reloads keep the
-last good registry; startup loads `effective-catalog.last-good.json` (written after
-each successful load) and reports the error in `/health` and admin status.
+An invalid owner layer never silently falls back to shipped-only:
+
+- Admin writes and `/admin/api/reload` validate strictly and roll back, as before.
+- Any other reload that fails keeps serving the last good registry and reports
+  `catalog.load_error` in admin status.
+- An override a release invalidates (for example a thinking level the shipped row
+  no longer allows) is skipped for that model only; the shipped row loads and
+  `origin.override_error` / `catalog.override_errors` say why.
+- Startup still refuses an invalid catalog: there is no earlier registry to keep.
+
+Admin status also lists overrides awaiting review (resolved with
+`POST /admin/api/models/{name}/review` `{"keep": bool}`), stale overrides, and
+retirements.
 
 ### Pi
 
