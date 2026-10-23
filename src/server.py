@@ -120,11 +120,15 @@ async def _lifespan(_app: FastAPI):
     # In-process so it runs on every deploy layout, not just launchers that
     # call scripts/export_catalogs.py themselves.
     from src.admin import _regenerate_catalogs, migrate_catalog
+    from src.config_lock import config_write_lock
     try:
-        # Curated models load by reference; retire copies older releases made.
-        migrate_catalog()
+        # Curated models load by reference; retire copies older releases made. Never wait for
+        # a config writer (local AI setup holds the lock while it restarts this gateway): a
+        # busy lock skips the migration until the next start.
+        with config_write_lock(config_io.CONFIG_PATH, blocking=False):
+            migrate_catalog()
     except Exception as exc:  # noqa: BLE001 — a failed migration must not stop the gateway
-        log.warning("catalog migration failed: %s", exc)
+        log.warning("catalog migration failed or skipped: %s", exc)
     log.info("catalog exports: %s", await _regenerate_catalogs())
     discovery.refresh()
     await federation.start()

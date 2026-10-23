@@ -131,6 +131,9 @@ MODEL_INFO_SOURCE_PATH="${MODEL_GATEWAY_MODEL_INFO_SOURCE:-${ACTIVE_MODEL_INFO_S
 LEDGER_PATH="${MODEL_GATEWAY_LEDGER_PATH:-${INSTALLED_LEDGER_PATH:-$(state_path "$APP_DIR/ledger.db" "$HOME/srv/model-gateway/shared/ledger.db")}}"
 # Legacy client keys file (e.g. imported from a Home Server gateway); kept across reinstalls.
 CLIENT_KEYS_FILE="${MODEL_GATEWAY_CLIENT_KEYS_FILE-$(installed_plist_env MODEL_GATEWAY_CLIENT_KEYS_FILE)}"
+# A custom state directory (local AI's home) is recorded in the LaunchAgent; keep it across reinstalls.
+MODEL_GATEWAY_STATE_DIR="${MODEL_GATEWAY_STATE_DIR:-$(installed_plist_env MODEL_GATEWAY_STATE_DIR)}"
+[ -z "$MODEL_GATEWAY_STATE_DIR" ] || export MODEL_GATEWAY_STATE_DIR
 if [ "${GATEWAY_VISION_FALLBACK+x}" = x ]; then
   VISION_FALLBACK="$GATEWAY_VISION_FALLBACK"
 else
@@ -498,6 +501,11 @@ write_plist() {
   if [ "$PLIST_DIR" != "$HOME/Library/LaunchAgents" ]; then
     launchd_keys="${launchd_keys}
   <key>MODEL_GATEWAY_PLIST_DIR</key><string>${e_plist_dir}</string>"
+  fi
+  # The gateway loads local AI's model from this directory, as the CLI installs it.
+  if [ -n "${MODEL_GATEWAY_STATE_DIR:-}" ] && [ "$MODEL_GATEWAY_STATE_DIR" != "$APP_DIR" ]; then
+    launchd_keys="${launchd_keys}
+  <key>MODEL_GATEWAY_STATE_DIR</key><string>$(xml_escape "$MODEL_GATEWAY_STATE_DIR")</string>"
   fi
   if [ -n "$CLIENT_KEYS_FILE" ]; then
     client_keys="

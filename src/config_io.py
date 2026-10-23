@@ -33,9 +33,10 @@ import yaml
 
 from src.catalog import (
     OWNER_META_FIELDS,
-    ROUTE_FIELDS,
     canonical_provider,
     normalize_thinking_capabilities,
+    route_differs,
+    same_field,
     validate_client_metadata,
     validate_pricing_policy,
 )
@@ -1293,10 +1294,10 @@ def upsert_model(name: str, **fields) -> dict:
     if shipped_row is not None:
         differing = sorted(
             field for field in {*entry, *shipped_row}
-            if field != "name" and entry.get(field) != shipped_row.get(field)
+            if field != "name" and not same_field(field, entry.get(field), shipped_row.get(field))
         )
         llm = [e for e in llm if e.get("name") != name]
-        if set(differing) & set(ROUTE_FIELDS):
+        if route_differs(entry, shipped_row):
             # Another route under this name is the owner's own model, not an override.
             llm.append({k: v for k, v in entry.items() if k not in OWNER_META_FIELDS})
         elif differing:
@@ -1496,7 +1497,8 @@ def shipped_migration_pending(loaded: dict[str, dict]) -> bool:
 
 
 @_write_transaction
-def migrate_to_shipped_layer(loaded: dict[str, dict], shipped_names: frozenset[str]) -> dict:
+def migrate_to_shipped_layer(loaded: dict[str, dict], shipped_names: frozenset[str], *,
+                             retire_ledger: bool = True) -> dict:
     """Move from copied curated rows to the shipped layer (docs/adr/0002-layered-model-catalog.md).
 
     ``loaded`` maps each shipped model this install loads to its shipped row.
@@ -1505,10 +1507,11 @@ def migrate_to_shipped_layer(loaded: dict[str, dict], shipped_names: frozenset[s
     and flagged ``review``, since nothing says whether the owner made them.
     Ledger names the owner deleted become ``catalog.hidden``, and the ledger is
     retired. Rows of shipped models not loaded here stay whole. Idempotent;
-    returns what changed (empty when nothing did).
+    returns what changed (empty when nothing did). ``retire_ledger=False``
+    converts only the rows of ``loaded`` (local AI setup), leaving the ledger.
     """
     ledger = auto_add_state_path()
-    offered = load_offered_models()
+    offered = load_offered_models() if retire_ledger else set()
     doc = load_model_info()
     rows = doc.get("llm") or []
     present = {row.get("name") for row in rows if isinstance(row, dict)}
@@ -1520,12 +1523,12 @@ def migrate_to_shipped_layer(loaded: dict[str, dict], shipped_names: frozenset[s
         if base is None or "shipped_base" in row or "review" in row:
             kept.append(row)
             continue
-        if any(field in row and row[field] != base.get(field) for field in ROUTE_FIELDS):
+        if route_differs(row, base):
             # Another route under the name stays whole (the owner's own model), flagged for review.
             kept.append({**row, "review": True})
             review.append(row["name"])
             continue
-        differing = [field for field in row if field != "name" and row[field] != base.get(field)]
+        differing = [field for field in row if field != "name" and not same_field(field, row[field], base.get(field))]
         if not differing:
             dropped.append(row["name"])
             continue
@@ -1536,7 +1539,7 @@ def migrate_to_shipped_layer(loaded: dict[str, dict], shipped_names: frozenset[s
             "review": True,
         })
         review.append(row["name"])
-    hidden = sorted((offered - present) & shipped_names)
+    hidden = sorted((offered - present) & shipped_names) if retire_ledger else []
     if dropped or review:
         doc["llm"] = kept
         _write_model_info(doc)
@@ -1547,7 +1550,7 @@ def migrate_to_shipped_layer(loaded: dict[str, dict], shipped_names: frozenset[s
         config["catalog"] = block
         _backup(CONFIG_PATH)
         _atomic_write(CONFIG_PATH, yaml.safe_dump(config, sort_keys=False, default_flow_style=False))
-    if ledger.exists():
+    if retire_ledger and ledger.exists():
         _backup(ledger)
         ledger.unlink()
     elif not (dropped or review or hidden):

@@ -1054,11 +1054,27 @@ def _catalog_names(*, shipped_only: bool = False) -> list[str]:
 def migrate_catalog() -> dict:
     """Retire copied curated rows in favour of the shipped layer (ADR 0002); runs at startup.
 
+    First, once per install, local AI models the owner deleted before they
+    loaded from the release stay deleted (:func:`src.local_runtime.adopt_catalog_layer`).
+
     This is the gateway's own upgrade, not an admin write, so it runs with admin
     writes off too; files are backed up and a rejected reload restores them.
     """
     import src.providers as providers
+    from src import local_runtime
 
+    try:
+        if local_runtime.catalog_adoption_pending():
+            # This release loads local AI's model itself; keep a model the owner deleted deleted.
+            hidden, reload_error = _apply_registry_mutation(local_runtime.adopt_catalog_layer)
+            if reload_error is not None:
+                log.warning("local AI catalog adoption rolled back: %s", reload_error)
+            else:
+                local_runtime.mark_catalog_layer()
+                if hidden:
+                    log.info("local AI models the owner had deleted stay hidden: %s", hidden)
+    except Exception as exc:  # noqa: BLE001 — never block the shipped-layer migration below
+        log.warning("local AI catalog adoption failed: %s", exc)
     # Only release rows: a consumer pack must never be able to remove an owner row.
     layer = shipped.layer(providers._load_config(), include_packs=False)
     loaded = {row["name"]: {k: v for k, v in row.items() if k != "origin"} for row in layer.entries}

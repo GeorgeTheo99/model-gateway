@@ -94,10 +94,17 @@ def _registered_packs(config_path=None) -> dict[str, dict]:
     return packs.load(config_path)
 
 
+def _local_ai_rows(config: dict, *, installed_only: bool = True) -> list[dict]:
+    from src import local_runtime
+
+    return local_runtime.catalog_rows(config, installed_only=installed_only)
+
+
 def all_shipped_rows(profiles: dict[str, dict] | None = None) -> list[dict]:
     """Every model a release ships, loaded on this install or not."""
     profiles = _packaged() if profiles is None else profiles
-    return [model for profile in profiles.values() if profile.get("auto_add") for model in profile["models"]]
+    return [*(model for profile in profiles.values() if profile.get("auto_add") for model in profile["models"]),
+            *_local_ai_rows({}, installed_only=False)]
 
 
 def layer(
@@ -134,6 +141,12 @@ def layer(
         entries.extend(
             {**model, "origin": {"layer": "shipped", "profile": profile_id}} for model in models
         )
+    # Gateway local AI (src.local_runtime) loads once installed, whatever the selection:
+    # the owner added it. Its names count only then, so an owner's own row under one
+    # (another oMLX setup) is never mistaken for an override of an absent model.
+    for model in _local_ai_rows(config):
+        names.add(model["name"])
+        entries.append({**model, "origin": {"layer": "shipped", "profile": "local-ai"}})
     # A name another profile still ships is alive, whatever an older profile retired.
     retired = {name: successor for name, successor in retired.items() if name not in names}
     if include_packs:

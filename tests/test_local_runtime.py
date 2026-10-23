@@ -186,7 +186,9 @@ def test_add_refuses_to_guess_the_label_of_an_unlabelled_gateway(eligible, gatew
     with pytest.raises(lr.LocalRuntimeError, match="label is unknown"):
         lr.start_add()
     assert bootstraps == []
-    write_plist(default, {"Label": lr.GATEWAY_LABEL, "EnvironmentVariables": {"MODEL_GATEWAY_CONFIG": str(gateway)}})
+    # As `model-gateway install` records it (this test's state directory is not the default).
+    write_plist(default, {"Label": lr.GATEWAY_LABEL, "EnvironmentVariables": {
+        "MODEL_GATEWAY_CONFIG": str(gateway), "MODEL_GATEWAY_STATE_DIR": str(lr.state_dir())}})
     assert lr.start_add()["state"] == "queued" and len(bootstraps) == 1
 
 
@@ -532,6 +534,12 @@ def test_add_refuses_ineligible_macs_full_disks_and_conflicts(gateway, launchctl
         {"name": "qwen3.8-27b", "provider": "fireworks", "provider_model_id": "qwen"}]}))
     with pytest.raises(lr.LocalRuntimeError, match="different model named"):
         lr.start_add()
+    config_io.MODEL_INFO_PATH.write_text(json.dumps({"allow_empty": True, "llm": []}))
+    # A gateway LaunchAgent with another state directory is refused before any download.
+    write_plist(lr.launch_agents_dir() / f"{lr.GATEWAY_LABEL}.plist",
+                {"Label": lr.GATEWAY_LABEL, "EnvironmentVariables": {"MODEL_GATEWAY_STATE_DIR": "/elsewhere"}})
+    with pytest.raises(lr.LocalRuntimeError, match="another state directory"):
+        lr.start_add()
     assert bootstraps == []
 
 
@@ -734,6 +742,26 @@ def test_cli_passes_its_unresolved_package_root_to_local_ai(tmp_path):
     assert result.stdout == f"{current}|{current}\n"
 
 
+@pytest.mark.parametrize("custom", [False, True])
+def test_the_gateway_launch_agent_carries_only_a_custom_state_dir(tmp_path, custom):
+    # The server loads local AI's model from the state directory the CLI installed it in.
+    harness = tmp_path / "harness.sh"
+    harness.write_text('cli="$1"\nset -- env\nsource "$cli" >/dev/null\n'
+                       'persist_install_config() { :; }\nwrite_plist >/dev/null\n')
+    env = {key: value for key, value in os.environ.items() if not key.startswith(("MODEL_GATEWAY_", "GATEWAY_VISION"))}
+    env.update(HOME=str(tmp_path), MODEL_GATEWAY_LAUNCHD_LABEL="com.local.model-gateway-test-does-not-exist",
+               MODEL_GATEWAY_PLIST_DIR=str(tmp_path / "LaunchAgents"))
+    expected = str(tmp_path / "state") if custom else None
+    # A later command from a plain shell (an update) keeps the recorded directory.
+    for state in (expected, None):
+        run_env = {**env, "MODEL_GATEWAY_STATE_DIR": state} if state else env
+        result = subprocess.run(["bash", str(harness), str(ROOT / "bin/model-gateway")],
+                                capture_output=True, text=True, env=run_env, timeout=60)
+        assert result.returncode == 0, result.stderr
+        plist = plistlib.loads((tmp_path / "LaunchAgents/com.local.model-gateway-test-does-not-exist.plist").read_bytes())
+        assert plist["EnvironmentVariables"].get("MODEL_GATEWAY_STATE_DIR") == expected
+
+
 def test_progress_never_recreates_removed_state(eligible):
     lr.runtime_root().mkdir(parents=True)
     progress = lr.Progress(QWEN, 10)
@@ -832,10 +860,12 @@ def test_install_verifies_builds_starts_and_wires_the_gateway(eligible, gateway,
                                            "managed_by": "local_ai"}
     assert config["providers"]["fireworks"]  # untouched
     assert key.read_text().strip() not in gateway.read_text()
-    (entry,) = json.loads(config_io.MODEL_INFO_PATH.read_text())["llm"]
-    assert (entry["name"], entry["provider"], entry["omlx_id"], entry["pricing_status"]) == (
-        "qwen3.8-27b", "omlx", QWEN_ID, "unmetered")
+    # The model loads from the release (shipped layer), never as a copy in the owner's catalog.
+    assert json.loads(config_io.MODEL_INFO_PATH.read_text())["llm"] == []
     providers.reload()
+    (entry,) = [row for row in providers.effective_model_inventory() if row["name"] == "qwen3.8-27b"]
+    assert (entry["provider"], entry["omlx_id"], entry["pricing_status"], entry["origin"]) == (
+        "omlx", QWEN_ID, "unmetered", {"layer": "shipped", "profile": "local-ai"})
     routed = providers.resolve("qwen3.8-27b")
     assert (routed.base_url, routed.api_key, routed.provider_model_id) == (
         "http://127.0.0.1:9110/v1", key.read_text().strip(), QWEN_ID)
@@ -881,6 +911,8 @@ def test_gateway_wiring_rolls_back_when_the_gateway_does_not_restart(gateway, la
     with pytest.raises(lr.LocalRuntimeError, match="not running"):
         lr.configure_gateway(QWEN, 9110)
     assert (gateway.read_text(), config_io.MODEL_INFO_PATH.read_text()) == before
+    # The restored files still get their one-time adoption.
+    assert not (lr.runtime_root() / lr.CATALOG_LAYER_MARKER).exists()
 
 
 def test_check_requires_the_sole_payload_and_a_real_completion(eligible, monkeypatch):
@@ -1075,6 +1107,269 @@ def test_unconfigure_leaves_a_foreign_omlx_provider_and_its_models_untouched(gat
     before = gateway.read_text()
     assert lr.unconfigure_gateway() is False
     assert gateway.read_text() == before and config_io.MODEL_INFO_PATH.read_text() == catalog
+
+
+# ── the local model in the shipped catalog layer (ADR 0002) ─────────────────
+
+
+def wire_local_ai(gateway, monkeypatch) -> None:
+    """The gateway as configure_gateway leaves it, with the payload installed."""
+    monkeypatch.setattr(lr, "manifest", lambda local: {"model_id": QWEN_ID})
+    lr._key(lr.api_key_path(), create=True)
+    (lr.mlx_dir() / QWEN_ID).mkdir(parents=True)
+    config = yaml.safe_load(gateway.read_text())
+    config["providers"]["omlx"] = {"base_url": "http://127.0.0.1:9110/v1", "protocol": "openai", "api_key": "",
+                                   "api_key_file": str(lr.api_key_path()), "enabled": True,
+                                   "managed_by": "local_ai"}
+    gateway.write_text(yaml.safe_dump(config))
+    providers.reload()
+
+
+def local_entry() -> dict | None:
+    providers.reload()
+    return next((row for row in providers.effective_model_inventory() if row["name"] == "qwen3.8-27b"), None)
+
+
+def test_the_local_model_loads_from_the_release_and_takes_its_fixes(gateway, monkeypatch):
+    assert local_entry() is None
+    wire_local_ai(gateway, monkeypatch)
+    entry = local_entry()
+    assert (entry["omlx_id"], entry["origin"]) == (QWEN_ID, {"layer": "shipped", "profile": "local-ai"})
+    # A release that changes the model's row reaches this install with nothing to migrate.
+    fixed = lr.LocalModel(QWEN.name, QWEN.manifest, {**QWEN.catalog, "context": 65536}, QWEN.settings)
+    monkeypatch.setitem(lr.MODELS, QWEN.name, fixed)
+    assert local_entry()["context"] == 65536
+    # The owner added it, so it loads whatever the shipped selection.
+    config = yaml.safe_load(gateway.read_text())
+    gateway.write_text(yaml.safe_dump({**config, "catalog": {"shipped": "none"}}))
+    assert local_entry() is not None
+    # Once the gateway no longer manages oMLX, or without the payload, it is gone.
+    config = yaml.safe_load(gateway.read_text())
+    managed = config["providers"].pop("omlx")
+    gateway.write_text(yaml.safe_dump(config))
+    assert local_entry() is None
+    config["providers"]["omlx"] = managed
+    gateway.write_text(yaml.safe_dump(config))
+    assert local_entry() is not None
+    (lr.mlx_dir() / QWEN_ID).rmdir()
+    assert local_entry() is None
+
+
+def test_startup_migration_retires_copies_of_the_local_model(gateway, monkeypatch):
+    from src import admin
+
+    wire_local_ai(gateway, monkeypatch)
+    # What configure_gateway used to write.
+    config_io.MODEL_INFO_PATH.write_text(json.dumps({"llm": [
+        {"name": "qwen3.8-27b", "provider": "omlx", "omlx_id": QWEN_ID, **QWEN.catalog}]}))
+    assert admin.migrate_catalog()["dropped"] == ["qwen3.8-27b"]
+    assert json.loads(config_io.MODEL_INFO_PATH.read_text())["llm"] == []
+    assert local_entry()["origin"]["layer"] == "shipped"
+    # A Home Server import (null provider, its own alias and fields) becomes a sparse,
+    # reviewable override: the route and the release's later fixes stay the gateway's.
+    imported = {"name": "qwen3.8-27b", "provider": None, "omlx_id": QWEN_ID, "alias": "qwen38mlx",
+                **QWEN.catalog, "desc": "Home Server's Qwen"}
+    config_io.MODEL_INFO_PATH.write_text(json.dumps({"llm": [imported]}))
+    assert admin.migrate_catalog()["review"] == ["qwen3.8-27b"]
+    (override,) = json.loads(config_io.MODEL_INFO_PATH.read_text())["llm"]
+    assert override == {"name": "qwen3.8-27b", "alias": "qwen38mlx", "desc": "Home Server's Qwen",
+                        "shipped_base": {"alias": None, "desc": QWEN.catalog["desc"]}, "review": True}
+    entry = local_entry()
+    assert (entry["alias"], entry["desc"], entry["origin"]["overridden"]) == (
+        "qwen38mlx", "Home Server's Qwen", ["alias", "desc"])
+    assert providers.resolve("qwen38mlx").provider_model_id == QWEN_ID
+
+
+def test_an_owner_qwen_without_gateway_local_ai_is_untouched(gateway):
+    from src import admin
+
+    # A developer gateway routing its own oMLX: the row is the owner's model.
+    config = yaml.safe_load(gateway.read_text())
+    config["providers"]["omlx"] = {"base_url": "http://127.0.0.1:8000/v1", "api_key_file": "/Users/dev/omlx.key"}
+    gateway.write_text(yaml.safe_dump(config))
+    catalog = json.dumps({"llm": [{"name": "qwen3.8-27b", "provider": None, "omlx_id": QWEN_ID}]})
+    config_io.MODEL_INFO_PATH.write_text(catalog)
+    assert admin.migrate_catalog() == {}
+    assert config_io.MODEL_INFO_PATH.read_text() == catalog
+    assert local_entry()["origin"] == {"layer": "owner"}
+
+
+def test_adding_local_ai_again_restores_a_hidden_model_and_tolerates_overrides(gateway, monkeypatch):
+    monkeypatch.setattr(lr, "manifest", lambda local: {"model_id": QWEN_ID})
+    monkeypatch.setattr(lr, "_restart_gateway", lambda required: None)
+    config = yaml.safe_load(gateway.read_text())
+    gateway.write_text(yaml.safe_dump({**config, "catalog": {"hidden": ["qwen3.8-27b", "other"]}}))
+    config_io.MODEL_INFO_PATH.write_text(json.dumps({"llm": [
+        {"name": "qwen3.8-27b", "desc": "mine", "shipped_base": {"desc": "x"}}]}))
+    lr.configure_gateway(QWEN, 9110)
+    assert yaml.safe_load(gateway.read_text())["catalog"]["hidden"] == ["other"]
+    # Another route under the name is still the owner's own model, and blocks local AI.
+    config_io.MODEL_INFO_PATH.write_text(json.dumps({"llm": [
+        {"name": "qwen3.8-27b", "provider": "fireworks", "provider_model_id": "qwen"}]}))
+    assert "different model" in lr.gateway_conflict(QWEN)
+
+
+def test_upgrading_keeps_a_local_model_the_owner_deleted_deleted_once(gateway, monkeypatch):
+    from src import admin
+
+    wire_local_ai(gateway, monkeypatch)
+    # Earlier releases always wrote the model: no row means the owner deleted it.
+    assert lr.catalog_adoption_pending()
+    admin.migrate_catalog()
+    assert yaml.safe_load(gateway.read_text())["catalog"]["hidden"] == ["qwen3.8-27b"]
+    assert local_entry() is None and not lr.catalog_adoption_pending()
+    # Only once: adding local AI again (or this release's own installs) is never hidden.
+    monkeypatch.setattr(lr, "_restart_gateway", lambda required: None)
+    lr.configure_gateway(QWEN, 9110)
+    assert "catalog" not in yaml.safe_load(gateway.read_text())
+    admin.migrate_catalog()
+    assert local_entry() is not None
+
+
+def test_adoption_keeps_a_model_that_still_has_its_copy(gateway, monkeypatch):
+    from src import admin
+
+    wire_local_ai(gateway, monkeypatch)
+    config_io.MODEL_INFO_PATH.write_text(json.dumps({"llm": [
+        {"name": "qwen3.8-27b", "provider": "omlx", "omlx_id": QWEN_ID, **QWEN.catalog}]}))
+    admin.migrate_catalog()
+    assert "catalog" not in yaml.safe_load(gateway.read_text())
+    assert json.loads(config_io.MODEL_INFO_PATH.read_text())["llm"] == []
+    assert local_entry()["origin"]["layer"] == "shipped" and not lr.catalog_adoption_pending()
+
+
+def test_an_admin_save_of_the_local_model_stores_only_what_changed(gateway, monkeypatch):
+    wire_local_ai(gateway, monkeypatch)
+    lr.mark_catalog_layer()
+    config_io.upsert_model("qwen3.8-27b", provider="local", omlx_id=QWEN_ID, desc="mine")
+    (row,) = json.loads(config_io.MODEL_INFO_PATH.read_text())["llm"]
+    assert row == {"name": "qwen3.8-27b", "desc": "mine", "shipped_base": {"desc": QWEN.catalog["desc"]}}
+    assert local_entry()["origin"]["overridden"] == ["desc"]
+
+
+def wire_local_ai_config(gateway) -> None:
+    config = yaml.safe_load(gateway.read_text())
+    config["providers"]["omlx"] = {"base_url": "http://127.0.0.1:9110/v1", "api_key_file": str(lr.api_key_path()),
+                                   "enabled": True, "managed_by": "local_ai"}
+    gateway.write_text(yaml.safe_dump(config))
+
+
+def test_remove_drops_old_copies_but_keeps_overrides_and_settings(gateway, monkeypatch):
+    wire_local_ai(gateway, monkeypatch)
+    override = {"name": "qwen3.8-27b", "desc": "mine", "shipped_base": {"desc": "x"}}
+    copy = {"name": "qwen3.8-27b", "provider": "omlx", "omlx_id": QWEN_ID}
+    for rows, kept in (([copy], []), ([override], [override])):
+        wire_local_ai_config(gateway)
+        config_io.MODEL_INFO_PATH.write_text(json.dumps({"llm": rows}))
+        assert lr.unconfigure_gateway() is True
+        written = yaml.safe_load(gateway.read_text())
+        assert "omlx" not in written["providers"] and "catalog" not in written
+        assert json.loads(config_io.MODEL_INFO_PATH.read_text())["llm"] == kept
+
+
+def test_routing_check_follows_what_the_gateway_loads(gateway, monkeypatch):
+    wire_local_ai(gateway, monkeypatch)
+    assert lr._catalog_routes(QWEN)
+    config = yaml.safe_load(gateway.read_text())
+    for change in ({"catalog": {"hidden": ["qwen3.8-27b"]}},
+                   {"models": [{"name": "qwen3.8-27b", "provider": "fireworks", "provider_model_id": "q"}]}):
+        gateway.write_text(yaml.safe_dump({**config, **change}))
+        assert not lr._catalog_routes(QWEN)
+    # An overlay row on the same route (any spelling of the local provider) is an override.
+    gateway.write_text(yaml.safe_dump({**config, "models": [{"name": "qwen3.8-27b", "provider": "local",
+                                                              "omlx_id": QWEN_ID, "desc": "overlay"}]}))
+    assert lr._catalog_routes(QWEN)
+
+
+def test_a_broken_local_manifest_never_takes_the_catalog_down(gateway, monkeypatch, caplog):
+    wire_local_ai(gateway, monkeypatch)
+
+    def broken(local):
+        raise lr.LocalRuntimeError("Invalid model manifest for qwen3.8-27b: fixture")
+
+    monkeypatch.setattr(lr, "manifest", broken)
+    config_io.MODEL_INFO_PATH.write_text(json.dumps({"llm": [
+        {"name": "glm", "provider": "fireworks", "provider_model_id": "glm"}]}))
+    assert local_entry() is None
+    assert [row["name"] for row in providers.effective_model_inventory()] == ["glm"]
+    assert "local AI model qwen3.8-27b not loaded" in caplog.text
+
+
+def test_setup_converts_copies_so_the_restarted_gateway_never_waits_for_its_lock(gateway, monkeypatch):
+    from src import shipped
+
+    monkeypatch.setattr(lr, "manifest", lambda local: {"model_id": QWEN_ID})
+    lr._key(lr.api_key_path(), create=True)
+    (lr.mlx_dir() / QWEN_ID).mkdir(parents=True)
+    # A Home Server import made before local AI was added on this Mac.
+    config_io.MODEL_INFO_PATH.write_text(json.dumps({"llm": [
+        {"name": "qwen3.8-27b", "provider": None, "omlx_id": QWEN_ID, "alias": "qwen38mlx", **QWEN.catalog}]}))
+    seen = []
+
+    def restart(required):
+        layer = shipped.layer(config_io.load_config_full(), include_packs=False)
+        loaded = {row["name"]: {k: v for k, v in row.items() if k != "origin"} for row in layer.entries}
+        seen.append((config_io.shipped_migration_pending(loaded), lr.catalog_adoption_pending()))
+
+    monkeypatch.setattr(lr, "_restart_gateway", restart)
+    lr.configure_gateway(QWEN, 9110)
+    assert seen == [(False, False)]
+    (override,) = json.loads(config_io.MODEL_INFO_PATH.read_text())["llm"]
+    assert override["alias"] == "qwen38mlx" and override["review"] is True and "provider" not in override
+
+
+def test_startup_skips_the_migration_while_another_writer_holds_the_lock(gateway, monkeypatch, caplog):
+    import threading
+
+    from src.config_lock import config_write_lock
+
+    wire_local_ai(gateway, monkeypatch)
+    lr.mark_catalog_layer()
+    copy = json.dumps({"llm": [{"name": "qwen3.8-27b", "provider": "omlx", "omlx_id": QWEN_ID, **QWEN.catalog}]})
+    config_io.MODEL_INFO_PATH.write_text(copy)
+    held, done = threading.Event(), threading.Event()
+
+    def writer():
+        with config_write_lock(config_io.CONFIG_PATH):
+            held.set()
+            done.wait(30)
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    try:
+        held.wait(5)
+        with TestClient(app):
+            pass
+    finally:
+        done.set()
+        thread.join()
+    assert "catalog migration failed or skipped" in caplog.text
+    assert config_io.MODEL_INFO_PATH.read_text() == copy
+    with TestClient(app):  # the next start migrates
+        pass
+    assert json.loads(config_io.MODEL_INFO_PATH.read_text())["llm"] == []
+
+
+def test_setup_refuses_a_gateway_launch_agent_with_another_state_dir(gateway, monkeypatch):
+    monkeypatch.setattr(lr, "manifest", lambda local: {"model_id": QWEN_ID})
+    monkeypatch.setattr(lr, "_restart_gateway", lambda required: None)
+    plist = lr.launch_agents_dir() / f"{lr.GATEWAY_LABEL}.plist"
+    write_plist(plist, {"Label": lr.GATEWAY_LABEL, "EnvironmentVariables": {"MODEL_GATEWAY_STATE_DIR": "/elsewhere"}})
+    with pytest.raises(lr.LocalRuntimeError, match="another state directory"):
+        lr.configure_gateway(QWEN, 9110)
+    assert "omlx" not in yaml.safe_load(gateway.read_text())["providers"]
+    write_plist(plist, {"Label": lr.GATEWAY_LABEL, "EnvironmentVariables": {"MODEL_GATEWAY_STATE_DIR": str(lr.state_dir())}})
+    lr.configure_gateway(QWEN, 9110)
+    assert yaml.safe_load(gateway.read_text())["providers"]["omlx"]["managed_by"] == "local_ai"
+
+
+def test_a_pack_cannot_claim_a_local_ai_model():
+    from src import packs, shipped
+
+    pack = {"schema_version": 1, "namespace": "app", "source_revision": "r", "requires": [],
+            "models": [{"name": "qwen3.8-27b", "provider": "omlx", "omlx_id": "other-payload"}]}
+    with pytest.raises(packs.PackError, match="used by a shipped model"):
+        packs.validate("app", pack, shipped_rows=shipped.all_shipped_rows(), owner_rows=[], other_packs={})
 
 
 # ── discovery, admin API, credentials, and package data ──────────────────────

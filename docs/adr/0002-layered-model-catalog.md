@@ -61,6 +61,16 @@ is merged under an override. Claiming a shipped row's `name` or upstream id
 replaces the whole shipped row. Collisions inside one layer remain an error;
 shipped collisions are a release bug caught by tests.
 
+### Local AI models
+
+The gateway's own local AI (`model-gateway local-ai`) is shipped too: its
+model rows come from the release (`src/local_runtime.py`), not a copy in
+`model-info.json`. They load, with origin profile `local-ai`, while this
+gateway manages the `omlx` provider and the model's payload is installed,
+whatever `catalog.shipped` selects (the owner added local AI); their names
+count as shipped only then, so an owner's own row under the name on a gateway
+without managed local AI stays the owner's model. Packs can never claim them.
+
 ### Which shipped models load
 
 - `catalog.shipped` in config: `all` (default), `none`, or a list of profile ids

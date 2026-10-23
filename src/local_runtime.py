@@ -33,6 +33,7 @@ import fcntl
 import hashlib
 import http.client
 import json
+import logging
 import os
 from pathlib import Path
 import platform
@@ -54,7 +55,7 @@ import urllib.request
 import yaml
 
 from src import config_io
-from src.catalog import canonical_provider
+from src.catalog import canonical_provider, route_differs
 from src.config_lock import config_write_lock
 from src.model_payload import VerificationError, read_json, validate_manifest, verify_payload
 from src.secret_files import resolve_api_key_file
@@ -698,6 +699,76 @@ def _our_catalog_entry(entry: object, local: LocalModel) -> bool:
             and entry.get("omlx_id") == manifest(local)["model_id"])
 
 
+def _catalog_row(local: LocalModel) -> dict:
+    return {"name": local.name, "provider": "omlx", "omlx_id": manifest(local)["model_id"], **local.catalog}
+
+
+# Written once this gateway's local models load from the release (see adopt_catalog_layer).
+CATALOG_LAYER_MARKER = "catalog-layer"
+
+
+def catalog_rows(config: dict, *, installed_only: bool = True) -> list[dict]:
+    """This runtime's models for the shipped catalog layer (docs/adr/0002-layered-model-catalog.md).
+
+    They come from this release rather than a copy in the owner's catalog, so a
+    release's fixes reach every install. They load while this gateway manages the
+    ``omlx`` provider and the model's verified payload is installed;
+    ``installed_only=False`` lists every model this release can install.
+    """
+    configured = config.get("providers")
+    if installed_only and not (isinstance(configured, dict) and _our_provider(configured.get("omlx"))):
+        return []
+    rows = []
+    for local in MODELS.values():
+        try:
+            row = _catalog_row(local)
+        except LocalRuntimeError as exc:  # a broken package must not take the whole catalog down
+            logging.getLogger("model-gateway").warning("local AI model %s not loaded: %s", local.name, exc)
+            continue
+        if not installed_only or (mlx_dir() / row["omlx_id"]).is_dir():
+            rows.append(row)
+    return rows
+
+
+def catalog_adoption_pending() -> bool:
+    """Whether this install still has to adopt the release-loaded local models (once)."""
+    return (not (runtime_root() / CATALOG_LAYER_MARKER).exists()
+            and bool(catalog_rows(config_io.load_config_full())))
+
+
+def adopt_catalog_layer() -> list[str]:
+    """Hide the local models the owner deleted before they loaded from the release.
+
+    Earlier releases always wrote the installed model into ``model-info.json``,
+    so a loaded local model without a row there is one the owner deleted. Run
+    once under the config write lock, then :func:`mark_catalog_layer`. Returns
+    the names hidden.
+    """
+    if (runtime_root() / CATALOG_LAYER_MARKER).exists():  # local AI was added again meanwhile
+        return []
+    present = {entry.get("name") for entry in config_io.load_model_info().get("llm", []) if isinstance(entry, dict)}
+    hidden = [row["name"] for row in catalog_rows(config_io.load_config_full()) if row["name"] not in present]
+    if hidden:
+        config_io._update_catalog_names(add=dict.fromkeys(hidden, "hidden"))
+    return hidden
+
+
+def mark_catalog_layer() -> None:
+    _atomic(runtime_root() / CATALOG_LAYER_MARKER, "1\n", runtime_root())
+
+
+def _require_gateway_state_dir() -> None:
+    """The gateway loads this runtime's model from its own state directory, so it must be this one."""
+    environment = (_plist(launch_agents_dir() / f"{gateway_label()}.plist") or {}).get("EnvironmentVariables")
+    if not isinstance(environment, dict):
+        return  # no LaunchAgent to compare (a gateway run by hand)
+    configured = environment.get("MODEL_GATEWAY_STATE_DIR") or str(
+        Path.home() / "Library" / "Application Support" / "model-gateway")
+    if os.path.realpath(os.path.expanduser(configured)) != os.path.realpath(state_dir()):
+        raise LocalRuntimeError("This gateway's LaunchAgent uses another state directory; "
+                                "run 'model-gateway install' to record it, then retry")
+
+
 def gateway_conflict(local: LocalModel) -> str | None:
     """Why this gateway's config cannot take the local runtime, if it cannot."""
     config = config_io.load_config_full()
@@ -708,8 +779,10 @@ def gateway_conflict(local: LocalModel) -> str | None:
         if canonical_provider(str(provider_id)) == "omlx" and not _our_provider(block):
             return (f"The gateway already has an oMLX provider ({provider_id!r}) that Model Gateway "
                     "local AI does not manage; remove it first")
+    ours = _catalog_row(local)
     for entry in config_io.load_model_info().get("llm", []):
-        if isinstance(entry, dict) and entry.get("name") == local.name and not _our_catalog_entry(entry, local):
+        # The owner's overrides of this runtime's row are fine; another route under its name is not.
+        if isinstance(entry, dict) and entry.get("name") == local.name and route_differs(entry, ours):
             return f"The gateway catalog already has a different model named {local.name!r}"
     return None
 
@@ -733,12 +806,18 @@ def _write_config(config: dict) -> None:
 
 
 def configure_gateway(local: LocalModel, omlx_port: int) -> None:
-    """Add the omlx provider and model, restart the gateway, roll back on failure."""
+    """Add the omlx provider, restart the gateway, roll back on failure.
+
+    The model itself loads from the shipped layer (:func:`catalog_rows`), never as a copy.
+    """
+    _require_gateway_state_dir()
     with config_write_lock(config_io.CONFIG_PATH):
         conflict = gateway_conflict(local)
         if conflict:
             raise LocalRuntimeError(conflict)
         snapshot = config_io.snapshot_writable_files()
+        marker = runtime_root() / CATALOG_LAYER_MARKER
+        marked = marker.exists()
         try:
             config = config_io.load_config_full()
             config.setdefault("providers", {})
@@ -752,11 +831,20 @@ def configure_gateway(local: LocalModel, omlx_port: int) -> None:
                 "managed_by": config_io.LOCAL_AI_MANAGED,
             }
             _write_config(config)
-            config_io.upsert_model(local.name, provider="omlx", omlx_id=manifest(local)["model_id"],
-                                   **local.catalog)
+            # Adding local AI again brings back a model the owner deleted (hid) earlier.
+            config_io._update_catalog_names(remove={local.name: "hidden"})
+            # Copies of the model (a Home Server import, a leftover) become overrides now: the
+            # restarted gateway's own migration skips while this job holds the lock.
+            loaded = {row["name"]: row for row in catalog_rows(config_io.load_config_full())}
+            if loaded:
+                config_io.migrate_to_shipped_layer(loaded, frozenset(loaded), retire_ledger=False)
+            # Set before the restart, so the gateway's one-time adoption never hides this model.
+            mark_catalog_layer()
             _restart_gateway(required=True)
         except BaseException:
             config_io.restore_writable_files(snapshot)
+            if not marked:
+                marker.unlink(missing_ok=True)  # the restored files still need their one-time adoption
             with contextlib.suppress(Exception):
                 _restart_gateway(required=False)
             raise
@@ -777,11 +865,14 @@ def unconfigure_gateway() -> bool:
             # With someone else's oMLX provider, a matching catalog entry routes to it, so it is theirs.
             foreign = any(canonical_provider(str(provider_id)) == "omlx" and not _our_provider(block)
                           for provider_id, block in configured.items())
-            for local in () if foreign else MODELS.values():
-                entries = config_io.load_model_info().get("llm", [])
-                if any(_our_catalog_entry(entry, local) for entry in entries):
-                    config_io.delete_model(local.name)
-                    changed = True
+            # Copies earlier releases wrote; the release-loaded rows leave with the provider.
+            doc = config_io.load_model_info()
+            entries = doc.get("llm", [])
+            kept = [entry for entry in entries
+                    if foreign or not any(_our_catalog_entry(entry, local) for local in MODELS.values())]
+            if len(kept) != len(entries):
+                config_io._write_model_info({**doc, "llm": kept})
+                changed = True
             if _our_provider(configured.get("omlx")):
                 del configured["omlx"]
                 _write_config(config)
@@ -1026,6 +1117,21 @@ def _anonymous_refused(gateway: str) -> bool:
     return False
 
 
+def _catalog_routes(local: LocalModel) -> bool:
+    """Whether the catalog the gateway loads (overlay, hidden, overrides) routes ``local`` to this runtime."""
+    from src import catalog, shipped
+
+    config = config_io.load_config_full()
+    layer = shipped.layer(config)
+    entries = catalog.load_catalog_entries(
+        config_io.MODEL_INFO_PATH, overlay=config.get("models", []), shipped=layer.entries,
+        shipped_names=layer.names, excluded=layer.hidden | frozenset(layer.retired))
+    entry = next((entry for entry in entries if entry.get("name") == local.name), None)
+    return (entry is not None and entry.get("provider") == "omlx"
+            and entry.get("omlx_id") == manifest(local)["model_id"]
+            and not (entry.get("origin") or {}).get("override_error"))
+
+
 def _check_direct(local: LocalModel, payload: dict) -> dict:
     """Without a gateway key: complete against oMLX and require the gateway's config to route to it.
 
@@ -1041,7 +1147,7 @@ def _check_direct(local: LocalModel, payload: dict) -> dict:
     if (not _our_provider(provider) or provider.get("enabled") is not True
             or provider.get("managed_by") != config_io.LOCAL_AI_MANAGED
             or provider.get("base_url") != f"http://127.0.0.1:{omlx_port}/v1"
-            or not any(_our_catalog_entry(entry, local) for entry in config_io.load_model_info().get("llm", []))):
+            or not _catalog_routes(local)):
         raise LocalRuntimeError(f"The gateway does not route {local.name} to local AI")
     return _request(f"http://127.0.0.1:{omlx_port}/v1/chat/completions", _key(api_key_path()), {
         "model": payload["model_id"], "messages": [{"role": "user", "content": "Reply with exactly OK."}],
@@ -1099,6 +1205,7 @@ def start_add(name: str | None = None) -> dict:
     if not eligible():
         raise LocalRuntimeError("This Mac needs Apple silicon and at least 48 GB of memory for local AI")
     _require_known_gateway()
+    _require_gateway_state_dir()  # before the download, not only when wiring the gateway
     root = runtime_root()
     _no_symlinks(root, root)
     root.mkdir(parents=True, exist_ok=True, mode=0o700)

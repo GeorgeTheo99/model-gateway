@@ -338,10 +338,20 @@ pinned payload in `local-models/` over HTTPS only (resumable, capped at
 `local-runtime/` project with uv, installs the `com.local.omlx` LaunchAgent
 (loopback, port `MODEL_GATEWAY_LOCAL_AI_PORT`, default 9110), adds the `omlx`
 provider (key file `local-ai/inference/api.key`, mode 0600, marked
-`managed_by: local_ai` so admin provider key edits and deletes refuse it) and
-model to this gateway, restarts the gateway, and requires a real completion
-through `/v1`. Without an admin key the job cannot authenticate to a `/v1`
-that requires keys (a package install with product consumers); then it
+`managed_by: local_ai` so admin provider key edits and deletes refuse it) to
+this gateway, restarts the gateway, and requires a real completion through
+`/v1`. The model itself is never copied into `model-info.json`: while the
+gateway manages `omlx` and the payload is installed, it loads from the release
+in the shipped catalog layer (ADR 0002, profile `local-ai`), whatever
+`catalog.shipped` selects, so a release's fixes to it reach every install and
+the owner can still override or hide it. Adding local AI again unhides it.
+The startup migration turns copies earlier releases wrote (or a Home Server
+import) into sparse overrides, dropping identical ones, and once hides an
+installed model the owner had deleted. A custom `MODEL_GATEWAY_STATE_DIR` is
+recorded in the gateway's LaunchAgent (and read back by later commands) so the
+gateway finds the payload; setup refuses a LaunchAgent with another one.
+Without an admin key the job cannot authenticate to a `/v1` that requires keys
+(a package install with product consumers); then it
 completes against oMLX with oMLX's own key and requires the gateway's config
 and catalog to route the model there, rather than adding a standing
 credential that would also close `/v1` to anonymous local clients. If Model Gateway is upgraded while the job downloads, the job

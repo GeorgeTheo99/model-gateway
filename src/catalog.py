@@ -310,6 +310,18 @@ _ID_FIELDS = ("name", "alias", "provider_model_id", "omlx_id", "alternate_ids", 
 LOWER_LAYERS = frozenset({"shipped", "pack"})
 
 
+def same_field(field: str, value: object, other: object) -> bool:
+    """Whether two values of a catalog field agree (providers compared canonically)."""
+    if field == "provider":
+        return canonical_provider(value) == canonical_provider(other)
+    return value == other
+
+
+def route_differs(fields: dict, base: dict) -> bool:
+    """Whether ``fields`` sets one of :data:`ROUTE_FIELDS` to another value than ``base``."""
+    return any(field in fields and not same_field(field, fields[field], base.get(field)) for field in ROUTE_FIELDS)
+
+
 def _alternates(row: dict) -> list:
     value = row.get("alternate_ids") or []
     return [value] if isinstance(value, str) else list(value)
@@ -355,17 +367,17 @@ def _fold_shipped(shipped: list[dict], owner: list[dict], shipped_names: frozens
         replaced.add(name)
         # Another route under the name, or the owner's own row for a pack's name (a pack
         # never shapes an owner model), replaces the lower model: nothing is merged in.
-        if (any(field in fields and fields[field] != base.get(field) for field in ROUTE_FIELDS)
-                or (base["origin"]["layer"] == "pack" and not sparse)):
+        if route_differs(fields, base) or (base["origin"]["layer"] == "pack" and not sparse):
             folded.append(({**fields, "origin": owned}, own_ids, None))
             continue
         merged = {**base, **fields}
         if "thinking" in fields and fields["thinking"] != base.get("thinking") and "thinking_levels" not in fields:
             merged.pop("thinking_levels", None)
-        changed = sorted(k for k in fields if k != "name" and base.get(k) != fields[k])
+        changed = sorted(k for k in fields if k != "name" and not same_field(k, fields[k], base.get(k)))
         recorded = row.get("shipped_base") if isinstance(row.get("shipped_base"), dict) else {}
         origin = {**base["origin"], "overridden": changed,
-                  "stale_overrides": sorted(k for k in changed if k in recorded and recorded[k] != base.get(k))}
+                  "stale_overrides": sorted(k for k in changed
+                                            if k in recorded and not same_field(k, recorded[k], base.get(k)))}
         if row.get("review") is True:
             origin["review"] = True
         try:
@@ -545,7 +557,7 @@ def load_catalog_entries(
         fields = {k: v for k, v in entry.items() if k != "origin"}
         if base is not None and _is_lower(base) and (
                 (base.get("origin") or {}).get("layer") == "pack"
-                or any(field in fields and fields[field] != base.get(field) for field in ROUTE_FIELDS)):
+                or route_differs(fields, base)):
             # Another route under a shipped name, or any overlay row over a pack model, is
             # the owner's own model: nothing is merged in.
             base = None
