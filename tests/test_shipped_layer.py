@@ -496,6 +496,15 @@ def test_an_override_colliding_with_another_owner_row_is_still_an_error(tmp_path
         _entries(tmp_path, owner, profiles)
 
 
+def test_an_owner_set_collision_fails_whatever_the_row_order(tmp_path):
+    profiles = {"p": _profile([{"name": "m1"}])}
+    owner = [{"name": "other", "provider": "example", "provider_model_id": "up/m1"},
+             {"name": "mine", "provider": "omlx", "omlx_id": "mine", "alternate_ids": ["x"], "pricing_status": "unmetered"},
+             {"name": "m1", "alternate_ids": ["x"], "shipped_base": {}}]
+    with pytest.raises(ValueError, match="collides"):
+        _entries(tmp_path, owner, profiles)
+
+
 def test_a_displaced_shipped_model_is_reported(tmp_path, monkeypatch):
     profile = _profile([{"name": "m1", "provider_model_id": "up/new"}])
     owner = [{"name": "m1", "desc": "mine", "shipped_base": {}},

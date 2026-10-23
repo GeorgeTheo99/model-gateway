@@ -496,9 +496,8 @@ def load_catalog_entries(
         if clashes:
             # A shipped or pack row yields to whatever it collides with, on identifiers the
             # release or pack supplied; any collision on an identifier the owner set is an error.
-            first = next(iter(clashes.values()))
-            if _yields(normalized, set(routable) & set(entry_routable_ids(first))):
-                _record_yield(normalized, first)
+            if all(_yields(normalized, set(routable) & set(entry_routable_ids(c))) for c in clashes.values()):
+                _record_yield(normalized, next(iter(clashes.values())))
                 continue
             for existing in clashes.values():
                 shared = set(routable) & set(entry_routable_ids(existing))
