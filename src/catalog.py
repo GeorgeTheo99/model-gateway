@@ -377,6 +377,7 @@ def _fold_shipped(shipped: list[dict], owner: list[dict], shipped_names: frozens
             # lower row's data, unavailable, with the reason.
             merged, origin = dict(base), {**origin, "override_error": str(exc)}
         merged["origin"] = origin
+        merged["_owner_ids"] = sorted(own_ids)  # which identifiers the owner set (dropped before returning)
         folded.append((merged, own_ids, base))
     # Identifiers a merged row takes from its lower row yield to ones another owner row sets.
     result: list[dict] = []
@@ -403,13 +404,23 @@ def _is_lower(entry: dict) -> bool:
     return (entry.get("origin") or {}).get("layer") in LOWER_LAYERS
 
 
-def _log_yield(lower: dict, winner: dict) -> None:
+def _yields(entry: dict, shared: set[str]) -> bool:
+    """Whether ``entry`` gives way on a collision over ``shared``: shipped/pack rows do,
+    unless an owner override of them set one of those identifiers itself."""
+    return _is_lower(entry) and not shared.intersection(entry.get("_owner_ids") or ())
+
+
+def _record_yield(lower: dict, winner: dict) -> None:
+    """Log a displaced lower model and note it on the winner's origin for admin status."""
     import logging
 
     logging.getLogger("model-gateway").warning(
         "catalog: %s model %r yields to %r, which uses one of its identifiers",
         (lower.get("origin") or {}).get("layer"), lower.get("name"), winner.get("name"),
     )
+    origin = dict(winner.get("origin") or {"layer": "owner"})
+    origin["displaced"] = sorted({*origin.get("displaced", []), str(lower.get("name"))})
+    winner["origin"] = origin
 
 
 def load_catalog_entries(
@@ -483,19 +494,20 @@ def load_catalog_entries(
             raise ValueError("catalog model entries require at least one routable identifier")
         clashes = {id(by_id[model_id]): by_id[model_id] for model_id in routable if model_id in by_id}
         if clashes:
-            # A shipped or pack row yields to whatever it collides with (an owner row, or an
-            # earlier lower row); only owner rows colliding with each other are an error.
-            if _is_lower(normalized):
-                _log_yield(normalized, next(iter(clashes.values())))
+            # A shipped or pack row yields to whatever it collides with, on identifiers the
+            # release or pack supplied; any collision on an identifier the owner set is an error.
+            first = next(iter(clashes.values()))
+            if _yields(normalized, set(routable) & set(entry_routable_ids(first))):
+                _record_yield(normalized, first)
                 continue
             for existing in clashes.values():
-                if not _is_lower(existing):
-                    shared = sorted(set(routable).intersection(entry_routable_ids(existing)))
+                shared = set(routable) & set(entry_routable_ids(existing))
+                if not _yields(existing, shared):
                     raise ValueError(
-                        f"routable id {shared[0]!r} collides between "
+                        f"routable id {sorted(shared)[0]!r} collides between "
                         f"{existing.get('name')!r} and {normalized.get('name')!r}"
                     )
-                _log_yield(existing, normalized)
+                _record_yield(existing, normalized)
                 for model_id in entry_routable_ids(existing):
                     if by_id.get(model_id) is existing:
                         del by_id[model_id]
@@ -532,9 +544,13 @@ def load_catalog_entries(
             )
         base = by_id.get(base_primary) if base_primary else None
         fields = {k: v for k, v in entry.items() if k != "origin"}
-        lower = base is not None and (base.get("origin") or {}).get("layer") in LOWER_LAYERS
-        if lower and any(field in fields and fields[field] != base.get(field) for field in ROUTE_FIELDS):
-            base = None  # another route under a shipped or pack name is the owner's own model
+        if base is not None and _is_lower(base) and (
+                (base.get("origin") or {}).get("layer") == "pack"
+                or any(field in fields and fields[field] != base.get(field) for field in ROUTE_FIELDS)):
+            # Another route under a shipped name, or any overlay row over a pack model, is
+            # the owner's own model: nothing is merged in.
+            base = None
+        lower = base is not None and _is_lower(base)
         normalized = {**base, **fields} if base else {**fields, "origin": {"layer": "owner"}}
         if (
             base
@@ -579,7 +595,7 @@ def load_catalog_entries(
 
     # Hiding and retirement apply to shipped and pack models; the owner's own rows always load.
     result = [
-        by_id[primary] for primary in order
+        {k: v for k, v in by_id[primary].items() if k != "_owner_ids"} for primary in order
         if by_id[primary].get("name") not in excluded
         or (by_id[primary].get("origin") or {}).get("layer") not in LOWER_LAYERS
     ]

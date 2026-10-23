@@ -354,7 +354,7 @@ def catalog_status() -> dict:
         entries = {id(v): v for v in _load_models().values()}.values()
     except Exception as exc:  # noqa: BLE001
         return {"load_error": str(exc), "review": [], "stale_overrides": {}, "override_errors": {}, "retired": {},
-                "retired_owner_rows": [], "packs": {}}
+                "displaced": {}, "retired_owner_rows": [], "packs": {}}
     origins = {entry["name"]: entry.get("origin") or {} for entry in entries}
     return {
         "load_error": _load_error,
@@ -363,6 +363,8 @@ def catalog_status() -> dict:
                             if origin.get("stale_overrides")},
         "override_errors": {name: origin["override_error"] for name, origin in origins.items()
                             if origin.get("override_error")},
+        # Shipped or pack models that gave way to a model using one of their identifiers.
+        "displaced": {name: origin["displaced"] for name, origin in origins.items() if origin.get("displaced")},
         "retired": dict(_retired),
         # The owner's own rows under a name a release retired: they keep working.
         "retired_owner_rows": sorted(name for name, origin in origins.items()

@@ -465,3 +465,40 @@ def test_an_invalid_catalog_block_during_fallback_is_not_a_server_error(tmp_path
     providers.reload()
     assert providers.resolve("nope") is None
     assert providers.catalog_status()["load_error"]
+
+
+def test_overlay_rows_never_merge_into_pack_models(tmp_path, monkeypatch):
+    pack = {"name": "qwen-pack", "provider": "omlx", "omlx_id": "qwen-8bit", "context": 7, "alias": "qp",
+            "pricing_status": "unmetered", "desc": "from the pack"}
+    monkeypatch.setattr(shipped, "_registered_packs", lambda config_path=None: {"ha": {"models": [pack]}})
+    config = {"models": [
+        {"name": "my-qwen", "provider": "omlx", "omlx_id": "qwen-8bit", "pricing_status": "unmetered"},
+    ]}
+    models, _ = _entries(tmp_path, [], {}, config)
+    assert models["my-qwen"]["origin"] == {"layer": "owner"}
+    assert "context" not in models["my-qwen"] and "desc" not in models["my-qwen"]
+    assert "qwen-pack" not in models
+
+
+def test_an_overlay_route_change_that_does_not_validate_is_a_clean_error(tmp_path):
+    profiles = {"p": _profile([{"name": "m1"}])}
+    config = {"models": [{"name": "m1", "provider": "omlx", "omlx_id": "x", "pricing_status": "unmetered",
+                          "thinking": "always", "thinking_levels": ["off"]}]}
+    with pytest.raises(ValueError, match="thinking"):
+        _entries(tmp_path, [], profiles, config)
+
+
+def test_an_override_colliding_with_another_owner_row_is_still_an_error(tmp_path):
+    profiles = {"p": _profile([{"name": "m1"}])}
+    owner = [{"name": "m1", "alias": "x", "shipped_base": {}},
+             {"name": "mine", "provider": "omlx", "omlx_id": "mine", "alias": "x", "pricing_status": "unmetered"}]
+    with pytest.raises(ValueError, match="collides"):
+        _entries(tmp_path, owner, profiles)
+
+
+def test_a_displaced_shipped_model_is_reported(tmp_path, monkeypatch):
+    profile = _profile([{"name": "m1", "provider_model_id": "up/new"}])
+    owner = [{"name": "m1", "desc": "mine", "shipped_base": {}},
+             {"name": "other", "provider": "example", "provider_model_id": "up/new"}]
+    _registry_with(tmp_path, monkeypatch, owner, profile)
+    assert providers.catalog_status()["displaced"] == {"other": ["m1"]}
