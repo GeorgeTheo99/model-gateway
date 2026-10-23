@@ -28,7 +28,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from src.admin import router as admin_router
 from src.auth import require_client_auth, require_consumer_auth, validate_credential_separation
 from src.errors import upstream_error, upstream_error_openai
-from src.providers import effective_model_inventory, list_available_models, list_models as list_routable_models, model_availability, pool_candidates, pricing_for, pricing_status_for, provider_quirks, resolve, retirement_redirect, snapshot_registry as snapshot_provider_registry
+from src.providers import effective_model_inventory, list_available_models, list_models as list_routable_models, model_availability, pool_candidates, pricing_for, pricing_status_for, provider_quirks, resolve, retirement_redirect, base_model_route, snapshot_registry as snapshot_provider_registry
 from src.upstream import (
     PoolContext,
     _retry_post,
@@ -2332,17 +2332,23 @@ _LEDGER_PATHS = {"/v1/chat/completions", "/v1/messages", "/v1/responses"}
 
 
 def _redirect_retired_model(request: Request, body: dict) -> str:
-    """Serve a retired model name through its successor, noted for the response headers.
+    """The concrete model a request is served by (docs/adr/0002-layered-model-catalog.md).
 
-    Profile executions route by their registered bindings and are never redirected.
+    A retired name is served by its successor, noted for the response headers; a
+    base-model name by its route. The body names the concrete route, so pricing,
+    the ledger and pool failover see the model actually used. Profile executions
+    route by their registered bindings and are never rewritten.
     """
     model = body.get("model", "")
     if not isinstance(model, str) or getattr(request.state, "profile_execution", None) is not None:
         return model
     successor = retirement_redirect(model)
-    if successor is None:
-        return model
-    request.state.model_redirect = (model, successor)
+    if successor is not None:
+        request.state.model_redirect = (model, successor)
+    else:
+        successor = base_model_route(model)
+        if successor is None:
+            return model
     body["model"] = successor
     return successor
 
@@ -2897,8 +2903,12 @@ async def register_catalog_pack(namespace: str, request: Request):
     def mutate():
         registered = packs.load()
         others = {ns: pack for ns, pack in registered.items() if ns != namespace}
-        layer = shipped.layer(config_io.load_config_full(), include_packs=False)
-        registered[namespace] = packs.validate(namespace, body, shipped_rows=layer.entries, other_packs=others)
+        overlay = config_io.load_config_full().get("models")
+        owner_rows = [row for row in [*(config_io.load_model_info().get("llm") or []),
+                                      *(overlay if isinstance(overlay, list) else [])] if isinstance(row, dict)]
+        registered[namespace] = packs.validate(
+            namespace, body, shipped_rows=shipped.all_shipped_rows(), owner_rows=owner_rows, other_packs=others,
+        )
         packs.write(registered)
         return registered[namespace]
 

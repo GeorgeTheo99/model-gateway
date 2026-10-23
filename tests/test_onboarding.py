@@ -446,3 +446,17 @@ def test_validate_upstream_rejects_missing_model(monkeypatch):
     monkeypatch.setattr(onboarding.httpx, "get", lambda *args, **kwargs: Response())
     with pytest.raises(onboarding.OnboardingError, match="does not advertise"):
         onboarding.validate_upstream_models(_profile(), "secret")
+
+
+def test_applying_a_curated_profile_resets_its_models_to_the_release(tmp_path):
+    """Curated models load by reference (ADR 0002): the CLI writes no copies of them."""
+    config, model_info, source = _files(tmp_path)
+    rows = json.loads(model_info.read_text())["llm"]
+    model_info.write_text(json.dumps({"llm": [*rows, {"name": "new-model", "provider": "new-provider",
+                                                      "provider_model_id": "new-upstream", "desc": "owner edit"}]}))
+    profile = {**_profile(), "auto_add": True}
+    onboarding.apply_profile(profile, config_path=config, model_info_path=model_info, model_info_source_path=source,
+                             api_key="secret", check_upstream=False, confirmed_retirements={"old-model"},
+                             confirmed_replacements={"new-model"}, allow_metadata_removal=True)
+    assert json.loads(model_info.read_text())["llm"] == []
+    assert yaml.safe_load(config.read_text())["providers"]["new-provider"]["base_url"] == "https://api.example.com/v1"

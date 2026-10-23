@@ -106,8 +106,8 @@ class ProviderInfo:
 _config: dict | None = None
 _models: dict[str, dict] | None = None
 _retired: dict[str, str | None] = {}  # retired name -> replacement, loaded with _models
-# The registry last loaded successfully, served when a lazy reload fails (ADR 0002 R7).
-_last_good: tuple[dict, dict[str, dict], dict[str, str | None]] | None = None
+# The models last loaded successfully, served when a lazy reload fails (ADR 0002 R7).
+_last_good: tuple[dict[str, dict], dict[str, str | None]] | None = None
 _load_error: str | None = None
 
 # OAuth token auto-refresh via an external CLI token cache (opt-in per provider
@@ -301,19 +301,21 @@ def _load_models(*, strict: bool = False) -> dict[str, dict]:
     A failed load keeps serving the last good registry and records the error
     (:func:`catalog_status`), unless ``strict`` validation asked for the error.
     """
-    global _config, _models, _retired, _last_good, _load_error
+    global _models, _retired, _last_good, _load_error
     if _models is not None:
         return _models
     try:
         _build_models()
     except Exception as exc:
-        if strict or _last_good is None:
+        # Only the catalog falls back. A config that does not parse still fails, and a
+        # parsed one is kept, so credential and provider changes are never reverted.
+        if strict or _last_good is None or _config is None:
             raise
-        _config, _models, _retired = _last_good
+        _models, _retired = _last_good
         _load_error = str(exc)
         log.error("model catalog failed to load; serving the last good catalog: %s", exc)
         return _models
-    _last_good, _load_error = (_config, _models, _retired), None
+    _last_good, _load_error = (_models, _retired), None
     return _models
 
 
@@ -352,7 +354,7 @@ def catalog_status() -> dict:
         entries = {id(v): v for v in _load_models().values()}.values()
     except Exception as exc:  # noqa: BLE001
         return {"load_error": str(exc), "review": [], "stale_overrides": {}, "override_errors": {}, "retired": {},
-                "packs": {}}
+                "retired_owner_rows": [], "packs": {}}
     origins = {entry["name"]: entry.get("origin") or {} for entry in entries}
     return {
         "load_error": _load_error,
@@ -362,6 +364,9 @@ def catalog_status() -> dict:
         "override_errors": {name: origin["override_error"] for name, origin in origins.items()
                             if origin.get("override_error")},
         "retired": dict(_retired),
+        # The owner's own rows under a name a release retired: they keep working.
+        "retired_owner_rows": sorted(name for name, origin in origins.items()
+                                     if name in _retired and origin.get("layer") == "owner"),
         "packs": _pack_summary(),
     }
 
@@ -460,16 +465,21 @@ def _is_model_enabled(name: str | None) -> bool:
 
 
 @_registry_locked
-def snapshot_registry() -> tuple[dict, dict[str, dict], dict[str, str | None]]:
-    """Validate and capture the loaded registry so a rejected admin reload can roll back."""
-    return _load_config(), _load_models(strict=True), _retired
+def snapshot_registry() -> tuple:
+    """Validate and capture the loaded registry so a rejected admin reload can roll back.
+
+    The snapshot includes the last good models, so a candidate rejected after
+    loading can never become what a later failed reload serves.
+    """
+    models = _load_models(strict=True)
+    return _load_config(), models, _retired, _last_good, _load_error
 
 
 @_registry_locked
-def restore_registry(snapshot: tuple[dict, dict[str, dict], dict[str, str | None]]) -> None:
+def restore_registry(snapshot: tuple) -> None:
     """Restore a snapshot returned by :func:`snapshot_registry`."""
-    global _config, _models, _retired
-    _config, _models, _retired = snapshot
+    global _config, _models, _retired, _last_good, _load_error
+    _config, _models, _retired, _last_good, _load_error = snapshot
 
 
 @_registry_locked
@@ -826,6 +836,15 @@ def _availability_for_entry(model_id: str, entry: dict | None) -> dict:
 
     name = entry.get("name") or model_id
     provider = _pool_members(entry, _load_config())[0]
+    override_error = (entry.get("origin") or {}).get("override_error")
+    if override_error:
+        return {
+            "available": False,
+            "reason": "override_invalid",
+            "model": name,
+            "provider": provider,
+            "message": f"Model {name!r} has an owner override this release no longer accepts: {override_error}",
+        }
     if not _is_model_enabled(name):
         return {
             "available": False,
@@ -967,7 +986,6 @@ def preview_pool_member(
 
 
 @_registry_locked
-@_registry_locked
 def retirement_redirect(model_id: str) -> str | None:
     """The available successor a retired, unpinned name is served by (docs/adr/0002-layered-model-catalog.md)."""
     models = _load_models()
@@ -992,7 +1010,9 @@ def resolve_base_model(model_id: str, *, locality: str | None = None) -> str | N
     """
     models = _load_models()
     preference = shipped.provider_preference(_load_config())
-    entries = [entry for entry in {id(v): v for v in models.values()}.values() if entry.get("base_model") == model_id]
+    # Pack routes never answer a base-model name: a consumer must not steer other consumers' traffic.
+    entries = [entry for entry in {id(v): v for v in models.values()}.values()
+               if entry.get("base_model") == model_id and (entry.get("origin") or {}).get("layer") != "pack"]
     if locality is not None:
         entries = [entry for entry in entries
                    if (_canonical_provider(entry.get("provider")) == "omlx") == (locality == "local_only")]
@@ -1007,6 +1027,24 @@ def resolve_base_model(model_id: str, *, locality: str | None = None) -> str | N
     return None
 
 
+@_registry_locked
+def base_model_route(model_id: str) -> str | None:
+    """The route serving ``model_id`` as a base-model reference, when it is not served as named.
+
+    A provider-specific route name is never rerouted (that could change retention
+    or cost), nor is a model the owner turned off.
+    """
+    entry = _load_models().get(model_id)
+    availability = _availability_for_entry(model_id, entry)
+    if availability["available"] or availability["reason"] == "model_disabled":
+        return None
+    if entry is not None and entry.get("base_model") != model_id:
+        return None
+    route = resolve_base_model(model_id)
+    return route if route != model_id else None
+
+
+@_registry_locked
 def resolve(model_id: str, provider_override: str | None = None) -> ProviderInfo | None:
     """Resolve a model name/alias/id to provider info.
 
@@ -1019,14 +1057,9 @@ def resolve(model_id: str, provider_override: str | None = None) -> ProviderInfo
     entry = models.get(model_id)
     availability = _availability_for_entry(model_id, entry)
     if not availability["available"]:
-        # A base-model reference is served by an available route of that base model. A
-        # provider-specific route name is not rerouted (that could change retention or
-        # cost), nor is a model the owner turned off.
-        if availability["reason"] != "model_disabled" and provider_override is None:
-            is_base = entry is None or entry.get("base_model") == model_id
-            route = resolve_base_model(model_id) if is_base else None
-            if route is not None and route != model_id:
-                return resolve(route)
+        route = base_model_route(model_id) if provider_override is None else None
+        if route is not None:
+            return resolve(route)
         if availability["reason"] == "model_not_found":
             return None
         log.info("Model %r unavailable: %s", model_id, availability["message"])

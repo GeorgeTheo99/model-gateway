@@ -106,7 +106,7 @@ def _export_targets(config: dict, args) -> dict[str, Path | None]:
     }
 
 
-def _merged_entries(model_info_path: Path, config: dict) -> list[dict]:
+def _merged_entries(model_info_path: Path, config: dict, config_path: Path | None = None) -> list[dict]:
     """Return the merged catalog (shipped layer + model-info.json + config.yaml models: overlay).
 
     Uses the same merge as the gateway router (``src.catalog``). Falls back to
@@ -117,7 +117,7 @@ def _merged_entries(model_info_path: Path, config: dict) -> list[dict]:
     if not isinstance(overlay, list):
         raise ValueError("config models overlay must be a list")
     if catalog_mod is not None:
-        layer = shipped_mod.layer(config)
+        layer = shipped_mod.layer(config, config_path=config_path)
         return catalog_mod.load_catalog_entries(
             model_info_path, overlay=overlay, shipped=layer.entries, shipped_names=layer.names,
             excluded=layer.hidden | frozenset(layer.retired),
@@ -514,7 +514,7 @@ def main() -> int:
     if not args.model_info.exists():
         sys.exit(f"export_catalogs: model-info.json not found: {args.model_info}")
     try:
-        entries = _merged_entries(args.model_info, config)
+        entries = _merged_entries(args.model_info, config, args.config)
     except ValueError as exc:
         parser.error(str(exc))
     exported = _exported_models(entries)

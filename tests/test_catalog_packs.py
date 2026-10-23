@@ -126,14 +126,69 @@ def test_re_registering_replaces_and_delete_removes(gateway):
     assert client.delete("/v1/catalog/packs/ha", headers=HA).status_code == 404
 
 
-def test_migration_drops_an_owner_copy_of_a_pack_model(gateway):
+def test_a_pack_never_removes_or_rewrites_owner_models(gateway):
     client, info = gateway
-    info.write_text(json.dumps({"llm": [dict(QWEN)], "allow_empty": True}))  # a legacy import's copy
+    mine = {"name": "mine", "provider": "omlx", "omlx_id": "local-x", "pricing_status": "unmetered"}
+    info.write_text(json.dumps({"llm": [dict(QWEN), mine], "allow_empty": True}))  # QWEN: a legacy import's copy
     providers.reload()
-    # The owner's row does not block the pack; it wins (here it is identical).
+    # Declaring the owner's identical copy is allowed; taking the owner's other model is not.
     assert client.put("/v1/catalog/packs/ha", headers=HA, json=_pack(QWEN)).status_code == 200
-    assert providers._load_models()["qwen-local"]["origin"]["overridden"] == []
-    with TestClient(app):  # startup migration
+    taken = client.put("/v1/catalog/packs/myai", headers=MYAI, json=_pack(
+        {**mine, "omlx_id": "attacker", "vision": True}, namespace="myai"))
+    assert taken.status_code == 409 and taken.json()["error"]["code"] == "pack_conflict"
+    with TestClient(app):  # the startup migration ignores packs
         pass
-    assert json.loads(info.read_text())["llm"] == []
-    assert providers._load_models()["qwen-local"]["origin"] == {"layer": "pack", "namespace": "ha"}
+    assert client.delete("/v1/catalog/packs/ha", headers=HA).status_code == 204
+    assert json.loads(info.read_text())["llm"] == [QWEN, mine]
+    assert providers.resolve("qwen-local").provider_model_id == "qwen-8bit"
+    assert providers.resolve("mine").provider_model_id == "local-x"
+
+
+@pytest.mark.parametrize("field", ["system_instruction", "quirks", "pool", "api_style", "fallbacks"])
+def test_pack_models_cannot_set_fields_that_reach_other_consumers(gateway, field):
+    client, _info = gateway
+    response = client.put("/v1/catalog/packs/ha", headers=HA, json=_pack({**QWEN, field: "x"}))
+    assert response.status_code == 422 and field in response.text
+
+
+def test_base_model_names_stay_with_the_release_and_the_owner(gateway):
+    client, _info = gateway
+    # A pack model named after a shipped base model, or routing that base model, steers nothing.
+    named = client.put("/v1/catalog/packs/myai", headers=MYAI, json=_pack({**QWEN, "name": "cloud"}, namespace="myai"))
+    assert named.status_code == 409
+    routed = {**QWEN, "family": "cloud", "base_model": "cloud"}
+    assert client.put("/v1/catalog/packs/myai", headers=MYAI, json=_pack(routed, namespace="myai")).status_code == 200
+    providers.CONFIG_PATH.write_text(yaml.safe_dump({
+        **yaml.safe_load(providers.CONFIG_PATH.read_text()), "catalog": {"provider_preference": ["omlx"]}}))
+    providers.reload()
+    assert providers.resolve_base_model("cloud") == "cloud-fw"
+
+
+def test_identifiers_of_shipped_models_not_loaded_here_are_reserved(gateway, monkeypatch):
+    client, _info = gateway
+    other = onboarding.validate_profile({
+        "schema_version": 1, "id": "other-curated", "auto_add": True,
+        "provider": {"id": "other", "base_url": "https://other.test/v1", "protocol": "openai"},
+        "models": [{"name": "other-m", "provider": "other", "provider_model_id": "up/other-m"}],
+    })
+    curated = shipped._packaged()
+    monkeypatch.setattr(shipped, "_packaged", lambda: {**curated, "other-curated": other})
+    providers.reload()
+    assert "other-m" not in providers._load_models()  # no key for "other" yet
+    response = client.put("/v1/catalog/packs/ha", headers=HA, json=_pack({**QWEN, "name": "other-m"}))
+    assert response.status_code == 409
+
+
+def test_a_release_that_ships_a_pack_identifier_wins_without_breaking_the_catalog(gateway, monkeypatch):
+    client, _info = gateway
+    assert client.put("/v1/catalog/packs/ha", headers=HA, json=_pack({**QWEN, "name": "later"})).status_code == 200
+    later = onboarding.validate_profile({
+        "schema_version": 1, "id": "later-curated", "auto_add": True,
+        "provider": {"id": "example", "base_url": BASE_URL, "protocol": "openai"},
+        "models": [{"name": "later", "provider": "example", "provider_model_id": "up/later",
+                    "pricing": {"input": 1.0, "output": 2.0}}],
+    })
+    curated = shipped._packaged()
+    monkeypatch.setattr(shipped, "_packaged", lambda: {**curated, "later-curated": later})
+    providers.reload()
+    assert providers._load_models()["later"]["origin"]["layer"] == "shipped"

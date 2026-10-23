@@ -33,6 +33,7 @@ import yaml
 
 from src.catalog import (
     OWNER_META_FIELDS,
+    ROUTE_FIELDS,
     canonical_provider,
     normalize_thinking_capabilities,
     validate_client_metadata,
@@ -1184,6 +1185,12 @@ def loaded_shipped_rows() -> list[dict]:
     ]
 
 
+def reserved_names() -> frozenset[str]:
+    """Hidden and retired names (call under the write lock)."""
+    layer = _shipped_state()
+    return layer.hidden | frozenset(layer.retired)
+
+
 def _update_catalog_names(add: dict[str, str] | None = None, remove: dict[str, str] | None = None) -> bool:
     """Add/remove names in config ``catalog.hidden``/``catalog.pinned`` (``{name: list}``); True if written."""
     config = load_config_full()
@@ -1287,7 +1294,10 @@ def upsert_model(name: str, **fields) -> dict:
             if field != "name" and entry.get(field) != shipped_row.get(field)
         )
         llm = [e for e in llm if e.get("name") != name]
-        if differing:
+        if set(differing) & set(ROUTE_FIELDS):
+            # Another route under this name is the owner's own model, not an override.
+            llm.append({k: v for k, v in entry.items() if k not in OWNER_META_FIELDS})
+        elif differing:
             llm.append({
                 "name": name,
                 # A field the owner removed is stored as null so the shipped value stays out.
@@ -1479,6 +1489,7 @@ def shipped_migration_pending(loaded: dict[str, dict]) -> bool:
     """Whether :func:`migrate_to_shipped_layer` has anything to do (a read-only check)."""
     return auto_add_state_path().exists() or any(
         isinstance(row, dict) and row.get("name") in loaded and "shipped_base" not in row and "review" not in row
+        and not any(field in row and row[field] != loaded[row["name"]].get(field) for field in ROUTE_FIELDS)
         for row in load_model_info().get("llm") or []
     )
 
@@ -1505,8 +1516,9 @@ def migrate_to_shipped_layer(loaded: dict[str, dict], shipped_names: frozenset[s
     review: list[str] = []
     for row in rows:
         base = loaded.get(row.get("name")) if isinstance(row, dict) else None
-        if base is None or "shipped_base" in row or "review" in row:
-            kept.append(row)
+        if (base is None or "shipped_base" in row or "review" in row
+                or any(field in row and row[field] != base.get(field) for field in ROUTE_FIELDS)):
+            kept.append(row)  # not a copy of it: another route under its name stays whole
             continue
         differing = [field for field in row if field != "name" and row[field] != base.get(field)]
         if not differing:

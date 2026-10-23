@@ -427,7 +427,10 @@ def _build_candidates(profile: dict, config: dict, model_doc: dict, *, secret_fi
         and current_by_name[str(model["name"])].get("provider_model_id") == model.get("provider_model_id")
         for model in models
     )
-    if missing_retired and not replacement_already_present:
+    # A curated profile's models load by reference (docs/adr/0002-layered-model-catalog.md):
+    # applying it resets them to the release, and the release handles its retirements.
+    curated = bool(profile.get("auto_add"))
+    if missing_retired and not replacement_already_present and not curated:
         raise OnboardingError(
             "expected retired model(s) not found: " + ", ".join(sorted(missing_retired))
         )
@@ -464,7 +467,8 @@ def _build_candidates(profile: dict, config: dict, model_doc: dict, *, secret_fi
         dict(row) for row in current_llm
         if isinstance(row, dict) and row.get("name") not in retired | new_names
     ]
-    llm.extend(models)
+    if not curated:
+        llm.extend(models)
     candidate_doc["llm"] = llm
     candidate_doc["updated"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
 

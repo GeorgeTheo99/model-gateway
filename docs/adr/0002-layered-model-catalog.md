@@ -35,21 +35,27 @@ Nothing from a lower layer is copied into a higher one.
 - An owner row whose `name` is a shipped model is an **override**: it is merged
   over the shipped row (`{**shipped, **owner}`), so fields it does not set keep
   receiving shipped updates.
+- An owner row that changes where the model routes (`provider`, `pool`,
+  `provider_model_id`, `omlx_id`) is the owner's own model and **replaces** the
+  shipped row; nothing is merged into it. Admin saves store it whole.
+- An override a release invalidates leaves the model **unavailable**
+  (`override_invalid`) instead of serving the shipped row.
 - Admin writes store overrides sparsely, with `shipped_base` recording the shipped
   value each overridden field replaced. The effective entry reports
   `origin.stale_overrides` when the shipped value has since changed
   ("update available under your override").
 - A legacy full copy of a shipped row merges to the same result, so installs load
   before migration.
-- A sparse override whose shipped row is not currently included is ignored, not
-  promoted to a standalone model.
+- A sparse override (with `shipped_base` or `review`) whose shipped row is not
+  currently loaded is ignored, never promoted to a standalone model.
 
 ### Identifiers (R6)
 
-Resolution is per identifier. An owner row may claim a shipped row's `alias`,
-`alternate_ids`, or upstream id; the shipped row loses only that identifier.
-Claiming a shipped row's `name` shadows the whole shipped row. Collisions inside
-one layer remain an error; shipped collisions are a release bug caught by tests.
+Resolution is per identifier. An owner row may claim a shipped row's `alias` or
+`alternate_ids`; the shipped row loses only that identifier, including when it
+is merged under an override. Claiming a shipped row's `name` or upstream id
+replaces the whole shipped row. Collisions inside one layer remain an error;
+shipped collisions are a release bug caught by tests.
 
 ### Which shipped models load
 
@@ -58,9 +64,9 @@ one layer remain an error; shipped collisions are a release bug caught by tests.
 - With `all`, a shipped model loads when its profile's provider is turned on,
   uses the profile's endpoint and protocol, and has a key — the same rule
   `auto_add` used. A release therefore **auto-enables** new shipped models.
-- With `none` or a list, only the named shipped models (plus pack `requires`)
-  load; new shipped models are not enabled. Named models are still references,
-  so their fixes and retirements still apply.
+- With `none` or a list, only the named shipped models load; new shipped models
+  are not enabled. Named models are still references, so their fixes and
+  retirements still apply. Pack `requires` are reported, never loaded for it.
 - Deleting a shipped model adds it to `catalog.hidden`; the replaced
   `auto-added-models.json` ledger is migrated into it.
 
@@ -68,9 +74,12 @@ one layer remain an error; shipped collisions are a release bug caught by tests.
 
 - A shipped profile retires names with `retire.models` and may map each to a
   successor with `retire.replaced_by: {old: new}`.
-- A retired name is hidden from every listing and export in every layer unless
-  it is in `catalog.pinned`. Saving a model with a retired name through the admin
-  API pins it (an owner action wins).
+- A retired name is hidden from every listing and export unless it is in
+  `catalog.pinned`. Retirement and `catalog.hidden` apply to shipped and pack
+  models only: an owner's own row under a retired name keeps working and is listed
+  in admin status (`retired_owner_rows`). Saving a model with a retired name
+  through the admin API pins it; create-only registration cannot reuse a hidden
+  or retired name.
 - A request for a retired, unpinned name is redirected to its `replaced_by` when
   that model is available, with `Deprecation: true` and a
   `X-Model-Gateway-Model-Redirect` header. Without a replacement it is not found.
@@ -85,7 +94,9 @@ gateway resolves it to an available route, preferring the owner's
 - A route name is never rerouted to another provider (that could change
   retention or cost); only a base-model name is, including a route named after
   its base model when that route is unavailable. A model the owner turned off is
-  not rerouted.
+  not rerouted. Requests are rewritten to the concrete route, so pricing, the
+  ledger and pool failover see the model used. Pack routes never answer a
+  base-model name.
 - A consumer profile route may name a base model. Registration binds it to the
   route available then, within the profile's locality, and stores that route, so
   ADR 0001's snapshot binding is unchanged; re-registering picks up a new
@@ -98,9 +109,18 @@ A pack is a per-namespace snapshot (`schema_version`, `namespace`,
 `PUT /v1/catalog/packs/{namespace}` by a consumer credential holding
 `profiles:write` on that namespace (a product's routing policy and the models it
 needs ship together). It is stored in `catalog-packs.json` beside `config.yaml`
-and replaced whole on each registration. Pack models cannot take a shipped or
-another pack's identifier (409); the owner can override or hide pack models like
-shipped ones. `requires` lists shipped models or base models the pack's profiles
+and replaced whole on each registration.
+
+- Pack models may set only route, capability, pricing and label fields; fields
+  that reach other consumers (`system_instruction`, `quirks`, `pool`,
+  `api_style`, ...) stay with the owner.
+- They cannot reuse an identifier or base-model name of any shipped model
+  (loaded here or not), of the owner's catalog (except an identical copy, as an
+  older install's import left), or of another pack (409).
+- A release that later ships a pack model's identifier wins; the pack model
+  yields instead of failing the catalog.
+- The owner can override or hide pack models like shipped ones. The startup
+  migration never treats pack rows as shipped, so a pack cannot remove owner rows. `requires` lists shipped models or base models the pack's profiles
 need; unmet requirements are reported (`unmet_requires` on the pack and in admin
 status), never forced on — the owner still wins.
 
@@ -109,8 +129,11 @@ status), never forced on — the owner still wins.
 An invalid owner layer never silently falls back to shipped-only:
 
 - Admin writes and `/admin/api/reload` validate strictly and roll back, as before.
-- Any other reload that fails keeps serving the last good registry and reports
-  `catalog.load_error` in admin status.
+- Any other reload whose catalog fails keeps serving the last good models with
+  the newly loaded config (credential and provider changes are never reverted;
+  a config that does not parse still fails) and reports `catalog.load_error`.
+  The last good models are part of each registry snapshot, so a candidate an
+  admin write rejected never becomes them.
 - An override a release invalidates (for example a thinking level the shipped row
   no longer allows) is skipped for that model only; the shipped row loads and
   `origin.override_error` / `catalog.override_errors` say why.

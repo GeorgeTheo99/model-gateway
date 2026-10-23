@@ -805,6 +805,9 @@ def _require_model_absent(model_name: str, body: dict) -> None:
     for entry in entries:
         if candidate_ids.intersection(entry_routable_ids(entry)):
             raise HTTPException(status_code=412, detail="Model identifier already exists")
+    # Re-creating a hidden or retired name would unhide or pin it: an owner decision, not a create.
+    if candidate_ids.intersection(config_io.reserved_names()):
+        raise HTTPException(status_code=412, detail="Model identifier is hidden or retired; only a full update can restore it")
 
 
 @router.put("/admin/api/models/{model_name}")
@@ -1056,7 +1059,8 @@ def migrate_catalog() -> dict:
     """
     import src.providers as providers
 
-    layer = shipped.layer(providers._load_config())
+    # Only release rows: a consumer pack must never be able to remove an owner row.
+    layer = shipped.layer(providers._load_config(), include_packs=False)
     loaded = {row["name"]: {k: v for k, v in row.items() if k != "origin"} for row in layer.entries}
     if not config_io.shipped_migration_pending(loaded):
         return {}
@@ -2721,7 +2725,8 @@ _ADMIN_HTML = r"""
               role="tab"
               data-tab="connections"
               aria-controls="panel-connections"
-     tabindex="-1"
+              aria-selected="false"
+              tabindex="-1"
             >
               Connections</button
             ><button

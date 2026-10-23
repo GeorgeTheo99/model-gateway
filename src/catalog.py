@@ -303,32 +303,58 @@ def _load_overlay(config_path: Path) -> list[dict]:
 
 # Owner-row bookkeeping (ADR 0002). ``origin`` is computed, never trusted from a file.
 OWNER_META_FIELDS = frozenset({"shipped_base", "review", "origin"})
+# Fields that say where a model routes. An owner row that changes one replaces the
+# lower row outright; merging the rest of a different route over it could misroute.
+ROUTE_FIELDS = ("provider", "pool", "provider_model_id", "omlx_id")
+_ID_FIELDS = ("name", "alias", "provider_model_id", "omlx_id", "alternate_ids", "provider")
+LOWER_LAYERS = frozenset({"shipped", "pack"})
+
+
+def _alternates(row: dict) -> list:
+    value = row.get("alternate_ids") or []
+    return [value] if isinstance(value, str) else list(value)
+
+
+def _strip_ids(row: dict, claimed: set[str]) -> dict:
+    """``row`` without the alias/alternate ids in ``claimed``."""
+    row = dict(row)
+    if row.get("alias") in claimed:
+        row.pop("alias")
+    if row.get("alternate_ids"):
+        row["alternate_ids"] = [value for value in _alternates(row) if value not in claimed]
+    return row
 
 
 def _fold_shipped(shipped: list[dict], owner: list[dict], shipped_names: frozenset[str]) -> list[dict]:
-    """Merge owner rows over the shipped layer: the owner wins per field and per identifier.
+    """Merge owner rows over the lower layers (shipped, then packs): the owner wins.
 
-    An owner row named after a loaded shipped model overrides only the fields it
-    sets. A sparse override (one recording ``shipped_base``/``review``, or with no
-    provider) of a shipped model that is not loaded here is ignored rather than
-    promoted to a model. An owner identifier that is a shipped row's alias or
-    alternate id moves to the owner; one that is its name or upstream id shadows
-    that shipped row.
+    An owner row named after a loaded lower model overrides only the fields it
+    sets, unless it changes the route (:data:`ROUTE_FIELDS`): then it replaces
+    that model. An override that no longer validates leaves the model
+    unavailable (``origin.override_error``) rather than serving the lower row. A
+    row recording ``shipped_base``/``review`` is an override and never loads on
+    its own. Identifiers the owner sets win per identifier: another model's
+    alias or alternate id moves to the owner; its name or upstream id makes the
+    owner's row replace it.
     """
     by_name = {row["name"]: row for row in shipped}
-    folded: list[dict] = []
-    overridden: set[str] = set()
+    folded: list[tuple[dict, set[str], dict | None]] = []  # (row, owner-set ids, lower row it merges)
+    replaced: set[str] = set()
     for row in owner:
         name = row.get("name")
         fields = {k: v for k, v in row.items() if k not in OWNER_META_FIELDS}
+        own_ids = set(entry_routable_ids({k: fields[k] for k in _ID_FIELDS if k in fields}))
+        bookkeeping = "shipped_base" in row or "review" in row
         base = by_name.get(name) if isinstance(name, str) else None
         if base is None:
-            sparse = "shipped_base" in row or "review" in row or not row.get("provider")
-            if name in shipped_names and sparse:
-                continue
-            folded.append({**fields, "origin": {"layer": "owner"}})
+            if bookkeeping or (name in shipped_names and not row.get("provider")):
+                continue  # an override whose lower model is not loaded here
+            folded.append(({**fields, "origin": {"layer": "owner"}}, own_ids, None))
             continue
-        overridden.add(name)
+        replaced.add(name)
+        if any(field in fields and fields[field] != base.get(field) for field in ROUTE_FIELDS):
+            folded.append(({**fields, "origin": {"layer": "owner"}}, own_ids, None))
+            continue
         merged = {**base, **fields}
         if "thinking" in fields and fields["thinking"] != base.get("thinking") and "thinking_levels" not in fields:
             merged.pop("thinking_levels", None)
@@ -339,34 +365,34 @@ def _fold_shipped(shipped: list[dict], owner: list[dict], shipped_names: frozens
         if row.get("review") is True:
             origin["review"] = True
         try:
-            # A release can change the row under a once-valid override; keep the shipped row then.
             validate_pricing_policy(merged)
             validate_client_metadata(merged)
             normalize_thinking_capabilities(merged)
         except ValueError as exc:
-            merged = {**base, "origin": {**base["origin"], "override_error": str(exc)}}
-        else:
-            merged["origin"] = origin
-        folded.append(merged)
+            # A release changed the row under a once-valid override. Fail closed: the
+            # lower row's data, unavailable, with the reason.
+            merged, origin = dict(base), {**origin, "override_error": str(exc)}
+        merged["origin"] = origin
+        folded.append((merged, own_ids, base))
+    # Identifiers a merged row takes from its lower row yield to ones another owner row sets.
+    result: list[dict] = []
+    for index, (row, _own, base) in enumerate(folded):
+        if base is not None:
+            others = set().union(*(own for i, (_r, own, _b) in enumerate(folded) if i != index))
+            row = _strip_ids(row, others - _own)
+        result.append(row)
     claimed: set[str] = set()
-    for row in folded:
+    for row in result:
         claimed.update(entry_routable_ids(row))
     kept: list[dict] = []
     for row in shipped:
-        if row["name"] in overridden:
+        if row["name"] in replaced:
             continue
-        alternates = row.get("alternate_ids") or []
-        alternates = [alternates] if isinstance(alternates, str) else list(alternates)
-        movable = {str(row.get("alias") or ""), *alternates}
+        movable = {str(row.get("alias") or ""), *_alternates(row)}
         if any(model_id in claimed for model_id in entry_routable_ids(row) if model_id not in movable):
             continue
-        row = dict(row)
-        if row.get("alias") in claimed:
-            row.pop("alias")
-        if alternates:
-            row["alternate_ids"] = [value for value in alternates if value not in claimed]
-        kept.append(row)
-    return kept + folded
+        kept.append(_strip_ids(row, claimed))
+    return kept + result
 
 
 def load_catalog_entries(
@@ -399,8 +425,8 @@ def load_catalog_entries(
 
     ``shipped`` rows (see :mod:`src.shipped`) load beneath the owner's catalog,
     which wins per field and per identifier (:func:`_fold_shipped`).
-    ``shipped_names`` lists every shipped name, loaded or not. Names in
-    ``excluded`` (hidden or retired) are dropped from the result.
+    ``shipped_names`` lists every shipped name, loaded or not. Shipped and pack
+    models named in ``excluded`` (hidden or retired) are dropped from the result.
 
     ``include_retired`` defaults to False, skipping GGUF/llama.cpp entries to
     match the gateway router. Generators that want the full raw catalog
@@ -515,7 +541,12 @@ def load_catalog_entries(
         if primary is not None and primary not in order:
             order.append(primary)
 
-    result = [by_id[primary] for primary in order if by_id[primary].get("name") not in excluded]
+    # Hiding and retirement apply to shipped and pack models; the owner's own rows always load.
+    result = [
+        by_id[primary] for primary in order
+        if by_id[primary].get("name") not in excluded
+        or (by_id[primary].get("origin") or {}).get("layer") not in LOWER_LAYERS
+    ]
     if require_nonempty and not result and not allows_empty(model_info_path):
         raise ValueError("effective model catalog is empty")
     return result

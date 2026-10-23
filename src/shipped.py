@@ -88,10 +88,16 @@ def _packaged() -> dict[str, dict]:
     return packaged_profiles()
 
 
-def _registered_packs() -> dict[str, dict]:
+def _registered_packs(config_path=None) -> dict[str, dict]:
     from src import packs
 
-    return packs.load()
+    return packs.load(config_path)
+
+
+def all_shipped_rows(profiles: dict[str, dict] | None = None) -> list[dict]:
+    """Every model a release ships, loaded on this install or not."""
+    profiles = _packaged() if profiles is None else profiles
+    return [model for profile in profiles.values() if profile.get("auto_add") for model in profile["models"]]
 
 
 def layer(
@@ -100,6 +106,7 @@ def layer(
     profiles: dict[str, dict] | None = None,
     ready: Callable[[dict, dict], bool] = provider_ready,
     include_packs: bool = True,
+    config_path=None,
 ) -> ShippedLayer:
     """Compute the rows beneath the owner's catalog: shipped, then consumer packs (src.packs)."""
     if profiles is None:
@@ -130,8 +137,14 @@ def layer(
     # A name another profile still ships is alive, whatever an older profile retired.
     retired = {name: successor for name, successor in retired.items() if name not in names}
     if include_packs:
-        for namespace, pack in sorted(_registered_packs().items()):
+        from src.catalog import entry_routable_ids
+
+        shipped_ids = {model_id for row in entries for model_id in entry_routable_ids(row)}
+        for namespace, pack in sorted(_registered_packs(config_path).items()):
             for model in pack.get("models") or []:
+                # A release that later ships an identifier a pack uses wins; the pack model yields.
+                if shipped_ids.intersection(entry_routable_ids(model)):
+                    continue
                 names.add(model["name"])
                 entries.append({**model, "origin": {"layer": "pack", "namespace": namespace}})
     return ShippedLayer(entries, frozenset(names), retired, hidden)

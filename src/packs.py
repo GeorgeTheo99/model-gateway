@@ -20,6 +20,15 @@ from src import catalog
 
 _NAMESPACE_RE = re.compile(r"^[a-z0-9-]{1,32}$")
 _FIELDS = {"schema_version", "namespace", "source_revision", "models", "requires"}
+# What a pack model may describe: its route, capabilities, pricing and labels. Fields
+# that reach other consumers' requests or routing (system_instruction, quirks, pool,
+# api_style, fallbacks, ...) stay with the owner.
+MODEL_FIELDS = frozenset({
+    "name", "provider", "provider_model_id", "omlx_id", "alias", "alternate_ids", "context",
+    "max_output_tokens", "thinking", "thinking_levels", "thinking_format", "vision", "pricing",
+    "pricing_status", "desc", "display_name", "zdr", "family", "base_model",
+    "params", "active", "format", "quant", "size_gb", "path", "hf_repo",
+})
 MAX_MODELS = 100
 MAX_REQUIRES = 50
 
@@ -30,15 +39,17 @@ class PackError(ValueError):
         self.status, self.code = status, code
 
 
-def path() -> Path:
-    import src.providers as providers
+def path(config_path: Path | None = None) -> Path:
+    if config_path is None:
+        import src.providers as providers
 
-    return providers.CONFIG_PATH.parent / "catalog-packs.json"
+        config_path = providers.CONFIG_PATH
+    return Path(config_path).parent / "catalog-packs.json"
 
 
-def load() -> dict[str, dict]:
+def load(config_path: Path | None = None) -> dict[str, dict]:
     """Registered packs by namespace (empty when none were registered)."""
-    target = path()
+    target = path(config_path)
     if not target.exists():
         return {}
     doc = json.loads(target.read_text())
@@ -48,8 +59,28 @@ def load() -> dict[str, dict]:
     return packs
 
 
-def validate(namespace: str, raw: object, *, shipped_rows: list[dict], other_packs: dict[str, dict]) -> dict:
-    """A normalized pack, or :class:`PackError` explaining why it cannot load."""
+def _normalized(row: dict) -> dict:
+    row = {**row, "provider": catalog.canonical_provider(row.get("provider"))}
+    catalog.validate_pricing_policy(row)
+    catalog.validate_client_metadata(row)
+    return catalog.normalize_thinking_capabilities(row)
+
+
+def validate(
+    namespace: str,
+    raw: object,
+    *,
+    shipped_rows: list[dict],
+    owner_rows: list[dict],
+    other_packs: dict[str, dict],
+) -> dict:
+    """A normalized pack, or :class:`PackError` explaining why it cannot load.
+
+    ``shipped_rows`` is every shipped row, loaded here or not, and ``owner_rows``
+    the owner's catalog and config overlay rows. A pack may not reuse their
+    identifiers or base-model names, except to declare a model the owner already
+    holds an identical copy of (an older install's import).
+    """
     def refuse(message: str, code: str = "invalid_pack", status: int = 422):
         raise PackError(status, code, message)
 
@@ -70,8 +101,17 @@ def validate(namespace: str, raw: object, *, shipped_rows: list[dict], other_pac
         refuse(f"pack requires must be a list of at most {MAX_REQUIRES} model names")
 
     taken: dict[str, str] = {}
-    for row in shipped_rows:
-        taken.update(dict.fromkeys(catalog.entry_routable_ids(row), "a shipped model"))
+    copies: dict[str, dict] = {}
+    for label, rows in (("a shipped model", shipped_rows), ("an owner model", owner_rows)):
+        for row in rows:
+            try:
+                taken.update(dict.fromkeys(catalog.entry_routable_ids(row), label))
+                if row.get("base_model"):
+                    taken.setdefault(str(row["base_model"]), f"{label}'s base model")
+                if label == "an owner model":
+                    copies[str(row.get("name"))] = _normalized(row)
+            except ValueError:
+                continue
     for other, pack in other_packs.items():
         for row in pack.get("models") or []:
             taken.update(dict.fromkeys(catalog.entry_routable_ids(row), f"pack {other!r}"))
@@ -80,20 +120,18 @@ def validate(namespace: str, raw: object, *, shipped_rows: list[dict], other_pac
         name = model.get("name")
         if not isinstance(name, str) or not name.strip():
             refuse("every pack model needs a name")
+        if set(model) - MODEL_FIELDS:
+            refuse(f"pack model {name!r} cannot set: " + ", ".join(sorted(set(model) - MODEL_FIELDS)))
         if not model.get("provider") or not (model.get("provider_model_id") or model.get("omlx_id")):
             refuse(f"pack model {name!r} needs provider and provider_model_id or omlx_id")
-        if catalog.OWNER_META_FIELDS & set(model):
-            refuse(f"pack model {name!r} cannot set origin or override bookkeeping")
         try:
-            row = {**model, "provider": catalog.canonical_provider(model["provider"])}
-            catalog.validate_pricing_policy(row)
-            catalog.validate_client_metadata(row)
-            row = catalog.normalize_thinking_capabilities(row)
+            row = _normalized(model)
             ids = catalog.entry_routable_ids(row)
         except ValueError as exc:
             refuse(str(exc))
+        identical_copy = copies.get(name) == row
         for model_id in ids:
-            if model_id in taken:
+            if model_id in taken and not (identical_copy and taken[model_id] == "an owner model"):
                 refuse(f"pack model {name!r} identifier {model_id!r} is used by {taken[model_id]}",
                        code="pack_conflict", status=409)
             taken[model_id] = f"pack model {name!r}"

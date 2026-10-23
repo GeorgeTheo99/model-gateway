@@ -103,17 +103,18 @@ def test_selection_mode(tmp_path, selection, expected):
     assert list(models) == expected
 
 
-def test_hidden_retired_and_pinned(tmp_path):
+def test_hidden_and_retired_apply_to_lower_layers_only(tmp_path):
     profiles = {
         "old": _profile([{"name": "other"}], profile_id="old",
                         retire={"models": ["gone", "pinned-one", "keeps"], "replaced_by": {"gone": "new"}}),
         "new": _profile([{"name": "new"}, {"name": "hide-me"}, {"name": "keeps"}], profile_id="new"),
     }
     owner = [{"name": n, "provider": "omlx", "omlx_id": n, "pricing_status": "unmetered"}
-             for n in ("gone", "pinned-one")]
-    config = {"catalog": {"hidden": ["hide-me"], "pinned": ["pinned-one"]}}
+             for n in ("gone", "pinned-one", "mine")]
+    config = {"catalog": {"hidden": ["hide-me", "mine"], "pinned": ["pinned-one"]}}
     models, layer = _entries(tmp_path, owner, profiles, config)
-    assert sorted(models) == ["keeps", "new", "other", "pinned-one"]
+    # The owner's own rows always load, retired or hidden names or not.
+    assert sorted(models) == ["gone", "keeps", "mine", "new", "other", "pinned-one"]
     # "keeps" is still shipped by a profile, so the older retirement does not apply.
     assert layer.retired == {"gone": "new"}
 
@@ -193,14 +194,34 @@ def _registry_with(tmp_path, monkeypatch, owner_rows, profile):
     return info
 
 
-def test_an_override_a_release_invalidates_falls_back_to_the_shipped_row(tmp_path, monkeypatch):
+def test_an_override_a_release_invalidates_leaves_the_model_unavailable(tmp_path, monkeypatch):
     # Valid when saved against an optional-thinking row; the release made thinking always-on.
     profile = _profile([{"name": "m1", "thinking": "always", "thinking_levels": ["low", "high"]}])
     _registry_with(tmp_path, monkeypatch, [{"name": "m1", "thinking_levels": ["off", "low"], "shipped_base": {}}], profile)
     entry = providers._load_models()["m1"]
-    assert entry["thinking_levels"] == ["low", "high"]
     assert "off" in entry["origin"]["override_error"]
+    assert providers.resolve("m1") is None  # fail closed, never the release's row instead
+    assert providers.model_availability("m1")["reason"] == "override_invalid"
     assert "m1" in providers.catalog_status()["override_errors"]
+
+
+def test_an_owner_route_replaces_the_lower_model_and_keeps_its_identifiers(tmp_path):
+    profiles = {"p": _profile([{"name": "cloud", "alias": "c"}, {"name": "glm-fw", "alias": "glm"}])}
+    owner = [
+        # A different route under a shipped name: the owner's model, nothing merged in.
+        {"name": "cloud", "provider": "omlx", "omlx_id": "my-local", "pricing_status": "unmetered"},
+        # An override, and another owner model already using the alias the release gives it.
+        {"name": "glm-fw", "desc": "mine", "shipped_base": {}},
+        {"name": "glm-local", "provider": "omlx", "omlx_id": "glm-local", "alias": "glm", "pricing_status": "unmetered"},
+        # An override whose shipped model is gone never becomes a model of its own.
+        {"name": "dropped", "context": 5, "shipped_base": {"context": 1}},
+    ]
+    models, _ = _entries(tmp_path, owner, profiles)
+    assert (models["cloud"]["provider"], models["cloud"]["omlx_id"]) == ("omlx", "my-local")
+    assert models["cloud"]["origin"] == {"layer": "owner"} and "alias" not in models["cloud"]
+    assert models["glm-fw"]["desc"] == "mine" and "alias" not in models["glm-fw"]
+    assert models["glm-local"]["alias"] == "glm"
+    assert "dropped" not in models
 
 
 def test_a_failed_lazy_reload_serves_the_last_good_catalog(tmp_path, monkeypatch):
@@ -213,6 +234,33 @@ def test_a_failed_lazy_reload_serves_the_last_good_catalog(tmp_path, monkeypatch
     with pytest.raises(ValueError):
         providers.reload()
         providers.snapshot_registry()  # validation still sees the error
+
+
+def test_a_failed_reload_keeps_the_new_config_and_credentials(tmp_path, monkeypatch):
+    info = _registry_with(tmp_path, monkeypatch, [], _profile([{"name": "m1"}]))
+    config = {"providers": {"example": {"base_url": BASE_URL, "api_key": "k"}},
+              "auth": {"client_keys": ["old-key"]}}
+    providers.CONFIG_PATH.write_text(yaml.safe_dump(config))
+    providers.reload()
+    assert "m1" in providers._load_models()
+    info.write_text("{broken")
+    providers.CONFIG_PATH.write_text(yaml.safe_dump({**config, "auth": {"client_keys": ["new-key"]}}))
+    providers.reload()
+    assert "m1" in providers._load_models()
+    assert providers._load_config()["auth"]["client_keys"] == ["new-key"]  # never the old credentials
+
+
+def test_a_rejected_candidate_never_becomes_the_last_good_catalog(tmp_path, monkeypatch):
+    info = _registry_with(tmp_path, monkeypatch, [], _profile([{"name": "m1"}]))
+    live = providers.snapshot_registry()
+    info.write_text(json.dumps({"llm": [{"name": "candidate", "provider": "omlx", "omlx_id": "c",
+                                         "pricing_status": "unmetered"}], "allow_empty": True}))
+    providers.reload()
+    assert "candidate" in providers.snapshot_registry()[1]  # validated, then rejected by a later check
+    providers.restore_registry(live)
+    info.write_text("{broken")
+    providers.reload()
+    assert "candidate" not in providers._load_models() and "m1" in providers._load_models()
 
 
 def test_review_keep_or_discard(tmp_path, monkeypatch):
@@ -290,3 +338,62 @@ def test_profile_routes_may_name_a_base_model(tmp_path, monkeypatch):
     assert registered["profiles"][0]["routes"] == {"text": "glm-fw"}  # bound to the route available now
     with pytest.raises(profiles.ProfileError):
         profiles.validate_manifest(manifest("local_only", "gateway_local"))  # no local route of glm
+
+
+def test_a_base_model_request_is_served_and_billed_as_its_route(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import src.server as server_module
+
+    _registry_with(tmp_path, monkeypatch, [], _profile([{"name": "glm-fw", "family": "glm", "base_model": "glm"}]))
+    served = []
+    real_ctx = server_module._set_ledger_ctx
+
+    def capture(request, model, info, is_stream=False):
+        served.append(model)
+        return real_ctx(request, model, info, is_stream)
+
+    async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
+        return server_module.JSONResponse(status_code=200, content={
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+
+    monkeypatch.setattr(server_module, "_set_ledger_ctx", capture)
+    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough_sync)
+    with TestClient(server_module.app) as client:
+        response = client.post("/v1/chat/completions", json={"model": "glm", "messages": [{"role": "user", "content": "hi"}]})
+    assert response.status_code == 200, response.text
+    assert set(served) == {"glm-fw"} and "Deprecation" not in response.headers
+
+
+def test_create_only_registration_cannot_restore_hidden_or_retired_names(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import src.server as server_module
+
+    monkeypatch.setenv("MODEL_GATEWAY_ADMIN_KEY", "admin")
+    monkeypatch.setenv("MODEL_GATEWAY_ADMIN_WRITES", "true")
+    _registry_with(tmp_path, monkeypatch, [], _profile([{"name": "m1"}], retire={"models": ["old"]}))
+    config = yaml.safe_load(providers.CONFIG_PATH.read_text())
+    providers.CONFIG_PATH.write_text(yaml.safe_dump({**config, "catalog": {"hidden": ["m1"]}}))
+    providers.reload()
+    headers = {"Authorization": "Bearer admin", "If-None-Match": "*"}
+    body = {"provider": "omlx", "omlx_id": "x", "pricing_status": "unmetered"}
+    with TestClient(server_module.app) as client:
+        for name in ("m1", "old"):
+            assert client.put(f"/admin/api/models/{name}", headers=headers, json=body).status_code == 412
+
+
+def test_a_profile_route_the_owner_turned_off_is_not_rebound(tmp_path, monkeypatch):
+    from src import profiles
+
+    profile = _profile([{"name": "astra", "family": "gpt", "base_model": "astra"},
+                        {"name": "astra-or", "family": "gpt", "base_model": "astra", "provider_model_id": "or/astra"}])
+    _registry_with(tmp_path, monkeypatch, [], profile)
+    config = yaml.safe_load(providers.CONFIG_PATH.read_text())
+    providers.CONFIG_PATH.write_text(yaml.safe_dump({**config, "model_overrides": {"astra": {"enabled": False}}}))
+    providers.reload()
+    manifest = {"schema_version": 1, "namespace": "ha", "source_revision": "r", "profiles": [{
+        "id": "ha/p", "locality": "cloud_explicit", "credential_policy": "gateway_managed",
+        "protocols": ["openai_chat"], "routes": {"text": "astra"}}]}
+    with pytest.raises(profiles.ProfileError):
+        profiles.validate_manifest(manifest)
