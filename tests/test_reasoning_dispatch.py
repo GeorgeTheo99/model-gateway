@@ -915,6 +915,41 @@ def test_anthropic_chat_without_client_cap_uses_model_output_limit(monkeypatch, 
     assert captured["max_tokens"] == expected
 
 
+@pytest.mark.parametrize("via_chat_body", [False, True])
+@pytest.mark.parametrize("client_cap, expected", [(None, 128000), ({"max_output_tokens": 2048}, 2048)])
+def test_anthropic_responses_without_client_cap_uses_model_output_limit(
+    monkeypatch, client_cap, expected, via_chat_body,
+):
+    info = _info(
+        "anthropic",
+        provider="anthropic",
+        provider_model_id="claude-opus-5-5",
+        max_output_tokens=128000,
+    )
+    captured = {}
+
+    async def fake_stream(endpoint, messages_req, model, headers, **kwargs):
+        captured.update(messages_req)
+        return server_module.JSONResponse(status_code=200, content={"ok": True})
+
+    monkeypatch.setattr(server_module, "_handle_responses_anthropic_stream", fake_stream)
+    monkeypatch.setattr(server_module, "_forward_headers", lambda *args, **kwargs: {})
+    body = {"model": "claude-opus-5-5", "input": "ping", "stream": True, **(client_cap or {})}
+    # Vision extraction hands over an image-free Chat request; its cap mirrors the Responses one.
+    chat_body = {
+        "model": "claude-opus-5-5",
+        "messages": [{"role": "user", "content": "ping"}],
+        **({"max_tokens": client_cap["max_output_tokens"]} if client_cap else {}),
+    } if via_chat_body else None
+    request = SimpleNamespace(state=SimpleNamespace())
+
+    asyncio.run(server_module._handle_responses_anthropic(
+        body, info, "claude-opus-5.5", request, chat_body=chat_body,
+    ))
+
+    assert captured["max_tokens"] == expected
+
+
 def test_openai_chat_anthropic_translation_roundtrip_shapes():
     req = openai_chat_to_anthropic({
         "model": "claude-alias",

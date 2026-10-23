@@ -3579,15 +3579,20 @@ async def chat_completions(request: Request):
                                    capture_thought_signatures=capture)
 
 
+def _default_anthropic_max_tokens(anthropic_req: dict, client_body: dict, info) -> None:
+    """Anthropic requires max_tokens. Without a client cap, use the model's own limit
+    rather than a translator default (8192/16384), which cuts off long tool calls:
+    thinking counts toward the cap."""
+    client_cap = any(client_body.get(key) for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"))
+    if not client_cap and getattr(info, "max_output_tokens", 0):
+        anthropic_req["max_tokens"] = int(info.max_output_tokens)
+
+
 async def _handle_chat_anthropic(body: dict, info, model: str, request: Request, is_stream: bool):
     """Serve OpenAI Chat Completions clients against native Anthropic models."""
     anthropic_req = openai_chat_to_anthropic(body)
     anthropic_req["model"] = info.provider_model_id
-    # Anthropic requires max_tokens. Without a client cap, use the model's own
-    # limit rather than the translator's 8192, which truncates long tool calls.
-    client_cap = any(body.get(key) for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"))
-    if not client_cap and getattr(info, "max_output_tokens", 0):
-        anthropic_req["max_tokens"] = int(info.max_output_tokens)
+    _default_anthropic_max_tokens(anthropic_req, body, info)
     _inject_anthropic_system_instruction(anthropic_req, info.system_instruction)
     thinking_enabled = _apply_gateway_reasoning(anthropic_req, info, target_api="messages")
     _normalize_anthropic_adaptive_thinking(anthropic_req, info)
@@ -4204,6 +4209,7 @@ async def _handle_responses_anthropic(
     if chat_body is None:
         _inject_anthropic_system_instruction(messages_req, info.system_instruction)
     messages_req["model"] = info.provider_model_id
+    _default_anthropic_max_tokens(messages_req, body, info)
 
     # Keep the same centralized capability validation/provider translation used
     # by Chat and Messages, including legacy booleans and max-only models.
