@@ -885,6 +885,36 @@ def test_adaptive_anthropic_chat_preserves_canonical_effort(effort):
     assert body["output_config"] == {"effort": effort}
 
 
+@pytest.mark.parametrize("client_cap, expected", [(None, 128000), ({"max_tokens": 2048}, 2048)])
+def test_anthropic_chat_without_client_cap_uses_model_output_limit(monkeypatch, client_cap, expected):
+    info = _info(
+        "anthropic",
+        provider="anthropic",
+        provider_model_id="claude-opus-5-5",
+        max_output_tokens=128000,
+    )
+    captured = {}
+
+    async def fake_stream(endpoint, body, model, headers, **kwargs):
+        captured.update(body)
+        return server_module.JSONResponse(status_code=200, content={"ok": True})
+
+    monkeypatch.setattr(server_module, "_chat_anthropic_stream", fake_stream)
+    monkeypatch.setattr(server_module, "_forward_headers", lambda *args, **kwargs: {})
+    body = {
+        "model": "claude-opus-5-5",
+        "messages": [{"role": "user", "content": "ping"}],
+        "stream": True,
+        "reasoning_effort": "high",
+        **(client_cap or {}),
+    }
+    request = SimpleNamespace(state=SimpleNamespace())
+
+    asyncio.run(server_module._handle_chat_anthropic(body, info, "claude-opus-5.5", request, True))
+
+    assert captured["max_tokens"] == expected
+
+
 def test_openai_chat_anthropic_translation_roundtrip_shapes():
     req = openai_chat_to_anthropic({
         "model": "claude-alias",

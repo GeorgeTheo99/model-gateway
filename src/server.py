@@ -3583,6 +3583,11 @@ async def _handle_chat_anthropic(body: dict, info, model: str, request: Request,
     """Serve OpenAI Chat Completions clients against native Anthropic models."""
     anthropic_req = openai_chat_to_anthropic(body)
     anthropic_req["model"] = info.provider_model_id
+    # Anthropic requires max_tokens. Without a client cap, use the model's own
+    # limit rather than the translator's 8192, which truncates long tool calls.
+    client_cap = any(body.get(key) for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"))
+    if not client_cap and getattr(info, "max_output_tokens", 0):
+        anthropic_req["max_tokens"] = int(info.max_output_tokens)
     _inject_anthropic_system_instruction(anthropic_req, info.system_instruction)
     thinking_enabled = _apply_gateway_reasoning(anthropic_req, info, target_api="messages")
     _normalize_anthropic_adaptive_thinking(anthropic_req, info)
