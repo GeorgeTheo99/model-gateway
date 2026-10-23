@@ -448,15 +448,28 @@ def test_validate_upstream_rejects_missing_model(monkeypatch):
         onboarding.validate_upstream_models(_profile(), "secret")
 
 
-def test_applying_a_curated_profile_resets_its_models_to_the_release(tmp_path):
+def test_applying_a_curated_profile_resets_its_models_to_the_release(tmp_path, monkeypatch):
     """Curated models load by reference (ADR 0002): the CLI writes no copies of them."""
     config, model_info, source = _files(tmp_path)
     rows = json.loads(model_info.read_text())["llm"]
     model_info.write_text(json.dumps({"llm": [*rows, {"name": "new-model", "provider": "new-provider",
                                                       "provider_model_id": "new-upstream", "desc": "owner edit"}]}))
-    profile = {**_profile(), "auto_add": True}
+    profile = onboarding.validate_profile({**_profile(), "auto_add": True})
+    monkeypatch.setattr(onboarding, "packaged_profiles", lambda directory=None: {profile["id"]: profile})
+    with open(config, "a") as stream:
+        stream.write("catalog:\n  hidden: [new-model, other]\n")
     onboarding.apply_profile(profile, config_path=config, model_info_path=model_info, model_info_source_path=source,
                              api_key="secret", check_upstream=False, confirmed_retirements={"old-model"},
                              confirmed_replacements={"new-model"}, allow_metadata_removal=True)
     assert json.loads(model_info.read_text())["llm"] == []
-    assert yaml.safe_load(config.read_text())["providers"]["new-provider"]["base_url"] == "https://api.example.com/v1"
+    saved = yaml.safe_load(config.read_text())
+    assert saved["providers"]["new-provider"]["base_url"] == "https://api.example.com/v1"
+    assert saved["catalog"] == {"hidden": ["other"]}
+
+
+def test_a_profile_that_is_not_the_releases_is_copied_as_before(tmp_path):
+    config, model_info, source = _files(tmp_path)
+    profile = {**_profile(), "auto_add": True}  # curated in name only: not a packaged profile
+    onboarding.apply_profile(profile, config_path=config, model_info_path=model_info, model_info_source_path=source,
+                             api_key="secret", check_upstream=False, confirmed_retirements={"old-model"})
+    assert [row["name"] for row in json.loads(model_info.read_text())["llm"]] == ["new-model"]

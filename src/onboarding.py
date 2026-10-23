@@ -427,9 +427,19 @@ def _build_candidates(profile: dict, config: dict, model_doc: dict, *, secret_fi
         and current_by_name[str(model["name"])].get("provider_model_id") == model.get("provider_model_id")
         for model in models
     )
-    # A curated profile's models load by reference (docs/adr/0002-layered-model-catalog.md):
-    # applying it resets them to the release, and the release handles its retirements.
-    curated = bool(profile.get("auto_add"))
+    # The release's own curated profile: its models load by reference
+    # (docs/adr/0002-layered-model-catalog.md), so applying it resets them to the
+    # release instead of copying them, and the release handles its retirements.
+    curated = bool(profile.get("auto_add")) and packaged_profiles().get(str(profile.get("id"))) == profile
+    if curated:
+        from src import shipped
+
+        selection, _hidden, _pinned = shipped.settings(config)
+        excluded = [name for name in sorted(new_names) if selection == "none" or (
+            selection != "all" and name not in selection and profile.get("id") not in selection)]
+        if excluded:
+            raise OnboardingError("config catalog.shipped does not select " + ", ".join(excluded)
+                                  + "; add them (or the profile) to it first")
     if missing_retired and not replacement_already_present and not curated:
         raise OnboardingError(
             "expected retired model(s) not found: " + ", ".join(sorted(missing_retired))
@@ -461,6 +471,15 @@ def _build_candidates(profile: dict, config: dict, model_doc: dict, *, secret_fi
         candidate_config["model_overrides"] = {
             name: value for name, value in overrides.items() if name not in retired
         }
+    if curated and isinstance(candidate_config.get("catalog"), dict):
+        # Applying the release's profile brings back any of its models the owner had hidden.
+        block = dict(candidate_config["catalog"])
+        hidden = [name for name in block.get("hidden") or [] if name not in new_names]
+        if hidden:
+            block["hidden"] = hidden
+        else:
+            block.pop("hidden", None)
+        candidate_config["catalog"] = block
 
     candidate_doc = dict(model_doc)
     llm = [

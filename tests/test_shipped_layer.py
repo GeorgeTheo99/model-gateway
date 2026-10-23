@@ -397,3 +397,71 @@ def test_a_profile_route_the_owner_turned_off_is_not_rebound(tmp_path, monkeypat
         "protocols": ["openai_chat"], "routes": {"text": "astra"}}]}
     with pytest.raises(profiles.ProfileError):
         profiles.validate_manifest(manifest)
+
+
+def test_base_model_fallback_never_crosses_locality_or_bypasses_owner_choices(tmp_path, monkeypatch):
+    profile = _profile([
+        {"name": "glm", "family": "glm", "base_model": "glm", "thinking": "always", "thinking_levels": ["low"]},
+        {"name": "glm-or", "family": "glm", "base_model": "glm", "provider_model_id": "or/glm"},
+    ])
+    local = {"name": "qwen", "provider": "omlx", "omlx_id": "qwen", "family": "qwen", "base_model": "qwen",
+             "pricing_status": "unmetered"}
+    _registry_with(tmp_path, monkeypatch, [{"name": "glm", "thinking_levels": ["off"], "shipped_base": {}}, local], profile)
+    assert providers.resolve("glm") is None  # override_invalid: fail closed, not rerouted
+    cloud_qwen = {"name": "qwen-fw", "provider": "example", "provider_model_id": "up/qwen", "family": "qwen",
+                  "base_model": "qwen", "pricing": {"input": 1.0, "output": 2.0}}
+    info = providers.MODEL_INFO_PATH
+    info.write_text(json.dumps({"llm": [local, cloud_qwen], "allow_empty": True}))
+    config = yaml.safe_load(providers.CONFIG_PATH.read_text())
+    for omlx in ({"base_url": "http://127.0.0.1:9110/v1", "enabled": False}, None):
+        providers.CONFIG_PATH.write_text(yaml.safe_dump(
+            {**config, "providers": {**config["providers"], **({"omlx": omlx} if omlx else {})}}))
+        providers.reload()
+        assert providers.base_model_route("qwen") is None  # local traffic never goes to the cloud route
+
+
+def test_overlay_rows_over_shipped_models_follow_the_owner_rules(tmp_path):
+    profiles = {"p": _profile([{"name": "m1"}, {"name": "m2", "thinking": "always", "thinking_levels": ["low"]}])}
+    config = {"models": [
+        {"name": "m1", "provider": "omlx", "omlx_id": "local-m1", "pricing_status": "unmetered"},
+        {"name": "m2", "thinking_levels": ["off"]},
+    ]}
+    models, _ = _entries(tmp_path, [], profiles, config)
+    assert (models["m1"]["provider"], models["m1"]["omlx_id"], models["m1"]["origin"]) == ("omlx", "local-m1", {"layer": "owner"})
+    assert "provider_model_id" not in models["m1"]
+    assert models["m2"]["origin"]["override_error"]
+
+
+def test_a_release_moving_an_identifier_onto_an_owner_row_never_breaks_the_catalog(tmp_path):
+    profiles = {"p": _profile([{"name": "m1", "provider_model_id": "up/new"}])}
+    owner = [{"name": "m1", "desc": "mine", "shipped_base": {}},
+             {"name": "other", "provider": "example", "provider_model_id": "up/new"}]
+    models, _ = _entries(tmp_path, owner, profiles)
+    assert models["other"]["provider_model_id"] == "up/new" and "m1" not in models
+
+
+def test_migration_flags_another_route_under_a_shipped_name_for_review(tmp_path, monkeypatch):
+    from src import config_io
+
+    profile = _profile([{"name": "m1"}])
+    fork = {"name": "m1", "provider": "example", "provider_model_id": "up/m1-v1", "context": 1000,
+            "pricing": {"input": 1.0, "output": 2.0}}
+    info = _registry_with(tmp_path, monkeypatch, [fork], profile)
+    layer = shipped.layer(providers._load_config(), include_packs=False)
+    loaded = {row["name"]: {k: v for k, v in row.items() if k != "origin"} for row in layer.entries}
+    assert config_io.shipped_migration_pending(loaded)
+    assert config_io.migrate_to_shipped_layer(loaded, layer.names)["review"] == ["m1"]
+    assert json.loads(info.read_text())["llm"] == [{**fork, "review": True}]
+    providers.reload()
+    assert providers.resolve("m1").provider_model_id == "up/m1-v1"
+    assert providers.catalog_status()["review"] == ["m1"]
+
+
+def test_an_invalid_catalog_block_during_fallback_is_not_a_server_error(tmp_path, monkeypatch):
+    _registry_with(tmp_path, monkeypatch, [], _profile([{"name": "m1"}]))
+    assert "m1" in providers._load_models()
+    config = yaml.safe_load(providers.CONFIG_PATH.read_text())
+    providers.CONFIG_PATH.write_text(yaml.safe_dump({**config, "catalog": {"shipped": "bogus"}}))
+    providers.reload()
+    assert providers.resolve("nope") is None
+    assert providers.catalog_status()["load_error"]

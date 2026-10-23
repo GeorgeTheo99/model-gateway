@@ -140,9 +140,11 @@ def layer(
         from src.catalog import entry_routable_ids
 
         shipped_ids = {model_id for row in entries for model_id in entry_routable_ids(row)}
+        shipped_ids.update(str(row["base_model"]) for row in entries if row.get("base_model"))
         for namespace, pack in sorted(_registered_packs(config_path).items()):
             for model in pack.get("models") or []:
-                # A release that later ships an identifier a pack uses wins; the pack model yields.
+                # A release that later ships an identifier or base-model name a pack uses
+                # wins; the pack model yields.
                 if shipped_ids.intersection(entry_routable_ids(model)):
                     continue
                 names.add(model["name"])

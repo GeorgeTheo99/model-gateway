@@ -37,7 +37,11 @@ Nothing from a lower layer is copied into a higher one.
   receiving shipped updates.
 - An owner row that changes where the model routes (`provider`, `pool`,
   `provider_model_id`, `omlx_id`) is the owner's own model and **replaces** the
-  shipped row; nothing is merged into it. Admin saves store it whole.
+  shipped row; nothing is merged into it. Admin saves store it whole. The owner's
+  own (non-override) row under a pack model's name always replaces the pack model.
+- The same rules apply to config `models:` overlay rows.
+- When a shipped or pack row and an owner row still collide on an identifier, the
+  lower row yields (logged) instead of failing the catalog.
 - An override a release invalidates leaves the model **unavailable**
   (`override_invalid`) instead of serving the shipped row.
 - Admin writes store overrides sparsely, with `shipped_base` recording the shipped
@@ -94,9 +98,10 @@ gateway resolves it to an available route, preferring the owner's
 - A route name is never rerouted to another provider (that could change
   retention or cost); only a base-model name is, including a route named after
   its base model when that route is unavailable. A model the owner turned off is
-  not rerouted. Requests are rewritten to the concrete route, so pricing, the
-  ledger and pool failover see the model used. Pack routes never answer a
-  base-model name.
+  not rerouted, nor a route whose provider the owner turned off or whose override
+  is invalid, and a fallback never crosses between local and cloud routes.
+  Requests are rewritten to the concrete route, so pricing, the ledger and pool
+  failover see the model used. Pack routes never answer a base-model name.
 - A consumer profile route may name a base model. Registration binds it to the
   route available then, within the profile's locality, and stores that route, so
   ADR 0001's snapshot binding is unchanged; re-registering picks up a new
@@ -113,14 +118,16 @@ and replaced whole on each registration.
 
 - Pack models may set only route, capability, pricing and label fields; fields
   that reach other consumers (`system_instruction`, `quirks`, `pool`,
-  `api_style`, ...) stay with the owner.
+  `api_style`, ...) or make public claims (`zdr`) stay with the owner.
 - They cannot reuse an identifier or base-model name of any shipped model
-  (loaded here or not), of the owner's catalog (except an identical copy, as an
-  older install's import left), or of another pack (409).
-- A release that later ships a pack model's identifier wins; the pack model
-  yields instead of failing the catalog.
-- The owner can override or hide pack models like shipped ones. The startup
-  migration never treats pack rows as shipped, so a pack cannot remove owner rows. `requires` lists shipped models or base models the pack's profiles
+  (loaded here or not), the owner's base-model names, or another pack's
+  identifiers (409). Owner rows are never a conflict: the owner's rows win at
+  load, whole, so a pack can never reshape or remove them.
+- A release that later ships a pack model's identifier or base-model name wins;
+  the pack model yields instead of failing the catalog.
+- The owner can override (sparsely) or hide pack models like shipped ones, and
+  that never blocks the product's next registration. The startup migration never
+  treats pack rows as shipped. `requires` lists shipped models or base models the pack's profiles
 need; unmet requirements are reported (`unmet_requires` on the pack and in admin
 status), never forced on — the owner still wins.
 
@@ -135,8 +142,8 @@ An invalid owner layer never silently falls back to shipped-only:
   The last good models are part of each registry snapshot, so a candidate an
   admin write rejected never becomes them.
 - An override a release invalidates (for example a thinking level the shipped row
-  no longer allows) is skipped for that model only; the shipped row loads and
-  `origin.override_error` / `catalog.override_errors` say why.
+  no longer allows) makes that model unavailable (`override_invalid`), never the
+  shipped row instead; `origin.override_error` / `catalog.override_errors` say why.
 - Startup still refuses an invalid catalog: there is no earlier registry to keep.
 
 Admin status also lists overrides awaiting review (resolved with
@@ -159,8 +166,15 @@ Run once at startup, under the config write lock, with a backup:
    `review: true` and listed in admin status (R5). Their origin is unknown — an
    owner edit or a stale copy — so they are neither silently pinned nor dropped;
    the owner keeps or discards each one.
-3. Ledger names absent from the catalog become `catalog.hidden`; the ledger is
+3. Rows with another route under a shipped name stay whole (the owner's own
+   model) and are also flagged for review.
+4. Ledger names absent from the catalog become `catalog.hidden`; the ledger is
    then retired.
+
+Applying a curated profile with the CLI resets its models to the release
+(owner rows of those names are removed with the CLI's usual approvals, hidden
+names are restored) instead of copying them; only the release's own packaged
+profile counts as curated.
 
 ## Consequences
 

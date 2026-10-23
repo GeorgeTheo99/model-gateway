@@ -344,16 +344,20 @@ def _fold_shipped(shipped: list[dict], owner: list[dict], shipped_names: frozens
         name = row.get("name")
         fields = {k: v for k, v in row.items() if k not in OWNER_META_FIELDS}
         own_ids = set(entry_routable_ids({k: fields[k] for k in _ID_FIELDS if k in fields}))
-        bookkeeping = "shipped_base" in row or "review" in row
+        sparse = "shipped_base" in row
+        owned = {"layer": "owner", **({"review": True} if row.get("review") is True else {})}
         base = by_name.get(name) if isinstance(name, str) else None
         if base is None:
-            if bookkeeping or (name in shipped_names and not row.get("provider")):
+            if sparse or (name in shipped_names and not row.get("provider")):
                 continue  # an override whose lower model is not loaded here
-            folded.append(({**fields, "origin": {"layer": "owner"}}, own_ids, None))
+            folded.append(({**fields, "origin": owned}, own_ids, None))
             continue
         replaced.add(name)
-        if any(field in fields and fields[field] != base.get(field) for field in ROUTE_FIELDS):
-            folded.append(({**fields, "origin": {"layer": "owner"}}, own_ids, None))
+        # Another route under the name, or the owner's own row for a pack's name (a pack
+        # never shapes an owner model), replaces the lower model: nothing is merged in.
+        if (any(field in fields and fields[field] != base.get(field) for field in ROUTE_FIELDS)
+                or (base["origin"]["layer"] == "pack" and not sparse)):
+            folded.append(({**fields, "origin": owned}, own_ids, None))
             continue
         merged = {**base, **fields}
         if "thinking" in fields and fields["thinking"] != base.get("thinking") and "thinking_levels" not in fields:
@@ -393,6 +397,19 @@ def _fold_shipped(shipped: list[dict], owner: list[dict], shipped_names: frozens
             continue
         kept.append(_strip_ids(row, claimed))
     return kept + result
+
+
+def _is_lower(entry: dict) -> bool:
+    return (entry.get("origin") or {}).get("layer") in LOWER_LAYERS
+
+
+def _log_yield(lower: dict, winner: dict) -> None:
+    import logging
+
+    logging.getLogger("model-gateway").warning(
+        "catalog: %s model %r yields to %r, which uses one of its identifiers",
+        (lower.get("origin") or {}).get("layer"), lower.get("name"), winner.get("name"),
+    )
 
 
 def load_catalog_entries(
@@ -464,19 +481,29 @@ def load_catalog_entries(
         routable = entry_routable_ids(normalized)
         if not routable:
             raise ValueError("catalog model entries require at least one routable identifier")
-        primary: str | None = None
+        clashes = {id(by_id[model_id]): by_id[model_id] for model_id in routable if model_id in by_id}
+        if clashes:
+            # A shipped or pack row yields to whatever it collides with (an owner row, or an
+            # earlier lower row); only owner rows colliding with each other are an error.
+            if _is_lower(normalized):
+                _log_yield(normalized, next(iter(clashes.values())))
+                continue
+            for existing in clashes.values():
+                if not _is_lower(existing):
+                    shared = sorted(set(routable).intersection(entry_routable_ids(existing)))
+                    raise ValueError(
+                        f"routable id {shared[0]!r} collides between "
+                        f"{existing.get('name')!r} and {normalized.get('name')!r}"
+                    )
+                _log_yield(existing, normalized)
+                for model_id in entry_routable_ids(existing):
+                    if by_id.get(model_id) is existing:
+                        del by_id[model_id]
+                order[:] = [prim for prim in order if prim in by_id]
         for model_id in routable:
-            if primary is None:
-                primary = model_id
-            existing = by_id.get(model_id)
-            if existing is not None and existing is not normalized:
-                raise ValueError(
-                    f"routable id {model_id!r} collides between "
-                    f"{existing.get('name')!r} and {normalized.get('name')!r}"
-                )
             by_id[model_id] = normalized
-        if primary is not None and primary not in order:
-            order.append(primary)
+        if routable[0] not in order:
+            order.append(routable[0])
 
     # Apply overlay: an overlay entry wins every id it claims, replacing any
     # catalog entry that shared one. The overlay entry's primary id is appended
@@ -505,6 +532,9 @@ def load_catalog_entries(
             )
         base = by_id.get(base_primary) if base_primary else None
         fields = {k: v for k, v in entry.items() if k != "origin"}
+        lower = base is not None and (base.get("origin") or {}).get("layer") in LOWER_LAYERS
+        if lower and any(field in fields and fields[field] != base.get(field) for field in ROUTE_FIELDS):
+            base = None  # another route under a shipped or pack name is the owner's own model
         normalized = {**base, **fields} if base else {**fields, "origin": {"layer": "owner"}}
         if (
             base
@@ -517,9 +547,15 @@ def load_catalog_entries(
         if not include_retired and provider in _RETIRED_LOCAL_PROVIDERS:
             continue
         normalized["provider"] = provider
-        validate_pricing_policy(normalized)
-        validate_client_metadata(normalized)
-        normalized = normalize_thinking_capabilities(normalized)
+        try:
+            validate_pricing_policy(normalized)
+            validate_client_metadata(normalized)
+            normalized = normalize_thinking_capabilities(normalized)
+        except ValueError as exc:
+            if not lower:
+                raise
+            # An overlay a release invalidated: fail closed on the lower row, as for owner rows.
+            normalized = {**base, "origin": {**base["origin"], "override_error": str(exc)}}
         ids = entry_routable_ids(normalized)
         if not ids:
             raise ValueError("catalog model entries require at least one routable identifier")

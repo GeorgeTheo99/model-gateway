@@ -131,17 +131,46 @@ def test_a_pack_never_removes_or_rewrites_owner_models(gateway):
     mine = {"name": "mine", "provider": "omlx", "omlx_id": "local-x", "pricing_status": "unmetered"}
     info.write_text(json.dumps({"llm": [dict(QWEN), mine], "allow_empty": True}))  # QWEN: a legacy import's copy
     providers.reload()
-    # Declaring the owner's identical copy is allowed; taking the owner's other model is not.
+    # A pack may name the owner's models; the owner's rows still win whole.
     assert client.put("/v1/catalog/packs/ha", headers=HA, json=_pack(QWEN)).status_code == 200
-    taken = client.put("/v1/catalog/packs/myai", headers=MYAI, json=_pack(
-        {**mine, "omlx_id": "attacker", "vision": True}, namespace="myai"))
-    assert taken.status_code == 409 and taken.json()["error"]["code"] == "pack_conflict"
+    assert client.put("/v1/catalog/packs/myai", headers=MYAI, json=_pack(
+        {**mine, "omlx_id": "attacker", "vision": True, "alias": "qwen-x"}, namespace="myai")).status_code == 200
+    entry = providers._load_models()["mine"]
+    assert (entry["omlx_id"], entry.get("vision"), entry["origin"]) == ("local-x", None, {"layer": "owner"})
     with TestClient(app):  # the startup migration ignores packs
         pass
-    assert client.delete("/v1/catalog/packs/ha", headers=HA).status_code == 204
-    assert json.loads(info.read_text())["llm"] == [QWEN, mine]
+    # A routine owner edit keeps the owner's row whole, never a sparse override of the pack's.
+    config_io.upsert_model("qwen-local", provider="omlx", omlx_id="qwen-8bit", context=8192)
+    for namespace, headers in (("ha", HA), ("myai", MYAI)):
+        assert client.delete(f"/v1/catalog/packs/{namespace}", headers=headers).status_code == 204
+    rows = {row["name"]: row for row in json.loads(info.read_text())["llm"]}
+    assert rows["mine"] == mine and rows["qwen-local"]["context"] == 8192 and "shipped_base" not in rows["qwen-local"]
     assert providers.resolve("qwen-local").provider_model_id == "qwen-8bit"
     assert providers.resolve("mine").provider_model_id == "local-x"
+
+
+def test_an_owner_override_does_not_block_the_products_next_registration(gateway):
+    client, info = gateway
+    assert client.put("/v1/catalog/packs/ha", headers=HA, json=_pack(QWEN)).status_code == 200
+    config_io.upsert_model("qwen-local", provider="omlx", omlx_id="qwen-8bit", context=8192)
+    providers.reload()
+    assert client.put("/v1/catalog/packs/ha", headers=HA, json=_pack(QWEN)).status_code == 200
+    assert providers._load_models()["qwen-local"]["context"] == 8192
+
+
+def test_a_pack_yields_to_a_base_model_name_a_release_later_ships(gateway, monkeypatch):
+    client, _info = gateway
+    assert client.put("/v1/catalog/packs/ha", headers=HA, json=_pack({**QWEN, "name": "newbase"})).status_code == 200
+    later = onboarding.validate_profile({
+        "schema_version": 1, "id": "later-curated", "auto_add": True,
+        "provider": {"id": "example", "base_url": BASE_URL, "protocol": "openai"},
+        "models": [{"name": "newbase-fw", "provider": "example", "provider_model_id": "up/newbase",
+                    "family": "newbase", "base_model": "newbase", "pricing": {"input": 1.0, "output": 2.0}}],
+    })
+    curated = shipped._packaged()
+    monkeypatch.setattr(shipped, "_packaged", lambda: {**curated, "later-curated": later})
+    providers.reload()
+    assert providers.resolve("newbase").provider_model_id == "up/newbase"
 
 
 @pytest.mark.parametrize("field", ["system_instruction", "quirks", "pool", "api_style", "fallbacks"])

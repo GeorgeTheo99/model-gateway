@@ -1009,7 +1009,10 @@ def resolve_base_model(model_id: str, *, locality: str | None = None) -> str | N
     (``local_only``/``cloud_explicit``) keeps only local or only cloud routes.
     """
     models = _load_models()
-    preference = shipped.provider_preference(_load_config())
+    try:
+        preference = shipped.provider_preference(_load_config())
+    except ValueError:  # an invalid catalog block is reported as the load error
+        preference = []
     # Pack routes never answer a base-model name: a consumer must not steer other consumers' traffic.
     entries = [entry for entry in {id(v): v for v in models.values()}.values()
                if entry.get("base_model") == model_id and (entry.get("origin") or {}).get("layer") != "pack"]
@@ -1027,20 +1030,32 @@ def resolve_base_model(model_id: str, *, locality: str | None = None) -> str | N
     return None
 
 
+# Why a route named after its base model may be served by another route of that base.
+_REROUTABLE = frozenset({"model_not_found", "provider_not_configured"})
+
+
 @_registry_locked
-def base_model_route(model_id: str) -> str | None:
+def base_model_route(model_id: str, *, locality: str | None = None) -> str | None:
     """The route serving ``model_id`` as a base-model reference, when it is not served as named.
 
-    A provider-specific route name is never rerouted (that could change retention
-    or cost), nor is a model the owner turned off.
+    Only a name that is no route here, or a route named after its base model whose
+    provider is not set up here, is rerouted, and only within its locality. A
+    provider-specific route name is never rerouted (that could change retention or
+    cost), nor is a model the owner turned off, a turned-off provider, or an
+    override the release no longer accepts.
     """
     entry = _load_models().get(model_id)
     availability = _availability_for_entry(model_id, entry)
-    if availability["available"] or availability["reason"] == "model_disabled":
+    if availability["available"] or availability["reason"] not in _REROUTABLE:
         return None
-    if entry is not None and entry.get("base_model") != model_id:
-        return None
-    route = resolve_base_model(model_id)
+    if entry is not None:
+        if entry.get("base_model") != model_id:
+            return None
+        entry_locality = "local_only" if _canonical_provider(entry.get("provider")) == "omlx" else "cloud_explicit"
+        if locality not in (None, entry_locality):
+            return None
+        locality = entry_locality
+    route = resolve_base_model(model_id, locality=locality)
     return route if route != model_id else None
 
 

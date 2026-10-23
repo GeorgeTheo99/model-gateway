@@ -1170,10 +1170,12 @@ def _shipped_state():
     return shipped.layer(load_config_full())
 
 
-def _loaded_shipped_row(layer, name: str) -> dict | None:
-    return next(
-        ({k: v for k, v in row.items() if k != "origin"} for row in layer.entries if row["name"] == name), None,
-    )
+def _loaded_shipped_row(layer, name: str, owner_row: dict | None = None) -> dict | None:
+    """The loaded shipped or pack row ``name`` overrides; none when the owner's own row replaces it."""
+    row = next((row for row in layer.entries if row["name"] == name), None)
+    if row is None or (row["origin"]["layer"] == "pack" and owner_row is not None and "shipped_base" not in owner_row):
+        return None
+    return {k: v for k, v in row.items() if k != "origin"}
 
 
 def loaded_shipped_rows() -> list[dict]:
@@ -1246,8 +1248,8 @@ def upsert_model(name: str, **fields) -> dict:
     doc = load_model_info()
     llm = doc.get("llm", [])
     layer = _shipped_state()
-    shipped_row = _loaded_shipped_row(layer, name)
     row = next((e for e in llm if e.get("name") == name), None)
+    shipped_row = _loaded_shipped_row(layer, name, row)
     if shipped_row is not None:
         owned = {k: v for k, v in (row or {}).items() if k not in OWNER_META_FIELDS}
         entry = {**shipped_row, **owned}
@@ -1489,7 +1491,6 @@ def shipped_migration_pending(loaded: dict[str, dict]) -> bool:
     """Whether :func:`migrate_to_shipped_layer` has anything to do (a read-only check)."""
     return auto_add_state_path().exists() or any(
         isinstance(row, dict) and row.get("name") in loaded and "shipped_base" not in row and "review" not in row
-        and not any(field in row and row[field] != loaded[row["name"]].get(field) for field in ROUTE_FIELDS)
         for row in load_model_info().get("llm") or []
     )
 
@@ -1516,9 +1517,13 @@ def migrate_to_shipped_layer(loaded: dict[str, dict], shipped_names: frozenset[s
     review: list[str] = []
     for row in rows:
         base = loaded.get(row.get("name")) if isinstance(row, dict) else None
-        if (base is None or "shipped_base" in row or "review" in row
-                or any(field in row and row[field] != base.get(field) for field in ROUTE_FIELDS)):
-            kept.append(row)  # not a copy of it: another route under its name stays whole
+        if base is None or "shipped_base" in row or "review" in row:
+            kept.append(row)
+            continue
+        if any(field in row and row[field] != base.get(field) for field in ROUTE_FIELDS):
+            # Another route under the name stays whole (the owner's own model), flagged for review.
+            kept.append({**row, "review": True})
+            review.append(row["name"])
             continue
         differing = [field for field in row if field != "name" and row[field] != base.get(field)]
         if not differing:

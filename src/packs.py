@@ -22,11 +22,11 @@ _NAMESPACE_RE = re.compile(r"^[a-z0-9-]{1,32}$")
 _FIELDS = {"schema_version", "namespace", "source_revision", "models", "requires"}
 # What a pack model may describe: its route, capabilities, pricing and labels. Fields
 # that reach other consumers' requests or routing (system_instruction, quirks, pool,
-# api_style, fallbacks, ...) stay with the owner.
+# api_style, fallbacks, ...) or make public claims (zdr) stay with the owner.
 MODEL_FIELDS = frozenset({
     "name", "provider", "provider_model_id", "omlx_id", "alias", "alternate_ids", "context",
     "max_output_tokens", "thinking", "thinking_levels", "thinking_format", "vision", "pricing",
-    "pricing_status", "desc", "display_name", "zdr", "family", "base_model",
+    "pricing_status", "desc", "display_name", "family", "base_model",
     "params", "active", "format", "quant", "size_gb", "path", "hf_repo",
 })
 MAX_MODELS = 100
@@ -76,10 +76,10 @@ def validate(
 ) -> dict:
     """A normalized pack, or :class:`PackError` explaining why it cannot load.
 
-    ``shipped_rows`` is every shipped row, loaded here or not, and ``owner_rows``
-    the owner's catalog and config overlay rows. A pack may not reuse their
-    identifiers or base-model names, except to declare a model the owner already
-    holds an identical copy of (an older install's import).
+    ``shipped_rows`` is every shipped row, loaded here or not: a pack may not reuse
+    their identifiers or base-model names, nor another pack's identifiers. Owner
+    rows (``owner_rows``) are never a conflict: the owner's rows always win at
+    load, so a pack only reserves their base-model names.
     """
     def refuse(message: str, code: str = "invalid_pack", status: int = 422):
         raise PackError(status, code, message)
@@ -101,17 +101,12 @@ def validate(
         refuse(f"pack requires must be a list of at most {MAX_REQUIRES} model names")
 
     taken: dict[str, str] = {}
-    copies: dict[str, dict] = {}
+    for row in shipped_rows:
+        taken.update(dict.fromkeys(catalog.entry_routable_ids(row), "a shipped model"))
     for label, rows in (("a shipped model", shipped_rows), ("an owner model", owner_rows)):
         for row in rows:
-            try:
-                taken.update(dict.fromkeys(catalog.entry_routable_ids(row), label))
-                if row.get("base_model"):
-                    taken.setdefault(str(row["base_model"]), f"{label}'s base model")
-                if label == "an owner model":
-                    copies[str(row.get("name"))] = _normalized(row)
-            except ValueError:
-                continue
+            if row.get("base_model"):
+                taken.setdefault(str(row["base_model"]), f"{label}'s base model")
     for other, pack in other_packs.items():
         for row in pack.get("models") or []:
             taken.update(dict.fromkeys(catalog.entry_routable_ids(row), f"pack {other!r}"))
@@ -129,9 +124,8 @@ def validate(
             ids = catalog.entry_routable_ids(row)
         except ValueError as exc:
             refuse(str(exc))
-        identical_copy = copies.get(name) == row
         for model_id in ids:
-            if model_id in taken and not (identical_copy and taken[model_id] == "an owner model"):
+            if model_id in taken:
                 refuse(f"pack model {name!r} identifier {model_id!r} is used by {taken[model_id]}",
                        code="pack_conflict", status=409)
             taken[model_id] = f"pack model {name!r}"
