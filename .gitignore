@@ -5,6 +5,7 @@ config/config.tmp*
 config/.config.yaml.*
 config/secrets/
 config/*.onboard.lock
+config/.locks/
 config/federation-cache.json
 config/consumer-profiles-registry*.json
 config/consumer-profiles-registry*.json.lock
