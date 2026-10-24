@@ -1,6 +1,6 @@
 # ADR 0003: Scoped Model Access and Lightweight Local Models
 
-- **Status:** Accepted
+- **Status:** Accepted; implemented in 0.8.4 (phases 0-1) and 0.8.5 (phases 2-5)
 - **Date:** 2026-10-23
 
 ## Context
@@ -284,7 +284,7 @@ repository at a 40-character revision.
 real path of `config.yaml`, keyed as today, and refuses a `.locks/` owned by
 another user. Every process writing one config file resolves the same lock
 whatever its environment, as the profile registry's lock beside its file
-already does. For one release, writers hold the new lock and both legacy
+already does. Until no install can still run 0.8.3, writers hold the new lock and both legacy
 locations (`/tmp/model-gateway-locks-<uid>/` and the per-user Darwin temp
 directory), in that fixed order, so processes from either version exclude
 each other during an upgrade whatever environment they started in.

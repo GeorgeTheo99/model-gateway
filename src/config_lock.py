@@ -62,8 +62,9 @@ def _legacy_roots() -> list[Path]:
 def legacy_lock_paths(config_path: Path) -> list[Path]:
     """Where releases before 0.8.4 locked this config: ``tempfile.gettempdir()``,
     which is ``/tmp`` under launchd and ``$TMPDIR`` in a shell. Writers hold these
-    too for one release so processes from either version exclude each other
-    during an upgrade; remove after 0.8.4. Roots another user owns are skipped."""
+    too so processes from either version exclude each other during an upgrade.
+    Remove once no install can still run 0.8.3: Home Server packages went from
+    0.8.3 straight to a later release. Roots another user owns are skipped."""
     _resolved, digest = _digest(config_path)
     paths = []
     for root in _legacy_roots():
