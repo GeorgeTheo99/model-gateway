@@ -1,6 +1,6 @@
 # ADR 0003: Scoped Model Access and Lightweight Local Models
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-10-23
 
 ## Context
