@@ -29,6 +29,7 @@ from src.server import app
 ROOT = Path(__file__).resolve().parents[1]
 REAL_MEMORY_BYTES = lr._memory_bytes
 REAL_DOWNLOAD_OPENER = lr._download_opener
+REAL_MANIFEST = lr.manifest
 QWEN = lr.MODELS[lr.DEFAULT_MODEL]
 QWEN_ID = "qwen3.8-27b-8bit-30gb"
 GIB = 1024**3
@@ -98,6 +99,11 @@ def launchctl(monkeypatch):
     return fake
 
 
+def qwen_manifest(payload: dict):
+    """``lr.manifest`` with ``payload`` for the default model; other models keep their own."""
+    return lambda local: payload if local.name == QWEN.name else REAL_MANIFEST(local)
+
+
 def write_plist(path: Path, value: dict) -> bytes:
     path.parent.mkdir(parents=True, exist_ok=True)
     raw = plistlib.dumps(value)
@@ -118,8 +124,12 @@ def owned_install(port: int = 9123) -> None:
 
 
 def test_status_on_a_mac_that_cannot_run_local_ai():
-    assert lr.status() == {"eligible": False, "installed": False, "managed": True, "model": None, "state": None,
-                           "bytes_done": 0, "bytes_total": 0, "message": "", "base_url": None, "loaded": None}
+    value = lr.status()
+    models = value.pop("models")
+    assert value == {"eligible": False, "installed": False, "managed": True, "model": None, "state": None,
+                     "bytes_done": 0, "bytes_total": 0, "message": "", "base_url": None, "loaded": None}
+    assert models == [{"name": name, "eligible": False, "installed": False, "min_memory_gb": gb, "loaded": None}
+                      for name, gb in (("qwen3.8-27b", 48), ("qwen3.8-27b-4bit", 32))]
     assert not lr.runtime_root().exists()  # reading status creates nothing
 
 
@@ -192,15 +202,19 @@ def test_add_refuses_to_guess_the_label_of_an_unlabelled_gateway(eligible, gatew
     assert lr.start_add()["state"] == "queued" and len(bootstraps) == 1
 
 
-def test_eligibility_needs_48_gib_and_uses_absolute_sysctl(monkeypatch):
+def test_eligibility_is_per_model_and_uses_absolute_sysctl(monkeypatch):
     monkeypatch.setattr(lr, "_apple_silicon", lambda: True)
-    for memory, expected in ((48 * GIB, True), (48 * GIB - 1, False), (16 * GIB, False)):
+    small = lr.MODELS["qwen3.8-27b-4bit"]
+    for memory, any_model, eight_bit, preferred in ((48 * GIB, True, True, QWEN), (48 * GIB - 1, True, False, small),
+                                                   (32 * GIB, True, False, small), (32 * GIB - 1, False, False, QWEN)):
         calls = []
         monkeypatch.setattr(lr.subprocess, "check_output", lambda args, **kw: calls.append(args) or f"{memory}\n")
         monkeypatch.setattr(lr, "_memory_bytes", REAL_MEMORY_BYTES)
-        assert lr.eligible() is expected
+        assert lr.eligible() is any_model
+        assert lr.eligible(QWEN) is eight_bit
+        assert lr.preferred_model() == preferred  # the default when nothing fits
         # Absolute, because launchd jobs and the gateway have no /usr/sbin on PATH.
-        assert calls == [["/usr/sbin/sysctl", "-n", "hw.memsize"]]
+        assert calls[0] == ["/usr/sbin/sysctl", "-n", "hw.memsize"]
     monkeypatch.setattr(lr, "_apple_silicon", lambda: False)
     assert lr.eligible() is False
 
@@ -345,9 +359,10 @@ def test_payload_download_retries_then_reports_a_bounded_error(progress, sleeps,
     with pytest.raises(RuntimeError, match="Could not download the local AI model"):
         lr.download_payload(manifest, progress)
     assert calls == ["https://huggingface.co/org/model/resolve/abc123/model.safetensors"] * lr.DOWNLOAD_ATTEMPTS
-    assert (lr.mlx_dir() / f"{QWEN_ID}.partial").is_dir()
+    assert (lr.staging_dir() / f"{QWEN_ID}.partial").is_dir()
+    assert not lr.mlx_dir().exists()  # oMLX never sees a partial payload
     # An already promoted payload is never downloaded again.
-    (lr.mlx_dir() / QWEN_ID).mkdir()
+    (lr.mlx_dir() / QWEN_ID).mkdir(parents=True)
     calls.clear()
     lr.download_payload(manifest, progress)
     assert calls == [] and progress.value["bytes_done"] == len(BODY)
@@ -371,7 +386,7 @@ def test_retries_restart_their_budget_whenever_the_file_grew(progress, sleeps, m
     monkeypatch.setattr(lr, "download_file", flaky)
     lr.download_payload(manifest, progress)
     assert len(calls) == 21 > lr.DOWNLOAD_ATTEMPTS
-    assert (lr.mlx_dir() / f"{QWEN_ID}.partial/model.safetensors").read_bytes() == BODY
+    assert (lr.staging_dir() / f"{QWEN_ID}.partial/model.safetensors").read_bytes() == BODY
     # A fresh budget backs off from the start again.
     assert set(sleeps) == {5}
 
@@ -816,9 +831,9 @@ def test_cli_job_reports_failures_without_a_traceback(eligible, monkeypatch, cap
 # ── install and gateway wiring ───────────────────────────────────────────────
 
 
-def tiny_payload() -> dict:
+def tiny_payload(model_id: str = QWEN_ID, *, staging: Path | None = None) -> dict:
     """A verified two-file payload staged in .partial, plus its manifest."""
-    partial = lr.mlx_dir() / f"{QWEN_ID}.partial"
+    partial = (staging or lr.staging_dir()) / f"{model_id}.partial"
     partial.mkdir(parents=True)
     files = {"model-00001.safetensors": b"weights",
              "model.safetensors.index.json": json.dumps({"weight_map": {"a": "model-00001.safetensors"}}).encode()}
@@ -826,21 +841,21 @@ def tiny_payload() -> dict:
     for name, data in files.items():
         (partial / name).write_bytes(data)
         entries.append({"path": name, "size_bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
-    return {"schema_version": 1, "model_id": QWEN_ID, "hf_repo": "org/model", "hf_revision": "0" * 40, "license": "x",
+    return {"schema_version": 1, "model_id": model_id, "hf_repo": "org/model", "hf_revision": "0" * 40, "license": "x",
             "total_bytes": sum(e["size_bytes"] for e in entries), "files": entries}
 
 
 def test_install_verifies_builds_starts_and_wires_the_gateway(eligible, gateway, launchctl, monkeypatch):
     payload = tiny_payload()
     runs, health = [], []
-    monkeypatch.setattr(lr, "manifest", lambda local: payload)
+    monkeypatch.setattr(lr, "manifest", qwen_manifest(payload))
     monkeypatch.setattr(lr, "_run", lambda *args, env=None: runs.append((args, env and env.get("UV_PROJECT_ENVIRONMENT"))))
     monkeypatch.setattr(lr, "_wait_health", health.append)
     monkeypatch.setattr(lr, "_uv", lambda: "/fake/uv")
     launchctl.loaded.add(lr.GATEWAY_LABEL)
     lr.install(QWEN, payload)
 
-    assert (lr.mlx_dir() / QWEN_ID).is_dir() and not (lr.mlx_dir() / f"{QWEN_ID}.partial").exists()
+    assert (lr.mlx_dir() / QWEN_ID).is_dir() and not (lr.staging_dir() / f"{QWEN_ID}.partial").exists()
     assert runs[0] == (("/fake/uv", "sync", "--locked", "--no-dev", "--project", str(lr.RUNTIME_PROJECT)),
                        str(lr.venv_dir()))
     assert runs[1][0][:2] == (str(lr.venv_dir() / "bin/python"), "-c")
@@ -874,7 +889,7 @@ def test_install_verifies_builds_starts_and_wires_the_gateway(eligible, gateway,
 
 def test_install_refuses_an_external_plist_that_appears_after_download(eligible, gateway, launchctl, monkeypatch):
     payload = tiny_payload()
-    monkeypatch.setattr(lr, "manifest", lambda local: payload)
+    monkeypatch.setattr(lr, "manifest", qwen_manifest(payload))
     monkeypatch.setattr(lr, "_uv", lambda: "/fake/uv")
     monkeypatch.setattr(lr, "_wait_health", lambda url: pytest.fail("started oMLX"))
     appeared = []
@@ -899,14 +914,14 @@ def test_install_refuses_an_external_plist_that_appears_after_download(eligible,
 
 def test_install_rejects_a_payload_that_fails_verification(eligible, gateway, monkeypatch):
     payload = tiny_payload()
-    (lr.mlx_dir() / f"{QWEN_ID}.partial/model-00001.safetensors").write_bytes(b"tampered")
+    (lr.staging_dir() / f"{QWEN_ID}.partial/model-00001.safetensors").write_bytes(b"tampered")
     with pytest.raises(lr.LocalRuntimeError, match="failed verification"):
         lr.install(QWEN, payload)
     assert not (lr.mlx_dir() / QWEN_ID).exists()
 
 
 def test_gateway_wiring_rolls_back_when_the_gateway_does_not_restart(gateway, launchctl, monkeypatch):
-    monkeypatch.setattr(lr, "manifest", lambda local: {"model_id": QWEN_ID})
+    monkeypatch.setattr(lr, "manifest", qwen_manifest({"model_id": QWEN_ID}))
     before = (gateway.read_text(), config_io.MODEL_INFO_PATH.read_text())
     with pytest.raises(lr.LocalRuntimeError, match="not running"):
         lr.configure_gateway(QWEN, 9110)
@@ -934,7 +949,7 @@ def test_check_requires_the_sole_payload_and_a_real_completion(eligible, monkeyp
         lr.check(QWEN, payload)
     replies["http://127.0.0.1:9123/v1/models/status"] = {"models": [{"id": QWEN_ID, "model_path": path},
                                                                     {"id": "other", "model_path": "/x"}]}
-    with pytest.raises(lr.LocalRuntimeError, match="sole verified"):
+    with pytest.raises(lr.LocalRuntimeError, match="exactly the verified"):
         lr.check(QWEN, payload)
 
 
@@ -965,7 +980,7 @@ def test_check_without_a_gateway_key_completes_against_omlx_and_requires_gateway
         lr.check(QWEN, payload)
     assert not any(url.endswith("/chat/completions") for url, _token, _body in seen)
 
-    monkeypatch.setattr(lr, "manifest", lambda local: payload)
+    monkeypatch.setattr(lr, "manifest", qwen_manifest(payload))
     monkeypatch.setattr(lr, "_restart_gateway", lambda required: None)
     lr.configure_gateway(QWEN, 9123)
     seen.clear()
@@ -1114,7 +1129,7 @@ def test_unconfigure_leaves_a_foreign_omlx_provider_and_its_models_untouched(gat
 
 def wire_local_ai(gateway, monkeypatch) -> None:
     """The gateway as configure_gateway leaves it, with the payload installed."""
-    monkeypatch.setattr(lr, "manifest", lambda local: {"model_id": QWEN_ID})
+    monkeypatch.setattr(lr, "manifest", qwen_manifest({"model_id": QWEN_ID}))
     lr._key(lr.api_key_path(), create=True)
     (lr.mlx_dir() / QWEN_ID).mkdir(parents=True)
     config = yaml.safe_load(gateway.read_text())
@@ -1136,7 +1151,8 @@ def test_the_local_model_loads_from_the_release_and_takes_its_fixes(gateway, mon
     entry = local_entry()
     assert (entry["omlx_id"], entry["origin"]) == (QWEN_ID, {"layer": "shipped", "profile": "local-ai"})
     # A release that changes the model's row reaches this install with nothing to migrate.
-    fixed = lr.LocalModel(QWEN.name, QWEN.manifest, {**QWEN.catalog, "context": 65536}, QWEN.settings)
+    fixed = lr.LocalModel(QWEN.name, QWEN.manifest, {**QWEN.catalog, "context": 65536}, QWEN.settings,
+                          QWEN.min_memory_bytes)
     monkeypatch.setitem(lr.MODELS, QWEN.name, fixed)
     assert local_entry()["context"] == 65536
     # The owner added it, so it loads whatever the shipped selection.
@@ -1195,7 +1211,7 @@ def test_an_owner_qwen_without_gateway_local_ai_is_untouched(gateway):
 
 
 def test_adding_local_ai_again_restores_a_hidden_model_and_tolerates_overrides(gateway, monkeypatch):
-    monkeypatch.setattr(lr, "manifest", lambda local: {"model_id": QWEN_ID})
+    monkeypatch.setattr(lr, "manifest", qwen_manifest({"model_id": QWEN_ID}))
     monkeypatch.setattr(lr, "_restart_gateway", lambda required: None)
     config = yaml.safe_load(gateway.read_text())
     gateway.write_text(yaml.safe_dump({**config, "catalog": {"hidden": ["qwen3.8-27b", "other"]}}))
@@ -1298,7 +1314,7 @@ def test_a_broken_local_manifest_never_takes_the_catalog_down(gateway, monkeypat
 def test_setup_converts_copies_so_the_restarted_gateway_never_waits_for_its_lock(gateway, monkeypatch):
     from src import shipped
 
-    monkeypatch.setattr(lr, "manifest", lambda local: {"model_id": QWEN_ID})
+    monkeypatch.setattr(lr, "manifest", qwen_manifest({"model_id": QWEN_ID}))
     lr._key(lr.api_key_path(), create=True)
     (lr.mlx_dir() / QWEN_ID).mkdir(parents=True)
     # A Home Server import made before local AI was added on this Mac.
@@ -1351,7 +1367,7 @@ def test_startup_skips_the_migration_while_another_writer_holds_the_lock(gateway
 
 
 def test_setup_refuses_a_gateway_launch_agent_with_another_state_dir(gateway, monkeypatch):
-    monkeypatch.setattr(lr, "manifest", lambda local: {"model_id": QWEN_ID})
+    monkeypatch.setattr(lr, "manifest", qwen_manifest({"model_id": QWEN_ID}))
     monkeypatch.setattr(lr, "_restart_gateway", lambda required: None)
     plist = lr.launch_agents_dir() / f"{lr.GATEWAY_LABEL}.plist"
     write_plist(plist, {"Label": lr.GATEWAY_LABEL, "EnvironmentVariables": {"MODEL_GATEWAY_STATE_DIR": "/elsewhere"}})
@@ -1443,7 +1459,7 @@ def test_invalid_config_is_a_safe_422_in_the_admin_api_and_cli(eligible, gateway
     assert refused.json()["error"]["message"] == "The gateway configuration is not valid YAML"
     assert lr.main(["add"]) == 2
     assert capsys.readouterr().err == "error: The gateway configuration is not valid YAML\n"
-    monkeypatch.setattr(lr, "status", lambda: (_ for _ in ()).throw(ValueError("invalid literal: 'sk-secret'")))
+    monkeypatch.setattr(lr, "status", lambda name=None: (_ for _ in ()).throw(ValueError("invalid literal: 'sk-secret'")))
     status = client.get("/admin/api/local-ai", headers=admin)
     assert status.status_code == 422 and "sk-secret" not in status.text
     assert lr.main(["status"]) == 2 and "sk-secret" not in capsys.readouterr().err
@@ -1562,7 +1578,7 @@ def test_package_root_follows_the_package_root_file_when_run_from_a_release(tmp_
 def test_status_reports_whether_the_installed_model_is_loaded(monkeypatch):
     local = lr.MODELS["qwen3.8-27b"]
     monkeypatch.setattr(lr, "omlx_owner", lambda: "ours")
-    monkeypatch.setattr(lr, "installed_model", lambda: local)
+    monkeypatch.setattr(lr, "installed_models", lambda: [local])
     monkeypatch.setattr(lr, "_key", lambda *a, **k: "omlx-key")
     model_id = lr.manifest(local)["model_id"]
     for rows, expected in (([{"id": model_id, "loaded": False}], False),
@@ -1576,3 +1592,392 @@ def test_status_reports_whether_the_installed_model_is_loaded(monkeypatch):
     assert lr.status()["loaded"] is None
     monkeypatch.setattr(lr, "omlx_owner", lambda: "external")
     assert lr.status()["loaded"] is None
+
+
+# ── several models (docs/adr/0003-scoped-access-and-lightweight-local-models.md section 3) ──
+
+SMALL = lr.MODELS["qwen3.8-27b-4bit"]
+SMALL_ID = "qwen3.8-27b-4bit-16gb"
+
+
+def running_runtime(gateway, launchctl, monkeypatch) -> list[str]:
+    """This gateway's runtime built, loaded and wired with the 8-bit model; records oMLX reloads."""
+    owned_install(9110)
+    lr._key(lr.api_key_path(), create=True)
+    (lr.venv_dir() / "bin").mkdir(parents=True)
+    (lr.venv_dir() / "bin" / "omlx").write_text("")
+    wire_local_ai_config(gateway)
+    launchctl.loaded.update({lr.OMLX_LABEL, lr.GATEWAY_LABEL})
+    reloads = []
+    monkeypatch.setattr(lr, "_omlx_reload", lambda: reloads.append("reload"))
+    return reloads
+
+
+def test_a_second_model_joins_the_running_runtime_without_a_restart(eligible, gateway, launchctl, monkeypatch):
+    reloads = running_runtime(gateway, launchctl, monkeypatch)
+    payload = tiny_payload(SMALL_ID)
+    monkeypatch.setattr(lr, "manifest", lambda local: payload if local is SMALL else REAL_MANIFEST(local))
+    monkeypatch.setattr(lr, "_run", lambda *a, **k: pytest.fail("rebuilt oMLX"))
+    before = lr.generation()
+    lr.install(SMALL, payload)
+
+    assert sorted(path.name for path in lr.mlx_dir().iterdir()) == sorted([QWEN_ID, SMALL_ID])
+    settings = json.loads((lr.inference_dir() / "model_settings.json").read_text())["models"]
+    assert {model_id: row["is_default"] for model_id, row in settings.items()} == {QWEN_ID: True, SMALL_ID: False}
+    assert reloads == ["reload"]
+    assert lr.generation() != before  # the running gateway reloads its catalog
+    assert not [call for call in launchctl.calls if call[0] in {"kickstart", "bootstrap", "bootout"}]
+    providers.reload()
+    names = {row["name"]: row for row in providers.effective_model_inventory() if row.get("provider") == "omlx"}
+    assert set(names) == {"qwen3.8-27b", "qwen3.8-27b-4bit"}
+    assert names["qwen3.8-27b-4bit"]["omlx_id"] == SMALL_ID
+    assert [m.name for m in lr.installed_models()] == ["qwen3.8-27b", "qwen3.8-27b-4bit"]
+
+
+def test_the_base_model_name_is_served_by_whichever_qwen_is_installed(gateway, launchctl, monkeypatch):
+    lr._key(lr.api_key_path(), create=True)
+    wire_local_ai_config(gateway)
+    write_plist(lr.omlx_plist_path(), lr.omlx_plist(9110))
+    (lr.mlx_dir() / SMALL_ID).mkdir(parents=True)
+    providers.reload()
+    routed = providers.resolve("qwen3.8-27b")
+    assert routed is not None and routed.provider_model_id == SMALL_ID
+
+
+def test_promotion_refuses_a_foreign_directory_and_moves_old_partials(eligible, gateway, monkeypatch):
+    payload = tiny_payload(staging=lr.mlx_dir())  # where earlier releases downloaded
+    monkeypatch.setattr(lr, "manifest", qwen_manifest(payload))
+    assert lr.partial_dir(QWEN_ID) == lr.staging_dir() / f"{QWEN_ID}.partial"
+    assert lr.partial_dir(QWEN_ID).is_dir() and not (lr.mlx_dir() / f"{QWEN_ID}.partial").exists()
+    (lr.mlx_dir() / "someone-elses-model").mkdir()
+    with pytest.raises(lr.LocalRuntimeError, match="remove someone-elses-model"):
+        lr._promote(payload)
+
+
+def test_removing_one_of_several_models_keeps_the_runtime(eligible, gateway, launchctl, monkeypatch):
+    reloads = running_runtime(gateway, launchctl, monkeypatch)
+    (lr.mlx_dir() / SMALL_ID).mkdir()
+    before = lr.generation()
+    status = lr.remove("qwen3.8-27b-4bit")
+    assert status["installed"] is False and status["model"] == "qwen3.8-27b-4bit"
+    assert [path.name for path in lr.mlx_dir().iterdir()] == [QWEN_ID]
+    assert list(json.loads((lr.inference_dir() / "model_settings.json").read_text())["models"]) == [QWEN_ID]
+    assert reloads == ["reload"] and lr.generation() != before
+    assert lr.omlx_plist_path().exists() and "omlx" in yaml.safe_load(gateway.read_text())["providers"]
+    with pytest.raises(lr.LocalRuntimeError, match="is not installed"):
+        lr.remove("qwen3.8-27b-4bit")
+
+
+def test_removing_the_last_model_removes_the_runtime(eligible, gateway, launchctl, monkeypatch):
+    running_runtime(gateway, launchctl, monkeypatch)
+    monkeypatch.setattr(lr, "_wait_health", lambda url: None)
+    lr.remove("qwen3.8-27b")
+    assert not lr.runtime_root().exists() and not lr.omlx_plist_path().exists()
+    assert "omlx" not in yaml.safe_load(gateway.read_text())["providers"]
+
+
+def test_add_defaults_to_the_best_model_this_mac_can_run(gateway, launchctl, monkeypatch):
+    monkeypatch.setattr(lr, "_apple_silicon", lambda: True)
+    monkeypatch.setattr(lr, "_memory_bytes", lambda: 36 * GIB)
+    bootstraps = queue(monkeypatch)
+    status = lr.start_add()
+    assert (status["model"], status["state"], len(bootstraps)) == ("qwen3.8-27b-4bit", "queued", 1)
+    with pytest.raises(lr.LocalRuntimeError, match="needs Apple silicon and at least 48 GB"):
+        lr.start_add("qwen3.8-27b")
+
+
+def test_one_setup_job_at_a_time(eligible, gateway, launchctl, monkeypatch):
+    queue(monkeypatch)
+    lr.start_add("qwen3.8-27b")
+    monkeypatch.setattr(lr, "_job_alive", lambda: True)
+    with pytest.raises(lr.LocalRuntimeError, match="installing qwen3.8-27b; add qwen3.8-27b-4bit when it finishes"):
+        lr.start_add("qwen3.8-27b-4bit")
+    assert lr.start_add("qwen3.8-27b")["state"] == "queued"
+
+
+def test_status_describes_each_model(eligible, monkeypatch):
+    monkeypatch.setattr(lr, "omlx_owner", lambda: "gateway")
+    monkeypatch.setattr(lr, "installed_models", lambda: [QWEN, SMALL])
+    monkeypatch.setattr(lr, "_key", lambda *a, **k: "omlx-key")
+    monkeypatch.setattr(lr, "_request", lambda *a, **k: {"models": [
+        {"id": QWEN_ID, "loaded": True}, {"id": SMALL_ID, "loaded": False}]})
+    value = lr.status("qwen3.8-27b-4bit")
+    assert (value["model"], value["installed"], value["loaded"], value["state"]) == (
+        "qwen3.8-27b-4bit", True, False, "done")
+    assert [(row["name"], row["loaded"]) for row in value["models"]] == [
+        ("qwen3.8-27b", True), ("qwen3.8-27b-4bit", False)]
+    # A job for one model never reports as another's progress.
+    lr._atomic(lr.status_path(), json.dumps({"state": "failed", "model": "qwen3.8-27b-4bit", "message": "x",
+                                             "updated_at": lr._now()}))
+    assert lr.status("qwen3.8-27b")["state"] == "done"
+    assert lr.status("qwen3.8-27b-4bit")["state"] == "failed"
+
+
+# ── pins: models local profiles use stay loaded ──────────────────────────────
+
+
+def pins(installed, names, memory=512 * GIB):
+    settings = lr.model_settings(installed, names, memory)["models"]
+    return {model_id: (row["is_default"], row["is_pinned"]) for model_id, row in settings.items()}
+
+
+def test_model_settings_pin_models_that_local_profiles_route_to():
+    assert pins([QWEN, SMALL], {"qwen3.8-27b-4bit"}) == {QWEN_ID: (True, False), SMALL_ID: (False, True)}
+    # A route to the 8-bit is served by the 4-bit once only the 4-bit is installed, so that is pinned.
+    assert pins([SMALL], {"qwen3.8-27b"}) == {SMALL_ID: (True, True)}
+    # Never more than the memory budget, whatever registered profiles route to.
+    assert pins([QWEN, SMALL], {"qwen3.8-27b", "qwen3.8-27b-4bit"}, 48 * GIB) == {
+        QWEN_ID: (True, True), SMALL_ID: (False, False)}
+
+
+def test_pins_must_fit_the_macs_memory(monkeypatch):
+    monkeypatch.setattr(lr, "installed_models", lambda: [QWEN, SMALL])
+    monkeypatch.setattr(lr, "_memory_bytes", lambda: 48 * GIB)
+    assert lr.pin_budget_error({"qwen3.8-27b"}) is None
+    assert lr.pin_budget_error({"not-local"}) is None
+    error = lr.pin_budget_error({"qwen3.8-27b", "qwen3.8-27b-4bit"})
+    assert error is not None and "more than 75% of this Mac's memory" in error
+
+
+def test_sync_pins_rewrites_settings_and_reloads_only_on_change(eligible, gateway, launchctl, monkeypatch):
+    reloads = running_runtime(gateway, launchctl, monkeypatch)
+    pinned = set()
+    monkeypatch.setattr(lr, "_pinned_names", lambda: pinned)
+    assert lr.sync_pins() is True and reloads == ["reload"]
+    assert lr.sync_pins() is False and reloads == ["reload"]
+    pinned.add("qwen3.8-27b")
+    assert lr.sync_pins() is True
+    assert json.loads((lr.inference_dir() / "model_settings.json").read_text())["models"][QWEN_ID]["is_pinned"]
+    with lr.provision_lock(wait=True):  # the setup job writes the same settings
+        pinned.clear()
+        assert lr.sync_pins() is False
+
+
+def test_sync_pins_does_nothing_without_this_gateways_runtime(monkeypatch):
+    monkeypatch.setattr(lr, "_omlx_reload", lambda: pytest.fail("reloaded"))
+    assert lr.sync_pins() is False
+    lr.runtime_root().mkdir(parents=True)
+    external_omlx()
+    assert lr.sync_pins() is False
+
+
+def test_omlx_reload_logs_in_with_the_runtime_key_then_reloads(monkeypatch):
+    lr._key(lr.api_key_path(), create=True)
+    key = lr.api_key_path().read_text().strip()
+    seen = []
+
+    class Headers(list):
+        def items(self):
+            return iter(self)
+
+    class Response:
+        status = 200
+
+        def __init__(self, headers=()):
+            self.headers = Headers(headers)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class Opener:
+        def open(self, request, timeout):
+            seen.append((request.full_url, request.data, dict(request.header_items())))
+            if request.full_url.endswith("/login"):
+                return Response([("Set-Cookie", "omlx_admin_session=abc; HttpOnly; Path=/")])
+            return Response()
+
+    monkeypatch.setattr(lr.urllib.request, "build_opener", lambda *handlers: Opener())
+    lr._omlx_reload()
+    assert seen[0][0] == "http://127.0.0.1:9110/admin/api/login" and json.loads(seen[0][1]) == {"api_key": key}
+    assert seen[1][0] == "http://127.0.0.1:9110/admin/api/reload" and seen[1][2]["Cookie"] == "omlx_admin_session=abc"
+
+
+def test_the_gateway_reloads_its_catalog_when_the_local_models_change(monkeypatch):
+    import asyncio
+
+    from src import admin
+
+    class Done(Exception):
+        pass
+
+    sequence = iter(["a", "a", "b", "b", "c", "c"])
+
+    def generation():
+        try:
+            return next(sequence)
+        except StopIteration:
+            raise Done from None
+
+    reloads, errors = [], iter([None, "rejected", None])
+
+    def reload():
+        reloads.append("reload")
+        return next(errors)
+
+    async def regenerate():
+        return "regenerated"
+
+    monkeypatch.setattr(lr, "generation", generation)
+    monkeypatch.setattr(admin, "_reload_for_local_ai", reload)
+    monkeypatch.setattr(admin, "_regenerate_catalogs", regenerate)
+    monkeypatch.setattr(admin.discovery, "refresh", lambda: reloads.append("refresh"))
+
+    async def run():
+        with pytest.raises(Done):
+            await admin.watch_local_ai(poll_seconds=0)
+
+    asyncio.run(run())
+    # a -> b reloads; b -> c is rejected once, then retried and applied.
+    assert reloads == ["reload", "refresh", "reload", "reload", "refresh"]
+
+
+def test_registering_a_local_profile_pins_its_model_within_the_memory_budget(monkeypatch):
+    from src import profiles
+    from tests.test_consumer_profiles import _configure, _manifest, _register
+
+    _configure(monkeypatch)
+    budget = []
+    monkeypatch.setattr(lr, "pin_budget_error", lambda names: budget.append(set(names)) or None)
+    synced = []
+    monkeypatch.setattr(lr, "sync_pins", lambda: synced.append(1) or True)
+    first = _register()
+    assert first.status_code == 200
+    assert budget == [{"test-local"}] and synced == [1]
+    assert profiles.local_route_models() == {"test-local"}
+
+    etag = first.headers["ETag"]
+    monkeypatch.setattr(lr, "pin_budget_error", lambda names: "Keeping test-local loaded needs 99 GB")
+    # A new revision routing to the same models pins nothing new, so it is not re-checked.
+    from tests.test_consumer_profiles import _headers, client
+    same = client.put("/v1/profiles/ha/snapshot", headers={**_headers(), "If-Match": etag},
+                      json=_manifest(source_revision="ha@two"))
+    assert same.status_code == 200
+    monkeypatch.setattr(profiles, "_local_routes", lambda namespaces: {"test-local", "another-local"}
+                        if namespaces.get("ha", [{}])[-1].get("manifest", {}).get("source_revision") == "ha@three"
+                        else {"test-local"})
+    refused = client.put("/v1/profiles/ha/snapshot", headers={**_headers(), "If-Match": same.headers["ETag"]},
+                         json=_manifest(source_revision="ha@three"))
+    assert refused.status_code == 409 and refused.json()["error"]["code"] == "local_memory_exceeded"
+
+
+def test_a_failed_omlx_reload_is_retried(eligible, gateway, launchctl, monkeypatch):
+    running_runtime(gateway, launchctl, monkeypatch)
+    pinned = {"qwen3.8-27b"}
+    monkeypatch.setattr(lr, "_pinned_names", lambda: pinned)
+    attempts = []
+
+    def flaky():
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise OSError("oMLX is busy")
+
+    monkeypatch.setattr(lr, "_omlx_reload", flaky)
+    before = lr._read_settings()
+    with pytest.raises(OSError):
+        lr.sync_pins()
+    assert lr._read_settings() == before  # restored, so the retry sees the change again
+    assert lr.sync_pins() is True and len(attempts) == 2
+
+
+def test_a_failed_join_takes_the_new_model_back_out(eligible, gateway, launchctl, monkeypatch):
+    reloads = running_runtime(gateway, launchctl, monkeypatch)
+    payload = tiny_payload(SMALL_ID)
+    monkeypatch.setattr(lr, "manifest", lambda local: payload if local is SMALL else REAL_MANIFEST(local))
+    monkeypatch.setattr(lr, "configure_gateway", lambda *a, **k: (_ for _ in ()).throw(
+        lr.LocalRuntimeError("The gateway catalog already has a different model named 'qwen3.8-27b-4bit'")))
+    before = lr.generation()
+    with pytest.raises(lr.LocalRuntimeError, match="different model"):
+        lr.install(SMALL, payload)
+    assert [path.name for path in lr.mlx_dir().iterdir()] == [QWEN_ID]
+    assert (lr.staging_dir() / f"{SMALL_ID}.partial").is_dir()  # kept for the next add
+    assert list(json.loads(lr._read_settings())["models"]) == [QWEN_ID]
+    assert reloads == ["reload", "reload"] and lr.generation() != before
+
+
+def test_a_failed_removal_keeps_serving_the_model(eligible, gateway, launchctl, monkeypatch):
+    running_runtime(gateway, launchctl, monkeypatch)
+    (lr.mlx_dir() / SMALL_ID).mkdir()
+    lr._write_model_settings(lr._promoted_models())
+    monkeypatch.setattr(lr, "_omlx_reload", lambda: (_ for _ in ()).throw(OSError("oMLX is busy")))
+    with pytest.raises(OSError):
+        lr.remove("qwen3.8-27b-4bit")
+    assert sorted(path.name for path in lr.mlx_dir().iterdir()) == sorted([QWEN_ID, SMALL_ID])
+    assert set(json.loads(lr._read_settings())["models"]) == {QWEN_ID, SMALL_ID}
+
+
+def test_default_status_reports_a_failed_add_of_a_model_not_installed(eligible, monkeypatch):
+    monkeypatch.setattr(lr, "omlx_owner", lambda: "gateway")
+    monkeypatch.setattr(lr, "installed_models", lambda: [QWEN])
+    monkeypatch.setattr(lr, "_loaded_models", lambda installed: {})
+    lr._atomic(lr.status_path(), json.dumps({"state": "failed", "model": "qwen3.8-27b-4bit", "message": "no disk",
+                                             "updated_at": lr._now()}))
+    value = lr.status()
+    assert (value["model"], value["state"], value["message"]) == ("qwen3.8-27b-4bit", "failed", "no disk")
+    lr._atomic(lr.status_path(), json.dumps({"state": "done", "model": "qwen3.8-27b-4bit", "updated_at": lr._now()}))
+    assert lr.status()["model"] == "qwen3.8-27b"
+
+
+def test_the_watcher_outlives_a_reload_that_raises(monkeypatch):
+    import asyncio
+
+    from src import admin
+
+    class Done(Exception):
+        pass
+
+    sequence = iter(["a", "b", "b"])
+
+    def generation():
+        try:
+            return next(sequence)
+        except StopIteration:
+            raise Done from None
+
+    outcomes = iter([RuntimeError("another config write holds the lock"), None])
+    reloads = []
+
+    def reload():
+        reloads.append(1)
+        outcome = next(outcomes)
+        if outcome:
+            raise outcome
+
+    async def regenerate():
+        return "ok"
+
+    monkeypatch.setattr(lr, "generation", generation)
+    monkeypatch.setattr(admin, "_reload_for_local_ai", reload)
+    monkeypatch.setattr(admin, "_regenerate_catalogs", regenerate)
+    monkeypatch.setattr(admin.discovery, "refresh", lambda: None)
+
+    async def run():
+        with pytest.raises(Done):
+            await admin.watch_local_ai(poll_seconds=0)
+
+    asyncio.run(run())
+    assert len(reloads) == 2
+
+
+def test_status_api_refuses_an_unknown_model(gateway):
+    response = TestClient(app).get("/admin/api/local-ai?model=bogus", headers={"Authorization": "Bearer admin"})
+    assert response.status_code == 400 and "qwen3.8-27b-4bit" in response.text
+
+
+def test_a_foreign_directory_stops_promotion_before_the_payload_moves(eligible, gateway, monkeypatch):
+    payload = tiny_payload()
+    (lr.mlx_dir() / "someone-elses-model").mkdir(parents=True)
+    with pytest.raises(lr.LocalRuntimeError, match="remove someone-elses-model"):
+        lr._promote(payload)
+    assert not (lr.mlx_dir() / QWEN_ID).exists() and lr.partial_dir(QWEN_ID).is_dir()
+
+
+def test_removal_succeeds_even_when_pins_cannot_sync_afterwards(eligible, gateway, launchctl, monkeypatch):
+    running_runtime(gateway, launchctl, monkeypatch)
+    (lr.mlx_dir() / SMALL_ID).mkdir()
+    lr._atomic(lr.status_path(), json.dumps({"state": "done", "model": "qwen3.8-27b-4bit", "updated_at": lr._now()}))
+    monkeypatch.setattr(lr, "sync_pins", lambda: (_ for _ in ()).throw(OSError("oMLX is busy")))
+    value = lr.remove("qwen3.8-27b-4bit")
+    assert (value["installed"], value["state"]) == (False, None)

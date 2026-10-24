@@ -320,27 +320,47 @@ the gateway-owned oMLX once it is installed.
 
 ## Local AI
 
-One gateway per Mac owns local AI for every product attached to it. On Apple
-silicon with at least 48 GiB of memory:
+One gateway per Mac owns local AI for every product attached to it. The release
+curates the models it can install, each with the memory it needs on Apple
+silicon, and serves any that fit side by side
+([ADR 0003](adr/0003-scoped-access-and-lightweight-local-models.md) section 3):
+
+| Model | Payload | Macs with |
+|---|---|---|
+| `qwen3.8-27b` (8-bit) | 30 GB | 48 GiB and up |
+| `qwen3.8-27b-4bit` | 16 GB | 32 GiB and up |
+
+Both serve base model `qwen3.8-27b`, so a request or profile naming it is
+served by whichever is installed (ADR 0002 R1).
 
 ```bash
-model-gateway local-ai status [--json]   # eligible, managed, installed, model, state, progress
-model-gateway local-ai add [MODEL]       # default and only model: qwen3.8-27b
-model-gateway local-ai cancel            # stop a download; a later add resumes it
-model-gateway local-ai remove            # remove the runtime, its model and routes, and all local AI state
+model-gateway local-ai status [MODEL] [--json]  # eligible, managed, installed, state, progress; every model
+model-gateway local-ai add [MODEL]              # default: the first model above this Mac can run
+model-gateway local-ai cancel                   # stop a download; a later add resumes it
+model-gateway local-ai remove [MODEL]           # one model, or (none, or the last) the runtime and all its state
 ```
 
-`add` launches a one-shot setup job from
+`add` launches a one-shot setup job (one at a time) from
 `~/Library/Application Support/model-gateway/local-ai/launchd/` (never
 `~/Library/LaunchAgents`, so it does not rerun at login). The job downloads the
 pinned payload in `local-models/` over HTTPS only (resumable, capped at
-150 Mbit/s, SHA-256 verified per file), builds oMLX 0.7.0 from the locked
+150 Mbit/s, SHA-256 verified per file) into `local-ai/models/staging/`, outside
+oMLX's model directory, then, for the first model, builds oMLX 0.7.0 from the locked
 `local-runtime/` project with uv, installs the `com.local.omlx` LaunchAgent
 (loopback, port `MODEL_GATEWAY_LOCAL_AI_PORT`, default 9110), adds the `omlx`
 provider (key file `local-ai/inference/api.key`, mode 0600, marked
 `managed_by: local_ai` so admin provider key edits and deletes refuse it) to
 this gateway, restarts the gateway, and requires a real completion through
-`/v1`. The model itself is never copied into `model-info.json`: while the
+`/v1`. A later model joins the running runtime: the job writes oMLX's
+`model_settings.json`, asks oMLX to rescan (`/admin/api/reload`, which unloads
+its loaded models; the next request loads its model again), and bumps
+`local-ai/catalog-generation`, which the gateway checks every 5 seconds to
+reload its catalog. Nothing restarts. Models that a registered `local_only`
+profile routes to are pinned (kept loaded); registering a profile that would
+pin more than 75% of the Mac's memory in payloads fails with
+`409 local_memory_exceeded`. oMLX keeps one request at a time
+(`--max-concurrent-requests 1`): on the memory-bound Macs local AI targets, a
+second concurrent request would grow the KV cache instead. The model itself is never copied into `model-info.json`: while the
 gateway manages `omlx` and the payload is installed, it loads from the release
 in the shipped catalog layer (ADR 0002, profile `local-ai`), whatever
 `catalog.shipped` selects, so a release's fixes to it reach every install and
@@ -360,12 +380,14 @@ current status without doing anything once local AI is installed.
 Progress is in `local-ai/status.json` (`queued`, `downloading`, `installing`,
 `done`, `failed`, `cancelled`; status reports `interrupted` when an active job
 stopped heartbeating). Products drive the same flow with
-`GET`/`POST /admin/api/local-ai` (`{"action": "add"|"cancel"}`) using a
+`GET /admin/api/local-ai[?model=]` and `POST /admin/api/local-ai`
+(`{"action": "add"|"cancel", "model"?}`) using a
 `local_ai:manage` credential or a full admin key.
 
-`remove` unwires the provider and model, stops and deletes the runtime and its
-model, then restarts the gateway once so `endpoint.json` no longer advertises
-it. It also works after `model-gateway uninstall` (which warns when this
+`remove MODEL` deletes one of several installed models the same way, without a
+restart. `remove` (or removing the last model) unwires the provider and models,
+stops and deletes the runtime and its models, then restarts the gateway once so
+`endpoint.json` no longer advertises it. It also works after `model-gateway uninstall` (which warns when this
 gateway's local AI is still installed); then only local AI's own files change.
 
 The oMLX LaunchAgent and setup job record `ModelGatewayRoot` as

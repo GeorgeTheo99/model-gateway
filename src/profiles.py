@@ -12,9 +12,11 @@ import fcntl
 import hashlib
 import ipaddress
 import json
+import logging
 import math
 import os
 import re
+import subprocess
 import tempfile
 import threading
 from contextlib import contextmanager
@@ -25,6 +27,8 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from src import catalog, providers
+
+log = logging.getLogger("model-gateway")
 
 _ID_RE = re.compile(r"^[a-z0-9-]{1,32}$")
 _NAME_RE = re.compile(r"^[a-z0-9-]{1,64}$")
@@ -506,6 +510,23 @@ def _public_snapshot(record: dict) -> dict:
     }
 
 
+# Localities whose models the gateway-managed local runtime keeps loaded.
+_PINNED_LOCALITIES = frozenset({"local_only"})
+
+
+def _local_routes(namespaces: dict) -> set[str]:
+    return {model for versions in namespaces.values() if versions
+            for profile in versions[-1]["manifest"]["profiles"] if profile["locality"] in _PINNED_LOCALITIES
+            for model in profile["routes"].values()}
+
+
+def local_route_models() -> set[str]:
+    """Models the current snapshots' local profiles route to
+    (docs/adr/0003-scoped-access-and-lightweight-local-models.md section 3)."""
+    with _lock, _file_lock(exclusive=False) as path:
+        return _local_routes(_load(path)["namespaces"])
+
+
 def register(namespace: str, raw: object, *, if_match: str | None, if_none_match: str | None) -> tuple[dict, str, bool]:
     manifest, bindings = validate_manifest(raw)
     if manifest["namespace"] != namespace:
@@ -543,6 +564,18 @@ def register(namespace: str, raw: object, *, if_match: str | None, if_none_match
             "bindings": bindings,
         }
         record["etag"] = _etag(_public_snapshot(record))
+        from src import local_runtime  # local_runtime imports this module lazily
+
+        pinned = _local_routes({**data["namespaces"], namespace: [record]})
+        if not pinned <= _local_routes(data["namespaces"]):  # only adding a pin can exceed the budget
+            try:
+                error = local_runtime.pin_budget_error(pinned)
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                # The budget protects latency, not access: an unreadable runtime skips it.
+                log.warning("local AI pin budget not checked: %s", local_runtime.safe_message(exc))
+                error = None
+            if error:
+                raise ProfileError(409, "local_memory_exceeded", error)
         versions.append(record)
         data["namespaces"][namespace] = versions
         if len(_canonical_bytes(versions)) > _MAX_NAMESPACE_BYTES:

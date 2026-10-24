@@ -1,13 +1,17 @@
-"""Gateway-owned local AI: a pinned oMLX runtime serving a verified MLX model.
+"""Gateway-owned local AI: a pinned oMLX runtime serving verified MLX models.
 
 One Model Gateway per Mac is shared by every product attached to it, so local
-AI is installed here rather than by each product. ``start_add`` launches a
-one-shot setup job (from ``local-ai/launchd``, never ``~/Library/LaunchAgents``,
+AI is installed here rather than by each product. The release curates the
+models it can install (``MODELS``), each with its own memory floor, and serves
+any that fit the Mac side by side
+(docs/adr/0003-scoped-access-and-lightweight-local-models.md section 3).
+``start_add`` launches a one-shot setup job (from ``local-ai/launchd``, never ``~/Library/LaunchAgents``,
 so it does not rerun at login) that downloads the pinned payload (HTTPS only,
 resumable, rate-limited, hash-verified), builds oMLX from the locked project
 in ``local-runtime/`` with uv, installs the ``com.local.omlx`` LaunchAgent,
-adds the ``omlx`` provider and model to this gateway, and requires a real
-completion through the gateway (or, when /v1 needs a key the job does not
+adds the ``omlx`` provider and model to this gateway (restarting it the first
+time; later models reach the running gateway and oMLX without a restart), and
+requires a real completion through the gateway (or, when /v1 needs a key the job does not
 hold, a completion from oMLX while the gateway's config and catalog route the
 model to it; see ``check``).
 
@@ -94,7 +98,7 @@ SETUP_LABEL = "com.local.model-gateway.local-ai-setup"
 GATEWAY_LABEL = "com.local.model-gateway"
 OWNER_KEY = "ModelGatewayRoot"
 DEFAULT_PORT = 9110
-MIN_MEMORY_BYTES = 48 * 1024**3
+GiB = 1024**3
 # Beyond the remaining download: the oMLX environment plus the bounded 8 GB KV cache.
 DISK_MARGIN = 12 * 1024**3
 # 150 Mbit/s, so a model download never saturates the owner's network.
@@ -140,23 +144,41 @@ class LocalModel:
     manifest: str  # file under local-models/
     catalog: dict  # model-info.json fields besides provider/omlx_id
     settings: dict  # oMLX model_settings.json entry
+    min_memory_bytes: int  # the Mac's memory this model needs
 
 
+_QWEN_CATALOG = {
+    "family": "qwen", "base_model": "qwen3.8-27b",
+    "context": 32768, "max_output_tokens": 4096, "thinking": "optional",
+    "thinking_levels": ["off", "xhigh"], "thinking_format": "qwen-chat-template",
+    "vision": True, "pricing_status": "unmetered",
+}
+_QWEN_SETTINGS = {"max_context_window": 32768, "max_tokens": 4096,
+                  "enable_thinking": True, "preserve_thinking": True}
+
+# In preference order: ``add`` without a model installs the first that fits this Mac.
+# Both serve base model qwen3.8-27b, so a profile naming it gets whichever is installed.
 MODELS = {
     "qwen3.8-27b": LocalModel(
         name="qwen3.8-27b",
         manifest="qwen3.8-27b-8bit.json",
-        catalog={
-            "context": 32768, "max_output_tokens": 4096, "thinking": "optional",
-            "thinking_levels": ["off", "xhigh"], "thinking_format": "qwen-chat-template",
-            "vision": True, "pricing_status": "unmetered",
-            "desc": "Qwen3.8-27B dense 8-bit MLX VL, served by Model Gateway local AI",
-        },
-        settings={"max_context_window": 32768, "max_tokens": 4096,
-                  "enable_thinking": True, "preserve_thinking": True},
+        catalog={**_QWEN_CATALOG, "desc": "Qwen3.8-27B dense 8-bit MLX VL, served by Model Gateway local AI"},
+        settings=_QWEN_SETTINGS,
+        min_memory_bytes=48 * GiB,
+    ),
+    "qwen3.8-27b-4bit": LocalModel(
+        name="qwen3.8-27b-4bit",
+        manifest="qwen3.8-27b-4bit.json",
+        catalog={**_QWEN_CATALOG, "desc": "Qwen3.8-27B dense 4-bit MLX VL, served by Model Gateway local AI"},
+        settings=_QWEN_SETTINGS,
+        min_memory_bytes=32 * GiB,
     ),
 }
+# The model a bare ``model(None)`` names (what earlier releases always installed).
 DEFAULT_MODEL = "qwen3.8-27b"
+# Pinned models' payloads may use at most this share of the Mac's memory; oMLX's
+# memory guard keeps about a fifth free for everything else.
+PIN_BUDGET = 0.75
 
 
 # ── paths ────────────────────────────────────────────────────────────────────
@@ -197,6 +219,11 @@ def venv_dir() -> Path:
 
 def mlx_dir() -> Path:
     return runtime_root() / "models" / "mlx"
+
+
+def staging_dir() -> Path:
+    """Downloads in progress, outside oMLX's --model-dir so it never sees a partial payload."""
+    return runtime_root() / "models" / "staging"
 
 
 def cache_dir() -> Path:
@@ -502,22 +529,40 @@ def manifest(local: LocalModel) -> dict:
     return value
 
 
-def installed_model() -> LocalModel | None:
-    """The model whose verified payload this gateway's runtime serves."""
-    if omlx_owner() != "gateway":
-        return None
-    for local in MODELS.values():
-        if (mlx_dir() / manifest(local)["model_id"]).is_dir():
-            return local
-    return None
+def _promoted_models() -> list[LocalModel]:
+    """The models whose payloads are in --model-dir, in ``MODELS`` order."""
+    return [local for local in MODELS.values() if (mlx_dir() / manifest(local)["model_id"]).is_dir()]
 
 
-def eligible() -> bool:
-    """Local AI needs Apple silicon with at least 48 GiB of memory."""
+def installed_models() -> list[LocalModel]:
+    """The models whose verified payloads this gateway's runtime serves, in ``MODELS`` order."""
+    return _promoted_models() if omlx_owner() == "gateway" else []
+
+
+def _usable_memory() -> int:
+    """This Mac's memory when it is Apple silicon, else 0 (local AI cannot run)."""
     try:
-        return _apple_silicon() and _memory_bytes() >= MIN_MEMORY_BYTES
+        return _memory_bytes() if _apple_silicon() else 0
     except (OSError, ValueError, subprocess.SubprocessError):
-        return False
+        return 0
+
+
+def eligible(local: LocalModel | None = None, *, memory: int | None = None) -> bool:
+    """Whether this Mac (Apple silicon) has the memory ``local`` needs; without one, any curated model."""
+    memory = _usable_memory() if memory is None else memory
+    floors = [local.min_memory_bytes] if local is not None else [m.min_memory_bytes for m in MODELS.values()]
+    return bool(memory) and memory >= min(floors)
+
+
+def preferred_model(*, memory: int | None = None) -> LocalModel:
+    """The first curated model this Mac can run, or the default when none fits."""
+    memory = _usable_memory() if memory is None else memory
+    return next((local for local in MODELS.values() if eligible(local, memory=memory)), MODELS[DEFAULT_MODEL])
+
+
+def _ineligible_message(local: LocalModel) -> str:
+    return (f"{local.name} needs Apple silicon and at least {local.min_memory_bytes // GiB} GB of memory; "
+            f"this Mac can run: {', '.join(m.name for m in MODELS.values() if eligible(m)) or 'none'}")
 
 
 # ── status ───────────────────────────────────────────────────────────────────
@@ -551,55 +596,75 @@ def record_failure(message: str) -> None:
     _write_status(value)
 
 
-def status() -> dict:
-    """Eligibility, ownership, and setup progress; never keys."""
+def status(name: str | None = None) -> dict:
+    """Eligibility, ownership, and setup progress; never keys.
+
+    The top-level fields describe ``name`` (by default the model the setup job is
+    working on, else the first installed, else the one ``add`` would install), as
+    they did when local AI served one model; ``models`` lists every curated model.
+    """
     owner = omlx_owner()
     current = read_status()
-    installed = installed_model()
-    state = current.get("state")
-    if state in ACTIVE_STATES and _stale(current) and not _job_running():
+    installed = installed_models()
+    memory = _usable_memory()
+    working = MODELS.get(current.get("model"))
+    if name is not None:
+        local = model(name)
+    elif working is not None and current.get("state") not in (None, "done"):
+        local = working  # setup is working on it, or failed or stopped
+    else:
+        local = installed[0] if installed else preferred_model(memory=memory)
+    job = current if current.get("model") in (None, local.name) else {}
+    state = job.get("state")
+    if state in ACTIVE_STATES and _stale(job) and not _job_running():
         # e.g. the Mac restarted mid-download; adding again resumes it.
         state = "interrupted"
-    if state is None and installed is not None:
+    if state is None and local in installed:
         state = "done"
-    message = str(current.get("message") or "")
+    message = str(job.get("message") or "")
     if owner == "external":
         message = f"{OMLX_LABEL} is managed outside Model Gateway"
+    loaded = _loaded_models(installed) if installed and owner != "external" else {}
     return {
-        "eligible": eligible(),
-        "installed": installed is not None,
+        "eligible": eligible(local, memory=memory),
+        "installed": local in installed,
         "managed": owner != "external",
-        "model": installed.name if installed else current.get("model"),
+        # As before several models: no model until one is named, installed, or being set up.
+        "model": local.name if name is not None or job or local in installed else None,
         "state": state,
-        "bytes_done": int(current.get("bytes_done") or 0),
-        "bytes_total": int(current.get("bytes_total") or 0),
+        "bytes_done": int(job.get("bytes_done") or 0),
+        "bytes_total": int(job.get("bytes_total") or 0),
         "message": message,
         "base_url": f"http://127.0.0.1:{port()}" if installed else None,
-        "loaded": _model_loaded(installed) if installed is not None and owner != "external" else None,
+        "loaded": loaded.get(local.name),
+        "models": [{"name": m.name, "eligible": eligible(m, memory=memory), "installed": m in installed,
+                    "min_memory_gb": m.min_memory_bytes // GiB, "loaded": loaded.get(m.name)}
+                   for m in MODELS.values()],
     }
 
 
-def _model_loaded(local: LocalModel) -> bool | None:
-    """Whether oMLX has the installed model in memory, so products can say it must load.
+def _loaded_models(installed: list[LocalModel]) -> dict[str, bool | None]:
+    """Which installed models oMLX has in memory, so products can say one must load.
 
     Unknown (None) whenever the runtime cannot be asked; never claims a reload.
     """
     try:
-        model_id = manifest(local)["model_id"]
+        ids = {manifest(local)["model_id"]: local.name for local in installed}
         inventory = _request(f"http://127.0.0.1:{port()}/v1/models/status", _key(api_key_path()), timeout=3)
     except Exception:  # noqa: BLE001 — status must never fail on a busy or stopped runtime
-        return None
+        return {}
+    result: dict[str, bool | None] = {}
     for row in inventory.get("models", []) if isinstance(inventory, dict) else []:
-        if isinstance(row, dict) and row.get("id") == model_id and isinstance(row.get("loaded"), bool):
-            return row["loaded"]
-    return None
+        if isinstance(row, dict) and row.get("id") in ids and isinstance(row.get("loaded"), bool):
+            result[ids[row["id"]]] = row["loaded"]
+    return result
 
 
 def endpoint_info() -> dict:
     """The endpoint.json ``local_runtime`` block: URLs only, never keys."""
     try:
         owner = omlx_owner()
-        base_url = f"http://127.0.0.1:{port()}" if installed_model() is not None else None
+        base_url = f"http://127.0.0.1:{port()}" if installed_models() else None
     except Exception:  # noqa: BLE001 — discovery must never fail on local AI state
         return {"managed": False, "base_url": None, "health_url": None}
     return {"managed": owner != "external", "base_url": base_url,
@@ -681,6 +746,161 @@ def _job_alive() -> bool:
             return False
     except _Busy:
         return True
+
+
+# ── running runtime ──────────────────────────────────────────────────────────
+
+# The running gateway reloads its catalog when this changes (src.admin.watch_local_ai).
+GENERATION_FILE = "catalog-generation"
+
+
+def generation() -> str:
+    """The current local AI catalog generation; empty before the first change."""
+    path = runtime_root() / GENERATION_FILE
+    try:
+        _regular(path)
+        return path.read_text().strip() if path.exists() else ""
+    except (OSError, UnicodeError, LocalRuntimeError):
+        return ""
+
+
+def bump_generation() -> None:
+    """Tell the running gateway that the installed models changed."""
+    _atomic(runtime_root() / GENERATION_FILE, secrets.token_hex(8) + "\n", runtime_root())
+
+
+def runtime_ready() -> bool:
+    """Whether this gateway's oMLX runtime is built, loaded, and wired, so a model can join it."""
+    provider = (config_io.load_config_full().get("providers") or {}).get("omlx")
+    return (omlx_owner() == "gateway" and _loaded(OMLX_LABEL) and (venv_dir() / "bin" / "omlx").is_file()
+            and _our_provider(provider))
+
+
+def _pinned(names: set[str], installed: list[LocalModel]) -> list[LocalModel]:
+    """The installed models that serve ``names``: by name, or for a model that is not installed
+    (its route reroutes by base model, ADR 0002 R1), every installed model of that base model."""
+    serving = {name for name in names if name in {local.name for local in installed}}
+    serving |= {local.name for local in installed for name in names - serving
+                if name in MODELS and local.catalog.get("base_model") == MODELS[name].catalog.get("base_model")}
+    return [local for local in installed if local.name in serving]
+
+
+def _within_budget(pinned: list[LocalModel], memory: int) -> list[LocalModel]:
+    """The longest prefix of ``pinned`` whose payloads fit ``PIN_BUDGET`` of ``memory``."""
+    kept, used = [], 0
+    for local in pinned:
+        used += manifest(local)["total_bytes"]
+        if used > memory * PIN_BUDGET:
+            break
+        kept.append(local)
+    return kept
+
+
+def pin_budget_error(names: set[str]) -> str | None:
+    """Why pinning the installed models serving ``names`` would not fit this Mac, if it would not."""
+    pinned = _pinned(names, installed_models())
+    if not pinned or _within_budget(pinned, _usable_memory()) == pinned:
+        return None
+    needed = sum(manifest(local)["total_bytes"] for local in pinned)
+    return (f"Keeping {', '.join(local.name for local in pinned)} loaded needs {needed / 1e9:.0f} GB, "
+            f"more than {PIN_BUDGET:.0%} of this Mac's memory")
+
+
+def model_settings(installed: list[LocalModel], pinned_names: set[str], memory: int) -> dict:
+    """oMLX's model_settings.json: every installed model, the first as default, and the models
+    local profiles use pinned, as many as fit the memory budget."""
+    pinned = {local.name for local in _within_budget(_pinned(pinned_names, installed), memory)}
+    return {"version": 1, "models": {
+        manifest(local)["model_id"]: {"is_default": index == 0, "is_pinned": local.name in pinned,
+                                      **local.settings}
+        for index, local in enumerate(installed)}}
+
+
+def _pinned_names() -> set[str]:
+    from src import profiles  # profiles imports providers, which imports this module
+
+    try:
+        return profiles.local_route_models()
+    except profiles.ProfileError as exc:  # an unreadable registry pins nothing rather than blocking setup
+        logging.getLogger("model-gateway").warning("local AI pins skipped: %s", exc.message)
+        return set()
+
+
+def _settings_path() -> Path:
+    return inference_dir() / "model_settings.json"
+
+
+def _read_settings() -> str | None:
+    path = _settings_path()
+    _regular(path)
+    return path.read_text() if path.exists() else None
+
+
+def _write_model_settings(installed: list[LocalModel]) -> bool:
+    """Write model_settings.json; return whether it changed."""
+    data = json.dumps(model_settings(installed, _pinned_names(), _usable_memory()), indent=2) + "\n"
+    if _read_settings() == data:
+        return False
+    _atomic(_settings_path(), data)
+    return True
+
+
+def _apply_settings(installed: list[LocalModel], *, rescan: bool) -> None:
+    """Write model_settings.json and have the running oMLX apply it (and, with ``rescan``, its
+    changed model directory). A failed reload restores the previous settings, so a retry
+    sees the change again instead of skipping it."""
+    previous = _read_settings()
+    if not _write_model_settings(installed) and not rescan:
+        return
+    try:
+        _omlx_reload()
+    except BaseException:
+        if previous is None:
+            _settings_path().unlink(missing_ok=True)
+        else:
+            _atomic(_settings_path(), previous)
+        raise
+
+
+def _omlx_reload() -> None:
+    """Have the running oMLX re-read model_settings.json and rescan its model directory.
+
+    oMLX unloads its loaded models to rescan; the next request loads its model
+    again. The process keeps running, so nothing restarts.
+    """
+    base, key = f"http://127.0.0.1:{port()}", _key(api_key_path())
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+    login = urllib.request.Request(f"{base}/admin/api/login", data=json.dumps({"api_key": key}).encode(),
+                                   headers={"Content-Type": "application/json"})
+    with opener.open(login, timeout=15) as response:
+        cookie = next((value.split(";", 1)[0] for name, value in response.headers.items()
+                       if name.lower() == "set-cookie" and value.startswith("omlx_admin_session=")), None)
+    if cookie is None:
+        raise LocalRuntimeError("oMLX did not open an admin session")
+    with opener.open(urllib.request.Request(f"{base}/admin/api/reload", data=b"{}", method="POST",
+                                            headers={"Cookie": cookie, "Content-Type": "application/json"}),
+                     timeout=120) as response:
+        if response.status != 200:
+            raise LocalRuntimeError("oMLX did not reload its models")
+
+
+def sync_pins() -> bool:
+    """Pin the installed models registered local profiles use; return whether oMLX was reloaded.
+
+    Skipped when this gateway's runtime is not running, and while setup installs
+    or a model is removed (each syncs pins again when it finishes).
+    """
+    if not runtime_root().is_dir() or omlx_owner() != "gateway":
+        return False
+    try:
+        with provision_lock(wait=False):
+            if not runtime_ready():
+                return False
+            before = _read_settings()
+            _apply_settings(installed_models(), rescan=False)
+            return _read_settings() != before
+    except _Busy:
+        return False  # the setup job or removal syncs pins when it finishes
 
 
 # ── gateway configuration ────────────────────────────────────────────────────
@@ -805,8 +1025,9 @@ def _write_config(config: dict) -> None:
                             yaml.safe_dump(config, sort_keys=False, default_flow_style=False))
 
 
-def configure_gateway(local: LocalModel, omlx_port: int) -> None:
-    """Add the omlx provider, restart the gateway, roll back on failure.
+def configure_gateway(local: LocalModel, omlx_port: int, *, restart: bool = True) -> None:
+    """Add the omlx provider and show ``local``, then restart (or, with ``restart=False``,
+    signal) the gateway; roll back on failure.
 
     The model itself loads from the shipped layer (:func:`catalog_rows`), never as a copy.
     """
@@ -840,13 +1061,16 @@ def configure_gateway(local: LocalModel, omlx_port: int) -> None:
                 config_io.migrate_to_shipped_layer(loaded, frozenset(loaded), retire_ledger=False)
             # Set before the restart, so the gateway's one-time adoption never hides this model.
             mark_catalog_layer()
-            _restart_gateway(required=True)
+            if restart:
+                _restart_gateway(required=True)
+            else:
+                bump_generation()
         except BaseException:
             config_io.restore_writable_files(snapshot)
             if not marked:
                 marker.unlink(missing_ok=True)  # the restored files still need their one-time adoption
             with contextlib.suppress(Exception):
-                _restart_gateway(required=False)
+                _restart_gateway(required=False) if restart else bump_generation()
             raise
 
 
@@ -943,14 +1167,24 @@ def _size(path: Path) -> int:
         return 0
 
 
+def partial_dir(model_id: str) -> Path:
+    """Where ``model_id`` downloads; a download an earlier release began in --model-dir moves here."""
+    partial = staging_dir() / f"{model_id}.partial"
+    legacy = mlx_dir() / f"{model_id}.partial"
+    _no_symlinks(partial, runtime_root())
+    if legacy.is_dir() and not legacy.is_symlink() and not partial.exists():
+        partial.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        legacy.rename(partial)
+    return partial
+
+
 def download_payload(payload: dict, progress: Progress) -> None:
-    """Fetch the pinned payload into the .partial directory that install verifies and promotes."""
+    """Fetch the pinned payload into the staging directory that install verifies and promotes."""
     destination = mlx_dir() / payload["model_id"]
     if destination.exists():
         progress.update(bytes_done=payload["total_bytes"])
         return
-    partial = destination.with_name(payload["model_id"] + ".partial")
-    _no_symlinks(partial, runtime_root())
+    partial = partial_dir(payload["model_id"])
     partial.mkdir(parents=True, exist_ok=True, mode=0o700)
     opener = _download_opener()
     base = f"https://huggingface.co/{payload['hf_repo']}/resolve/{payload['hf_revision']}/"
@@ -1015,7 +1249,7 @@ def _job_environment(omlx_port: int) -> dict:
     }
     if config_io.MODEL_INFO_SOURCE_PATH:
         env["MODEL_GATEWAY_MODEL_INFO_SOURCE"] = str(config_io.MODEL_INFO_SOURCE_PATH)
-    for name in ("MODEL_GATEWAY_BACKUP_DIR", "MODEL_GATEWAY_UV_BIN"):
+    for name in ("MODEL_GATEWAY_BACKUP_DIR", "MODEL_GATEWAY_UV_BIN", "MODEL_GATEWAY_PROFILE_REGISTRY"):
         if os.environ.get(name, "").strip():
             env[name] = os.environ[name].strip()
     return env
@@ -1056,23 +1290,59 @@ def _wait_health(url: str, seconds: int = 90) -> None:
         time.sleep(2)
 
 
-def install(local: LocalModel, payload: dict) -> None:
-    """Verify and promote the payload, build oMLX, start it, and wire it into the gateway."""
-    _require_owned()
+def _promote(payload: dict) -> None:
+    """Verify the staged (or already promoted) payload and move it into oMLX's --model-dir."""
     model_id = payload["model_id"]
     destination = mlx_dir() / model_id
-    partial = destination.with_name(model_id + ".partial")
+    partial = partial_dir(model_id)
     staged = destination if destination.exists() else partial
     _no_symlinks(staged, runtime_root())
     try:
         verify_payload(staged, payload)
     except VerificationError as exc:
         raise LocalRuntimeError(f"The local model failed verification: {exc}") from None
-    if staged == partial:
-        partial.rename(destination)
     # oMLX serves every model in --model-dir; never a forgotten or foreign one.
-    if {path.name for path in mlx_dir().iterdir()} != {model_id}:
-        raise LocalRuntimeError(f"{mlx_dir()} must contain only the verified {model_id} payload")
+    known = {manifest(local)["model_id"] for local in MODELS.values()}
+    foreign = sorted(path.name for path in mlx_dir().iterdir() if path.name not in known) if mlx_dir().is_dir() else []
+    if foreign:
+        raise LocalRuntimeError(f"{mlx_dir()} must contain only verified local AI payloads; remove {foreign[0]}")
+    if staged == partial:
+        mlx_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
+        partial.rename(destination)
+
+
+def _unpromote(model_id: str) -> Path:
+    """Move a promoted payload back to staging (one rename) and return where it went."""
+    source, target = mlx_dir() / model_id, partial_dir(model_id)
+    _no_symlinks(source, runtime_root())
+    if target.exists():
+        shutil.rmtree(target)  # a stale partial download; the verified payload replaces it
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    source.rename(target)
+    return target
+
+
+def install(local: LocalModel, payload: dict) -> None:
+    """Verify and promote the payload and serve it: join a running runtime, or build oMLX,
+    start it, and wire it into the gateway."""
+    _require_owned()
+    if runtime_ready():
+        _promote(payload)
+        try:
+            _apply_settings(_promoted_models(), rescan=True)
+            configure_gateway(local, port(), restart=False)
+        except BaseException:
+            # Never leave a model the gateway could list (its payload is in --model-dir) after a failed add.
+            for undo in (lambda: _unpromote(payload["model_id"]),
+                         lambda: _apply_settings(_promoted_models(), rescan=True), bump_generation):
+                try:
+                    undo()
+                except Exception as exc:  # noqa: BLE001 — keep undoing; the original error is raised
+                    logging.getLogger("model-gateway").warning("local AI rollback step failed: %s",
+                                                               safe_message(exc))
+            raise
+        return
+    _promote(payload)
     env = dict(os.environ, UV_PROJECT_ENVIRONMENT=str(venv_dir()))
     _run(_uv(), "sync", "--locked", "--no-dev", "--project", str(RUNTIME_PROJECT), env=env)
     _run(str(venv_dir() / "bin" / "python"), "-c", METAL_SMOKE)
@@ -1080,8 +1350,7 @@ def install(local: LocalModel, payload: dict) -> None:
     _atomic(inference_dir() / "settings.json", json.dumps({
         "auth": {"api_key": api_key}, "logging": {"log_dir": str(runtime_root() / "logs" / "omlx")}},
         indent=2) + "\n")
-    _atomic(inference_dir() / "model_settings.json", json.dumps({
-        "version": 1, "models": {model_id: {"is_default": True, **local.settings}}}, indent=2) + "\n")
+    _write_model_settings(_promoted_models())
     cache_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
     (runtime_root() / "logs").mkdir(parents=True, exist_ok=True, mode=0o700)
     omlx_port = port()
@@ -1158,10 +1427,12 @@ def check(local: LocalModel, payload: dict) -> None:
     """oMLX serves exactly the verified payload and the gateway completes with it."""
     model_id = payload["model_id"]
     inventory = _request(f"http://127.0.0.1:{port()}/v1/models/status", _key(api_key_path()))
-    rows = [row for row in inventory.get("models", []) if isinstance(row, dict) and row.get("source_type") != "builtin"]
-    if (len(rows) != 1 or rows[0].get("id") != model_id
-            or os.path.realpath(str(rows[0].get("model_path"))) != os.path.realpath(mlx_dir() / model_id)):
-        raise LocalRuntimeError("oMLX is not serving the sole verified local model")
+    rows = {row.get("id"): row for row in inventory.get("models", [])
+            if isinstance(row, dict) and row.get("source_type") != "builtin"}
+    expected = {manifest(installed)["model_id"] for installed in installed_models()}
+    if (set(rows) != expected or model_id not in rows
+            or os.path.realpath(str(rows[model_id].get("model_path"))) != os.path.realpath(mlx_dir() / model_id)):
+        raise LocalRuntimeError("oMLX is not serving exactly the verified local models")
     gateway, token = gateway_origin(), _gateway_token()
     if not token and _anonymous_refused(gateway):
         _completion_ok(_check_direct(local, payload))
@@ -1193,17 +1464,15 @@ def _completion_ok(completion: dict) -> None:
 
 
 def start_add(name: str | None = None) -> dict:
-    """Queue the setup job; reuse a running one. Partial downloads resume."""
-    local = model(name)
+    """Queue the setup job for ``name`` (default: the best model this Mac can run); reuse a
+    running one. Partial downloads resume."""
+    local = model(name) if name else preferred_model()
     _require_owned()
-    installed = installed_model()
-    if installed is not None and installed != local:
-        raise LocalRuntimeError(f"Local AI already serves {installed.name}; remove it first")
-    current = status()
+    current = status(local.name)
     if current["installed"] and current["state"] == "done":
         return current
-    if not eligible():
-        raise LocalRuntimeError("This Mac needs Apple silicon and at least 48 GB of memory for local AI")
+    if not eligible(local):
+        raise LocalRuntimeError(_ineligible_message(local))
     _require_known_gateway()
     _require_gateway_state_dir()  # before the download, not only when wiring the gateway
     root = runtime_root()
@@ -1215,7 +1484,10 @@ def start_add(name: str | None = None) -> dict:
         except _Busy:
             return status()  # another add is starting the job right now
         if _job_running() or _job_alive():
-            return status()
+            working = read_status().get("model")
+            if working not in (None, local.name):
+                raise LocalRuntimeError(f"Local AI setup is installing {working}; add {local.name} when it finishes")
+            return status(local.name)
         conflict = gateway_conflict(local)
         if conflict:
             raise LocalRuntimeError(conflict)
@@ -1223,7 +1495,7 @@ def start_add(name: str | None = None) -> dict:
         if omlx_owner() is None and _port_in_use(omlx_port):
             raise LocalRuntimeError(f"Port {omlx_port} is in use; set MODEL_GATEWAY_LOCAL_AI_PORT to a free port")
         payload = manifest(local)
-        partial = mlx_dir() / (payload["model_id"] + ".partial")
+        partial = partial_dir(payload["model_id"])
         staged = sum((partial / e["path"]).stat().st_size for e in payload["files"]
                      if (partial / e["path"]).is_file() and (partial / e["path"]).stat().st_size <= e["size_bytes"])
         remaining = 0 if (mlx_dir() / payload["model_id"]).exists() else payload["total_bytes"] - staged
@@ -1240,7 +1512,7 @@ def start_add(name: str | None = None) -> dict:
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
             record_failure(safe_message(exc))
             raise
-    return status()
+    return status(local.name)
 
 
 def cancel() -> dict:
@@ -1271,16 +1543,51 @@ def _teardown() -> bool:
     return changed
 
 
-def remove() -> dict:
-    """Remove this gateway's runtime, its provider and model, and all local AI state.
+def _remove_model(local: LocalModel) -> dict:
+    """Stop serving one of several installed models and delete its payload; nothing restarts."""
+    with provision_lock(wait=False, busy="Local AI is being installed; wait for it to finish, then remove it"):
+        if _job_alive():
+            raise LocalRuntimeError("Local AI setup is running; wait for it to finish, then remove the model")
+        model_id = manifest(local)["model_id"]
+        ready = runtime_ready()
+        staged = _unpromote(model_id)  # one rename: the payload is either served or not
+        try:
+            if ready:
+                _apply_settings(_promoted_models(), rescan=True)
+            else:
+                _write_model_settings(_promoted_models())
+        except BaseException:
+            staged.rename(mlx_dir() / model_id)
+            raise
+        finally:
+            with contextlib.suppress(Exception):  # never hide why the removal failed
+                bump_generation()
+        shutil.rmtree(staged)
+        if read_status().get("model") == local.name:
+            status_path().unlink(missing_ok=True)  # its setup record no longer describes anything
+    with contextlib.suppress(Exception):  # a profile registered meanwhile; removal itself succeeded
+        sync_pins()
+    return status(local.name)
 
-    The gateway restarts once, after teardown, so it and endpoint.json stop
-    advertising the runtime. Without a loaded gateway (uninstalled), only the
-    files change.
+
+def remove(name: str | None = None) -> dict:
+    """Remove one model, or (without ``name``, or for the last installed model) this gateway's
+    runtime, its provider and models, and all local AI state.
+
+    Removing the runtime restarts the gateway once, after teardown, so it and
+    endpoint.json stop advertising it. Without a loaded gateway (uninstalled),
+    only the files change.
     """
     _require_owned()
     root = runtime_root()
     _no_symlinks(root, root)
+    if name is not None:
+        local = model(name)
+        installed = installed_models()
+        if local not in installed:
+            raise LocalRuntimeError(f"{local.name} is not installed")
+        if installed != [local]:
+            return _remove_model(local)
     tearing_down = False
     try:
         with provision_lock(wait=False, busy="Local AI is being installed; wait for it to finish, then remove it"):
@@ -1336,8 +1643,8 @@ def run_job(name: str) -> None:
         progress = cleanup.enter_context(Progress(local, payload["total_bytes"]))
         try:
             _require_owned()
-            if not eligible():
-                raise LocalRuntimeError("This Mac needs Apple silicon and at least 48 GB of memory for local AI")
+            if not eligible(local):
+                raise LocalRuntimeError(_ineligible_message(local))
             download_payload(payload, progress)
             if _source_digest() != source:
                 # Model Gateway was upgraded during the download: install with the new release's code.
@@ -1349,6 +1656,8 @@ def run_job(name: str) -> None:
                 install(local, payload)
                 check(local, payload)
             progress.update(state="done", message="")
+            with contextlib.suppress(Exception):  # a profile registered while this job held the lock
+                sync_pins()
         except Cancelled:
             if progress.value["state"] == "installing":
                 progress.update(state="failed", message="Setup stopped while installing; add local AI again to repair it")
@@ -1368,10 +1677,10 @@ def _print_status(value: dict) -> None:
     if value["bytes_total"]:
         progress = f" ({value['bytes_done'] / 1e9:.1f} / {value['bytes_total'] / 1e9:.1f} GB)"
     rows = [
-        ("eligible", "yes" if value["eligible"] else "no (needs Apple silicon and 48 GB of memory)"),
+        ("model", value["model"] or "-"),
+        ("eligible", "yes" if value["eligible"] else "no (this Mac lacks the memory it needs)"),
         ("managed", "yes" if value["managed"] else "no"),
         ("installed", "yes" if value["installed"] else "no"),
-        ("model", value["model"] or "-"),
         ("state", f"{value['state'] or 'none'}{progress}"),
         ("base_url", value["base_url"] or "-"),
     ]
@@ -1379,17 +1688,25 @@ def _print_status(value: dict) -> None:
         rows.append(("message", value["message"]))
     for label, text in rows:
         print(f"{label + ':':<12}{text}")
+    print("models:")
+    for row in value["models"]:
+        state = "installed" if row["installed"] else "available" if row["eligible"] else "needs more memory"
+        print(f"  {row['name']:<20}{state} ({row['min_memory_gb']} GB Macs and up)")
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="model-gateway local-ai", description=__doc__.split("\n\n")[0])
     commands = parser.add_subparsers(dest="command", required=True)
     show = commands.add_parser("status", help="eligibility, ownership, and setup progress")
+    show.add_argument("model", nargs="?", choices=sorted(MODELS))
     show.add_argument("--json", action="store_true")
-    add = commands.add_parser("add", help="download and install local AI in the background")
-    add.add_argument("model", nargs="?", default=DEFAULT_MODEL, choices=sorted(MODELS))
+    add = commands.add_parser("add", help="download and install a local model in the background "
+                                          "(default: the best one this Mac can run)")
+    add.add_argument("model", nargs="?", choices=sorted(MODELS))
     commands.add_parser("cancel", help="stop a download (a later add resumes it)")
-    commands.add_parser("remove", help="remove the runtime, its model, and its gateway routes")
+    drop = commands.add_parser("remove", help="remove one model, or (without a model) the runtime, "
+                                              "its models, and its gateway routes")
+    drop.add_argument("model", nargs="?", choices=sorted(MODELS))
     job = commands.add_parser("job", help=argparse.SUPPRESS)
     job.add_argument("model", choices=sorted(MODELS))
     args = parser.parse_args(argv)
@@ -1399,7 +1716,7 @@ def main(argv: list[str] | None = None) -> int:
             run_job(args.model)
             return 0
         if args.command == "status":
-            value = status()
+            value = status(args.model)
             if args.json:
                 print(json.dumps(value, indent=2))
             else:
@@ -1407,14 +1724,14 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "add":
             value = start_add(args.model)
-            print(f"Local AI setup {value['state'] or 'started'} for {args.model}; "
-                  "follow it with 'model-gateway local-ai status'")
+            print(f"Local AI setup {value['state'] or 'started'} for {value['model']}; "
+                  f"follow it with 'model-gateway local-ai status {value['model']}'")
             return 0
         if args.command == "cancel":
             print(f"Local AI setup {cancel()['state'] or 'not running'}")
             return 0
-        remove()
-        print("Local AI removed")
+        remove(args.model)
+        print(f"Local AI {args.model} removed" if args.model else "Local AI removed")
         return 0
     except (ValueError, yaml.YAMLError, OSError, RuntimeError, subprocess.SubprocessError,
             http.client.HTTPException) as exc:

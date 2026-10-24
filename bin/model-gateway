@@ -977,13 +977,14 @@ run_local_ai() {
     MODEL_GATEWAY_HOST="$HOST" MODEL_GATEWAY_PORT="$PORT" \
     MODEL_GATEWAY_LAUNCHD_LABEL="$LABEL" MODEL_GATEWAY_PLIST_DIR="$PLIST_DIR" \
     MODEL_GATEWAY_UV_BIN="${MODEL_GATEWAY_UV_BIN:-$uv}" \
+    MODEL_GATEWAY_PROFILE_REGISTRY="${MODEL_GATEWAY_PROFILE_REGISTRY:-$(installed_plist_env MODEL_GATEWAY_PROFILE_REGISTRY)}" \
     MODEL_GATEWAY_PACKAGE_ROOT="$ROOT_DIR" \
       run_python -m src.local_runtime "$@"
   )
 }
 
 cmd_local_ai() {
-  local usage="usage: model-gateway local-ai {status [--json] | add [MODEL] | cancel | remove}"
+  local usage="usage: model-gateway local-ai {status [MODEL] [--json] | add [MODEL] | cancel | remove [MODEL]}"
   [ $# -ge 1 ] || die "$usage"
   case "$1" in
     status|cancel) ;;

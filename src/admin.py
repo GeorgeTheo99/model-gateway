@@ -134,8 +134,11 @@ async def admin_providers(request: Request):
 async def admin_local_ai(request: Request):
     """Gateway-owned local AI: eligibility, ownership, and setup progress."""
     require_admin_or_scope(request, "local_ai:manage")
+    model = request.query_params.get("model") or None
+    if model is not None and model not in local_runtime.MODELS:
+        return _bad_request(f"Unknown local model; available: {', '.join(sorted(local_runtime.MODELS))}")
     try:
-        return await run_in_threadpool(local_runtime.status)
+        return await run_in_threadpool(local_runtime.status, model)
     except (ValueError, yaml.YAMLError, OSError) as exc:
         return _local_ai_error(exc, status=503)
 
@@ -143,7 +146,8 @@ async def admin_local_ai(request: Request):
 @router.post("/admin/api/local-ai")
 async def admin_local_ai_action(request: Request):
     """Body: {action: add|cancel, model?}. Add queues a one-shot setup job
-    outside the gateway, which restarts the gateway when it finishes."""
+    outside the gateway (``model`` defaults to the best one this Mac can run); the
+    first add restarts the gateway when it finishes, later ones reload its catalog."""
     require_admin_or_scope(request, "local_ai:manage")
     require_admin_writes()
     try:
@@ -343,6 +347,60 @@ async def admin_reload(request: Request):
         "catalogs": catalogs,
         "federation": federation_status,
     }
+
+
+LOCAL_AI_POLL_SECONDS = 5.0
+
+
+def _reload_for_local_ai() -> str | None:
+    """Reload the registry after the local AI models changed; an error leaves the old one live."""
+    with config_write_lock(config_io.CONFIG_PATH):
+        return _reload_registry_transactionally(snapshot_provider_registry())
+
+
+async def watch_local_ai(poll_seconds: float = LOCAL_AI_POLL_SECONDS) -> None:
+    """Reload the catalog when local AI adds or removes a model
+    (docs/adr/0003-scoped-access-and-lightweight-local-models.md section 3).
+
+    The setup job and ``local-ai remove`` bump ``local_runtime.generation()``
+    instead of restarting this gateway.
+    """
+    seen = await run_in_threadpool(local_runtime.generation)
+    while True:
+        await asyncio.sleep(poll_seconds)
+        current = await run_in_threadpool(local_runtime.generation)
+        if current == seen:
+            continue
+        try:
+            error = await run_in_threadpool(_reload_for_local_ai)
+        except Exception as exc:  # noqa: BLE001 — the watcher must outlive any one reload
+            error = str(exc)
+        if error is not None:
+            log.warning("local AI models changed but the registry reload failed: %s", error)
+            continue  # retried at the next poll
+        seen = current
+        try:
+            log.info("local AI models changed; catalog reloaded (exports: %s)", await _regenerate_catalogs())
+            discovery.refresh()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("local AI catalog exports not refreshed: %s", exc)
+
+
+_background: set[asyncio.Task] = set()
+
+
+def sync_local_ai_pins_soon() -> None:
+    """Pin the local models registered profiles use, without holding up the caller: an oMLX
+    reload can take minutes while it preloads a pinned model."""
+    async def run() -> None:
+        try:
+            await run_in_threadpool(local_runtime.sync_pins)
+        except Exception as exc:  # noqa: BLE001 — pins catch up on the next change
+            log.warning("local AI pins not updated: %s", local_runtime.safe_message(exc))
+
+    task = asyncio.create_task(run())
+    _background.add(task)
+    task.add_done_callback(_background.discard)
 
 
 # One export at a time, so a slower older render never overwrites a newer one.

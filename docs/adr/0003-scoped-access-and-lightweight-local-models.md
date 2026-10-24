@@ -131,16 +131,23 @@ verified manifest per model in `local-models/`), each with its own
   runtime down, as `remove` does today. One setup job runs at a time.
 - The first add builds the runtime as today. Adding or removing a model on a
   running runtime reloads the gateway's catalog and oMLX's model list without
-  restarting either; Phase 2 confirms how oMLX discovers a new model directory.
+  restarting either. oMLX 0.7.0 rescans on `POST /admin/api/reload` (after a
+  login with its API key), which unloads its loaded models; the gateway polls a
+  `catalog-generation` file the job bumps.
 - Downloads stage outside oMLX's `--model-dir`, and the model directory
   invariant becomes "exactly the verified payloads of the installed models".
 - `model_settings.json` lists every installed model. oMLX's engine pool and
   memory guard decide what stays loaded, except that models bound by a
   registered `local_only` or `trusted_local` profile on this node are pinned.
-  An add, or a profile registration, that would make the pinned models'
-  memory floors exceed the Mac's memory is refused.
-- `--max-concurrent-requests 1` serializes every local model behind one slot;
-  Phase 2 revisits it.
+  A profile registration that would pin payloads larger than 75% of the Mac's
+  memory is refused (`409 local_memory_exceeded`); an add pins nothing, since
+  profiles bind only models already served.
+- `--max-concurrent-requests 1` serializes every local model behind one slot.
+  Kept: on the memory-bound Macs local AI targets, a second concurrent request
+  grows the KV cache, and pins keep the models profiles depend on resident.
+- The curated set is Qwen3.8-27B in 8-bit (48 GiB Macs) and 4-bit (32 GiB
+  Macs); both have base model `qwen3.8-27b`, and `add` without a model installs
+  the first this Mac can run.
 - Each installed model loads as a shipped-layer row (origin profile
   `local-ai`), as ADR 0002 describes for the single model today.
 - Installs keep the existing download rules: HTTPS only, resumable, hash

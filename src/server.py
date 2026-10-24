@@ -8,6 +8,7 @@ Presents the same dual API contract on port 9111:
 """
 
 import asyncio
+import contextlib
 import base64
 import copy
 import hashlib
@@ -132,9 +133,15 @@ async def _lifespan(_app: FastAPI):
     log.info("catalog exports: %s", await _regenerate_catalogs())
     discovery.refresh()
     await federation.start()
+    from src.admin import sync_local_ai_pins_soon, watch_local_ai
+    local_ai_watch = asyncio.create_task(watch_local_ai())
+    sync_local_ai_pins_soon()  # e.g. after an upgrade that started pinning
     try:
         yield
     finally:
+        local_ai_watch.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await local_ai_watch
         await federation.stop()
 
 
@@ -2913,6 +2920,10 @@ async def register_profile_snapshot(namespace: str, request: Request):
         )
     except profiles.ProfileError as exc:
         return _profile_api_error(exc.status, exc.code, exc.message)
+    if _changed:
+        # Keep the local models local profiles use loaded (ADR 0003 section 3).
+        from src.admin import sync_local_ai_pins_soon
+        sync_local_ai_pins_soon()
     version_path = f"/v1/profiles/{namespace}/snapshot/{snapshot['gateway_version']}"
     return JSONResponse(
         content=snapshot,
