@@ -654,7 +654,32 @@ def _prepare_profile_execution(
             path,
             profiles.ProfileError(403, "direct_model_access_denied", "Consumer principal is not authorized to invoke direct models"),
         )
+    if principal is not None and principal.models is not None:
+        # Checked before any redirect, resolution, federation forward or availability
+        # error, so a name the credential may not use reveals nothing about it
+        # (docs/adr/0003-scoped-access-and-lightweight-local-models.md section 1).
+        successor = retirement_redirect(model) if isinstance(model, str) else None
+        if not _direct_model_permitted(request, model) or (
+            successor is not None and not _direct_model_permitted(request, successor)
+        ):
+            return _profile_inference_error(
+                path,
+                profiles.ProfileError(403, "direct_model_access_denied", "Consumer principal is not authorized to invoke this model"),
+            )
+        # Configured model fallbacks name upstream ids, not catalog models, so they cannot be checked.
+        request.state.disable_model_fallback = True
     return None
+
+
+def _model_allowlist(request: Request):
+    """The consumer principal whose ``models`` allowlist limits this request, if any."""
+    principal = getattr(getattr(request.state, "auth_identity", None), "principal", None)
+    return principal if principal is not None and principal.models is not None else None
+
+
+def _direct_model_permitted(request: Request, model: object) -> bool:
+    principal = _model_allowlist(request)
+    return principal is None or providers.direct_model_permitted(model, principal.models, principal.namespaces)
 
 
 def _validate_inbound_peer_model(request: Request, path: str, model: object) -> JSONResponse | None:
@@ -1998,6 +2023,13 @@ async def _apply_chat_vision_fallback(
             "Profile vision route is no longer vision-capable; re-register the profile.",
         )
     fallback_model, fallback_info, error = _resolve_vision_fallback(requested_model, info, error_factory)
+    if _model_allowlist(request) is not None and (error or not _direct_model_permitted(request, fallback_model)):
+        # Neither the helper model nor why it is unusable is named to a restricted credential.
+        log.info("vision_fallback endpoint=%s requested=%s served=none mode=%s outcome=not_permitted image_count=%d", endpoint_name, requested_model, mode, image_count)
+        return body, requested_model, info, error_factory(
+            400, "invalid_request_error",
+            f"Model '{requested_model}' is text-only; send images to a vision model this credential may use.",
+        )
     if error:
         log.info("vision_fallback endpoint=%s requested=%s served=none mode=%s outcome=rejected image_count=%d", endpoint_name, requested_model, mode, image_count)
         return body, requested_model, info, error
@@ -2348,6 +2380,8 @@ def _redirect_retired_model(request: Request, body: dict) -> str:
         return model
     successor = retirement_redirect(model)
     if successor is not None:
+        if not _direct_model_permitted(request, successor):
+            return model  # the catalog changed since the request was authorized; serve nothing new
         request.state.model_redirect = (model, successor)
     else:
         successor = base_model_route(model)
@@ -2602,10 +2636,14 @@ async def health():
     return {"status": "ok", "service": "model-gateway"}
 
 
-def _direct_model_rows() -> list[dict]:
-    """Return the existing local discovery rows, field-for-field compatible."""
+def _direct_model_rows(models: list[dict] | None = None) -> list[dict]:
+    """Return the existing local discovery rows, field-for-field compatible.
+
+    ``models`` defaults to every available routable identifier; the federation
+    export always uses that default.
+    """
     data = []
-    for m in list_available_models():
+    for m in list_available_models() if models is None else models:
         # Unavailable models (disabled or provider not configured locally) are
         # hidden from clients; admin/debug APIs expose them with reasons.
         caps = _thinking_capabilities(m)
@@ -3006,20 +3044,55 @@ async def get_profile_snapshot_version(namespace: str, gateway_version: str, req
     return JSONResponse(content=snapshot, headers=headers)
 
 
+def _restricted_principal(identity):
+    """The consumer principal with a ``models`` allowlist behind ``identity``, if any."""
+    principal = identity.principal
+    return principal if principal is not None and principal.models is not None else None
+
+
+def _permitted_inventory(principal, inventory: list[dict]) -> list[dict]:
+    """The inventory a credential with ``models`` may call
+    (docs/adr/0003-scoped-access-and-lightweight-local-models.md section 2).
+
+    Its listed entries, and each listed base model under its own name with the
+    capabilities of the route that name resolves to now. Routes it does not list
+    are not shown.
+    """
+    rows = [model for model in inventory
+            if providers.direct_model_permitted(model.get("name"), principal.models, principal.namespaces)]
+    identifiers = {route_id for model in inventory for route_id in model.get("routable_ids") or []}
+    by_name = {model.get("name"): model for model in inventory}
+    for name in sorted(principal.models - identifiers):
+        route = by_name.get(providers.resolve_base_model(name))
+        if route is not None:
+            rows.append({**route, "name": name, "id": name, "routable_ids": [name]})
+    return rows
+
+
 @app.get("/v1/models")
 async def list_models(request: Request):
-    require_client_auth(request)
-    data = _direct_model_rows()
+    principal = _restricted_principal(require_client_auth(request))
+    if principal is None:
+        data = _direct_model_rows()
+    else:
+        data = _direct_model_rows([
+            {**model, "id": route_id}
+            for model in _permitted_inventory(principal, effective_model_inventory()) if model.get("available")
+            for route_id in model.get("routable_ids") or []
+        ])
     local_ids = {m.get("id") for m in list_routable_models()}
-    data.extend(row for row in federation.manager().imported_rows() if row["id"] not in local_ids)
+    data.extend(row for row in federation.manager().imported_rows()
+                if row["id"] not in local_ids and (principal is None or row["id"] in principal.models))
     return {"object": "list", "data": data}
 
 
 @app.get("/v1/models/canonical")
 async def list_canonical_models(request: Request):
     """Return one authenticated, safe row per logical gateway model."""
-    require_client_auth(request)
+    principal = _restricted_principal(require_client_auth(request))
     inventory = effective_model_inventory()
+    if principal is not None:
+        inventory = _permitted_inventory(principal, inventory)
     rows = _canonical_model_rows(inventory, _canonical_includes(request))
     auto_models, model_presets = _canonical_cloud_policy(inventory, rows)
     return {
@@ -3045,16 +3118,20 @@ async def federation_catalog(request: Request):
 
 @app.get("/v1/debug/thinking")
 async def debug_thinking(request: Request):
-    require_client_auth(request)
     """Read-only matrix of per-model thinking forwarding, derived at runtime.
 
     Surfaces, for every routable model, which thinking params the dispatch
     actually forwards upstream under a max-effort probe — making silent gaps
     (e.g. zai dropping reasoning_effort) visible without reading the source.
     """
+    principal = _restricted_principal(require_client_auth(request))
     seen: dict[str, dict] = {}
-    for m in list_routable_models():
-        seen.setdefault(m.get("name") or m["id"], m)
+    if principal is None:
+        for m in list_routable_models():
+            seen.setdefault(m.get("name") or m["id"], m)
+    else:
+        for m in _permitted_inventory(principal, effective_model_inventory()):
+            seen.setdefault(m["name"], m)
     rows = []
     for name, m in seen.items():
         caps = _thinking_capabilities(m)

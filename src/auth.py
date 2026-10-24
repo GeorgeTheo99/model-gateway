@@ -31,6 +31,9 @@ LOCAL_AI_PERMISSION = "local_ai:manage"
 # only ones this credential created, under reserved ids; no provider allowlist.
 CUSTOM_PROVIDERS_PERMISSION = "providers:custom"
 ADMIN_SCOPES = MANAGEMENT_PERMISSIONS | {LOCAL_AI_PERMISSION, CUSTOM_PROVIDERS_PERMISSION}
+# A credential that can register profiles or models could route around its own
+# ``models`` allowlist, so the two never combine.
+MODEL_ALLOWLIST_EXCLUDED_PERMISSIONS = frozenset({"profiles:write"}) | MANAGEMENT_PERMISSIONS
 _CONSUMER_PERMISSIONS = _PROFILE_PERMISSIONS | ADMIN_SCOPES
 _PROVIDER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 _client_auth_required_latched = False
@@ -63,6 +66,9 @@ class ConsumerPrincipal:
     namespaces: frozenset[str]
     allow_direct_models: bool
     providers: frozenset[str] = frozenset()
+    # Direct models this credential may call; None is every model
+    # (docs/adr/0003-scoped-access-and-lightweight-local-models.md section 1).
+    models: frozenset[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -204,6 +210,24 @@ def _read_consumer_key_file(raw_path: object) -> str:
     return value
 
 
+def validate_model_allowlist(models: object, *, allow_direct_models: bool, permissions: list[str]) -> None:
+    """Reject a ``models`` allowlist the credential could not be held to (ADR 0003 section 1)."""
+    if models is None:
+        return
+    if (
+        not isinstance(models, list) or not models
+        or any(not isinstance(value, str) or not value.strip() or len(value) > 512 for value in models)
+        or len(models) != len(set(models))
+    ):
+        raise ValueError("consumer credential models must be a non-empty list of unique model names")
+    if not allow_direct_models:
+        raise ValueError("consumer credential models requires allow_direct_models")
+    if MODEL_ALLOWLIST_EXCLUDED_PERMISSIONS.intersection(permissions):
+        raise ValueError(
+            "consumer credential models cannot be combined with profiles:write, providers:manage or models:register"
+        )
+
+
 def _consumer_credentials() -> list[tuple[str, ConsumerPrincipal]]:
     raw = _config_auth().get("consumer_credentials")
     if raw is None:
@@ -218,6 +242,7 @@ def _consumer_credentials() -> list[tuple[str, ConsumerPrincipal]]:
             raise ValueError("consumer credential entries must be objects")
         unknown = set(item) - {
             "id", "consumer", "key_file", "key", "permissions", "namespaces", "allow_direct_models", "providers",
+            "models",
         }
         if unknown:
             raise ValueError(f"consumer credential has unknown fields: {sorted(unknown)}")
@@ -270,6 +295,8 @@ def _consumer_credentials() -> list[tuple[str, ConsumerPrincipal]]:
             raise ValueError("consumer credential providers are invalid")
         if bool(managed) != bool(MANAGEMENT_PERMISSIONS.intersection(permissions)):
             raise ValueError("consumer credential providers are required exactly for management permissions")
+        models = item.get("models")
+        validate_model_allowlist(models, allow_direct_models=allow_direct, permissions=permissions)
         result.append((token, ConsumerPrincipal(
             credential_id=credential_id,
             consumer=consumer,
@@ -277,6 +304,7 @@ def _consumer_credentials() -> list[tuple[str, ConsumerPrincipal]]:
             namespaces=frozenset(namespaces),
             allow_direct_models=allow_direct,
             providers=frozenset(managed),
+            models=None if models is None else frozenset(models),
         )))
     return result
 

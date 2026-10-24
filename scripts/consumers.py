@@ -31,6 +31,8 @@ def main() -> int:
                      help="profile namespace (repeatable; default: the consumer id)")
     add.add_argument("--allow-direct-models", action="store_true",
                      help="also allow explicit catalog models outside profiles")
+    add.add_argument("--model", action="append", dest="models",
+                     help="limit direct models to this name (repeatable; needs --allow-direct-models, runtime role)")
     add.add_argument("--provider", action="append", dest="providers",
                      help="provider a manager may administer (repeatable; required for --role manager)")
     add.add_argument("--local-ai", action="store_true",
@@ -59,6 +61,8 @@ def main() -> int:
                 print("no consumer credentials configured")
             for row in rows if not args.json else ():
                 direct = " direct-models" if row["allow_direct_models"] else ""
+                if row["allow_direct_models"] and row["models"] is not None:
+                    direct += f"={','.join(row['models'])}"
                 managed = f" providers={','.join(row['providers'])}" if row["providers"] else ""
                 print(f"{row['id']:<24} consumer={row['consumer']} namespaces={','.join(row['namespaces'])} "
                       f"permissions={','.join(row['permissions'])}{direct}{managed} key={row['key_status']} "
@@ -67,7 +71,7 @@ def main() -> int:
         if args.command == "add":
             row = config_io.add_consumer_credential(
                 args.consumer, args.role, namespaces=args.namespaces,
-                allow_direct_models=args.allow_direct_models, providers=args.providers,
+                allow_direct_models=args.allow_direct_models, models=args.models, providers=args.providers,
                 local_ai=args.local_ai, custom_providers=args.custom_providers)
             print(f"{row['status']} {row['id']} -> {row['key_file']}")
             if row["enables_client_auth"]:

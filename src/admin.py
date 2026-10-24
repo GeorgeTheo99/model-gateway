@@ -21,6 +21,7 @@ from src.auth import (
     require_admin_auth,
     require_admin_or_scope,
     require_admin_writes,
+    validate_credential_separation,
 )
 from src.catalog import canonical_provider, entry_routable_ids
 from src.config_lock import config_write_lock
@@ -31,6 +32,7 @@ from src.providers import (
     model_status,
     provider_status,
     standalone_provider_status,
+    unmatched_model_names,
     workspace_pool_status,
     registry_transaction as provider_registry_transaction,
     reload as reload_provider_registry,
@@ -60,6 +62,27 @@ def _require_provider_scope(principal, provider_id: object) -> None:
     raw = provider_id.strip().lower() if isinstance(provider_id, str) else ""
     if not raw or canonical_provider(raw) not in {canonical_provider(p) for p in principal.providers}:
         raise HTTPException(status_code=403, detail="Credential is not authorized for this provider")
+
+
+def _credential_status() -> dict:
+    """Legacy keys to retire (ADR 0001) and allowlist names that match nothing
+    (docs/adr/0003-scoped-access-and-lightweight-local-models.md section 1)."""
+    try:
+        consumers, legacy_keys, _admins = validate_credential_separation()
+    except (OSError, UnicodeError, ValueError):
+        return {"deprecated_legacy_client_keys": 0, "unmatched_model_allowlists": {}}
+    unmatched = {}
+    try:
+        for _token, principal in consumers:
+            if principal.models is None:
+                continue
+            names = [name for name in unmatched_model_names(principal.models)
+                     if federation.manager().resolve_imported(name) is None]
+            if names:
+                unmatched[principal.credential_id] = names
+    except Exception:  # noqa: BLE001 — admin status must stay available to recover a broken catalog
+        unmatched = {}
+    return {"deprecated_legacy_client_keys": len(legacy_keys), "unmatched_model_allowlists": unmatched}
 
 
 @router.get("/admin/api/status")
@@ -92,6 +115,7 @@ async def admin_status(request: Request):
             "admin_key_configured": mode.admin_key_configured,
             "unsafe_admin_without_key": mode.unsafe_admin_without_key,
             "warning": mode.warning,
+            **_credential_status(),
         },
     }
 
@@ -1645,7 +1669,8 @@ async def admin_consumers(request: Request):
 async def admin_add_consumer(request: Request):
     """Create ``<consumer>-<role>``. A generated key is returned once, uncached.
 
-    Body: {consumer, role, namespaces?, allow_direct_models?, providers?, local_ai?, custom_providers?}.
+    Body: {consumer, role, namespaces?, allow_direct_models?, models?, providers?, local_ai?, custom_providers?}.
+    ``models`` limits the direct models a ``runtime`` credential may call;
     ``providers`` is the allowlist a ``manager`` credential may administer;
     ``local_ai`` also grants ``local_ai:manage`` and ``custom_providers`` ``providers:custom``.
     """
@@ -1660,6 +1685,7 @@ async def admin_add_consumer(request: Request):
     consumer, role = body.get("consumer"), body.get("role")
     namespaces = body.get("namespaces")
     allow_direct = body.get("allow_direct_models", False)
+    models = body.get("models")
     managed = body.get("providers")
     local_ai = body.get("local_ai", False)
     custom = body.get("custom_providers", False)
@@ -1673,6 +1699,8 @@ async def admin_add_consumer(request: Request):
         return _bad_request("namespaces must be a list of strings")
     if not isinstance(allow_direct, bool):
         return _bad_request("allow_direct_models must be a boolean")
+    if models is not None and (not isinstance(models, list) or any(not isinstance(value, str) for value in models)):
+        return _bad_request("models must be a list of strings")
     if not isinstance(local_ai, bool) or not isinstance(custom, bool):
         return _bad_request("local_ai and custom_providers must be booleans")
     if managed is not None and (
@@ -1680,7 +1708,7 @@ async def admin_add_consumer(request: Request):
     ):
         return _bad_request("providers must be a list of strings")
     result, error = _consumer_mutation(credential_id, lambda: config_io.add_consumer_credential(
-        consumer, role, namespaces=namespaces, allow_direct_models=allow_direct,
+        consumer, role, namespaces=namespaces, allow_direct_models=allow_direct, models=models,
         providers=managed, local_ai=local_ai, custom_providers=custom, reveal_key=True,
     ))
     if error is not None:
@@ -4819,7 +4847,11 @@ _ADMIN_HTML = r"""
                   ) +
                   '<span class="small">' +
                   esc((c.permissions || []).join(", ")) +
-                  (c.allow_direct_models ? " · direct models" : "") +
+                  (c.allow_direct_models
+                    ? c.models
+                      ? " · direct models " + esc(c.models.join(", "))
+                      : " · direct models"
+                    : "") +
                   ((c.providers || []).length
                     ? " · providers " + esc(c.providers.join(", "))
                     : "") +

@@ -1003,6 +1003,39 @@ def retirement_redirect(model_id: str) -> str | None:
 
 
 @_registry_locked
+def direct_model_permitted(model_id: object, allowed: frozenset[str], namespaces: frozenset[str]) -> bool:
+    """Whether a credential limited to ``allowed`` may request ``model_id``
+    (docs/adr/0003-scoped-access-and-lightweight-local-models.md section 1).
+
+    An identifier (name, alias, alternate or upstream id) counts as the catalog
+    entry it names, both in ``allowed`` and in the request. Any other name (a
+    base model, a retired name, a federated ``<peer>/<id>``) must be listed
+    itself; a listed base model so permits only requests by that base-model
+    name, which resolve as ADR 0002 R1 describes. A pack row counts only for
+    credentials holding the pack's namespace.
+    """
+    if not isinstance(model_id, str):
+        return False
+    models = _load_models()
+    entry = models.get(model_id)
+    if entry is None:
+        return model_id in allowed
+    origin = entry.get("origin") or {}
+    if origin.get("layer") == "pack" and origin.get("namespace") not in namespaces:
+        return False
+    return entry["name"] in {models[name]["name"] if name in models else name for name in allowed}
+
+
+@_registry_locked
+def unmatched_model_names(names: frozenset[str]) -> list[str]:
+    """Listed names that are not a catalog identifier, a base model or a retired name here."""
+    models = _load_models()
+    base_models = {entry.get("base_model") for entry in models.values()
+                   if (entry.get("origin") or {}).get("layer") != "pack"}
+    return sorted(name for name in names if name not in models and name not in base_models and name not in _retired)
+
+
+@_registry_locked
 def resolve_base_model(model_id: str, *, locality: str | None = None) -> str | None:
     """The available route for a base-model reference (docs/adr/0002-layered-model-catalog.md R1).
 

@@ -279,3 +279,28 @@ def test_cli_manager_role_requires_and_lists_provider_allowlist(tmp_path):
     assert "providers=fireworks" in run("list").stdout
     (entry,) = yaml.safe_load(config.read_text())["auth"]["consumer_credentials"]
     assert entry["id"] == "ha-manager" and entry["providers"] == ["fireworks"]
+
+
+def test_cli_runtime_role_limits_direct_models(tmp_path):
+    real = Path(os.path.realpath(tmp_path))
+    config = real / "config.yaml"
+    config.write_text("auth:\n  client_keys: [client-token]\nproviders: {}\n")
+    config.chmod(0o600)
+    env = {key: value for key, value in os.environ.items() if not key.startswith("MODEL_GATEWAY_CLIENT_KEYS")}
+    env["MODEL_GATEWAY_BACKUP_DIR"] = str(real / "backups")
+
+    def run(*args):
+        return subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "consumers.py"), "--config", str(config), *args],
+            env=env, capture_output=True, text=True, timeout=60,
+        )
+
+    without_direct = run("add", "bot", "--role", "runtime", "--model", "glm-5.3")
+    assert without_direct.returncode == 2 and "requires allow_direct_models" in without_direct.stderr
+    deployer = run("add", "bot", "--role", "deployer", "--allow-direct-models", "--model", "glm-5.3")
+    assert deployer.returncode == 2 and "cannot be combined" in deployer.stderr
+    added = run("add", "bot", "--role", "runtime", "--allow-direct-models", "--model", "glm-5.3", "--model", "qwen")
+    assert added.returncode == 0, added.stderr
+    assert "direct-models=glm-5.3,qwen" in run("list").stdout
+    (entry,) = yaml.safe_load(config.read_text())["auth"]["consumer_credentials"]
+    assert entry["models"] == ["glm-5.3", "qwen"]

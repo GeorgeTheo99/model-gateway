@@ -17,6 +17,7 @@ CAPABILITIES = (
     "layered_catalog.v1",
     "legacy_home_server_import.v1",
     "local_runtime.v1",
+    "model_allowlists.v1",
     "onboarding_auto_add.v1",
     "onboarding_profiles.v1",
     "profiles.v1",

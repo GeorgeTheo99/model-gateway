@@ -59,6 +59,8 @@ def endpoint_document() -> dict:
                 "providers": list(entry.get("providers") or []),
                 "key_file": str(resolve_api_key_file(entry["key_file"], providers.CONFIG_PATH)),
             }
+            if isinstance(entry.get("models"), list):
+                consumers[entry["id"]]["models"] = list(entry["models"])
     client_key_file = os.environ.get("MODEL_GATEWAY_CLIENT_KEYS_FILE", "").strip()
     return {
         "version": ENDPOINT_VERSION,

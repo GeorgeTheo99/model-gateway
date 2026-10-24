@@ -835,6 +835,7 @@ def _consumer_summary(entry: dict) -> dict:
         "namespaces": list(entry.get("namespaces") or []),
         "permissions": list(entry.get("permissions") or []),
         "allow_direct_models": bool(entry.get("allow_direct_models", False)),
+        "models": list(entry["models"]) if isinstance(entry.get("models"), list) else None,
         "providers": list(entry.get("providers") or []),
         "key_file": entry.get("key_file"),
         "key_status": _consumer_key_status(entry),
@@ -874,6 +875,7 @@ def add_consumer_credential(
     *,
     namespaces: list[str] | None = None,
     allow_direct_models: bool = False,
+    models: list[str] | None = None,
     providers: list[str] | None = None,
     local_ai: bool = False,
     custom_providers: bool = False,
@@ -887,12 +889,14 @@ def add_consumer_credential(
     Returns the non-secret summary plus ``status`` (``created``/``repaired``/
     ``unchanged``) and ``enables_client_auth`` when ``/v1`` was open before.
     ``providers`` is required for, and only accepted by, the manager role.
+    ``models`` limits the direct models the credential may call (with
+    ``allow_direct_models``; the runtime role only).
     ``local_ai`` adds ``local_ai:manage`` (the local AI admin API) to any role,
     and ``custom_providers`` adds ``providers:custom`` (owner-defined providers).
     ``reveal_key`` adds ``key`` only when this call generated it, for the
     admin UI's one-time display; an adopted or unchanged key is never read.
     """
-    from src.auth import _PRINCIPAL_ID_RE, _read_consumer_key_file
+    from src.auth import _PRINCIPAL_ID_RE, _read_consumer_key_file, validate_model_allowlist
 
     credential_id = consumer_credential_id(consumer, role)
     target = consumer_key_path(credential_id)
@@ -915,6 +919,9 @@ def add_consumer_credential(
         + (["providers:custom"] if custom_providers else []),
         "allow_direct_models": bool(allow_direct_models),
     }
+    if models is not None:
+        validate_model_allowlist(models, allow_direct_models=allow_direct_models, permissions=desired["permissions"])
+        desired["models"] = list(models)
     if role == "manager":
         desired["providers"] = list(providers)
 
@@ -922,9 +929,12 @@ def add_consumer_credential(
     entries = _consumer_entries(config)
     existing = next((entry for entry in entries if entry.get("id") == credential_id), None)
     if existing is not None:
-        comparable = {key: existing.get(key) for key in desired if key != "key_file"}
+        comparable = {key: existing.get(key) for key in (*desired, "models") if key != "key_file"}
         comparable["allow_direct_models"] = bool(existing.get("allow_direct_models", False))
-        if comparable != {key: value for key, value in desired.items() if key != "key_file"}:
+        wanted = {key: desired.get(key) for key in comparable}
+        if isinstance(comparable["models"], list) and isinstance(wanted["models"], list):
+            comparable["models"], wanted["models"] = sorted(comparable["models"], key=str), sorted(wanted["models"], key=str)
+        if comparable != wanted:
             raise ValueError(
                 f"consumer credential {credential_id!r} already exists with different settings; revoke it first"
             )
