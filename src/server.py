@@ -24,6 +24,7 @@ from types import SimpleNamespace
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from src.admin import router as admin_router
@@ -711,6 +712,30 @@ def _resolve_for(request: Request, model: object):
         if catalog.canonical_provider(info.provider) != "omlx":
             return None
     return info
+
+
+async def _install_on_demand(request: Request, path: str, model: object) -> JSONResponse | None:
+    """With no route here or on a trusted peer, a model the owner lets requests install
+    (``local_ai.auto_install``) starts installing; the request is answered at once with 503 and
+    Retry-After, never held (docs/adr/0003-scoped-access-and-lightweight-local-models.md section 5)."""
+    if not isinstance(model, str) or getattr(request.state, "profile_execution", None) is not None:
+        return None
+    # Only a model this gateway has no entry for: a disabled or hidden one stays as it is.
+    if model_availability(model).get("reason") != "model_not_found" or not _direct_model_permitted(request, model):
+        return None
+    try:
+        local = await run_in_threadpool(local_runtime.on_demand_model, model, providers._load_config())
+    except Exception:  # noqa: BLE001 — the request then fails as not found
+        return None
+    if local is None:
+        return None
+    principal = _model_allowlist(request) or getattr(getattr(request.state, "auth_identity", None), "principal", None)
+    outcome = await run_in_threadpool(local_runtime.request_install, local,
+                                      requester=getattr(principal, "credential_id", ""))
+    response = _profile_inference_error(path, profiles.ProfileError(503, outcome.code, str(outcome)))
+    if outcome.retry_after is not None:
+        response.headers["Retry-After"] = str(outcome.retry_after)
+    return response
 
 
 def _validate_inbound_peer_model(request: Request, path: str, model: object) -> JSONResponse | None:
@@ -2754,7 +2779,7 @@ def _nonnegative_catalog_int(value: object) -> int:
 
 
 # Optional row fields a client asks for with ``?include=``; older clients keep exact rows.
-CANONICAL_OPTIONAL_FIELDS = ("display_name", "zero_data_retention", "family", "base_model")
+CANONICAL_OPTIONAL_FIELDS = ("display_name", "zero_data_retention", "family", "base_model", "local_install")
 
 
 def _canonical_includes(request: Request) -> frozenset[str]:
@@ -2817,8 +2842,25 @@ def _canonical_model_rows(inventory: list[dict], include: frozenset[str] = froze
         for field in ("family", "base_model"):
             if field in include:
                 row[field] = _bounded_catalog_string(model.get(field), limit=64)
+        if "local_install" in include:
+            # "on_demand": a local AI model a request installs (ADR 0003 section 5); "" otherwise.
+            row["local_install"] = "on_demand" if model.get("local_install") == "on_demand" else ""
         rows.append(row)
     return rows
+
+
+def _on_demand_inventory() -> list[dict]:
+    """Inventory rows for the local AI models a request would install (none serves their name
+    now), which load once installed."""
+    try:
+        models = local_runtime.on_demand_models(providers._load_config())
+    except Exception:  # noqa: BLE001 — discovery must not fail on local AI state
+        return []
+    models = [local for local in models if providers.base_model_route(local.name) is None]
+    return [{**local.catalog, "name": local.name, "provider": "omlx", "declared_providers": ["omlx"],
+             "effective_provider": "omlx", "enabled": True, "available": False,
+             "availability_reason": "not_installed", "routable_ids": [local.name], "local_install": "on_demand"}
+            for local in models]
 
 
 def _canonical_cloud_id_map(inventory: list[dict], rows: list[dict]) -> dict[str, str]:
@@ -3156,10 +3198,14 @@ async def list_models(request: Request):
 async def list_canonical_models(request: Request):
     """Return one authenticated, safe row per logical gateway model."""
     principal = _restricted_principal(require_client_auth(request))
+    include = _canonical_includes(request)
     inventory = effective_model_inventory()
+    if "local_install" in include:
+        names = {model.get("name") for model in inventory}
+        inventory += [row for row in await run_in_threadpool(_on_demand_inventory) if row["name"] not in names]
     if principal is not None:
         inventory = _permitted_inventory(principal, inventory)
-    rows = _canonical_model_rows(inventory, _canonical_includes(request))
+    rows = _canonical_model_rows(inventory, include)
     auto_models, model_presets = _canonical_cloud_policy(inventory, rows)
     return {
         "object": "list",
@@ -3330,6 +3376,9 @@ async def create_response(request: Request):
         forwarded = await _forward_imported_if_known(request, "/v1/responses", body)
         if forwarded is not None:
             return forwarded
+        installing = await _install_on_demand(request, "/v1/responses", model)
+        if installing is not None:
+            return installing
     if not info:
         return _error_openai(404, "invalid_request_error", _model_error_message(model))
     thinking_error = _thinking_validation_response(body, info, _error_openai)
@@ -3717,6 +3766,9 @@ async def chat_completions(request: Request):
         forwarded = await _forward_imported_if_known(request, "/v1/chat/completions", body)
         if forwarded is not None:
             return forwarded
+        installing = await _install_on_demand(request, "/v1/chat/completions", model)
+        if installing is not None:
+            return installing
     if not info:
         return JSONResponse(
             status_code=404,
@@ -4199,6 +4251,9 @@ async def messages(request: Request):
         forwarded = await _forward_imported_if_known(request, "/v1/messages", body)
         if forwarded is not None:
             return forwarded
+        installing = await _install_on_demand(request, "/v1/messages", model)
+        if installing is not None:
+            return installing
     if not info:
         return _error(404, "invalid_request_error", _model_error_message(model))
     if getattr(info, "api_style", "") == "open_responses":

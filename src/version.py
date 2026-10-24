@@ -19,6 +19,7 @@ CAPABILITIES = (
     "legacy_home_server_import.v1",
     "local_runtime.v1",
     "local_runtime_models.v1",
+    "local_runtime_on_demand.v1",
     "model_allowlists.v1",
     "onboarding_auto_add.v1",
     "onboarding_profiles.v1",

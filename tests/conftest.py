@@ -55,6 +55,28 @@ def _isolate_local_runtime(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_upstreams(monkeypatch):
+    """No test reaches a real upstream: this Mac runs a production oMLX and gateway on the
+    default ports. Tests stub upstream calls or use httpx.MockTransport."""
+    import httpx
+
+    attempts = []
+
+    def refuse(request):
+        # Recorded as well as raised: a handler's own except clause may turn the raise into an error response.
+        attempts.append(f"{request.method} {request.url.host}:{request.url.port}")
+        raise AssertionError(f"test attempted a real upstream request to {request.url.host}:{request.url.port}")
+
+    async def refuse_async(self, request):
+        refuse(request)
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", refuse_async)
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", lambda self, request: refuse(request))
+    yield
+    assert not attempts, f"test attempted real upstream requests: {attempts}"
+
+
+@pytest.fixture(autouse=True)
 def _isolate_shipped_layer(monkeypatch):
     """Released curated profiles load only in tests that opt in (patch ``shipped._packaged``)."""
     from src import shipped

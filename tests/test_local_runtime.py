@@ -20,6 +20,7 @@ import tomllib
 
 import pytest
 import yaml
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from src import config_io, discovery, local_runtime as lr
@@ -126,6 +127,7 @@ def owned_install(port: int = 9123) -> None:
 def test_status_on_a_mac_that_cannot_run_local_ai():
     value = lr.status()
     models = value.pop("models")
+    assert (value.pop("auto_install"), value.pop("auto_install_error")) == ([], "")
     assert value == {"eligible": False, "installed": False, "managed": True, "model": None, "state": None,
                      "bytes_done": 0, "bytes_total": 0, "message": "", "base_url": None, "loaded": None}
     assert models == [{"name": name, "eligible": False, "installed": False, "min_memory_gb": gb, "loaded": None}
@@ -1981,3 +1983,210 @@ def test_removal_succeeds_even_when_pins_cannot_sync_afterwards(eligible, gatewa
     monkeypatch.setattr(lr, "sync_pins", lambda: (_ for _ in ()).throw(OSError("oMLX is busy")))
     value = lr.remove("qwen3.8-27b-4bit")
     assert (value["installed"], value["state"]) == (False, None)
+
+
+# ── on-demand install (docs/adr/0003-scoped-access-and-lightweight-local-models.md section 5) ──
+
+
+@pytest.fixture
+def on_demand(eligible, gateway, launchctl, monkeypatch):
+    """The 8-bit installed and running; the 4-bit listed for on-demand install.
+
+    Here the 4-bit has a base model of its own: with the curated one (the 8-bit's), the
+    installed 8-bit serves its name and nothing installs (ADR 0003 section 4's order).
+    """
+    from dataclasses import replace
+
+    monkeypatch.setitem(lr.MODELS, SMALL.name, replace(SMALL, catalog={**SMALL.catalog, "base_model": "qwen-small"}))
+    running_runtime(gateway, launchctl, monkeypatch)
+    config = yaml.safe_load(gateway.read_text())
+    config["local_ai"] = {"auto_install": ["qwen3.8-27b-4bit"]}
+    gateway.write_text(yaml.safe_dump(config))
+    providers.reload()
+    lr._on_demand_started.clear()
+    starts = []
+
+    def start(name):
+        starts.append(name)
+        lr._atomic(lr.status_path(), json.dumps({
+            "state": "queued", "model": name, "bytes_done": 0, "bytes_total": 16_000_000_000,
+            "updated_at": lr._now()}))
+        return lr.status(name)
+
+    monkeypatch.setattr(lr, "start_add", start)
+    return starts
+
+
+def chat(model, token="admin"):
+    return TestClient(app).post("/v1/chat/completions", headers={"Authorization": f"Bearer {token}"},
+                                json={"model": model, "messages": [{"role": "user", "content": "hi"}]})
+
+
+def test_a_request_starts_installing_a_listed_model_and_returns_at_once(on_demand):
+    response = chat("qwen3.8-27b-4bit")
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "model_installing"
+    assert int(response.headers["Retry-After"]) == 16_000_000_000 // lr.DOWNLOAD_BYTES_PER_SECOND + 60
+    # Later requests follow the job instead of starting another.
+    again = chat("qwen3.8-27b-4bit")
+    assert again.json()["error"]["code"] == "model_installing" and on_demand == ["qwen3.8-27b-4bit"]
+
+
+def test_only_listed_models_install_on_demand(on_demand, gateway):
+    config = yaml.safe_load(gateway.read_text())
+    config["local_ai"] = {"auto_install": []}
+    gateway.write_text(yaml.safe_dump(config))
+    providers.reload()
+    assert chat("qwen3.8-27b-4bit").status_code == 404 and on_demand == []
+
+
+def test_a_busy_or_failed_job_is_reported_not_retried(on_demand):
+    lr._atomic(lr.status_path(), json.dumps({"state": "downloading", "model": "qwen3.8-27b", "bytes_done": 1,
+                                             "bytes_total": 2, "updated_at": lr._now()}))
+    assert chat("qwen3.8-27b-4bit").json()["error"]["code"] == "model_install_busy"
+    lr._atomic(lr.status_path(), json.dumps({"state": "failed", "model": "qwen3.8-27b-4bit", "message": "no disk",
+                                             "updated_at": lr._now()}))
+    response = chat("qwen3.8-27b-4bit")
+    assert response.json()["error"]["code"] == "model_not_installable"
+    assert "no disk" not in response.text  # why is for the owner (local AI status)
+    assert "Retry-After" not in response.headers and on_demand == []
+
+
+def test_an_interrupted_download_resumes_on_the_next_request(on_demand):
+    stale = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    lr._atomic(lr.status_path(), json.dumps({"state": "downloading", "model": "qwen3.8-27b-4bit", "bytes_done": 5,
+                                             "bytes_total": 10, "updated_at": stale}))
+    assert chat("qwen3.8-27b-4bit").json()["error"]["code"] == "model_installing"
+    assert on_demand == ["qwen3.8-27b-4bit"]
+
+
+def test_a_refused_start_is_answered_from_cache_until_the_window_passes(on_demand, monkeypatch):
+    attempts = []
+
+    def refuse(name):
+        attempts.append(name)
+        raise lr.LocalRuntimeError(f"Local AI needs 30 GB of free disk space in {lr.runtime_root()}")
+
+    monkeypatch.setattr(lr, "start_add", refuse)
+    for _ in range(3):
+        response = chat("qwen3.8-27b-4bit")
+        assert response.json()["error"]["code"] == "model_not_installable"
+        assert "free disk space" not in response.text and str(lr.runtime_root()) not in response.text
+    assert attempts == ["qwen3.8-27b-4bit"]
+    started_at, answer = lr._on_demand_started["qwen3.8-27b-4bit"]
+    lr._on_demand_started["qwen3.8-27b-4bit"] = (started_at - lr.ON_DEMAND_START_SECONDS, answer)
+    chat("qwen3.8-27b-4bit")
+    assert attempts == ["qwen3.8-27b-4bit"] * 2
+
+
+def test_another_models_live_job_is_busy_not_refused(on_demand, monkeypatch):
+    monkeypatch.setattr(lr, "start_add", lambda name: (_ for _ in ()).throw(lr._InstallBusy("installing x")))
+    assert chat("qwen3.8-27b-4bit").json()["error"]["code"] == "model_install_busy"
+
+
+@pytest.mark.parametrize("path, body", [
+    ("/v1/responses", {"input": "hi"}),
+    ("/v1/messages", {"max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}),
+])
+def test_every_endpoint_installs_on_demand(on_demand, path, body):
+    response = TestClient(app).post(path, headers={"Authorization": "Bearer admin"},
+                                    json={"model": "qwen3.8-27b-4bit", **body})
+    assert response.status_code == 503 and "Retry-After" in response.headers
+    assert on_demand == ["qwen3.8-27b-4bit"]
+
+
+def test_a_disabled_or_installed_model_never_installs_on_demand(on_demand, gateway, monkeypatch):
+    config = yaml.safe_load(gateway.read_text())
+    config["model_overrides"] = {"qwen3.8-27b": {"enabled": False}}
+    config["local_ai"] = {"auto_install": ["qwen3.8-27b-4bit", "qwen3.8-27b"]}
+    gateway.write_text(yaml.safe_dump(config))
+    providers.reload()
+    # The 8-bit exists here but is turned off: it stays off, nothing downloads.
+    assert chat("qwen3.8-27b").status_code == 404
+    assert lr.on_demand_model("qwen3.8-27b", config) is None
+    assert on_demand == []
+
+
+def test_auto_install_errors_are_reported_to_the_owner(gateway):
+    config = yaml.safe_load(gateway.read_text())
+    config["local_ai"] = {"auto_install": ["gpt-6"]}
+    gateway.write_text(yaml.safe_dump(config))
+    value = lr.status()
+    assert value["auto_install"] == [] and "local_ai.auto_install must list" in value["auto_install_error"]
+
+
+def test_nothing_installs_on_demand_without_a_runtime(gateway, eligible, monkeypatch):
+    config = yaml.safe_load(gateway.read_text())
+    config["local_ai"] = {"auto_install": ["qwen3.8-27b-4bit"]}
+    gateway.write_text(yaml.safe_dump(config))
+    providers.reload()
+    monkeypatch.setattr(lr, "start_add", lambda name: pytest.fail("installed on demand"))
+    assert chat("qwen3.8-27b-4bit").status_code == 404
+    assert lr.on_demand_models(config) == []
+
+
+def test_restricted_credentials_install_on_demand_only_what_they_list(on_demand, gateway):
+    config = yaml.safe_load(gateway.read_text())
+    config["auth"]["consumer_credentials"].append({
+        "id": "bot-runtime", "consumer": "bot", "key": "bot-token", "namespaces": ["bot"],
+        "permissions": ["profiles:invoke"], "allow_direct_models": True, "models": ["qwen3.8-27b"]})
+    gateway.write_text(yaml.safe_dump(config))
+    providers.reload()
+    assert chat("qwen3.8-27b-4bit", token="bot-token").status_code == 403
+    assert on_demand == []
+
+
+def test_canonical_lists_on_demand_models_only_when_asked(on_demand):
+    client = TestClient(app)
+    plain = client.get("/v1/models/canonical", headers={"Authorization": "Bearer admin"}).json()["data"]
+    assert "qwen3.8-27b-4bit" not in {row["id"] for row in plain}
+    assert all("local_install" not in row for row in plain)
+    rows = {row["id"]: row for row in client.get("/v1/models/canonical?include=local_install",
+                                                 headers={"Authorization": "Bearer admin"}).json()["data"]}
+    assert rows["qwen3.8-27b-4bit"]["local_install"] == "on_demand"
+    assert (rows["qwen3.8-27b-4bit"]["available"], rows["qwen3.8-27b-4bit"]["scope"]) == (False, "local")
+    assert rows["qwen3.8-27b"]["local_install"] == ""
+    models = client.get("/v1/models", headers={"Authorization": "Bearer admin"}).json()["data"]
+    assert "qwen3.8-27b-4bit" not in {row["id"] for row in models}
+
+
+def test_auto_install_must_name_local_ai_models():
+    with pytest.raises(ValueError, match="local_ai.auto_install"):
+        lr.auto_install_names({"local_ai": {"auto_install": ["gpt-6"]}})
+    assert lr.auto_install_names({}) == []
+
+
+def test_a_model_whose_base_is_served_here_is_never_installed_on_demand(eligible, gateway, launchctl, monkeypatch):
+    running_runtime(gateway, launchctl, monkeypatch)
+    config = yaml.safe_load(gateway.read_text())
+    config["local_ai"] = {"auto_install": ["qwen3.8-27b-4bit"]}
+    gateway.write_text(yaml.safe_dump(config))
+    providers.reload()
+    monkeypatch.setattr(lr, "start_add", lambda name: pytest.fail("installed on demand"))
+    served = []
+
+    async def passthrough(endpoint, body, headers, provider="", request=None, **_kwargs):
+        served.append(body["model"])
+        return JSONResponse({"choices": []})
+
+    from src import server
+    monkeypatch.setattr(server, "_passthrough_sync", passthrough)
+    assert chat("qwen3.8-27b-4bit").status_code == 200
+    assert served == [QWEN_ID]  # the installed 8-bit serves the 4-bit's base model
+
+
+def test_a_credential_limited_to_the_missing_model_installs_it(eligible, gateway, launchctl, monkeypatch):
+    running_runtime(gateway, launchctl, monkeypatch)
+    config = yaml.safe_load(gateway.read_text())
+    config["local_ai"] = {"auto_install": ["qwen3.8-27b-4bit"]}
+    config["auth"]["consumer_credentials"].append({
+        "id": "bot-runtime", "consumer": "bot", "key": "bot-token", "namespaces": ["bot"],
+        "permissions": ["profiles:invoke"], "allow_direct_models": True, "models": ["qwen3.8-27b-4bit"]})
+    gateway.write_text(yaml.safe_dump(config))
+    providers.reload()
+    lr._on_demand_started.clear()
+    starts = []
+    monkeypatch.setattr(lr, "start_add", lambda name: starts.append(name) or lr.status(name))
+    response = chat("qwen3.8-27b-4bit", token="bot-token")
+    assert response.status_code == 503 and response.json()["error"]["code"] == "model_installing"
+    assert starts == ["qwen3.8-27b-4bit"]

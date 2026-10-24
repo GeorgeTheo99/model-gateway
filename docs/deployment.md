@@ -384,6 +384,26 @@ stopped heartbeating). Products drive the same flow with
 (`{"action": "add"|"cancel", "model"?}`) using a
 `local_ai:manage` credential or a full admin key.
 
+Once the runtime exists, the owner can let requests install more models:
+
+```yaml
+local_ai:
+  auto_install: [qwen3.8-27b-4bit]
+```
+
+A request for a listed model (by its name or base model) that has no route
+here, on this Mac or a trusted federation peer, starts its setup job and is
+answered at once with `503 model_installing` and `Retry-After` (seconds,
+estimated from the bytes left to download); it is never held open. Later
+requests follow the same job. `503 model_install_busy` means another model is
+installing; `503 model_not_installable` (no `Retry-After`) means the Mac lacks
+the memory or disk, or the last attempt failed or was cancelled, which only the
+owner retries (`local-ai add`). An interrupted download resumes on the next
+request. Nothing installs on demand before the first `add`, and a model whose
+base model another installed model serves is served by that model instead.
+`GET /v1/models/canonical?include=local_install` lists the models a request
+would install, with `"local_install": "on_demand"` and `available: false`.
+
 `remove MODEL` deletes one of several installed models the same way, without a
 restart. `remove` (or removing the last model) unwires the provider and models,
 stops and deletes the runtime and its models, then restarts the gateway once so

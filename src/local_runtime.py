@@ -122,6 +122,10 @@ class Cancelled(Exception):
     """launchd stopped the setup job (cancel)."""
 
 
+class _InstallBusy(LocalRuntimeError):
+    """Setup is installing another model."""
+
+
 class _Busy(LocalRuntimeError):
     """Another process holds a local AI lock."""
 
@@ -640,7 +644,20 @@ def status(name: str | None = None) -> dict:
         "models": [{"name": m.name, "eligible": eligible(m, memory=memory), "installed": m in installed,
                     "min_memory_gb": m.min_memory_bytes // GiB, "loaded": loaded.get(m.name)}
                    for m in MODELS.values()],
+        **_auto_install_status(),
     }
+
+
+def _auto_install_status() -> dict:
+    """What requests may install (``local_ai.auto_install``), or why the setting is ignored."""
+    try:
+        config = config_io.load_config_full()
+    except (ValueError, OSError, yaml.YAMLError) as exc:
+        return {"auto_install": [], "auto_install_error": safe_message(exc)}
+    try:
+        return {"auto_install": auto_install_names(config), "auto_install_error": ""}
+    except ValueError as exc:  # our own message, naming only the valid models
+        return {"auto_install": [], "auto_install_error": str(exc)}
 
 
 def _loaded_models(installed: list[LocalModel]) -> dict[str, bool | None]:
@@ -1482,11 +1499,11 @@ def start_add(name: str | None = None) -> dict:
         try:
             stack.enter_context(_lock(".start.lock", 0, ""))
         except _Busy:
-            return status()  # another add is starting the job right now
+            return status(local.name)  # another add is starting the job right now
         if _job_running() or _job_alive():
             working = read_status().get("model")
             if working not in (None, local.name):
-                raise LocalRuntimeError(f"Local AI setup is installing {working}; add {local.name} when it finishes")
+                raise _InstallBusy(f"Local AI setup is installing {working}; add {local.name} when it finishes")
             return status(local.name)
         conflict = gateway_conflict(local)
         if conflict:
@@ -1513,6 +1530,110 @@ def start_add(name: str | None = None) -> dict:
             record_failure(safe_message(exc))
             raise
     return status(local.name)
+
+
+# ── on-demand install (docs/adr/0003-scoped-access-and-lightweight-local-models.md section 5) ──
+
+# A request starts setup at most this often per model; between starts, answers come from status.json.
+ON_DEMAND_START_SECONDS = 30
+# What a client is told to wait at least, and at most, before retrying.
+RETRY_AFTER_BOUNDS = (10, 3600)
+_on_demand_lock = threading.Lock()
+# Per model: when a request last tried to start setup, and what it answered.
+_on_demand_started: dict[str, tuple[float, "OnDemand"]] = {}
+
+
+class OnDemand(LocalRuntimeError):
+    """Why a request for an on-demand model cannot be served now: ``code``, ``retry_after`` seconds."""
+
+    def __init__(self, code: str, message: str, retry_after: int | None = None):
+        super().__init__(message)
+        self.code, self.retry_after = code, retry_after
+
+
+def auto_install_names(config: dict) -> list[str]:
+    """The curated models the owner lets a request install (``local_ai.auto_install``)."""
+    block = config.get("local_ai") if isinstance(config.get("local_ai"), dict) else {}
+    names = block.get("auto_install") or []
+    if not isinstance(names, list) or any(not isinstance(name, str) or name not in MODELS for name in names):
+        raise ValueError(f"local_ai.auto_install must list local AI models: {', '.join(MODELS)}")
+    return list(dict.fromkeys(names))
+
+
+def on_demand_models(config: dict) -> list[LocalModel]:
+    """Listed models a request may install now: this gateway's runtime exists, they fit this Mac,
+    and they are not installed."""
+    installed = installed_models()
+    if not installed:
+        return []  # building the runtime is never request-triggered
+    memory = _usable_memory()
+    return [MODELS[name] for name in auto_install_names(config)
+            if MODELS[name] not in installed and eligible(MODELS[name], memory=memory)]
+
+
+def on_demand_model(name: str, config: dict) -> LocalModel | None:
+    """The on-demand model a request for ``name`` (its name, or its base model) would install:
+    listed, not installed, and able to run on this Mac, while this gateway's runtime exists."""
+    try:
+        listed = [MODELS[candidate] for candidate in auto_install_names(config)]
+    except ValueError:
+        return None
+    matches = [local for local in listed if local.name == name or local.catalog.get("base_model") == name]
+    if not matches:
+        return None  # cheap: most requests stop here, before any file or subprocess
+    available = on_demand_models(config)
+    return next((local for local in matches if local in available), None)
+
+
+def _retry_after(job: dict) -> int:
+    remaining = max(0, int(job.get("bytes_total") or 0) - int(job.get("bytes_done") or 0))
+    low, high = RETRY_AFTER_BOUNDS
+    return max(low, min(high, remaining // DOWNLOAD_BYTES_PER_SECOND + 60))
+
+
+def _not_installable(local: LocalModel) -> "OnDemand":
+    # Why stays with the owner (local AI status); clients learn nothing about this Mac.
+    return OnDemand("model_not_installable", f"{local.name} cannot be installed on demand now")
+
+
+def request_install(local: LocalModel, *, requester: str = "") -> OnDemand:
+    """Start (at most once per ``ON_DEMAND_START_SECONDS``) or follow the setup job for an
+    on-demand model; never waits for it.
+
+    Returns why the request cannot be served yet. A failed or cancelled job is
+    not retried by requests: the owner retries it.
+    """
+    job = read_status()
+    state, working = job.get("state"), job.get("model")
+    active = state in ACTIVE_STATES and not _stale(job)
+    if active and working == local.name:
+        return OnDemand("model_installing", f"{local.name} is being installed", _retry_after(job))
+    if active:
+        return OnDemand("model_install_busy", "Local AI is installing another model; retry later", _retry_after(job))
+    if working == local.name and state in {"failed", "cancelled"}:
+        return _not_installable(local)
+    with _on_demand_lock:
+        now = time.monotonic()
+        started_at, answer = _on_demand_started.get(local.name, (-ON_DEMAND_START_SECONDS, None))
+        if answer is not None and now - started_at < ON_DEMAND_START_SECONDS:
+            return answer  # the answer of the last start, without trying again
+        _on_demand_started[local.name] = (now, OnDemand("model_installing", f"{local.name} is being installed",
+                                                        RETRY_AFTER_BOUNDS[0]))
+    try:
+        started = start_add(local.name)  # an interrupted download resumes
+        answer = OnDemand("model_installing", f"{local.name} is being installed", _retry_after(started))
+        logging.getLogger("model-gateway").info("local AI: a request%s started installing %s",
+                                                f" from {requester}" if requester else "", local.name)
+    except _InstallBusy:
+        answer = OnDemand("model_install_busy", "Local AI is installing another model; retry later",
+                          RETRY_AFTER_BOUNDS[0])
+    except (ValueError, OSError, RuntimeError, subprocess.SubprocessError, yaml.YAMLError) as exc:
+        logging.getLogger("model-gateway").warning("local AI: %s cannot be installed on demand: %s",
+                                                   local.name, safe_message(exc))
+        answer = _not_installable(local)
+    with _on_demand_lock:
+        _on_demand_started[local.name] = (time.monotonic(), answer)
+    return answer
 
 
 def cancel() -> dict:

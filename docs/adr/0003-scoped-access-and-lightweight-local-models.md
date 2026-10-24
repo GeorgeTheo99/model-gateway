@@ -242,6 +242,9 @@ local_ai:
 - Profiles bind only routes available at registration (section 4), so a
   product needing a not-yet-installed model names it in its pack `requires`
   and registers once the model is served.
+- A listed model whose base model an installed model already serves is served
+  by that model (section 4's order), so it installs on demand only for a
+  request that names it and may not use the other model.
 
 ### 6. Open local models (owner opt-in)
 
