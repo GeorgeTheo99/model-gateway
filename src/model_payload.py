@@ -76,7 +76,10 @@ def read_json(path: Path, label: str) -> dict:
     return value
 
 
-def validate_manifest(manifest: dict) -> dict[str, dict]:
+def validate_manifest(manifest: dict, *, single_file_ok: bool = False) -> dict[str, dict]:
+    """The manifest's files by path. A sharded model lists model.safetensors.index.json and the
+    shards it names; with ``single_file_ok`` (owner-pinned models), exactly one model.safetensors
+    and no index is accepted too."""
     if (not isinstance(manifest, dict)
             or type(manifest.get("schema_version")) is not int
             or manifest["schema_version"] != 1):
@@ -109,14 +112,15 @@ def validate_manifest(manifest: dict) -> dict[str, dict]:
         files[name] = entry
     if sum(entry["size_bytes"] for entry in files.values()) != manifest["total_bytes"]:
         raise VerificationError("manifest total_bytes does not equal file sizes")
-    if "model.safetensors.index.json" not in files:
+    if "model.safetensors.index.json" not in files and not (
+            single_file_ok and [name for name in files if name.endswith(".safetensors")] == ["model.safetensors"]):
         raise VerificationError("manifest must list model.safetensors.index.json")
     return files
 
 
-def verify_payload(directory: str | Path, manifest: dict) -> dict:
+def verify_payload(directory: str | Path, manifest: dict, *, single_file_ok: bool = False) -> dict:
     """Verify every listed file and index coverage; return a small JSON-ready summary."""
-    files = validate_manifest(manifest)
+    files = validate_manifest(manifest, single_file_ok=single_file_ok)
     root = Path(directory)
     try:
         check_path(root, directory=True)
@@ -160,6 +164,8 @@ def verify_payload(directory: str | Path, manifest: dict) -> dict:
         if total != manifest["total_bytes"]:
             raise VerificationError("payload total_bytes mismatch")
 
+        if "model.safetensors.index.json" not in files:  # a single-file model (validated above)
+            return {"ok": True, "model_id": manifest["model_id"], "file_count": len(files), "total_bytes": total}
         index = read_json(root / "model.safetensors.index.json", "safetensors index")
         weight_map = index.get("weight_map")
         if (not isinstance(weight_map, dict) or not weight_map

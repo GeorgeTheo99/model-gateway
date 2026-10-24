@@ -1066,15 +1066,19 @@ def resolve_base_model(model_id: str, *, locality: str | None = None) -> str | N
 
 
 def _curated_local_name(model_id: str) -> bool:
+    """A local AI model: curated by the release, or pinned by the owner."""
     from src import local_runtime
 
-    return model_id in local_runtime.MODELS
+    return model_id in local_runtime.MODELS or model_id in local_runtime.pinned_models()
 
 
-def _curated_local_base(model_id: str) -> str:
+def _curated_local_base(model_id: str) -> str | None:
     from src import local_runtime
 
-    return local_runtime.MODELS[model_id].catalog.get("base_model") or model_id
+    curated = local_runtime.MODELS.get(model_id)
+    if curated is None:
+        return None  # a pin
+    return curated.catalog.get("base_model") or model_id
 
 
 # Why a route named after its base model may be served by another route of that base.
@@ -1100,8 +1104,12 @@ def base_model_route(model_id: str, *, locality: str | None = None) -> str | Non
         # A gateway local AI model this Mac has not installed stays local: another local route of
         # its base model, a trusted peer, or nothing; never a cloud route that shares its base
         # model (docs/adr/0003-scoped-access-and-lightweight-local-models.md section 4). Only a
-        # profile that explicitly asks for the cloud gets a cloud route of its base model.
-        locality, base = "local_only", _curated_local_base(model_id)
+        # profile that explicitly asks for the cloud gets a cloud route of its base model. A pin
+        # has no base model, so nothing else serves it (section 6).
+        base = _curated_local_base(model_id)
+        if base is None:
+            return None
+        locality = "local_only"
     if entry is not None:
         if entry.get("base_model") != model_id:
             return None

@@ -246,3 +246,27 @@ class ModelPayloadTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_a_single_file_model_is_accepted_only_where_asked(tmp_path):
+    import hashlib as _hashlib
+
+    import pytest
+
+    from src.model_payload import VerificationError, validate_manifest, verify_payload
+
+    data = b"weights"
+    payload = tmp_path / "payload"
+    payload.mkdir()
+    (payload / "model.safetensors").write_bytes(data)
+    manifest = {"schema_version": 1, "model_id": "pin-x", "hf_repo": "org/x", "hf_revision": "a" * 40,
+                "license": "mit", "total_bytes": len(data),
+                "files": [{"path": "model.safetensors", "size_bytes": len(data),
+                           "sha256": _hashlib.sha256(data).hexdigest()}]}
+    with pytest.raises(VerificationError, match="index"):
+        validate_manifest(manifest)
+    assert verify_payload(payload, manifest, single_file_ok=True)["ok"] is True
+    two = dict(manifest, files=[*manifest["files"], {"path": "model-2.safetensors", "size_bytes": 0,
+                                                     "sha256": _hashlib.sha256(b"").hexdigest()}])
+    with pytest.raises(VerificationError, match="index"):
+        validate_manifest(two, single_file_ok=True)

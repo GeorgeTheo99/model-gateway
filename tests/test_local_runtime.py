@@ -130,7 +130,8 @@ def test_status_on_a_mac_that_cannot_run_local_ai():
     assert (value.pop("auto_install"), value.pop("auto_install_error")) == ([], "")
     assert value == {"eligible": False, "installed": False, "managed": True, "model": None, "state": None,
                      "bytes_done": 0, "bytes_total": 0, "message": "", "base_url": None, "loaded": None}
-    assert models == [{"name": name, "eligible": False, "installed": False, "min_memory_gb": gb, "loaded": None}
+    assert models == [{"name": name, "eligible": False, "installed": False, "min_memory_gb": gb, "loaded": None,
+                       "source": "release"}
                       for name, gb in (("qwen3.8-27b", 48), ("qwen3.8-27b-4bit", 32))]
     assert not lr.runtime_root().exists()  # reading status creates nothing
 
@@ -2190,3 +2191,252 @@ def test_a_credential_limited_to_the_missing_model_installs_it(eligible, gateway
     response = chat("qwen3.8-27b-4bit", token="bot-token")
     assert response.status_code == 503 and response.json()["error"]["code"] == "model_installing"
     assert starts == ["qwen3.8-27b-4bit"]
+
+
+# ── owner-pinned open models (docs/adr/0003-scoped-access-and-lightweight-local-models.md section 6) ──
+
+PIN_REV = "c" * 40
+
+
+def pin_host(*, files=None):
+    from tests.test_hf_manifest import Host, REV
+
+    weights = b"single-file weights"
+    host = Host({"config.json": json.dumps({"model_type": "llama"}).encode(), **(files or {})},
+                lfs={"model.safetensors": (hashlib.sha256(weights).hexdigest(), len(weights))},
+                info={"sha": PIN_REV, "gated": False, "cardData": {"license": "mit"}})
+    # The fake serves revision REV paths; answer for PIN_REV too.
+    original = host.open
+
+    def open_(request, timeout):
+        request.full_url = request.full_url.replace(PIN_REV, REV)
+        return original(request, timeout)
+
+    host.open = open_
+    host.weights = weights
+    return host
+
+
+@pytest.fixture
+def open_models(gateway):
+    config = yaml.safe_load(gateway.read_text())
+    config["local_ai"] = {"open_models": True}
+    gateway.write_text(yaml.safe_dump(config))
+    providers.reload()
+    return gateway
+
+
+def test_pinning_needs_the_owners_opt_in(gateway):
+    with pytest.raises(lr.LocalRuntimeError, match="local_ai.open_models: true"):
+        lr.pin_model("tiny", "org/model", PIN_REV, opener=pin_host())
+
+
+def test_a_pin_records_a_verified_manifest_and_joins_the_local_models(open_models):
+    from tests.test_hf_manifest import REPO
+
+    host = pin_host()
+    pinned = lr.pin_model("tiny", REPO, PIN_REV, context=8192, opener=host)
+    assert (pinned["license"], pinned["min_memory_gb"]) == ("mit", 16)
+    path = lr.pins_dir() / "tiny.json"
+    assert path.stat().st_mode & 0o777 == 0o600
+    local = lr.models()["tiny"]
+    assert lr.manifest(local)["model_id"] == "pin-tiny"
+    assert "base_model" not in local.catalog and local.settings["max_context_window"] == 8192
+    assert [row["source"] for row in lr.status()["models"]] == ["release", "release", "pin"]
+    # A single-file payload verifies against the pin, and installs like a curated model.
+    staged = lr.partial_dir("pin-tiny")
+    staged.mkdir(parents=True)
+    (staged / "config.json").write_bytes(json.dumps({"model_type": "llama"}).encode())
+    (staged / "model.safetensors").write_bytes(host.weights)
+    with pytest.raises(lr.LocalRuntimeError, match="failed verification"):
+        lr._promote(lr.manifest(local))  # the curated rule: a single file needs the pin's own rule
+    lr._promote(lr.manifest(local), single_file_ok=True)
+    assert (lr.mlx_dir() / "pin-tiny").is_dir()
+
+
+@pytest.mark.parametrize("name, message", [
+    ("Tiny", "lowercase"),
+    ("qwen3.8-27b-4bit", "already a model"),
+    ("qwen3.8-27b", "already a model"),
+    ("test-local", "already a model"),  # an identifier in the owner's catalog
+])
+def test_pins_never_reuse_a_name(open_models, monkeypatch, name, message):
+    monkeypatch.setattr(providers, "_models", {"test-local": {"name": "test-local", "provider": "omlx"}})
+    with pytest.raises(lr.LocalRuntimeError, match=message):
+        lr.pin_model(name, "org/model", PIN_REV, opener=pin_host())
+
+
+def test_a_repository_with_code_cannot_be_pinned(open_models):
+    from tests.test_hf_manifest import REPO
+
+    with pytest.raises(lr.LocalRuntimeError, match="cannot be pinned"):
+        lr.pin_model("tiny", REPO, PIN_REV, opener=pin_host(files={"modeling.py": b"import os\n"}))
+    assert not (lr.pins_dir() / "tiny.json").exists()
+
+
+def test_a_pinned_model_loads_once_installed_and_wins_over_a_release_row(open_models, gateway, monkeypatch):
+    from src import shipped
+    from tests.test_hf_manifest import REPO
+
+    lr.pin_model("tiny", REPO, PIN_REV, opener=pin_host())
+    wire_local_ai_config(gateway)
+    lr._key(lr.api_key_path(), create=True)
+    write_plist(lr.omlx_plist_path(), lr.omlx_plist(9110))
+    # A later release ships its own "tiny" for a provider this install serves.
+    monkeypatch.setattr(shipped, "_packaged", lambda: {"later": {
+        "auto_add": True, "provider": {"id": "omlx", "base_url": "http://127.0.0.1:9110/v1"},
+        "models": [{"name": "tiny", "provider": "omlx", "omlx_id": "someone-elses-tiny",
+                    "pricing_status": "unmetered"}]}})
+    providers.reload()
+    # Not installed: the pin does not load, and the release's row does.
+    (row,) = [row for row in providers.effective_model_inventory() if row["name"] == "tiny"]
+    assert row["omlx_id"] == "someone-elses-tiny"
+    (lr.mlx_dir() / "pin-tiny").mkdir(parents=True)
+    providers.reload()
+    (row,) = [row for row in providers.effective_model_inventory() if row["name"] == "tiny"]
+    assert (row["omlx_id"], row["origin"]["profile"]) == ("pin-tiny", "local-ai-pin")
+    assert row["origin"]["displaced"] == ["tiny"]  # visible in admin status, not silent
+    assert "base_model" not in row
+
+
+def test_unpinning_needs_the_model_removed_first(open_models):
+    from tests.test_hf_manifest import REPO
+
+    lr.pin_model("tiny", REPO, PIN_REV, opener=pin_host())
+    (lr.mlx_dir() / "pin-tiny").mkdir(parents=True)
+    with pytest.raises(lr.LocalRuntimeError, match="remove it first"):
+        lr.unpin_model("tiny")
+    (lr.mlx_dir() / "pin-tiny").rmdir()
+    lr.unpin_model("tiny")
+    assert "tiny" not in lr.models()
+    with pytest.raises(lr.LocalRuntimeError, match="not a pinned model"):
+        lr.unpin_model("tiny")
+
+
+def test_only_a_full_admin_pins_over_the_api(open_models, monkeypatch):
+    from tests.test_hf_manifest import REPO
+
+    monkeypatch.setattr("src.hf_manifest._opener", lambda: pin_host())
+    client = TestClient(app)
+    body = {"name": "tiny", "repo": REPO, "revision": PIN_REV}
+    assert client.post("/admin/api/local-ai/pins", headers={"Authorization": "Bearer local-token"},
+                       json=body).status_code in {401, 403}
+    created = client.post("/admin/api/local-ai/pins", headers={"Authorization": "Bearer admin"}, json=body)
+    assert created.status_code == 200 and created.json()["name"] == "tiny"
+    again = client.post("/admin/api/local-ai/pins", headers={"Authorization": "Bearer admin"}, json=body)
+    assert again.status_code == 409
+    assert client.delete("/admin/api/local-ai/pins/tiny", headers={"Authorization": "Bearer admin"}).json() == {
+        "unpinned": "tiny"}
+
+
+def test_removing_local_ai_keeps_the_owners_pins(open_models, gateway, launchctl, monkeypatch):
+    from tests.test_hf_manifest import REPO
+
+    lr.pin_model("tiny", REPO, PIN_REV, opener=pin_host())
+    running_runtime(gateway, launchctl, monkeypatch)
+    monkeypatch.setattr(lr, "_wait_health", lambda url: None)
+    lr.remove()
+    assert not lr.runtime_root().exists() and "tiny" in lr.models()
+
+
+def test_a_pin_not_installed_never_reroutes_to_the_cloud(open_models, monkeypatch):
+    from tests.test_hf_manifest import REPO
+
+    lr.pin_model("tiny", REPO, PIN_REV, opener=pin_host())
+    config = yaml.safe_load(config_io.CONFIG_PATH.read_text())
+    config["providers"]["cloud-test"] = {"base_url": "https://cloud.invalid/v1", "api_key": "secret"}
+    # A later release ships a cloud model whose base model has the pin's name.
+    config["models"] = [{"name": "tiny-cloud", "base_model": "tiny", "family": "tiny", "provider": "cloud-test",
+                         "provider_model_id": "tiny-native", "pricing": {"input": 1.0, "output": 2.0}}]
+    config_io.CONFIG_PATH.write_text(yaml.safe_dump(config))
+    providers.reload()
+    assert providers.base_model_route("tiny") is None
+
+
+def test_an_invalid_pin_blocks_nothing_and_can_be_unpinned(open_models, monkeypatch):
+    lr.pins_dir().mkdir(parents=True)
+    (lr.pins_dir() / "broken.json").write_text(json.dumps({"schema_version": 1, "name": "broken",
+                                                           "manifest": {"model_id": "elsewhere"}}))
+    assert "broken" not in lr.models()
+    payload = tiny_payload()
+    monkeypatch.setattr(lr, "manifest", qwen_manifest(payload))
+    (lr.mlx_dir() / "pin-broken").mkdir(parents=True)  # its payload, installed before the pin broke
+    lr._promote(payload)  # a pin-* payload is ours, never foreign
+    lr.unpin_model("broken")  # and unpin takes it out with the broken pin
+    assert not (lr.mlx_dir() / "pin-broken").exists() and not (lr.pins_dir() / "broken.json").exists()
+
+
+def test_a_pin_file_cannot_reshape_routing(open_models):
+    from tests.test_hf_manifest import REPO
+
+    lr.pin_model("tiny", REPO, PIN_REV, opener=pin_host())
+    path = lr.pins_dir() / "tiny.json"
+    document = json.loads(path.read_text())
+    document["catalog"].update(base_model="qwen3.8-27b", alias="gpt-6", provider="cloud-test", context="big")
+    document["settings"].update(is_default=True)
+    path.write_text(json.dumps(document))
+    local = lr.models()["tiny"]
+    assert set(local.catalog) <= set(lr._PIN_CATALOG_FIELDS) and "context" not in local.catalog
+    assert set(local.settings) <= set(lr._PIN_SETTINGS_FIELDS)
+    document["manifest"]["files"].append({"path": "modeling.py", "size_bytes": 0, "sha256": "0" * 64})
+    path.write_text(json.dumps(document))
+    assert "tiny" not in lr.models()
+
+
+def test_a_release_model_of_the_same_name_shadows_a_pin(open_models, monkeypatch):
+    lr.pins_dir().mkdir(parents=True)
+    (lr.pins_dir() / "qwen3.8-27b-4bit.json").write_text("{}")
+    assert lr.models()["qwen3.8-27b-4bit"] is lr.MODELS["qwen3.8-27b-4bit"]
+
+
+def test_a_listed_pin_cannot_be_unpinned(open_models, gateway):
+    from tests.test_hf_manifest import REPO
+
+    lr.pin_model("tiny", REPO, PIN_REV, opener=pin_host())
+    config = yaml.safe_load(gateway.read_text())
+    config["local_ai"]["auto_install"] = ["tiny"]
+    gateway.write_text(yaml.safe_dump(config))
+    with pytest.raises(lr.PinError, match="auto_install"):
+        lr.unpin_model("tiny")
+
+
+def test_pin_api_status_codes(gateway, monkeypatch):
+    from tests.test_hf_manifest import REPO
+
+    client = TestClient(app)
+    admin = {"Authorization": "Bearer admin"}
+    body = {"name": "tiny", "repo": REPO, "revision": PIN_REV}
+    assert client.post("/admin/api/local-ai/pins", headers=admin, json=body).status_code == 403
+    config = yaml.safe_load(gateway.read_text())
+    config["local_ai"] = {"open_models": True}
+    gateway.write_text(yaml.safe_dump(config))
+    assert client.post("/admin/api/local-ai/pins", headers=admin, json={**body, "context": 0}).status_code == 400
+    assert client.delete("/admin/api/local-ai/pins/nothing", headers=admin).status_code == 404
+    monkeypatch.setattr("src.hf_manifest._opener", lambda: pin_host(files={"run.py": b""}))
+    assert client.post("/admin/api/local-ai/pins", headers=admin, json=body).status_code == 422
+    monkeypatch.delenv("MODEL_GATEWAY_ADMIN_WRITES")
+    assert client.post("/admin/api/local-ai/pins", headers=admin, json=body).status_code == 403
+
+
+def test_unpin_takes_out_an_orphaned_payload(open_models, gateway, launchctl, monkeypatch):
+    reloads = running_runtime(gateway, launchctl, monkeypatch)
+    lr.pins_dir().mkdir(parents=True)
+    (lr.pins_dir() / "broken.json").write_text("{}")  # the pin broke after it was installed
+    (lr.mlx_dir() / "pin-broken").mkdir()
+    before = lr.generation()
+    lr.unpin_model("broken")
+    assert not (lr.mlx_dir() / "pin-broken").exists() and not (lr.pins_dir() / "broken.json").exists()
+    assert reloads == ["reload"] and lr.generation() != before
+
+
+def test_an_uninstalled_pin_is_never_served_by_another_local_route(open_models, monkeypatch):
+    from tests.test_hf_manifest import REPO
+
+    lr.pin_model("tiny", REPO, PIN_REV, opener=pin_host())
+    config = yaml.safe_load(config_io.CONFIG_PATH.read_text())
+    config["providers"]["omlx"] = {"base_url": "http://127.0.0.1:9110/v1", "api_key": "x"}
+    config["models"] = [{"name": "owner-tiny", "base_model": "tiny", "family": "tiny", "provider": "omlx",
+                         "omlx_id": "owner-tiny-mlx", "pricing_status": "unmetered"}]
+    config_io.CONFIG_PATH.write_text(yaml.safe_dump(config))
+    providers.reload()
+    assert providers.base_model_route("tiny") is None

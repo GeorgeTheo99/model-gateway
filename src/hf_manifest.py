@@ -89,7 +89,7 @@ def _blob_id(data: bytes) -> str:
     return hashlib.sha1(b"blob %d\0" % len(data) + data, usedforsecurity=False).hexdigest()
 
 
-def build_manifest(repo: str, revision: str, model_id: str, *, opener=None) -> dict:
+def build_manifest(repo: str, revision: str, model_id: str, *, opener=None, single_file_ok: bool = False) -> dict:
     """The manifest for ``repo`` at ``revision``; raises ManifestError when it cannot be pinned."""
     if not HF_REPO_RE.fullmatch(repo or ""):
         raise ManifestError("repository must be 'owner/name'")
@@ -145,7 +145,7 @@ def build_manifest(repo: str, revision: str, model_id: str, *, opener=None) -> d
                 "license": license_id.strip(), "total_bytes": sum(item["size_bytes"] for item in files),
                 "files": files}
     try:
-        validate_manifest(manifest)
+        validate_manifest(manifest, single_file_ok=single_file_ok)
     except VerificationError as exc:
         raise ManifestError(f"the repository is not a supported MLX model: {exc}") from None
     return manifest

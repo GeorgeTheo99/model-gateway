@@ -984,10 +984,10 @@ run_local_ai() {
 }
 
 cmd_local_ai() {
-  local usage="usage: model-gateway local-ai {status [MODEL] [--json] | add [MODEL] | cancel | remove [MODEL]}"
+  local usage="usage: model-gateway local-ai {status [MODEL] [--json] | add [MODEL] | cancel | remove [MODEL] | pin NAME REPO REVISION [--context N] [--max-output-tokens N] [--vision] | unpin NAME}"
   [ $# -ge 1 ] || die "$usage"
   case "$1" in
-    status|cancel) ;;
+    status|cancel|pin|unpin) ;;
     # The setup job restarts the gateway, so it must be this checkout's loaded service.
     add) check_prereqs; ensure_runtime_paths_safe "local AI setup" ;;
     # Also works after 'uninstall', when there is no gateway LaunchAgent to check or restart.

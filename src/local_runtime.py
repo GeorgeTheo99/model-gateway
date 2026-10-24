@@ -42,6 +42,7 @@ import os
 from pathlib import Path
 import platform
 import plistlib
+import re
 import secrets
 import shutil
 import signal
@@ -516,30 +517,152 @@ def port() -> int:
 # ── models ───────────────────────────────────────────────────────────────────
 
 
+# ── owner-pinned open models (docs/adr/0003-scoped-access-and-lightweight-local-models.md section 6) ──
+
+PIN_PREFIX = "pin:"  # LocalModel.manifest of a pinned model: its manifest is in pins_dir()
+PIN_NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+MAX_PIN_BYTES = 512 * GiB
+PIN_MEMORY_FACTOR = 1.6  # the curated 8-bit: 30 GB of weights on 48 GiB Macs
+MIN_PIN_MEMORY = 16 * GiB
+
+
+# What a pin may set: anything else in its file is ignored, so the file cannot reshape routing.
+_PIN_CATALOG_FIELDS = {"context": int, "max_output_tokens": int, "vision": bool, "pricing_status": str,
+                       "hf_repo": str, "desc": str}
+_PIN_SETTINGS_FIELDS = {"max_context_window": int, "max_tokens": int}
+
+
+class PinError(LocalRuntimeError):
+    """A pin or unpin the owner asked for that cannot happen; ``status`` is the HTTP status."""
+
+    def __init__(self, message: str, status: int = 409):
+        super().__init__(message)
+        self.status = status
+
+
+def pins_dir() -> Path:
+    """Beside, not inside, the runtime: removing local AI keeps the owner's pins."""
+    return state_dir() / "local-ai-pins"
+
+
+def _pin_path(name: str) -> Path:
+    path = pins_dir() / f"{name}.json"
+    _no_symlinks(path, state_dir())
+    return path
+
+
+def _pin_document(name: str) -> dict:
+    try:
+        value = read_json(_pin_path(name), "pinned model")
+    except VerificationError as exc:
+        raise LocalRuntimeError(f"Pinned model {name} is unreadable: {exc}") from None
+    if value.get("schema_version") != 1 or value.get("name") != name:
+        raise LocalRuntimeError(f"Pinned model {name} is invalid")
+    return value
+
+
+def _typed(block: object, fields: dict, label: str) -> dict:
+    if not isinstance(block, dict):
+        raise LocalRuntimeError(f"Pinned model {label} is invalid")
+    return {key: block[key] for key, kind in fields.items()
+            if key in block and type(block[key]) is kind}
+
+
+def _pinned_model(name: str) -> LocalModel:
+    """The pin, validated whole: an invalid one is never a model, so it blocks nothing else."""
+    from src.hf_manifest import _allowed
+
+    document = _pin_document(name)
+    memory = document.get("min_memory_bytes")
+    payload = document.get("manifest")
+    if type(memory) is not int or not isinstance(payload, dict) or payload.get("model_id") != f"pin-{name}":
+        raise LocalRuntimeError(f"Pinned model {name} is invalid")
+    try:
+        files = validate_manifest(payload, single_file_ok=True)
+    except VerificationError as exc:
+        raise LocalRuntimeError(f"Pinned model {name} has an invalid manifest: {exc}") from None
+    if not all(_allowed(path) for path in files):
+        raise LocalRuntimeError(f"Pinned model {name} lists files a local model may not contain")
+    return LocalModel(name=name, manifest=PIN_PREFIX + name,
+                      catalog=_typed(document.get("catalog"), _PIN_CATALOG_FIELDS, name),
+                      settings=_typed(document.get("settings"), _PIN_SETTINGS_FIELDS, name),
+                      min_memory_bytes=memory)
+
+
+_pins_cache: tuple[tuple, dict[str, LocalModel]] = ((), {})
+_pins_cache_lock = threading.Lock()
+
+
+def pinned_models() -> dict[str, LocalModel]:
+    """The owner's pinned open models, by name. Read again only when a pin file changes; an
+    invalid pin, or one a curated model now names, is skipped and logged once."""
+    global _pins_cache
+    directory = pins_dir()
+    try:
+        if directory.is_symlink() or not directory.is_dir():
+            return {}
+        key = tuple(sorted((entry.name, entry.stat(follow_symlinks=False).st_mtime_ns)
+                           for entry in os.scandir(directory)
+                           if entry.name.endswith(".json") and entry.is_file(follow_symlinks=False)))
+    except OSError:
+        return {}
+    with _pins_cache_lock:
+        if _pins_cache[0] == key:
+            return dict(_pins_cache[1])
+    pinned = {}
+    for file_name, _mtime in key:
+        name = file_name.removesuffix(".json")
+        if not PIN_NAME_RE.fullmatch(name):
+            continue
+        if name in MODELS:
+            logging.getLogger("model-gateway").warning(
+                "local AI: pin %s is ignored: this release ships a model by that name", name)
+            continue
+        try:
+            pinned[name] = _pinned_model(name)
+        except LocalRuntimeError as exc:
+            logging.getLogger("model-gateway").warning("local AI: %s", exc)
+    with _pins_cache_lock:
+        _pins_cache = (key, pinned)
+    return dict(pinned)
+
+
+def models() -> dict[str, LocalModel]:
+    """Every model local AI can install: the release's curated ones, then the owner's pins."""
+    return {**MODELS, **pinned_models()}
+
+
 def model(name: str | None) -> LocalModel:
-    found = MODELS.get(name or DEFAULT_MODEL)
+    available = models()
+    found = available.get(name or DEFAULT_MODEL)
     if found is None:
-        raise LocalRuntimeError(f"Unknown local model {name!r}; available: {', '.join(sorted(MODELS))}")
+        raise LocalRuntimeError(f"Unknown local model {name!r}; available: {', '.join(sorted(available))}")
     return found
 
 
 def manifest(local: LocalModel) -> dict:
+    pinned = local.manifest.startswith(PIN_PREFIX)
     try:
-        # The strict reader refuses symlinked ancestors; a package's root is the `current` link.
-        value = read_json(Path(os.path.realpath(MODELS_DIR / local.manifest)), "model manifest")
-        validate_manifest(value)
+        if pinned:
+            value = _pin_document(local.name).get("manifest")  # validated with the pin (_pinned_model)
+            if not isinstance(value, dict):
+                raise VerificationError("missing manifest")
+        else:
+            # The strict reader refuses symlinked ancestors; a package's root is the `current` link.
+            value = read_json(Path(os.path.realpath(MODELS_DIR / local.manifest)), "model manifest")
+        validate_manifest(value, single_file_ok=pinned)
     except VerificationError as exc:
         raise LocalRuntimeError(f"Invalid model manifest for {local.name}: {exc}") from None
     return value
 
 
 def _promoted_models() -> list[LocalModel]:
-    """The models whose payloads are in --model-dir, in ``MODELS`` order."""
-    return [local for local in MODELS.values() if (mlx_dir() / manifest(local)["model_id"]).is_dir()]
+    """The models whose payloads are in --model-dir, curated first, in ``models()`` order."""
+    return [local for local in models().values() if (mlx_dir() / manifest(local)["model_id"]).is_dir()]
 
 
 def installed_models() -> list[LocalModel]:
-    """The models whose verified payloads this gateway's runtime serves, in ``MODELS`` order."""
+    """The models whose verified payloads this gateway's runtime serves, in ``models()`` order."""
     return _promoted_models() if omlx_owner() == "gateway" else []
 
 
@@ -566,7 +689,7 @@ def preferred_model(*, memory: int | None = None) -> LocalModel:
 
 def _ineligible_message(local: LocalModel) -> str:
     return (f"{local.name} needs Apple silicon and at least {local.min_memory_bytes // GiB} GB of memory; "
-            f"this Mac can run: {', '.join(m.name for m in MODELS.values() if eligible(m)) or 'none'}")
+            f"this Mac can run: {', '.join(m.name for m in models().values() if eligible(m)) or 'none'}")
 
 
 # ── status ───────────────────────────────────────────────────────────────────
@@ -611,7 +734,8 @@ def status(name: str | None = None) -> dict:
     current = read_status()
     installed = installed_models()
     memory = _usable_memory()
-    working = MODELS.get(current.get("model"))
+    available = models()
+    working = available.get(current.get("model"))
     if name is not None:
         local = model(name)
     elif working is not None and current.get("state") not in (None, "done"):
@@ -642,8 +766,9 @@ def status(name: str | None = None) -> dict:
         "base_url": f"http://127.0.0.1:{port()}" if installed else None,
         "loaded": loaded.get(local.name),
         "models": [{"name": m.name, "eligible": eligible(m, memory=memory), "installed": m in installed,
-                    "min_memory_gb": m.min_memory_bytes // GiB, "loaded": loaded.get(m.name)}
-                   for m in MODELS.values()],
+                    "min_memory_gb": m.min_memory_bytes // GiB, "loaded": loaded.get(m.name),
+                    "source": "pin" if m.manifest.startswith(PIN_PREFIX) else "release"}
+                   for m in available.values()],
         **_auto_install_status(),
     }
 
@@ -956,7 +1081,7 @@ def catalog_rows(config: dict, *, installed_only: bool = True) -> list[dict]:
     if installed_only and not (isinstance(configured, dict) and _our_provider(configured.get("omlx"))):
         return []
     rows = []
-    for local in MODELS.values():
+    for local in models().values():
         try:
             row = _catalog_row(local)
         except LocalRuntimeError as exc:  # a broken package must not take the whole catalog down
@@ -1110,7 +1235,7 @@ def unconfigure_gateway() -> bool:
             doc = config_io.load_model_info()
             entries = doc.get("llm", [])
             kept = [entry for entry in entries
-                    if foreign or not any(_our_catalog_entry(entry, local) for local in MODELS.values())]
+                    if foreign or not any(_our_catalog_entry(entry, local) for local in models().values())]
             if len(kept) != len(entries):
                 config_io._write_model_info({**doc, "llm": kept})
                 changed = True
@@ -1307,7 +1432,7 @@ def _wait_health(url: str, seconds: int = 90) -> None:
         time.sleep(2)
 
 
-def _promote(payload: dict) -> None:
+def _promote(payload: dict, *, single_file_ok: bool = False) -> None:
     """Verify the staged (or already promoted) payload and move it into oMLX's --model-dir."""
     model_id = payload["model_id"]
     destination = mlx_dir() / model_id
@@ -1315,12 +1440,14 @@ def _promote(payload: dict) -> None:
     staged = destination if destination.exists() else partial
     _no_symlinks(staged, runtime_root())
     try:
-        verify_payload(staged, payload)
+        verify_payload(staged, payload, single_file_ok=single_file_ok)
     except VerificationError as exc:
         raise LocalRuntimeError(f"The local model failed verification: {exc}") from None
-    # oMLX serves every model in --model-dir; never a forgotten or foreign one.
-    known = {manifest(local)["model_id"] for local in MODELS.values()}
-    foreign = sorted(path.name for path in mlx_dir().iterdir() if path.name not in known) if mlx_dir().is_dir() else []
+    # oMLX serves every model in --model-dir; never a forgotten or foreign one. Any pin's
+    # payload (pin-*) is ours, even one whose pin is gone: it is removable, never foreign.
+    known = {manifest(local)["model_id"] for local in models().values()}
+    foreign = sorted(path.name for path in mlx_dir().iterdir()
+                     if path.name not in known and not path.name.startswith("pin-")) if mlx_dir().is_dir() else []
     if foreign:
         raise LocalRuntimeError(f"{mlx_dir()} must contain only verified local AI payloads; remove {foreign[0]}")
     if staged == partial:
@@ -1343,8 +1470,9 @@ def install(local: LocalModel, payload: dict) -> None:
     """Verify and promote the payload and serve it: join a running runtime, or build oMLX,
     start it, and wire it into the gateway."""
     _require_owned()
+    single_file_ok = local.manifest.startswith(PIN_PREFIX)
     if runtime_ready():
-        _promote(payload)
+        _promote(payload, single_file_ok=single_file_ok)
         try:
             _apply_settings(_promoted_models(), rescan=True)
             configure_gateway(local, port(), restart=False)
@@ -1359,7 +1487,7 @@ def install(local: LocalModel, payload: dict) -> None:
                                                                safe_message(exc))
             raise
         return
-    _promote(payload)
+    _promote(payload, single_file_ok=single_file_ok)
     env = dict(os.environ, UV_PROJECT_ENVIRONMENT=str(venv_dir()))
     _run(_uv(), "sync", "--locked", "--no-dev", "--project", str(RUNTIME_PROJECT), env=env)
     _run(str(venv_dir() / "bin" / "python"), "-c", METAL_SMOKE)
@@ -1446,7 +1574,7 @@ def check(local: LocalModel, payload: dict) -> None:
     inventory = _request(f"http://127.0.0.1:{port()}/v1/models/status", _key(api_key_path()))
     rows = {row.get("id"): row for row in inventory.get("models", [])
             if isinstance(row, dict) and row.get("source_type") != "builtin"}
-    expected = {manifest(installed)["model_id"] for installed in installed_models()}
+    expected = {path.name for path in mlx_dir().iterdir()}  # what --model-dir holds, all verified on promotion
     if (set(rows) != expected or model_id not in rows
             or os.path.realpath(str(rows[model_id].get("model_path"))) != os.path.realpath(mlx_dir() / model_id)):
         raise LocalRuntimeError("oMLX is not serving exactly the verified local models")
@@ -1532,6 +1660,116 @@ def start_add(name: str | None = None) -> dict:
     return status(local.name)
 
 
+# ── pinning open models ──────────────────────────────────────────────────────
+
+
+def open_models_enabled(config: dict) -> bool:
+    block = config.get("local_ai") if isinstance(config.get("local_ai"), dict) else {}
+    return block.get("open_models") is True
+
+
+def _taken_names(config: dict) -> set[str]:
+    """Names a pin, or its payload id, may not reuse: the catalog's identifiers and base-model
+    names, every model a release ships (loaded here or not), every local AI model, and the
+    names the owner hid or a release retired."""
+    from src import providers, shipped
+    from src.catalog import entry_routable_ids
+
+    taken = set(models())
+    for entry in [*providers._load_models().values(), *shipped.all_shipped_rows()]:
+        taken.update(entry_routable_ids(entry))
+        if entry.get("base_model"):
+            taken.add(str(entry["base_model"]))
+    _selection, hidden, _pinned = shipped.settings(config)
+    taken.update(hidden)
+    taken.update(providers._retired)
+    return taken
+
+
+def pin_model(name: str, repo: str, revision: str, *, context: int = 32768, max_output_tokens: int = 4096,
+              vision: bool = False, opener=None) -> dict:
+    """Pin ``repo`` at ``revision`` as local AI model ``name``; the owner's opt-in (section 6).
+
+    The manifest is built now, from Hugging Face's listing at that revision, and
+    every later install verifies against it. Nothing downloads until ``add``.
+    """
+    from src import hf_manifest
+
+    config = config_io.load_config_full()
+    if not open_models_enabled(config):
+        raise PinError("Pinning models needs local_ai.open_models: true in the gateway config", 403)
+    if not isinstance(name, str) or not PIN_NAME_RE.fullmatch(name):
+        raise PinError("A pinned model's name is 1-64 lowercase letters, digits, '.', '_' or '-'", 400)
+    for value, label in ((context, "context"), (max_output_tokens, "max_output_tokens")):
+        if type(value) is not int or not 0 < value <= 10_000_000:
+            raise PinError(f"{label} must be a positive integer", 400)
+    if not isinstance(vision, bool):
+        raise PinError("vision must be true or false", 400)
+    taken = _taken_names(config)
+    if name in taken or f"pin-{name}" in taken or _pin_path(name).exists():
+        raise PinError(f"{name} is already a model, alias, or base-model name here")
+    try:
+        payload = hf_manifest.build_manifest(repo, revision, f"pin-{name}", opener=opener, single_file_ok=True)
+    except hf_manifest.ManifestError as exc:
+        raise PinError(f"{repo} cannot be pinned: {exc}", 422) from None
+    except (OSError, ValueError, http.client.HTTPException) as exc:
+        raise PinError(f"Hugging Face could not be read ({type(exc).__name__})", 502) from None
+    if payload["total_bytes"] > MAX_PIN_BYTES:
+        raise PinError(f"{repo} is larger than {MAX_PIN_BYTES // GiB} GiB", 422)
+    floor = max(MIN_PIN_MEMORY, -(-int(payload["total_bytes"] * PIN_MEMORY_FACTOR) // GiB) * GiB)
+    document = {
+        "schema_version": 1, "name": name, "hf_repo": repo, "hf_revision": revision, "manifest": payload,
+        # No base_model: a pin never answers a base-model name or widens an allowlist.
+        "catalog": {"context": context, "max_output_tokens": max_output_tokens, "vision": vision,
+                    "pricing_status": "unmetered", "hf_repo": repo,
+                    "desc": f"{repo}@{revision[:7]} ({payload['license']}), pinned by the owner, "
+                            "served by Model Gateway local AI"},
+        "settings": {"max_context_window": context, "max_tokens": max_output_tokens},
+        "min_memory_bytes": floor,
+    }
+    path = _pin_path(name)
+    pins_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
+    _create_new(path, (json.dumps(document, indent=2) + "\n").encode())
+    return {"name": name, "hf_repo": repo, "hf_revision": revision, "license": payload["license"],
+            "total_bytes": payload["total_bytes"], "min_memory_gb": floor // GiB}
+
+
+def unpin_model(name: str) -> None:
+    """Forget a pinned model, even one whose file is invalid; it must not be installed (``remove``
+    it first) nor listed in ``local_ai.auto_install``. A payload whose pin is no longer a model
+    (its file broke, or a release model took its name) is taken out of oMLX here, since
+    ``remove`` cannot name it."""
+    if not isinstance(name, str) or not PIN_NAME_RE.fullmatch(name) or not _pin_path(name).is_file():
+        raise PinError(f"{name} is not a pinned model", 404)
+    block = config_io.load_config_full().get("local_ai")
+    listed = block.get("auto_install") if isinstance(block, dict) else None
+    if isinstance(listed, list) and name in listed:
+        raise PinError(f"{name} is listed in local_ai.auto_install; take it out first")
+    model_id = f"pin-{name}"
+    with provision_lock(wait=False, busy="Local AI setup is installing; unpin when it finishes"):
+        job = read_status()
+        if job.get("model") == name and job.get("state") in ACTIVE_STATES and (_job_alive() or _job_running()):
+            raise PinError(f"Local AI setup is installing {name}; cancel it first")
+        if (mlx_dir() / model_id).exists():
+            local = pinned_models().get(name)
+            if local is not None:
+                raise PinError(f"{name} is installed; remove it first")
+            # An orphaned payload: out of oMLX and the catalog, then deleted with the pin.
+            ready = runtime_ready()
+            staged = _unpromote(model_id)
+            try:
+                if ready:
+                    _apply_settings(_promoted_models(), rescan=True)
+            except BaseException:
+                staged.rename(mlx_dir() / model_id)
+                raise
+            finally:
+                with contextlib.suppress(Exception):
+                    bump_generation()
+        shutil.rmtree(partial_dir(model_id), ignore_errors=True)
+        _pin_path(name).unlink()
+
+
 # ── on-demand install (docs/adr/0003-scoped-access-and-lightweight-local-models.md section 5) ──
 
 # A request starts setup at most this often per model; between starts, answers come from status.json.
@@ -1555,8 +1793,11 @@ def auto_install_names(config: dict) -> list[str]:
     """The curated models the owner lets a request install (``local_ai.auto_install``)."""
     block = config.get("local_ai") if isinstance(config.get("local_ai"), dict) else {}
     names = block.get("auto_install") or []
-    if not isinstance(names, list) or any(not isinstance(name, str) or name not in MODELS for name in names):
-        raise ValueError(f"local_ai.auto_install must list local AI models: {', '.join(MODELS)}")
+    if not names:
+        return []
+    available = models()
+    if not isinstance(names, list) or any(not isinstance(name, str) or name not in available for name in names):
+        raise ValueError(f"local_ai.auto_install must list local AI models: {', '.join(available)}")
     return list(dict.fromkeys(names))
 
 
@@ -1566,16 +1807,17 @@ def on_demand_models(config: dict) -> list[LocalModel]:
     installed = installed_models()
     if not installed:
         return []  # building the runtime is never request-triggered
-    memory = _usable_memory()
-    return [MODELS[name] for name in auto_install_names(config)
-            if MODELS[name] not in installed and eligible(MODELS[name], memory=memory)]
+    memory, available = _usable_memory(), models()
+    return [available[name] for name in auto_install_names(config)
+            if available[name] not in installed and eligible(available[name], memory=memory)]
 
 
 def on_demand_model(name: str, config: dict) -> LocalModel | None:
     """The on-demand model a request for ``name`` (its name, or its base model) would install:
     listed, not installed, and able to run on this Mac, while this gateway's runtime exists."""
     try:
-        listed = [MODELS[candidate] for candidate in auto_install_names(config)]
+        available = models()
+        listed = [available[candidate] for candidate in auto_install_names(config) if candidate in available]
     except ValueError:
         return None
     matches = [local for local in listed if local.name == name or local.catalog.get("base_model") == name]
@@ -1819,17 +2061,28 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="model-gateway local-ai", description=__doc__.split("\n\n")[0])
     commands = parser.add_subparsers(dest="command", required=True)
     show = commands.add_parser("status", help="eligibility, ownership, and setup progress")
-    show.add_argument("model", nargs="?", choices=sorted(MODELS))
+    choices = sorted(models())
+    show.add_argument("model", nargs="?", choices=choices)
     show.add_argument("--json", action="store_true")
     add = commands.add_parser("add", help="download and install a local model in the background "
                                           "(default: the best one this Mac can run)")
-    add.add_argument("model", nargs="?", choices=sorted(MODELS))
+    add.add_argument("model", nargs="?", choices=choices)
     commands.add_parser("cancel", help="stop a download (a later add resumes it)")
     drop = commands.add_parser("remove", help="remove one model, or (without a model) the runtime, "
                                               "its models, and its gateway routes")
-    drop.add_argument("model", nargs="?", choices=sorted(MODELS))
+    drop.add_argument("model", nargs="?", choices=choices)
+    pin = commands.add_parser("pin", help="pin a Hugging Face MLX repository at a revision as a local model "
+                                          "(needs local_ai.open_models: true)")
+    pin.add_argument("name")
+    pin.add_argument("repo", help="owner/name")
+    pin.add_argument("revision", help="40-character commit hash")
+    pin.add_argument("--context", type=int, default=32768)
+    pin.add_argument("--max-output-tokens", type=int, default=4096)
+    pin.add_argument("--vision", action="store_true")
+    unpin = commands.add_parser("unpin", help="forget a pinned model that is not installed")
+    unpin.add_argument("name")
     job = commands.add_parser("job", help=argparse.SUPPRESS)
-    job.add_argument("model", choices=sorted(MODELS))
+    job.add_argument("model")  # model() validates it inside the job, which records a failure
     args = parser.parse_args(argv)
     os.umask(0o077)
     try:
@@ -1850,6 +2103,17 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "cancel":
             print(f"Local AI setup {cancel()['state'] or 'not running'}")
+            return 0
+        if args.command == "pin":
+            pinned = pin_model(args.name, args.repo, args.revision, context=args.context,
+                               max_output_tokens=args.max_output_tokens, vision=args.vision)
+            print(f"Pinned {pinned['name']}: {pinned['hf_repo']}@{pinned['hf_revision'][:7]} ({pinned['license']}, "
+                  f"{pinned['total_bytes'] / 1e9:.1f} GB, {pinned['min_memory_gb']} GB Macs and up); "
+                  f"install it with 'model-gateway local-ai add {pinned['name']}'")
+            return 0
+        if args.command == "unpin":
+            unpin_model(args.name)
+            print(f"Unpinned {args.name}")
             return 0
         remove(args.model)
         print(f"Local AI {args.model} removed" if args.model else "Local AI removed")

@@ -404,6 +404,37 @@ base model another installed model serves is served by that model instead.
 `GET /v1/models/canonical?include=local_install` lists the models a request
 would install, with `"local_install": "on_demand"` and `available: false`.
 
+With `local_ai.open_models: true`, the owner can also pin any Hugging Face MLX
+repository at a commit, then install it like a curated model:
+
+```bash
+model-gateway local-ai pin NAME OWNER/REPO REVISION [--context N] [--max-output-tokens N] [--vision]
+model-gateway local-ai add NAME
+model-gateway local-ai unpin NAME     # once it is removed
+```
+
+Pinning builds the model's manifest from Hugging Face's listing at that
+revision: LFS files carry its SHA-256, and every other file is downloaded and
+checked against its Git blob id before it is hashed. Only weights,
+configuration, tokenizer, template and documentation files are accepted; a
+repository with Python files, `auto_map` or `trust_remote_code`, a gated
+repository, or one without a license is refused. A sharded model needs its
+`model.safetensors.index.json`; a single `model.safetensors` is accepted too.
+The memory floor is 1.6 times the payload (at least 16 GiB). A pin's name may
+not reuse any model, alias, or base-model name, and a pin has no base model.
+The pin lives in `local-ai-pins/NAME.json` in the state directory, outside the
+payload and runtime directories, so removing local AI keeps it; every install
+verifies against it, and only its context, output limit, vision and description
+are read from it. A pin whose file is invalid is ignored, and a later
+release's local AI model with the same name takes precedence; either way
+`unpin NAME` takes its payload out of oMLX and deletes it. A pin does take
+precedence over a later release's catalog row (a cloud route, say) that uses
+one of its identifiers. Only
+the CLI or a full admin key (`POST /admin/api/local-ai/pins`,
+`DELETE /admin/api/local-ai/pins/NAME`) can pin; turning `open_models` off later
+stops new pins, not existing ones. A pin must be a chat model: installing it
+requires it to answer a short completion check.
+
 `remove MODEL` deletes one of several installed models the same way, without a
 restart. `remove` (or removing the last model) unwires the provider and models,
 stops and deletes the runtime and its models, then restarts the gateway once so

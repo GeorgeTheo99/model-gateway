@@ -100,6 +100,12 @@ def _local_ai_rows(config: dict, *, installed_only: bool = True) -> list[dict]:
     return local_runtime.catalog_rows(config, installed_only=installed_only)
 
 
+def _pinned_local_ai_names() -> set[str]:
+    from src import local_runtime
+
+    return set(local_runtime.pinned_models())
+
+
 def all_shipped_rows(profiles: dict[str, dict] | None = None) -> list[dict]:
     """Every model a release ships, loaded on this install or not."""
     profiles = _packaged() if profiles is None else profiles
@@ -143,15 +149,27 @@ def layer(
         )
     # Gateway local AI (src.local_runtime) loads once installed, whatever the selection:
     # the owner added it. Its names count only then, so an owner's own row under one
-    # (another oMLX setup) is never mistaken for an override of an absent model.
+    # (another oMLX setup) is never mistaken for an override of an absent model. A model
+    # the owner pinned (docs/adr/0003-scoped-access-and-lightweight-local-models.md
+    # section 6) wins over a release row a later release ships under one of its identifiers.
+    from src.catalog import entry_routable_ids
+
+    from src.catalog import _record_yield
+
+    pins = _pinned_local_ai_names()
     for model in _local_ai_rows(config):
+        pinned = model["name"] in pins
+        row = {**model, "origin": {"layer": "shipped", "profile": "local-ai-pin" if pinned else "local-ai"}}
+        if pinned:
+            claimed = set(entry_routable_ids(model))
+            for entry in [entry for entry in entries if claimed.intersection(entry_routable_ids(entry))]:
+                _record_yield(entry, row)  # logged, and listed in admin status as displaced
+                entries.remove(entry)
         names.add(model["name"])
-        entries.append({**model, "origin": {"layer": "shipped", "profile": "local-ai"}})
+        entries.append(row)
     # A name another profile still ships is alive, whatever an older profile retired.
     retired = {name: successor for name, successor in retired.items() if name not in names}
     if include_packs:
-        from src.catalog import entry_routable_ids
-
         shipped_ids = {model_id for row in entries for model_id in entry_routable_ids(row)}
         shipped_ids.update(str(row["base_model"]) for row in entries if row.get("base_model"))
         for namespace, pack in sorted(_registered_packs(config_path).items()):

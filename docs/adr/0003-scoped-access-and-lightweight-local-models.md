@@ -266,9 +266,13 @@ repository at a 40-character revision.
   limit, thinking, vision, license). Its name may not collide with any
   identifier or base-model name, and it has no `base_model`, so a pin never
   joins base-model resolution or widens an allowlist.
-- Pinned models load in the owner layer (ADR 0002). A later release that
-  ships the same name is an owner row claiming a shipped name: the owner's pin
-  replaces the shipped row.
+- Pins are kept beside the runtime (`local-ai-pins/`), so removing local AI
+  keeps them. Pinned models load beside the curated ones once installed (origin
+  `local-ai-pin`), so a pin that is not installed routes nowhere, never to a
+  route that shares its name as a base model. A later
+  release catalog row that uses one of a pin's identifiers loses it to the pin,
+  as an owner row would win (ADR 0002); a later release's own local AI model
+  with the pin's name wins over the pin, whose payload `unpin` then removes.
 - Packs cannot pin open models. They may name one in `requires`, which
   reports it as unmet until the owner pins it (ADR 0002).
 - Pinned models then behave like curated models for eligibility, add, remove,

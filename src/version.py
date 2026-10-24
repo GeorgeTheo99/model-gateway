@@ -20,6 +20,7 @@ CAPABILITIES = (
     "local_runtime.v1",
     "local_runtime_models.v1",
     "local_runtime_on_demand.v1",
+    "local_runtime_pins.v1",
     "model_allowlists.v1",
     "onboarding_auto_add.v1",
     "onboarding_profiles.v1",

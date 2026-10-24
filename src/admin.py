@@ -135,8 +135,9 @@ async def admin_local_ai(request: Request):
     """Gateway-owned local AI: eligibility, ownership, and setup progress."""
     require_admin_or_scope(request, "local_ai:manage")
     model = request.query_params.get("model") or None
-    if model is not None and model not in local_runtime.MODELS:
-        return _bad_request(f"Unknown local model; available: {', '.join(sorted(local_runtime.MODELS))}")
+    available = await run_in_threadpool(local_runtime.models)
+    if model is not None and model not in available:
+        return _bad_request(f"Unknown local model; available: {', '.join(sorted(available))}")
     try:
         return await run_in_threadpool(local_runtime.status, model)
     except (ValueError, yaml.YAMLError, OSError) as exc:
@@ -165,6 +166,45 @@ async def admin_local_ai_action(request: Request):
         return await run_in_threadpool(local_runtime.cancel)
     except (ValueError, yaml.YAMLError, OSError, RuntimeError) as exc:
         return _local_ai_error(exc, status=409)
+
+
+@router.post("/admin/api/local-ai/pins")
+async def admin_pin_local_model(request: Request):
+    """Body: {name, repo, revision, context?, max_output_tokens?, vision?}. Pin a Hugging Face MLX
+    repository at a revision as a local model (docs/adr/0003 section 6). Full admin only, with
+    ``local_ai.open_models: true``; ``add`` installs it."""
+    require_admin_auth(request)
+    require_admin_writes()
+    try:
+        body = await request.json()
+    except Exception:
+        return _bad_request("Invalid JSON body")
+    if not isinstance(body, dict) or set(body) - {"name", "repo", "revision", "context", "max_output_tokens", "vision"}:
+        return _bad_request("Body is {name, repo, revision, context?, max_output_tokens?, vision?}")
+    if any(not isinstance(body.get(key), str) for key in ("name", "repo", "revision")):
+        return _bad_request("name, repo and revision must be strings")
+    options = {key: body[key] for key in ("context", "max_output_tokens", "vision") if key in body}
+    try:
+        return await run_in_threadpool(lambda: local_runtime.pin_model(body["name"], body["repo"], body["revision"],
+                                                                       **options))
+    except local_runtime.PinError as exc:
+        return _bad_request(str(exc), status=exc.status)
+    except (ValueError, yaml.YAMLError, OSError, RuntimeError) as exc:
+        return _local_ai_error(exc, status=409)
+
+
+@router.delete("/admin/api/local-ai/pins/{name}")
+async def admin_unpin_local_model(name: str, request: Request):
+    """Forget a pinned model that is not installed. Full admin only."""
+    require_admin_auth(request)
+    require_admin_writes()
+    try:
+        await run_in_threadpool(local_runtime.unpin_model, name)
+    except local_runtime.PinError as exc:
+        return _bad_request(str(exc), status=exc.status)
+    except (ValueError, yaml.YAMLError, OSError, RuntimeError) as exc:
+        return _local_ai_error(exc, status=409)
+    return {"unpinned": name}
 
 
 def _local_ai_error(exc: Exception, *, status: int) -> JSONResponse:
