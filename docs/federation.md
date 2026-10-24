@@ -87,7 +87,7 @@ Authorization: Bearer <configured edge credential>
 ```
 
 The endpoint always requires a configured peer credential, even when normal
-`/v1` client auth is open. It returns schema version 1, the source node ID, a
+`/v1` client auth is open. It returns catalog schema 1 (or 2, below), the source node ID, a
 monotonically comparable revision, a SHA-256 digest, generation time, and only
 direct local routes. The response repeats `X-Model-Gateway-Source` for node
 identity validation.
@@ -142,6 +142,59 @@ timeout before response headers is returned as `504`. Once streaming headers
 have been sent, HTTP status can no longer change; an idle timeout therefore
 closes/truncates the downstream stream rather than returning a `504` envelope.
 Clients must treat a stream without its protocol completion marker as failed.
+
+## Trusted-local peers (catalog schema 2)
+
+A peer the owner trusts with local work is marked `trusted_local`; its
+`base_url` must be `https`:
+
+```yaml
+federation:
+  peers:
+    studio:
+      base_url: https://studio-gateway.example.com
+      api_key_file: secrets/main-studio.api-key
+      trusted_local: true
+```
+
+Importers ask every peer for `GET /v1/federation/catalog?schema_version=2`.
+Schema 2 adds each model's `locality` (`local` when its whole route closure is
+loopback oMLX and it has no `model_fallbacks` target, else `cloud`) and
+`base_model`. A node that predates schema 2 ignores the query and answers
+schema 1, which is treated as all `cloud`. Each schema keeps its own revision
+and digest, and an importer starts a new revision baseline when a peer's
+schema changes (an upgrade or a rollback), so neither looks like it moved
+backwards.
+
+A trusted peer serves local work this node cannot:
+
+- A request for a base-model name, or for a curated local AI model this Mac
+  has not installed, with no route here goes to the first fresh `local` row
+  serving that name (its `base_model`, else its direct ID) on a
+  `trusted_local` peer, in configuration order. A curated local AI model name
+  never falls back to a cloud route that shares its base model.
+- A profile with locality `trusted_local` (credential policy `gateway_local`)
+  binds this Mac's local route first, then a trusted peer's `local` row as
+  `<peer>/<direct_id>`. The binding records the exported row: a stale or
+  unreachable peer is `503 profile_route_unavailable`, a changed row or a peer
+  no longer trusted is `409 profile_binding_changed`. `local_only` profiles
+  keep meaning this Mac only.
+
+These requests go to `/v1/federation/local/{chat/completions,messages,responses}`,
+which only schema 2 nodes serve, so a peer downgraded since the importer's last
+refresh refuses them instead of running its ordinary pipeline. On that path the
+peer serves exactly the named model, available and local there, with no
+retirement redirect, base-model reroute, `model_fallbacks` or vision fallback;
+otherwise it answers `409`. Only authenticated peer forwards may use it, and
+it is recorded in the serving node's ledger under its own path.
+Explicit `<peer>/<id>` requests keep the ordinary forwarding path above, and
+`/v1/models` shows `locality` and `base_model` only for trusted peers, where
+they govern routing. A pack model's `base_model` is never exported, as it never
+answers a base-model name on its own node.
+
+Rolling an importer back to a release without schema 2 drops the cached
+schema 2 peer catalogs (their digests no longer validate) until the next
+refresh; its own schema 1 catalog is kept.
 
 ## Lifecycle and operations
 

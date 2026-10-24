@@ -3,6 +3,14 @@
 Federated catalogs and routes deliberately live outside the provider registry.
 A node exports only its direct local routes; importers retain a validated
 last-known-good catalog and address imported models as ``<owner>/<direct_id>``.
+
+Catalog schema 2, which an importer asks for with ``?schema_version=2``, adds
+each model's ``locality`` and ``base_model``. A peer the owner marks
+``trusted_local`` may serve this node's local work: a base-model name with no
+route here, or a ``trusted_local`` profile, reaches its ``local`` rows through
+``/v1/federation/local/...``, which only schema 2 nodes serve and serve only from
+their own loopback oMLX
+(docs/adr/0003-scoped-access-and-lightweight-local-models.md section 4).
 """
 
 from __future__ import annotations
@@ -33,7 +41,11 @@ from src.secret_files import read_api_key_file, resolve_api_key_file
 
 log = logging.getLogger("model-gateway")
 
+# The federation cache's own format; catalogs are schema 1 or 2.
 SCHEMA_VERSION = 1
+CATALOG_SCHEMAS = (1, 2)
+LATEST_SCHEMA = 2
+LOCAL_FORWARD_PREFIX = "/v1/federation/local"
 SOURCE_HEADER = "X-Model-Gateway-Source"
 OWNER_HEADER = "X-Model-Gateway-Owner"
 _NODE_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
@@ -58,6 +70,9 @@ _MODEL_METADATA_FIELDS = {
     "forwarded_params",
     "vision",
 }
+# Added by catalog schema 2.
+_SCHEMA_2_FIELDS = {"locality", "base_model"}
+_LOCALITIES = {"local", "cloud"}
 _HOP_BY_HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -83,6 +98,8 @@ class PeerConfig:
     node_id: str
     base_url: str
     api_key: str = field(repr=False)
+    # The owner trusts this machine with local work (ADR 0003 section 4).
+    trusted_local: bool = False
 
 
 @dataclass(frozen=True)
@@ -108,6 +125,7 @@ class PeerState:
     last_attempt_at: float | None = None
     healthy: bool = False
     last_error: str = "not_refreshed"
+    schema_version: int = 1
 
 
 @dataclass(frozen=True)
@@ -115,6 +133,8 @@ class ImportedRoute:
     owner_node: str
     direct_model_id: str
     peer: PeerConfig
+    # Sent to the peer's local-only path: it must serve the model from its own oMLX.
+    local: bool = False
 
     @property
     def route_id(self) -> str:
@@ -215,7 +235,7 @@ def load_config(config_path: Path | str) -> FederationConfig | None:
             raise FederationConfigError(f"federation peer {peer_id!r} cannot be this node")
         if not isinstance(raw_peer, dict):
             raise FederationConfigError(f"federation.peers.{peer_id} must be a mapping")
-        peer_unknown = set(raw_peer) - {"base_url", "api_key", "api_key_file"}
+        peer_unknown = set(raw_peer) - {"base_url", "api_key", "api_key_file", "trusted_local"}
         if peer_unknown:
             raise FederationConfigError(
                 f"unknown setting(s) for federation peer {peer_id!r}: {', '.join(sorted(peer_unknown))}"
@@ -243,11 +263,14 @@ def load_config(config_path: Path | str) -> FederationConfig | None:
             api_key = raw_key.strip()
         if not api_key:
             raise FederationConfigError(f"federation peer {peer_id!r} credential is empty")
-        peers[peer_id] = PeerConfig(
-            node_id=peer_id,
-            base_url=_validate_base_url(raw_peer.get("base_url"), f"federation.peers.{peer_id}"),
-            api_key=api_key,
-        )
+        trusted_local = raw_peer.get("trusted_local", False)
+        if not isinstance(trusted_local, bool):
+            raise FederationConfigError(f"federation peer {peer_id!r} trusted_local must be true or false")
+        base_url = _validate_base_url(raw_peer.get("base_url"), f"federation.peers.{peer_id}")
+        if trusted_local and not base_url.startswith("https://"):
+            # Local work must not cross the network in the clear.
+            raise FederationConfigError(f"federation peer {peer_id!r} must use https to be trusted_local")
+        peers[peer_id] = PeerConfig(node_id=peer_id, base_url=base_url, api_key=api_key, trusted_local=trusted_local)
 
     raw_cache_path = block.get("cache_path", "federation-cache.json")
     if not isinstance(raw_cache_path, str) or not raw_cache_path.strip():
@@ -313,7 +336,11 @@ def _valid_direct_id(value: Any) -> str:
     return value
 
 
-def _sanitize_model(raw: Any, owner: str) -> dict[str, Any]:
+def _fields(schema_version: int) -> set[str]:
+    return _MODEL_METADATA_FIELDS | (_SCHEMA_2_FIELDS if schema_version >= 2 else set())
+
+
+def _sanitize_model(raw: Any, owner: str, schema_version: int = 1) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise CatalogValidationError("catalog models must be objects")
     direct_id = _valid_direct_id(raw.get("direct_model_id"))
@@ -321,7 +348,11 @@ def _sanitize_model(raw: Any, owner: str) -> dict[str, Any]:
         raise CatalogValidationError(f"catalog model {direct_id!r} has the wrong owner_node")
 
     model: dict[str, Any] = {"direct_model_id": direct_id, "owner_node": owner}
-    for key in _MODEL_METADATA_FIELDS:
+    if schema_version >= 2:
+        if raw.get("locality") not in _LOCALITIES:
+            raise CatalogValidationError(f"catalog model {direct_id!r} has invalid locality")
+        model["locality"] = raw["locality"]
+    for key in _MODEL_METADATA_FIELDS | ({"base_model"} if schema_version >= 2 else set()):
         if key not in raw:
             continue
         value = raw[key]
@@ -404,7 +435,8 @@ def validate_catalog(
     """Validate a peer catalog and return its normalized payload/model index."""
     if not isinstance(payload, dict):
         raise CatalogValidationError("catalog must be a JSON object")
-    if payload.get("schema_version") != SCHEMA_VERSION:
+    schema_version = payload.get("schema_version")
+    if isinstance(schema_version, bool) or schema_version not in CATALOG_SCHEMAS:
         raise CatalogValidationError("unsupported federation catalog schema_version")
     if payload.get("node_id") != expected_node:
         raise CatalogValidationError("federation catalog node_id does not match the configured peer")
@@ -434,7 +466,7 @@ def validate_catalog(
     models: list[dict[str, Any]] = []
     by_id: dict[str, dict[str, Any]] = {}
     for raw in raw_models:
-        model = _sanitize_model(raw, expected_node)
+        model = _sanitize_model(raw, expected_node, schema_version)
         direct_id = model["direct_model_id"]
         if direct_id in by_id:
             raise CatalogValidationError(f"catalog contains duplicate direct_model_id {direct_id!r}")
@@ -450,7 +482,7 @@ def validate_catalog(
             raise CatalogValidationError("catalog digest changed without a revision change")
 
     normalized = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": schema_version,
         "node_id": expected_node,
         "revision": revision,
         "digest": digest,
@@ -541,10 +573,8 @@ class FederationManager:
         self._refresh_task: asyncio.Task | None = None
         self._cache_write_lock = threading.Lock()
         self._owns_cache_writes = True
-        self._catalog_revision = 0
-        self._catalog_digest = ""
-        self._catalog_generated_at = ""
-        self._catalog_models: list[dict[str, Any]] = []
+        # What this node exports, per catalog schema: revision, digest, generated_at, models.
+        self._local: dict[int, dict[str, Any]] = {}
         if config:
             self._load_cache()
 
@@ -617,8 +647,12 @@ class FederationManager:
         except CatalogValidationError as exc:
             raise HTTPException(status_code=400, detail="federation forward requires a valid direct local model") from exc
 
-    def build_catalog(self, local_rows: list[dict[str, Any]]) -> dict[str, Any]:
-        """Build a stable revisioned catalog from direct local discovery rows."""
+    def build_catalog(self, local_rows: list[dict[str, Any]], schema_version: int = 1) -> dict[str, Any]:
+        """Build a stable revisioned catalog from direct local discovery rows.
+
+        Each schema keeps its own revision and digest, so importers on either
+        schema see a revision change exactly when their view changes.
+        """
         if not self.config:
             raise HTTPException(status_code=404, detail="federation is not configured")
         models: list[dict[str, Any]] = []
@@ -631,28 +665,25 @@ class FederationManager:
             raw = {
                 "direct_model_id": direct_id,
                 "owner_node": self.config.node_id,
-                **{key: row[key] for key in _MODEL_METADATA_FIELDS if key in row},
+                **{key: row[key] for key in _fields(schema_version) if key in row},
             }
-            models.append(_sanitize_model(raw, self.config.node_id))
+            models.append(_sanitize_model(raw, self.config.node_id, schema_version))
         models.sort(key=lambda item: item["direct_model_id"])
         digest = catalog_digest(models)
-        if not self._catalog_digest or not secrets.compare_digest(digest, self._catalog_digest):
+        current = self._local.get(schema_version) or {"revision": 0, "digest": ""}
+        if not current["digest"] or not secrets.compare_digest(digest, current["digest"]):
             # Epoch milliseconds remain exactly comparable in JSON/JavaScript;
             # +1 handles multiple catalog changes within the same millisecond.
             # The value is cached below, preserving monotonicity across restarts.
-            self._catalog_revision = max(time.time_ns() // 1_000_000, self._catalog_revision + 1)
-            self._catalog_digest = digest
-            self._catalog_generated_at = _iso_timestamp()
-            self._catalog_models = models
+            current = {
+                "revision": max(time.time_ns() // 1_000_000, current["revision"] + 1),
+                "digest": digest,
+                "generated_at": _iso_timestamp(),
+                "models": models,
+            }
+            self._local[schema_version] = current
             self._write_cache()
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "node_id": self.config.node_id,
-            "revision": self._catalog_revision,
-            "digest": self._catalog_digest,
-            "generated_at": self._catalog_generated_at,
-            "models": self._catalog_models,
-        }
+        return {"schema_version": schema_version, "node_id": self.config.node_id, **current}
 
     async def refresh_peer(self, node_id: str) -> bool:
         if not self.config or node_id not in self.config.peers:
@@ -660,7 +691,8 @@ class FederationManager:
         peer = self.config.peers[node_id]
         state = self.states[node_id]
         state.last_attempt_at = time.time()
-        endpoint = f"{peer.base_url}/v1/federation/catalog"
+        # Older nodes ignore the query and answer schema 1.
+        endpoint = f"{peer.base_url}/v1/federation/catalog?schema_version={LATEST_SCHEMA}"
         try:
             # HTTPX read timeouts bound inactivity, not total wall time. This
             # outer deadline covers headers and the complete catalog body so a
@@ -696,13 +728,17 @@ class FederationManager:
                                 raise CatalogValidationError("catalog exceeds the configured byte limit")
                             chunks.append(chunk)
                 payload = _json_loads_finite(b"".join(chunks))
+                # Revisions are per schema: a peer that changes schema (an upgrade or a
+                # rollback) starts a new baseline instead of looking like it moved backwards.
+                same_schema = isinstance(payload, dict) and payload.get("schema_version") == state.schema_version
                 normalized, by_id = validate_catalog(
                     payload,
                     node_id,
                     max_models=self.config.max_models_per_peer,
-                    previous_revision=state.revision,
-                    previous_digest=state.digest,
+                    previous_revision=state.revision if same_schema else None,
+                    previous_digest=state.digest if same_schema else "",
                 )
+                state.schema_version = normalized["schema_version"]
                 state.models = by_id
                 state.revision = normalized["revision"]
                 state.digest = normalized["digest"]
@@ -753,6 +789,42 @@ class FederationManager:
                 if current and current.cancelling() > cancelling_before:
                     raise
 
+    def _fresh(self, state: PeerState, now: float | None = None) -> bool:
+        assert self.config is not None
+        current = time.time() if now is None else now
+        return bool(state.healthy and state.last_success_at is not None
+                    and current - state.last_success_at <= self.config.stale_after_seconds)
+
+    def trusted_local_row(self, route_id: Any) -> tuple[dict[str, Any], bool] | None:
+        """``(row, available)`` for ``<peer>/<id>`` when it is a ``local`` row of a trusted_local
+        peer on schema 2, from the last-known-good catalog even while the peer is stale."""
+        if not self.config or not isinstance(route_id, str) or "/" not in route_id:
+            return None
+        owner, direct_id = route_id.split("/", 1)
+        peer, state = self.config.peers.get(owner), self.states.get(owner)
+        if not peer or not peer.trusted_local or not state or state.schema_version < 2:
+            return None
+        row = state.models.get(direct_id)
+        if row is None or row.get("locality") != "local":
+            return None
+        return row, self._fresh(state)
+
+    def trusted_local_route(self, name: Any) -> ImportedRoute | None:
+        """The first fresh ``local`` row serving ``name`` (its id, else its base model) on a
+        trusted_local peer, in configuration order."""
+        if not self.config or not isinstance(name, str) or not name:
+            return None
+        for owner, peer in self.config.peers.items():
+            state = self.states.get(owner)
+            if not peer.trusted_local or not state or state.schema_version < 2 or not self._fresh(state):
+                continue
+            rows = [row for row in state.models.values() if row.get("locality") == "local"]
+            match = (next((row for row in rows if row["direct_model_id"] == name), None)
+                     or next((row for row in rows if row.get("base_model") == name), None))
+            if match is not None:
+                return ImportedRoute(owner_node=owner, direct_model_id=match["direct_model_id"], peer=peer, local=True)
+        return None
+
     def resolve_imported(self, route_id: Any) -> ImportedRoute | None:
         if not self.config or not isinstance(route_id, str) or "/" not in route_id:
             return None
@@ -779,10 +851,13 @@ class FederationManager:
                 "catalog_revision": state.revision,
                 "catalog_digest": state.digest,
             }
+            # Locality is shown only where it governs routing: an explicit import from any
+            # other peer runs that peer's ordinary pipeline.
+            shown = _MODEL_METADATA_FIELDS | (_SCHEMA_2_FIELDS if self.config.peers[owner].trusted_local else set())
             for direct_id, model in state.models.items():
                 metadata = {
                     key: model[key]
-                    for key in _MODEL_METADATA_FIELDS
+                    for key in shown
                     if key in model and key not in {"object", "created", "thinking_levels"}
                 }
                 metadata["thinking_levels"] = _imported_thinking_levels(model)
@@ -830,7 +905,9 @@ class FederationManager:
             OWNER_HEADER: route.owner_node,
             "Via": f"1.1 {self.config.node_id}-model-gateway",
         }
-        endpoint = f"{route.peer.base_url}{path}"
+        # A local route goes where only schema 2 nodes answer, and only from their own oMLX.
+        endpoint = f"{route.peer.base_url}{LOCAL_FORWARD_PREFIX}{path.removeprefix('/v1')}" if route.local else (
+            f"{route.peer.base_url}{path}")
         client = self._client(streaming=is_stream)
 
         async def close(response: httpx.Response | None = None) -> None:
@@ -911,6 +988,7 @@ class FederationManager:
             if state.revision is None:
                 continue
             peers[node_id] = {
+                "schema_version": state.schema_version,
                 "revision": state.revision,
                 "digest": state.digest,
                 "generated_at": state.generated_at,
@@ -919,18 +997,12 @@ class FederationManager:
                 "last_error": state.last_error,
                 "models": list(state.models.values()),
             }
-        local_catalog = None
-        if self._catalog_digest:
-            local_catalog = {
-                "revision": self._catalog_revision,
-                "digest": self._catalog_digest,
-                "generated_at": self._catalog_generated_at,
-                "models": self._catalog_models,
-            }
         return {
             "schema_version": SCHEMA_VERSION,
             "node_id": self.config.node_id,
-            "local_catalog": local_catalog,
+            # Schema 1 keeps its original key, so an older release reads its cache back.
+            "local_catalog": self._local.get(1),
+            "local_catalog_v2": self._local.get(2),
             "peers": peers,
         }
 
@@ -981,7 +1053,8 @@ class FederationManager:
             return
         try:
             raw = path.read_bytes()
-            if len(raw) > self.config.max_catalog_bytes * max(1, len(self.config.peers) + 1):
+            # Every peer's catalog plus this node's, once per catalog schema.
+            if len(raw) > self.config.max_catalog_bytes * (len(self.config.peers) + 2):
                 raise CatalogValidationError("cache exceeds its size limit")
             document = _json_loads_finite(raw)
             if (
@@ -992,27 +1065,31 @@ class FederationManager:
             ):
                 raise CatalogValidationError("cache identity/schema mismatch")
 
-            restored_local: dict[str, Any] | None = None
-            local_cache = document.get("local_catalog")
-            if local_cache is not None:
+            restored_local: dict[int, dict[str, Any]] = {}
+            for schema_version, key in ((1, "local_catalog"), (2, "local_catalog_v2")):
+                local_cache = document.get(key)
+                if local_cache is None:
+                    continue
                 try:
                     if not isinstance(local_cache, dict):
                         raise CatalogValidationError("cached local catalog is invalid")
                     local_payload = {
-                        "schema_version": SCHEMA_VERSION,
+                        "schema_version": schema_version,
                         "node_id": self.config.node_id,
                         "revision": local_cache.get("revision"),
                         "digest": local_cache.get("digest"),
                         "generated_at": local_cache.get("generated_at"),
                         "models": local_cache.get("models"),
                     }
-                    restored_local, _ = validate_catalog(
+                    normalized, _ = validate_catalog(
                         local_payload,
                         self.config.node_id,
                         max_models=len(local_cache.get("models", []))
                         if isinstance(local_cache.get("models"), list)
                         else 0,
                     )
+                    restored_local[schema_version] = {
+                        key: normalized[key] for key in ("revision", "digest", "generated_at", "models")}
                 except (CatalogValidationError, TypeError, ValueError):
                     log.warning("ignoring invalid local section in federation cache")
 
@@ -1026,7 +1103,7 @@ class FederationManager:
                     if not isinstance(peer_cache, dict):
                         raise CatalogValidationError("cached peer section must be an object")
                     payload = {
-                        "schema_version": SCHEMA_VERSION,
+                        "schema_version": peer_cache.get("schema_version", 1),
                         "node_id": node_id,
                         "revision": peer_cache.get("revision"),
                         "digest": peer_cache.get("digest"),
@@ -1046,13 +1123,10 @@ class FederationManager:
 
             # Apply only after every section has been validated into temporary
             # state, so no exception can leave a half-restored section.
-            if restored_local is not None:
-                self._catalog_revision = restored_local["revision"]
-                self._catalog_digest = restored_local["digest"]
-                self._catalog_generated_at = restored_local["generated_at"]
-                self._catalog_models = restored_local["models"]
+            self._local.update(restored_local)
             for node_id, (normalized, by_id, success, attempt) in restored_peers.items():
                 state = self.states[node_id]
+                state.schema_version = normalized["schema_version"]
                 state.models = by_id
                 state.revision = normalized["revision"]
                 state.digest = normalized["digest"]

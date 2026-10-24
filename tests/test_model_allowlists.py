@@ -143,8 +143,11 @@ def test_every_model_taking_endpoint_is_covered():
     """A new inference endpoint must be added to the parametrized denial test above."""
     writes = {route.path for route in server.app.routes
               if route.path.startswith("/v1") and {"POST", "PUT"} & (getattr(route, "methods", None) or set())}
+    # The local federation paths admit only authenticated peer forwards, never consumer credentials.
     assert writes == {"/v1/chat/completions", "/v1/responses", "/v1/messages",
-                      "/v1/profiles/{namespace}/snapshot", "/v1/catalog/packs/{namespace}"}
+                      "/v1/profiles/{namespace}/snapshot", "/v1/catalog/packs/{namespace}",
+                      "/v1/federation/local/chat/completions", "/v1/federation/local/responses",
+                      "/v1/federation/local/messages"}
 
 
 def test_names_match_exactly(monkeypatch, dispatched):

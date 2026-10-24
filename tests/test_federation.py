@@ -249,7 +249,7 @@ def test_catalog_validation_accepts_direct_ids_with_arbitrary_slashes():
 @pytest.mark.parametrize(
     "mutate,match",
     [
-        (lambda p: p.update(schema_version=2), "schema_version"),
+        (lambda p: p.update(schema_version=3), "schema_version"),
         (lambda p: p.update(node_id="wrong"), "does not match"),
         (lambda p: p["models"][0].update(owner_node="wrong"), "wrong owner"),
         (lambda p: p["models"].append(dict(p["models"][0])), "duplicate"),
@@ -449,7 +449,7 @@ def test_cached_local_catalog_ignores_low_inbound_peer_limit(tmp_path):
 
     restored = federation.FederationManager(config)
     assert restored.build_catalog(local_rows) == original
-    assert [model["direct_model_id"] for model in restored._catalog_models] == ["local/a", "local/b"]
+    assert [model["direct_model_id"] for model in restored._local[1]["models"]] == ["local/a", "local/b"]
 
 
 def test_cache_restores_valid_sections_atomically_beside_corrupt_peer(tmp_path):
@@ -471,7 +471,7 @@ def test_cache_restores_valid_sections_atomically_beside_corrupt_peer(tmp_path):
     config.cache_path.write_text(json.dumps(document))
 
     restored = federation.FederationManager(config)
-    assert restored._catalog_revision == local["revision"]
+    assert restored._local[1]["revision"] == local["revision"]
     assert restored.resolve_imported("west/west/a") is not None
     edge_state = restored.states["edge"]
     assert edge_state.models == {}

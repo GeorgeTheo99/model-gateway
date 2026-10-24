@@ -1065,6 +1065,18 @@ def resolve_base_model(model_id: str, *, locality: str | None = None) -> str | N
     return None
 
 
+def _curated_local_name(model_id: str) -> bool:
+    from src import local_runtime
+
+    return model_id in local_runtime.MODELS
+
+
+def _curated_local_base(model_id: str) -> str:
+    from src import local_runtime
+
+    return local_runtime.MODELS[model_id].catalog.get("base_model") or model_id
+
+
 # Why a route named after its base model may be served by another route of that base.
 _REROUTABLE = frozenset({"model_not_found", "provider_not_configured"})
 
@@ -1083,6 +1095,13 @@ def base_model_route(model_id: str, *, locality: str | None = None) -> str | Non
     availability = _availability_for_entry(model_id, entry)
     if availability["available"] or availability["reason"] not in _REROUTABLE:
         return None
+    base = model_id
+    if entry is None and _curated_local_name(model_id) and locality != "cloud_explicit":
+        # A gateway local AI model this Mac has not installed stays local: another local route of
+        # its base model, a trusted peer, or nothing; never a cloud route that shares its base
+        # model (docs/adr/0003-scoped-access-and-lightweight-local-models.md section 4). Only a
+        # profile that explicitly asks for the cloud gets a cloud route of its base model.
+        locality, base = "local_only", _curated_local_base(model_id)
     if entry is not None:
         if entry.get("base_model") != model_id:
             return None
@@ -1090,7 +1109,7 @@ def base_model_route(model_id: str, *, locality: str | None = None) -> str | Non
         if locality not in (None, entry_locality):
             return None
         locality = entry_locality
-    route = resolve_base_model(model_id, locality=locality)
+    route = resolve_base_model(base, locality=locality)
     return route if route != model_id else None
 
 

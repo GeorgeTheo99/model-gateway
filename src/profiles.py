@@ -26,14 +26,17 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from src import catalog, providers
+from src import catalog, federation, providers
 
 log = logging.getLogger("model-gateway")
 
 _ID_RE = re.compile(r"^[a-z0-9-]{1,32}$")
 _NAME_RE = re.compile(r"^[a-z0-9-]{1,64}$")
 _PROTOCOLS = {"openai_chat", "openai_responses", "anthropic_messages"}
-_LOCALITIES = {"local_only", "cloud_explicit"}
+# trusted_local: this Mac's oMLX, or a peer the owner marked trusted_local
+# (docs/adr/0003-scoped-access-and-lightweight-local-models.md section 4).
+_LOCALITIES = {"local_only", "trusted_local", "cloud_explicit"}
+_LOCAL_LOCALITIES = frozenset({"local_only", "trusted_local"})
 _CREDENTIAL_POLICIES = {"gateway_local", "gateway_managed", "consumer_byok"}
 _ROOT_FIELDS = {"schema_version", "namespace", "source_revision", "default_profile", "profiles"}
 _PROFILE_FIELDS = {"id", "description", "locality", "credential_policy", "protocols", "routes", "defaults"}
@@ -65,6 +68,7 @@ class ExecutionProfile:
     gateway_version: int
     model: str
     defaults: dict
+    locality: str = "local_only"
 
 
 def is_selector(value: object) -> bool:
@@ -268,7 +272,35 @@ def _fallback_target(entry: dict, inventory: dict[str, dict]) -> str | None:
     return matches[0]
 
 
+# What a peer route binds: what the model is, not release details such as forwarded_params.
+_PEER_BINDING_FIELDS = ("direct_model_id", "locality", "base_model", "vision", "thinking")
+
+
+def _peer_route_closure(model: str) -> dict:
+    """A trusted_local profile route on a trusted peer: bound to its last-known-good exported row."""
+    found = federation.manager().trusted_local_row(model)
+    if found is None:
+        raise ProfileError(422, "invalid_profile_route", f"Route target '{model}' is not a local model of a trusted peer")
+    row = found[0]
+    owner, _direct_id = model.split("/", 1)
+    binding = {field: row[field] for field in _PEER_BINDING_FIELDS if field in row}
+    binding["thinking_levels"] = federation._imported_thinking_levels(row)
+    return {"model": model, "peer": owner, "row": binding}
+
+
+def _route_entry(model: str, inventory: dict[str, dict]) -> dict:
+    """The catalog entry, or for a trusted peer's route its exported row, that capability checks read."""
+    if model in inventory:
+        return inventory[model]
+    row = (federation.manager().trusted_local_row(model) or ({}, False))[0]
+    return {**row, "thinking_levels": federation._imported_thinking_levels(row)} if row else {}
+
+
 def _route_closure(model: str, *, locality: str, inventory: dict[str, dict], stack: tuple[str, ...] = ()) -> dict:
+    if locality == "trusted_local":
+        if model not in inventory:
+            return _peer_route_closure(model)
+        locality = "local_only"  # this Mac's route: exactly the local_only rules
     entry = inventory.get(model)
     if entry is None:
         raise ProfileError(422, "invalid_profile_route", f"Route target '{model}' is not a canonical gateway model")
@@ -309,7 +341,7 @@ def _route_closure(model: str, *, locality: str, inventory: dict[str, dict], sta
 
 def _profile_is_executable(profile: dict) -> bool:
     return (
-        profile["locality"] == "local_only"
+        profile["locality"] in _LOCAL_LOCALITIES
         and profile["credential_policy"] == "gateway_local"
     ) or (
         profile["locality"] == "cloud_explicit"
@@ -322,7 +354,7 @@ def _validate_defaults_for_routes(profile: dict, inventory: dict[str, dict]) -> 
     reasoning_effort = defaults.get("reasoning_effort")
     max_output_tokens = defaults.get("max_output_tokens")
     for model in set(profile["routes"].values()):
-        entry = inventory[model]
+        entry = _route_entry(model, inventory)
         if reasoning_effort is not None:
             try:
                 levels = catalog.normalized_thinking_levels(entry)
@@ -360,7 +392,7 @@ def _binding_for(profile: dict, inventory: dict[str, dict]) -> str:
     }
     vision_model = profile["routes"].get("vision")
     if vision_model:
-        vision_entry = inventory[vision_model]
+        vision_entry = _route_entry(vision_model, inventory)
         if not vision_entry.get("vision"):
             raise ProfileError(422, "invalid_profile_route", f"Vision route '{vision_model}' is not vision-capable")
     _validate_defaults_for_routes(profile, inventory)
@@ -405,7 +437,7 @@ def validate_manifest(raw: object) -> tuple[dict, dict[str, str]]:
         if locality not in _LOCALITIES or credential_policy not in _CREDENTIAL_POLICIES:
             raise ProfileError(422, "invalid_profile_manifest", f"profiles[{index}] has an unsupported policy value")
         valid_policy = (
-            locality == "local_only" and credential_policy == "gateway_local"
+            locality in _LOCAL_LOCALITIES and credential_policy == "gateway_local"
         ) or (
             locality == "cloud_explicit"
             and credential_policy in {"gateway_managed", "consumer_byok"}
@@ -473,10 +505,21 @@ def validate_manifest(raw: object) -> tuple[dict, dict[str, str]]:
     for profile in normalized_profiles:
         for role, model in profile["routes"].items():
             # A base-model reference binds to the route available now, within the
-            # profile's locality (docs/adr/0002-layered-model-catalog.md R1).
-            route = providers.base_model_route(model, locality=profile["locality"])
+            # profile's locality (docs/adr/0002-layered-model-catalog.md R1): for
+            # trusted_local, this Mac's local route first, then a trusted peer's.
+            local = profile["locality"] in _LOCAL_LOCALITIES
+            route = providers.base_model_route(model, locality="local_only" if local else profile["locality"])
+            if route is None and profile["locality"] == "trusted_local" and model not in inventory:
+                peer = federation.manager().trusted_local_route(model)
+                route = peer.route_id if peer is not None else None
             if route is not None:
                 profile["routes"][role] = route
+            peer = federation.manager().trusted_local_row(profile["routes"][role]) if (
+                profile["locality"] == "trusted_local" and profile["routes"][role] not in inventory) else None
+            if peer is not None and not peer[1]:
+                # Bind only a route available now; the last-known-good row is for serving through outages.
+                raise ProfileError(422, "invalid_profile_route",
+                                   f"Route target '{profile['routes'][role]}' is on a peer that is not reachable now")
     bindings = {profile["id"]: _binding_for(profile, inventory) for profile in normalized_profiles}
     return manifest, bindings
 
@@ -511,7 +554,7 @@ def _public_snapshot(record: dict) -> dict:
 
 
 # Localities whose models the gateway-managed local runtime keeps loaded.
-_PINNED_LOCALITIES = frozenset({"local_only"})
+_PINNED_LOCALITIES = _LOCAL_LOCALITIES
 
 
 def _local_routes(namespaces: dict) -> set[str]:
@@ -649,7 +692,8 @@ def resolve_execution(selector: object, *, protocol: str, has_image: bool) -> Ex
             raise ProfileError(409, "profile_binding_changed", "Profile route binding changed; re-register the profile") from exc
         if live_binding != record["bindings"].get(profile_id):
             raise ProfileError(409, "profile_binding_changed", "Profile route binding changed; re-register the profile")
-        if not providers.resolve(model):
+        peer = federation.manager().trusted_local_row(model) if profile["locality"] == "trusted_local" else None
+        if not (peer[1] if peer is not None else providers.resolve(model)):
             raise ProfileError(503, "profile_route_unavailable", "Profile route is unavailable")
         return ExecutionProfile(
             selector=str(selector),
@@ -658,4 +702,5 @@ def resolve_execution(selector: object, *, protocol: str, has_image: bool) -> Ex
             gateway_version=record["gateway_version"],
             model=model,
             defaults=copy.deepcopy(profile.get("defaults") or {}),
+            locality=profile["locality"],
         )

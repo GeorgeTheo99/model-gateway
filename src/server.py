@@ -43,7 +43,7 @@ from src.responses import chat_to_responses, responses_result_events, responses_
 from src.signature_cache import store_from_extra_content
 from src.streaming import _flatten_list_content, translate_stream
 from src.translator import anthropic_to_openai, anthropic_to_openai_chat, openai_chat_to_anthropic, openai_to_anthropic
-from src import catalog, config_io, custom_providers, signature_cache, discovery, federation, ledger, profiles, providers
+from src import catalog, config_io, custom_providers, signature_cache, discovery, federation, ledger, local_runtime, profiles, providers
 from src.usage import (
     anthropic_usage_to_openai_chat as convert_anthropic_usage_to_openai_chat,
     anthropic_usage_to_responses,
@@ -689,6 +689,30 @@ def _direct_model_permitted(request: Request, model: object) -> bool:
     return principal is None or providers.direct_model_permitted(model, principal.models, principal.namespaces)
 
 
+def _resolve_for(request: Request, model: object):
+    """``resolve(model)``, except that a trusted_local profile's peer route is never resolved here
+    (it is forwarded), and the local federation path takes only loopback oMLX."""
+    execution = getattr(request.state, "profile_execution", None)
+    if (execution is not None and execution.locality == "trusted_local"
+            and federation.manager().trusted_local_row(model) is not None):
+        return None
+    if isinstance(model, str) and model in local_runtime.MODELS and _model_allowlist(request) is not None:
+        # resolve() serves a local AI model this Mac lacks by another route of its base model; a
+        # credential that listed only this model's name may not use that route (ADR 0003 section 1).
+        successor = base_model_route(model)
+        if successor is not None and not _direct_model_permitted(request, successor):
+            return None
+    info = resolve(model)
+    if info is not None and getattr(request.state, "federation_local", False):
+        try:
+            profiles._effective_endpoint_binding(model, locality="local_only")
+        except profiles.ProfileError:
+            return None
+        if catalog.canonical_provider(info.provider) != "omlx":
+            return None
+    return info
+
+
 def _validate_inbound_peer_model(request: Request, path: str, model: object) -> JSONResponse | None:
     if not getattr(request.state, "federation_source", None):
         return None
@@ -696,17 +720,36 @@ def _validate_inbound_peer_model(request: Request, path: str, model: object) -> 
         federation.manager().validate_inbound_direct_model(model)
     except HTTPException as exc:
         return _peer_forward_error(path, exc)
+    if getattr(request.state, "federation_local", False) and not (
+            model_availability(model).get("available") and _local_route(model, profiles._inventory_by_name())):
+        # Exactly the model asked for, available here and local; never anything it could be rerouted to.
+        return _peer_forward_error(path, HTTPException(status_code=409, detail="model is not served locally here"))
     return None
 
 
 async def _forward_imported_if_known(request: Request, path: str, body: dict) -> Response | None:
-    """Resolve an exact namespaced import and relay it to its direct owner."""
+    """Relay an exact namespaced import, or (with no route here) a name a trusted-local peer
+    serves locally (ADR 0003 section 4), to its direct owner."""
     model = body.get("model")
     # A known-but-disabled/unconfigured local route still owns its identifier;
     # federation is considered only when local resolution truly has no entry.
     if isinstance(model, str) and model_availability(model).get("reason") != "model_not_found":
         return None
-    route = federation.manager().resolve_imported(model)
+    manager = federation.manager()
+    execution = getattr(request.state, "profile_execution", None)
+    if execution is not None:
+        # A trusted_local profile's peer route always goes to the peer's local-only path.
+        route = manager.resolve_imported(model)
+        if route is not None and execution.locality == "trusted_local":
+            route = federation.ImportedRoute(route.owner_node, route.direct_model_id, route.peer, local=True)
+    else:
+        route = manager.resolve_imported(model) or manager.trusted_local_route(model)
+        if route is None and isinstance(model, str) and model in local_runtime.MODELS:
+            # A local AI model this Mac has not installed: a trusted peer's model of its base, unless
+            # the caller may use only the model it named.
+            base = local_runtime.MODELS[model].catalog.get("base_model")
+            if _direct_model_permitted(request, base):
+                route = manager.trusted_local_route(base)
     if route is None:
         return None
     request.state.ledger_ctx = {
@@ -2029,6 +2072,10 @@ async def _apply_chat_vision_fallback(
             "invalid_request_error",
             "Profile vision route is no longer vision-capable; re-register the profile.",
         )
+    if getattr(request.state, "federation_local", False):
+        return body, requested_model, info, error_factory(
+            409, "invalid_request_error", "This local model is text-only; send images to a local vision model.",
+        )
     fallback_model, fallback_info, error = _resolve_vision_fallback(requested_model, info, error_factory)
     if _model_allowlist(request) is not None and (error or not _direct_model_permitted(request, fallback_model)):
         # Neither the helper model nor why it is unusable is named to a restricted credential.
@@ -2371,7 +2418,9 @@ def _enable_openrouter_gemini_prompt_cache(req: dict) -> None:
 
 # ── Request/usage ledger middleware ─────────────────────────────────────────
 
-_LEDGER_PATHS = {"/v1/chat/completions", "/v1/messages", "/v1/responses"}
+# The local federation paths are recorded under their own path: a peer's local work.
+_LEDGER_PATHS = {"/v1/chat/completions", "/v1/messages", "/v1/responses",
+                 *(f"{federation.LOCAL_FORWARD_PREFIX}/{name}" for name in ("chat/completions", "messages", "responses"))}
 
 
 def _redirect_retired_model(request: Request, body: dict) -> str:
@@ -2383,7 +2432,8 @@ def _redirect_retired_model(request: Request, body: dict) -> str:
     route by their registered bindings and are never rewritten.
     """
     model = body.get("model", "")
-    if not isinstance(model, str) or getattr(request.state, "profile_execution", None) is not None:
+    if (not isinstance(model, str) or getattr(request.state, "profile_execution", None) is not None
+            or getattr(request.state, "federation_local", False)):
         return model
     successor = retirement_redirect(model)
     if successor is not None:
@@ -2393,6 +2443,11 @@ def _redirect_retired_model(request: Request, body: dict) -> str:
     else:
         successor = base_model_route(model)
         if successor is None:
+            return model
+        if model in local_runtime.MODELS and not _direct_model_permitted(request, successor):
+            # A local AI model's name is a route name: listing it never permits another route
+            # (docs/adr/0003-scoped-access-and-lightweight-local-models.md section 1); _resolve_for
+            # refuses the same reroute.
             return model
     body["model"] = successor
     return successor
@@ -3074,7 +3129,7 @@ def _permitted_inventory(principal, inventory: list[dict]) -> list[dict]:
     identifiers = {route_id for model in inventory for route_id in model.get("routable_ids") or []}
     by_name = {model.get("name"): model for model in inventory}
     for name in sorted(principal.models - identifiers):
-        route = by_name.get(providers.resolve_base_model(name))
+        route = by_name.get(providers.base_model_route(name))  # where a request for it goes
         if route is not None:
             rows.append({**route, "name": name, "id": name, "routable_ids": [name]})
     return rows
@@ -3114,17 +3169,72 @@ async def list_canonical_models(request: Request):
     }
 
 
+def _local_route(model: str, inventory: dict[str, dict]) -> bool:
+    """Whether ``model`` stays on this Mac: its whole route closure is loopback oMLX and it has
+    no configured model fallback (docs/adr/0003-scoped-access-and-lightweight-local-models.md section 4)."""
+    entry = providers._load_models().get(model)
+    if entry is None:
+        return False
+    try:
+        closure = profiles._route_closure(entry["name"], locality="local_only", inventory=inventory)
+    except profiles.ProfileError:
+        return False
+    return "fallback" not in closure
+
+
+def _federation_rows(schema_version: int) -> list[dict]:
+    rows = _direct_model_rows()
+    if schema_version < 2:
+        return rows
+    inventory = profiles._inventory_by_name()
+    models = providers._load_models()
+    for row in rows:
+        row["locality"] = "local" if _local_route(row["id"], inventory) else "cloud"
+        entry = models.get(row["id"]) or {}
+        base_model = entry.get("base_model")
+        # As here (providers.resolve_base_model), a pack's model never answers a base-model name.
+        if isinstance(base_model, str) and base_model and (entry.get("origin") or {}).get("layer") != "pack":
+            row["base_model"] = base_model
+    return rows
+
+
 @app.get("/v1/federation/catalog")
 async def federation_catalog(request: Request):
-    """Return direct local routes to an explicitly configured peer."""
+    """Return direct local routes to an explicitly configured peer (``?schema_version=2`` adds locality)."""
     manager = federation.manager()
     try:
         validate_credential_separation()
     except (OSError, UnicodeError, ValueError) as exc:
         raise HTTPException(status_code=503, detail="model-gateway authentication is misconfigured") from exc
     manager.authenticate_catalog_request(request)
-    payload = manager.build_catalog(_direct_model_rows())
+    schema_version = 2 if request.query_params.get("schema_version") == "2" else 1
+    payload = manager.build_catalog(_federation_rows(schema_version), schema_version)
     return JSONResponse(content=payload, headers={federation.SOURCE_HEADER: manager.config.node_id})
+
+
+async def _local_forward(request: Request, path: str, handler):
+    """A trusted peer's local work: served only by this Mac's own oMLX, with no redirect, reroute,
+    model fallback or vision fallback (ADR 0003 section 4). Only peer forwards may use it."""
+    if not federation.manager().has_forwarding_headers(request):
+        return _peer_forward_error(path, HTTPException(status_code=403, detail="the local federation path is for peers"))
+    request.state.federation_local = True
+    request.state.disable_model_fallback = True
+    return await handler(request)
+
+
+@app.post(f"{federation.LOCAL_FORWARD_PREFIX}/chat/completions")
+async def local_forward_chat_completions(request: Request):
+    return await _local_forward(request, "/v1/chat/completions", chat_completions)
+
+
+@app.post(f"{federation.LOCAL_FORWARD_PREFIX}/messages")
+async def local_forward_messages(request: Request):
+    return await _local_forward(request, "/v1/messages", messages)
+
+
+@app.post(f"{federation.LOCAL_FORWARD_PREFIX}/responses")
+async def local_forward_responses(request: Request):
+    return await _local_forward(request, "/v1/responses", create_response)
 
 
 @app.get("/v1/debug/thinking")
@@ -3215,7 +3325,7 @@ async def create_response(request: Request):
         model_error = _validate_inbound_peer_model(request, "/v1/responses", model)
         if model_error is not None:
             return model_error
-    info = resolve(model)
+    info = _resolve_for(request, model)
     if not inbound_source and not info:
         forwarded = await _forward_imported_if_known(request, "/v1/responses", body)
         if forwarded is not None:
@@ -3602,7 +3712,7 @@ async def chat_completions(request: Request):
         model_error = _validate_inbound_peer_model(request, "/v1/chat/completions", model)
         if model_error is not None:
             return model_error
-    info = resolve(model)
+    info = _resolve_for(request, model)
     if not inbound_source and not info:
         forwarded = await _forward_imported_if_known(request, "/v1/chat/completions", body)
         if forwarded is not None:
@@ -4084,7 +4194,7 @@ async def messages(request: Request):
         model_error = _validate_inbound_peer_model(request, "/v1/messages", model)
         if model_error is not None:
             return model_error
-    info = resolve(model)
+    info = _resolve_for(request, model)
     if not inbound_source and not info:
         forwarded = await _forward_imported_if_known(request, "/v1/messages", body)
         if forwarded is not None:

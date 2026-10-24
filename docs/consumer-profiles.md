@@ -83,13 +83,14 @@ Registration replaces one consumer namespace atomically.
 ### Allowed values
 
 - `schema_version`: `1`.
-- `locality`: `local_only`, `cloud_explicit`.
+- `locality`: `local_only` (this Mac's loopback oMLX), `trusted_local` (this Mac, or a local model on a federation peer the owner marked `trusted_local`; see [federation.md](federation.md#trusted-local-peers-catalog-schema-2)), `cloud_explicit`.
 - `credential_policy`: `gateway_local`, `gateway_managed`, `consumer_byok`.
 - `protocols`: one or more of `openai_chat`, `openai_responses`, `anthropic_messages`.
 
 Valid combinations are:
 
 - `local_only` + `gateway_local`
+- `trusted_local` + `gateway_local`
 - `cloud_explicit` + `gateway_managed`
 - `cloud_explicit` + `consumer_byok`
 
