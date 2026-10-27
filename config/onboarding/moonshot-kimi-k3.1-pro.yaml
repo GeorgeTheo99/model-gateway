@@ -1,0 +1,41 @@
+schema_version: 1
+id: moonshot-kimi-k3.1-pro
+# Part of the curated list: installs with this provider's key get these models automatically.
+auto_add: true
+
+provider:
+  id: moonshot
+  base_url: https://api.moonshot.ai/v1
+  protocol: openai
+  display_name: Moonshot
+  secret_name: moonshot.api-key
+
+models:
+  - name: kimi-k3.1-pro
+    provider: moonshot
+    provider_model_id: kimi-k3.1-pro
+    alias: kimi31
+    display_name: Kimi K3.1 Pro (Moonshot)
+    family: kimi
+    base_model: kimi-k3.1-pro
+    context: 1048576
+    max_output_tokens: 131072
+    thinking: always
+    thinking_levels: [max]
+    thinking_format: openai
+    vision: true
+    pricing:
+      input: 2.0
+      output: 10.0
+      cache_read: 0.2
+      cache_write: 2.0
+      cache_write_1h: 4.0
+    quirks:
+      - force_reasoning_effort_max
+      - use_max_completion_tokens
+      - drop_fixed_sampling_fields
+      - named_tool_choice_as_required
+      - inline_image_urls_only
+    pi:
+      id: kimi-k3.1-pro
+    desc: Kimi K3.1 Pro via Moonshot; always-thinking multimodal and tool-capable model with a 1M-token context

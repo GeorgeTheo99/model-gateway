@@ -328,6 +328,22 @@ def test_committed_kimi_moonshot_rollback_has_no_stale_retirement():
     assert profile.get("retire", {}).get("models", []) == []
 
 
+def test_committed_kimi_k31_pro_profile_routes_to_moonshot_as_its_own_model():
+    from src.onboarding import load_profile
+
+    path = Path(__file__).resolve().parents[1] / "config" / "onboarding" / "moonshot-kimi-k3.1-pro.yaml"
+    profile = load_profile(path)
+    kimi = profile["models"][0]
+    assert profile["auto_add"] is True
+    assert kimi["provider"] == "moonshot"
+    assert kimi["provider_model_id"] == "kimi-k3.1-pro"
+    # Its own base model, so clients list it beside Kimi K3 rather than as another route to it.
+    assert (kimi["family"], kimi["base_model"]) == ("kimi", "kimi-k3.1-pro")
+    assert kimi["thinking_levels"] == ["max"]
+    assert "force_reasoning_effort_max" in kimi["quirks"]
+    assert profile.get("retire", {}).get("models", []) == []
+
+
 def test_committed_fireworks_glm53_profile_uses_exact_serverless_routes():
     from src.onboarding import load_profile
 

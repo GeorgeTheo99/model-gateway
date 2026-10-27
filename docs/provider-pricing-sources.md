@@ -48,7 +48,7 @@ useful only as a cross-check, never as the source of record.
 | `openai` | https://platform.openai.com/docs/pricing | HTML table | cached input (read only) |
 | `fireworks` | https://docs.fireworks.ai/serverless/pricing | HTML table (per-model: input / cached input / output) | cached input (read only) |
 | `openrouter` | https://openrouter.ai/api/v1/models | **JSON API** (machine-readable) | `prompt_cache_read` / `prompt_cache_write` (often null) |
-| `moonshot` | https://platform.kimi.ai/docs/pricing/chat-k3 | HTML table | cached input (read only) |
+| `moonshot` | https://platform.kimi.ai/docs/pricing/chat | HTML table | cached input, 5m and 1h writes (K3.1) |
 | `zhipuai` | https://open.bigmodel.cn/pricing | HTML (Chinese site) | none reported |
 
 ### Parsing notes per provider
@@ -105,6 +105,12 @@ above) when `prompt_cache_read` is non-null.
 these to `input`, `cache_read`, and `output` respectively. Automatic context
 caching is included; no separate cache-write token class is reported.
 
+**Moonshot** (verified 2026-10-27): Kimi K3.1 Pro is `$2.00` input, `$0.20`
+cached input, `$10.00` output, `$2.00` 5-minute writes and `$4.00` 1-hour
+writes per 1M tokens. Map these to `input`, `cache_read`, `output`,
+`cache_write` and `cache_write_1h`; its usage reports
+`prompt_tokens_details.cache_write_tokens`.
+
 **ZhipuAI (`zhipuai`)**: the BigModel pricing page
 (https://open.bigmodel.cn/pricing) lists GLM models in CNY per 1M tokens.
 Convert CNY→USD at the current rate and note the conversion date in the commit
@@ -127,6 +133,7 @@ Use this to know which source to read for each model. Regenerate with:
 | glm-5.3-fw | fireworks | accounts/fireworks/models/glm-5p3 | fireworks |
 | glm-5.3-flash-fw | fireworks | accounts/fireworks/models/glm-5p3-flash | fireworks |
 | kimi-k3 | fireworks | accounts/fireworks/models/kimi-k3 | fireworks |
+| kimi-k3.1-pro | moonshot | kimi-k3.1-pro | moonshot |
 | minimax-m3-fw | fireworks | accounts/fireworks/models/minimax-m3 | fireworks |
 | qwen3.8-max-fw | fireworks | accounts/fireworks/models/qwen3p8-max | fireworks |
 | deepseek-v4-flash-or | openrouter | deepseek/deepseek-v4-flash | openrouter API |

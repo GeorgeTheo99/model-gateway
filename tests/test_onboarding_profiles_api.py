@@ -128,6 +128,7 @@ def _rows(client, headers=MANAGER) -> dict[str, dict]:
 def test_lists_packaged_profiles_filtered_by_allowlist(client):
     assert set(_rows(client, ADMIN)) == {
         "anthropic-claude", "fireworks-glm-5.3", "fireworks-kimi-k3", "moonshot-kimi-k3-rollback",
+        "moonshot-kimi-k3.1-pro",
         "openai-gpt", "openrouter-claude", "openrouter-gemini-4", "openrouter-gpt",
     }
     rows = _rows(client)
