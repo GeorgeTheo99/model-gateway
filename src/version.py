@@ -4,7 +4,7 @@ Consumers compare these against their own minimum before using the gateway;
 ``/health`` stays version-free because older installers match it exactly.
 """
 
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 
 # Contracts a consumer may require. Add a name when a feature ships; never
 # remove or change the meaning of one.
@@ -28,5 +28,6 @@ CAPABILITIES = (
     "profiles.v1",
     "reasoning_tiers.v1",
     "scoped_manager.v1",
+    "text_only_image_notes.v1",
     "trusted_local_profiles.v1",
 )
