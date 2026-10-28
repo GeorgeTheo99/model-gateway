@@ -20,9 +20,9 @@ MEDIA_KEY = "media-gen-key"
 CATALOG = [
     {"name": "chat-a", "provider": "cloud-test", "provider_model_id": "chat-native",
      "pricing": {"input": 1.0, "output": 2.0}},
-    {"name": "pic", "alias": "pic-alias", "provider": "media", "provider_model_id": "z-image-turbo",
+    {"name": "pic", "alias": "pic-alias", "provider": "media", "provider_model_id": "qwen-image-2.1",
      "modality": "image", "pricing_status": "unmetered", "display_name": "Picture"},
-    {"name": "clip", "provider": "media", "provider_model_id": "ltx-2.3-distilled",
+    {"name": "clip", "provider": "media", "provider_model_id": "ltx-2.5",
      "modality": "video", "pricing_status": "unmetered"},
 ]
 
@@ -115,7 +115,7 @@ def test_modality_is_validated():
 def test_image_generation_is_forwarded_with_the_provider_model_id(media_gen):
     response = _image(model="pic-alias", seed=3)
     assert response.status_code == 200, response.text
-    assert response.json()["model_seen"] == "z-image-turbo"
+    assert response.json()["model_seen"] == "qwen-image-2.1"
     [forwarded] = media_gen.requests
     assert str(forwarded.url) == "http://media.test/v1/images/generations"
     assert json.loads(forwarded.content)["seed"] == 3
@@ -160,7 +160,7 @@ def test_allowlists_apply(media_gen):
 
 
 def test_media_is_hidden_from_default_discovery(media_gen):
-    media_ids = {"pic", "pic-alias", "z-image-turbo", "clip", "ltx-2.3-distilled"}
+    media_ids = {"pic", "pic-alias", "qwen-image-2.1", "clip", "ltx-2.5"}
     ids = {row["id"] for row in client.get("/v1/models", headers=_auth()).json()["data"]}
     assert "chat-a" in ids
     assert not ids & media_ids
@@ -186,7 +186,7 @@ def test_media_is_listed_on_request(media_gen):
     assert canonical["chat-a"]["modality"] == "chat"
     limited = client.get("/v1/models?include=modality", headers=_auth(LIMITED)).json()["data"]
     # Routable ids include each route's provider model id, as for chat rows.
-    assert {row["id"] for row in limited} == {"chat-a", "chat-native", "clip", "ltx-2.3-distilled"}
+    assert {row["id"] for row in limited} == {"chat-a", "chat-native", "clip", "ltx-2.5"}
     limited_canonical = client.get("/v1/models/canonical?include=modality", headers=_auth(LIMITED)).json()
     assert {row["id"] for row in limited_canonical["data"]} == {"chat-a", "clip"}
 
@@ -196,7 +196,7 @@ def test_video_jobs_belong_to_their_creator(media_gen):
     assert created.status_code == 200
     video = created.json()
     assert video["model"] == "clip"
-    assert media_gen.videos[video["id"]]["model"] == "ltx-2.3-distilled"
+    assert media_gen.videos[video["id"]]["model"] == "ltx-2.5"
 
     assert client.get(f"/v1/videos/{video['id']}", headers=_auth()).json()["status"] == "queued"
     content = client.get(f"/v1/videos/{video['id']}/content", headers=_auth())

@@ -57,19 +57,27 @@ class MediaModel:
     desc: str
     memory_gib: int  # media-gen's floor for loading and running it
     download_bytes: int
+    license: str
+    license_url: str
+    # Gated on Hugging Face: the owner accepts its terms there and signs in (`hf auth login`) first.
+    gated: bool = False
 
 
 # The curated models of the media-gen release media-runtime/ pins; each matches its catalog.
 MODELS = {
     model.name: model
     for model in (
-        MediaModel("flux2-klein-4b", "image", "FLUX.2 [klein] 4B",
-                   "FLUX.2 [klein] 4B text-to-image (Apache-2.0), served by Model Gateway media", 24, 15_996_000_000),
-        MediaModel("z-image-turbo", "image", "Z-Image Turbo",
-                   "Z-Image Turbo text-to-image (Apache-2.0), served by Model Gateway media", 40, 32_833_000_000),
-        MediaModel("ltx-2.3-distilled", "video", "LTX-2.3 Distilled",
-                   "LTX-2.3 distilled text/image-to-video with audio (LTX-2 Community License), "
-                   "served by Model Gateway media", 48, 49_200_000_000),
+        MediaModel("flux3-image-klein", "image", "FLUX 3 Image Klein",
+                   "FLUX 3 Image Klein text-to-image, served by Model Gateway media", 28, 20_321_000_000,
+                   "FLUX Kommunity License", "https://huggingface.co/black-forest-labs/flux-3-image-klein", gated=True),
+        MediaModel("qwen-image-2.1", "image", "Qwen-Image 2.1",
+                   "Qwen-Image 2.1 text-to-image with strong text rendering, served by Model Gateway media",
+                   74, 33_132_000_000,
+                   "Qwen Research License (non-commercial)", "https://huggingface.co/Qwen/Qwen-Image-2.1"),
+        MediaModel("ltx-2.5", "video", "LTX-2.5",
+                   "LTX-2.5 distilled text/image-to-video with audio, served by Model Gateway media",
+                   40, 45_224_000_000,
+                   "LTX-2 Community License", "https://huggingface.co/dgrauet/ltx-2.5-mlx-q8", gated=True),
     )
 }
 
@@ -389,6 +397,10 @@ def add(name: str) -> dict:
         if rebuilt:
             print("Building media-gen and its engines...", flush=True)
             _build()
+            # A release can retire models: their files go, and installed.json forgets them.
+            _run(str(venv_dir() / "bin" / "media-gen"), "prune",
+                 env=dict(os.environ, MEDIA_GEN_HOME=str(home_dir())))
+            _write_installed(installed())
         print(f"Downloading {media.name} ({media.download_bytes / 1e9:.1f} GB)...", flush=True)
         _pull(media)
         before = installed()
@@ -453,6 +465,23 @@ def _print_status(value: dict) -> None:
               f"{row['memory_gib']} GiB to run)")
 
 
+def _license_accepted(media: MediaModel, accepted: bool) -> bool:
+    """Each owner downloads the weights and is bound by the model's own license, so they accept it first."""
+    print(f"{media.display_name} is licensed under the {media.license}: {media.license_url}")
+    if media.gated:
+        print("Its weights are gated: accept its terms on that page while signed in to Hugging Face, "
+              "then sign in here with `hf auth login` (or set HF_TOKEN).")
+    if accepted:
+        return True
+    if not sys.stdin.isatty():
+        print("error: pass --accept-license to accept the license and install it", file=sys.stderr)
+        return False
+    if input("Accept its terms and install it? [y/N] ").strip().lower() in ("y", "yes"):
+        return True
+    print("Not installed")
+    return False
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="model-gateway media", description=__doc__.split("\n\n")[0])
     commands = parser.add_subparsers(dest="command", required=True)
@@ -460,6 +489,8 @@ def main(argv: list[str] | None = None) -> int:
     show.add_argument("--json", action="store_true")
     add_parser = commands.add_parser("add", help="install a model (and media-gen, the first time)")
     add_parser.add_argument("model", choices=sorted(MODELS))
+    add_parser.add_argument("--accept-license", action="store_true",
+                            help="accept the model's license without being asked")
     drop = commands.add_parser("remove", help="remove one model, or (without a model) everything")
     drop.add_argument("model", nargs="?", choices=sorted(MODELS))
     args = parser.parse_args(argv)
@@ -469,6 +500,8 @@ def main(argv: list[str] | None = None) -> int:
             value = status()
             print(json.dumps(value, indent=2)) if args.json else _print_status(value)
         elif args.command == "add":
+            if not _license_accepted(MODELS[args.model], args.accept_license):
+                return 1
             add(args.model)
             print(f"{args.model} is ready: POST /v1/images/generations or /v1/videos on this gateway "
                   f"(list it with GET /v1/models?include=modality)")

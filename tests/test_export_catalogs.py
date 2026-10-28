@@ -293,7 +293,7 @@ def test_media_models_are_not_exported(tmp_path):
     _write_model_info(
         mi,
         [
-            {"name": "pic", "alias": "pic", "provider": "media", "provider_model_id": "z-image-turbo",
+            {"name": "pic", "alias": "pic", "provider": "media", "provider_model_id": "qwen-image-2.1",
              "modality": "image", "pricing_status": "unmetered"},
             {"name": "b", "alias": "b", "provider": "openrouter", "provider_model_id": "b-id"},
         ],
@@ -303,7 +303,7 @@ def test_media_models_are_not_exported(tmp_path):
     r = _run(cfg, mi)
     assert r.returncode == 0, r.stderr
     aliases = json.loads((tmp_path / "aliases.json").read_text())
-    assert not [key for key in aliases if "z-image-turbo" in key]
+    assert not [key for key in aliases if "qwen-image-2.1" in key]
     assert "cloud:b-id" in aliases
 
 

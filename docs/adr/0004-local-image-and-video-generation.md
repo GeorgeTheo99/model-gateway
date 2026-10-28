@@ -8,11 +8,11 @@
 Model Gateway routes chat models only: three chat protocols, a token ledger,
 and a catalog every consumer (Pi, my-ai, Home Assistant) reads as a list of
 chat models. A Mac with enough unified memory can also generate images and
-video with open models (Z-Image, FLUX.2 [klein], LTX-2.3) through MLX, but:
+video with open models (FLUX 3 Image Klein, Qwen-Image 2.1, LTX-2.5) through MLX, but:
 
 - Generation is not chat: binary outputs, file storage, and video jobs that
   run for minutes. A video cannot be one HTTP request.
-- The engines (mflux, mlx-video-with-audio, torch) are several GB, move
+- The engines (mflux, ltx-2-mlx, torch) are several GB, move
   weekly, and a diffusion model that runs out of memory must not take chat
   routing down.
 - oMLX (0.7) has no image or video endpoints.

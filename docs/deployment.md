@@ -72,9 +72,9 @@ Installer component package that products (Home Server) embed and that also
 installs on its own:
 
 ```bash
-packaging/component/scripts/build-component-pkg.sh --version 0.11.0 --out-dir dist/component [--ref REF] [--product]
-packaging/component/scripts/build-component-pkg.sh --version 0.11.0 --out-dir dist/component --dry-run
-packaging/component/scripts/verify-component-pkg.sh dist/component/ModelGateway-component-0.11.0.pkg
+packaging/component/scripts/build-component-pkg.sh --version 0.12.0 --out-dir dist/component [--ref REF] [--product]
+packaging/component/scripts/build-component-pkg.sh --version 0.12.0 --out-dir dist/component --dry-run
+packaging/component/scripts/verify-component-pkg.sh dist/component/ModelGateway-component-0.12.0.pkg
 ```
 
 - The build needs a clean tree; `--version` must equal `src/version.py` at
@@ -460,20 +460,26 @@ Image and video generation is optional and runs in **media-gen**, its own
 loopback service ([ADR 0004](adr/0004-local-image-and-video-generation.md)).
 The release curates the models it can install:
 
-| Model | Kind | Download | Memory to run | M3 Ultra time |
-|---|---|---|---|---|
-| `flux2-klein-4b` | image | 16 GB | 24 GiB (Macs with 40 GiB and up) | ~8 s at 1024² |
-| `z-image-turbo` | image | 33 GB | 40 GiB (56 GiB and up) | ~40 s at 1024² |
-| `ltx-2.3-distilled` | video with audio | 49 GB | 48 GiB (64 GiB and up) | ~95 s for 5 s at 768×512 |
+| Model | Kind | Download | Memory to run | M3 Ultra time | License |
+|---|---|---|---|---|---|
+| `flux3-image-klein` | image | 20 GB | 28 GiB (Macs with 44 GiB and up) | ~31 s at 1024² | FLUX Kommunity (gated) |
+| `qwen-image-2.1` | image, strong text rendering | 33 GB | 74 GiB (90 GiB and up) | ~3.5 min at 1328² | Qwen Research (non-commercial) |
+| `ltx-2.5` | video with audio | 45 GB | 40 GiB (56 GiB and up) | ~3 min for 5 s at 1280×704 | LTX-2 Community (gated) |
+
+Each owner downloads the weights and is bound by the model's license, so `add`
+shows it and asks to accept it (`--accept-license` accepts it without asking).
+Gated models also need their terms accepted on Hugging Face while signed in,
+then `hf auth login` (or `HF_TOKEN`) on this Mac. A release that retires models
+deletes their files the next time `add` builds it (`media-gen prune`).
 
 ```bash
 model-gateway media status [--json]   # managed, running, every model and whether it is installed
-model-gateway media add MODEL         # build media-gen (first time), download, start, wire the gateway
+model-gateway media add MODEL [--accept-license]   # build media-gen (first time), download, start, wire the gateway
 model-gateway media remove [MODEL]    # one model, or (none, or the last) the service and all its state
 ```
 
 `add` runs in the foreground. It builds media-gen and its engines (mflux,
-mlx-video-with-audio) from the locked `media-runtime/` project with uv into
+ltx-2-mlx) from the locked `media-runtime/` project with uv into
 `~/Library/Application Support/model-gateway/media/venv`, downloads the
 model's pinned files through `media-gen pull` (HTTPS only, resumable, capped at
 `MODEL_GATEWAY_MEDIA_DOWNLOAD_MBPS`, default 150, each file's SHA-256 or Git
@@ -496,7 +502,7 @@ Clients call the OpenAI-shaped endpoints on the gateway:
 
 - `POST /v1/images/generations` (`b64_json` only; extensions `seed`, `steps`, `guidance`).
 - `POST /v1/videos` (JSON, or multipart with an `input_reference` image;
-  `seconds` 1-12; `size` snapped to multiples of 64, so `1280x720` becomes
+  `seconds` 1-15; `size` snapped to multiples of 64, so `1280x720` becomes
   `1280x704`), then
   poll `GET /v1/videos/{id}` until `completed` and fetch
   `GET /v1/videos/{id}/content`. `GET /v1/videos` lists the caller's videos,

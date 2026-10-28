@@ -99,11 +99,13 @@ def _config() -> dict:
 
 
 def test_add_builds_downloads_starts_and_wires_the_gateway(gateway, mac):
-    status = mr.add("flux2-klein-4b")
+    status = mr.add("flux3-image-klein")
 
     commands = [c[1:4] for c in mac.calls if c[0] == "run"]
     assert commands[0] == ("uv", "sync", "--locked")
-    assert commands[2] == (str(mr.venv_dir() / "bin" / "media-gen"), "pull", "flux2-klein-4b")
+    # A new build first deletes the files of models its release retired.
+    assert commands[2] == (str(mr.venv_dir() / "bin" / "media-gen"), "prune")
+    assert commands[3] == (str(mr.venv_dir() / "bin" / "media-gen"), "pull", "flux3-image-klein")
     plist = plistlib.loads(mr.plist_path().read_bytes())
     assert plist[lr.OWNER_KEY] == lr.owner_value()
     assert plist["ProgramArguments"] == [str(mr.venv_dir() / "bin" / "media-gen"), "serve"]
@@ -119,31 +121,31 @@ def test_add_builds_downloads_starts_and_wires_the_gateway(gateway, mac):
     assert lr.generation()  # the running gateway reloads
 
     providers.reload()
-    info = providers.resolve("flux2-klein-4b")
+    info = providers.resolve("flux3-image-klein")
     assert info.provider == "media" and info.modality == "image"
-    assert providers.pricing_status_for("flux2-klein-4b") == "unmetered"
-    assert [m["name"] for m in status["models"] if m["installed"]] == ["flux2-klein-4b"]
+    assert providers.pricing_status_for("flux3-image-klein") == "unmetered"
+    assert [m["name"] for m in status["models"] if m["installed"]] == ["flux3-image-klein"]
     assert status["managed"] and status["running"]
 
 
 def test_a_second_model_joins_and_video_skips_the_generation_check(gateway, mac):
-    mr.add("flux2-klein-4b")
+    mr.add("flux3-image-klein")
     mac.calls.clear()
-    mr.add("ltx-2.3-distilled")
+    mr.add("ltx-2.5")
     assert ("request", "v1/images/generations", True) not in mac.calls
     # Same build, same plist, service healthy: no rebuild, no restart of running jobs.
     assert not [c for c in mac.calls if c[0] == "run" and c[2:3] == ("sync",)]
     assert not [c for c in mac.calls if c[:2] == ("launchctl", "bootstrap")]
     providers.reload()
-    assert providers.resolve("ltx-2.3-distilled").modality == "video"
-    assert mr.installed() == ["flux2-klein-4b", "ltx-2.3-distilled"]
+    assert providers.resolve("ltx-2.5").modality == "video"
+    assert mr.installed() == ["flux3-image-klein", "ltx-2.5"]
 
 
 def test_rows_load_only_while_this_gateway_manages_media(gateway, mac):
     assert mr.catalog_rows(_config()) == []
-    mr.add("z-image-turbo")
+    mr.add("qwen-image-2.1")
     rows = shipped.layer(_config()).entries
-    [row] = [r for r in rows if r["name"] == "z-image-turbo"]
+    [row] = [r for r in rows if r["name"] == "qwen-image-2.1"]
     assert row["origin"] == {"layer": "shipped", "profile": "media"}
     assert row["modality"] == "image"
     names = {r["name"] for r in shipped.all_shipped_rows({})}
@@ -154,13 +156,13 @@ def test_refuses_a_foreign_service_or_provider(gateway, mac):
     mr.plist_path().parent.mkdir(parents=True, exist_ok=True)
     mr.plist_path().write_bytes(plistlib.dumps({"Label": mr.MEDIA_LABEL}))
     with pytest.raises(lr.LocalRuntimeError, match="managed outside Model Gateway"):
-        mr.add("flux2-klein-4b")
+        mr.add("flux3-image-klein")
     mr.plist_path().unlink()
     config = _config()
     config["providers"]["media"] = {"base_url": "http://elsewhere/v1", "api_key": "x"}
     config_io.CONFIG_PATH.write_text(yaml.safe_dump(config))
     with pytest.raises(lr.LocalRuntimeError, match="does not manage"):
-        mr.add("flux2-klein-4b")
+        mr.add("flux3-image-klein")
     assert [c for c in mac.calls if c[0] == "run"] == []
 
 
@@ -181,19 +183,20 @@ def test_a_failed_gateway_wiring_unlists_the_model(gateway, mac, monkeypatch):
 
     monkeypatch.setattr(lr, "_write_config", broken_config)
     with pytest.raises(OSError):
-        mr.add("flux2-klein-4b")
+        mr.add("flux3-image-klein")
     assert mr.installed() == []
     assert "media" not in _config()["providers"]
 
 
 def test_refuses_a_mac_that_is_too_small(gateway, mac, monkeypatch):
     monkeypatch.setattr(lr, "_memory_bytes", lambda: 48 * GIB)
-    with pytest.raises(lr.LocalRuntimeError, match="at least 64 GB"):
-        mr.add("ltx-2.3-distilled")
+    needed = mr.MODELS["ltx-2.5"].memory_gib + mr.SYSTEM_MEMORY // GIB
+    with pytest.raises(lr.LocalRuntimeError, match=f"at least {needed} GB"):
+        mr.add("ltx-2.5")
     monkeypatch.setattr(lr, "_memory_bytes", lambda: 128 * GIB)
     monkeypatch.setattr(lr, "_disk_free", lambda path: 20 * GIB)
     with pytest.raises(lr.LocalRuntimeError, match="free disk space"):
-        mr.add("ltx-2.3-distilled")
+        mr.add("ltx-2.5")
 
 
 def test_failed_check_leaves_the_gateway_unchanged(gateway, mac, monkeypatch):
@@ -204,7 +207,7 @@ def test_failed_check_leaves_the_gateway_unchanged(gateway, mac, monkeypatch):
 
     monkeypatch.setattr(lr, "_request", broken)
     with pytest.raises(lr.LocalRuntimeError, match="does not report"):
-        mr.add("flux2-klein-4b")
+        mr.add("flux3-image-klein")
     assert "media" not in _config()["providers"]
     assert mr.installed() == []
     # The first install's service is stopped again; the build is kept for a retry.
@@ -214,20 +217,20 @@ def test_failed_check_leaves_the_gateway_unchanged(gateway, mac, monkeypatch):
 
 
 def test_a_new_release_rebuilds_and_restarts(gateway, mac):
-    mr.add("flux2-klein-4b")
+    mr.add("flux3-image-klein")
     (mr.RUNTIME_PROJECT / "uv.lock").write_text("version = 2\n")
     mac.calls.clear()
-    mr.add("z-image-turbo")
+    mr.add("qwen-image-2.1")
     assert [c for c in mac.calls if c[0] == "run" and c[2:3] == ("sync",)]
     assert [c for c in mac.calls if c[:2] == ("launchctl", "bootstrap")]
 
 
 def test_remove_one_model_then_everything(gateway, mac):
-    mr.add("flux2-klein-4b")
-    mr.add("z-image-turbo")
-    mr.remove("flux2-klein-4b")
-    assert mr.installed() == ["z-image-turbo"]
-    assert ("run", str(mr.venv_dir() / "bin" / "media-gen"), "remove", "flux2-klein-4b") in mac.calls
+    mr.add("flux3-image-klein")
+    mr.add("qwen-image-2.1")
+    mr.remove("flux3-image-klein")
+    assert mr.installed() == ["qwen-image-2.1"]
+    assert ("run", str(mr.venv_dir() / "bin" / "media-gen"), "remove", "flux3-image-klein") in mac.calls
     assert "media" in _config()["providers"]
 
     mr.remove()
@@ -240,17 +243,27 @@ def test_remove_one_model_then_everything(gateway, mac):
 
 
 def test_admin_cannot_edit_the_managed_provider(gateway, mac):
-    mr.add("flux2-klein-4b")
+    mr.add("flux3-image-klein")
     with pytest.raises(ValueError, match="model-gateway media"):
         config_io._refuse_local_ai_provider(_config()["providers"], "media")
 
 
-def test_cli(gateway, mac, capsys):
-    assert mr.main(["add", "flux2-klein-4b"]) == 0
-    assert "flux2-klein-4b is ready" in capsys.readouterr().out
+def test_cli(gateway, mac, capsys, monkeypatch):
+    # The owner accepts the model's license first: asked at a terminal, else --accept-license.
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    assert mr.main(["add", "flux3-image-klein"]) == 1
+    out, err = capsys.readouterr()
+    assert "FLUX Kommunity License" in out and "hf auth login" in out and "--accept-license" in err
+    assert not mr.installed()
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt: "n")
+    assert mr.main(["add", "qwen-image-2.1"]) == 1
+    assert "Not installed" in capsys.readouterr().out
+    assert mr.main(["add", "flux3-image-klein", "--accept-license"]) == 0
+    assert "flux3-image-klein is ready" in capsys.readouterr().out
     assert mr.main(["status", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["managed"] is True
-    assert mr.main(["remove", "z-image-turbo"]) == 2
+    assert mr.main(["remove", "qwen-image-2.1"]) == 2
     assert "not installed" in capsys.readouterr().err
 
 
@@ -263,6 +276,15 @@ def test_the_locked_runtime_pins_media_gen_by_commit():
     assert source["git"] == "https://github.com/GeorgeTheo99/media-gen" and len(source["rev"]) == 40
     lock = (mr.RUNTIME_PROJECT / "uv.lock").read_text()
     assert f'source = {{ git = "{source["git"]}?rev={source["rev"]}#{source["rev"]}" }}' in lock
-    for engine in ('name = "mflux"\nversion = "0.24.0"', 'name = "mlx-video-with-audio"\nversion = "0.1.37"'):
+    for engine in ('name = "mflux"\nversion = "0.24.0"', 'name = "ltx-pipelines-mlx"\nversion = "0.18.0"'):
         assert engine in lock
-    assert set(mr.MODELS) == {"flux2-klein-4b", "z-image-turbo", "ltx-2.3-distilled"}
+    assert set(mr.MODELS) == {"flux3-image-klein", "qwen-image-2.1", "ltx-2.5"}
+
+
+def test_a_new_release_forgets_the_models_it_retired(gateway, mac):
+    mr.add("flux3-image-klein")
+    mr.installed_path().write_text(json.dumps(["flux3-image-klein", "z-image-turbo"]))
+    mr.build_path().write_text("an older release\n")
+    mr.add("ltx-2.5")
+    assert json.loads(mr.installed_path().read_text()) == ["flux3-image-klein", "ltx-2.5"]
+
