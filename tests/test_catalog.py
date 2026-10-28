@@ -312,8 +312,9 @@ def test_committed_kimi_onboarding_profile_routes_to_fireworks_with_stable_pi_id
     assert kimi["provider"] == "fireworks"
     assert kimi["provider_model_id"] == "accounts/fireworks/models/kimi-k3"
     assert kimi["thinking"] == "always"
-    assert kimi["thinking_levels"] == ["max"]
-    assert kimi["quirks"] == ["force_reasoning_effort_max"]
+    assert kimi["thinking_levels"] == ["low", "high", "max"]
+    assert kimi["thinking_format"] == "kimi"
+    assert "quirks" not in kimi
     assert kimi["pi"]["id"] == "kimi-k3"
 
 
@@ -325,6 +326,7 @@ def test_committed_kimi_moonshot_rollback_has_no_stale_retirement():
     kimi = profile["models"][0]
     assert kimi["provider"] == "moonshot"
     assert kimi["provider_model_id"] == "kimi-k3"
+    assert (kimi["thinking_levels"], kimi["thinking_format"]) == (["low", "high", "max"], "kimi")
     assert profile.get("retire", {}).get("models", []) == []
 
 
@@ -339,8 +341,8 @@ def test_committed_kimi_k31_pro_profile_routes_to_moonshot_as_its_own_model():
     assert kimi["provider_model_id"] == "kimi-k3.1-pro"
     # Its own base model, so clients list it beside Kimi K3 rather than as another route to it.
     assert (kimi["family"], kimi["base_model"]) == ("kimi", "kimi-k3.1-pro")
-    assert kimi["thinking_levels"] == ["max"]
-    assert "force_reasoning_effort_max" in kimi["quirks"]
+    assert (kimi["thinking_levels"], kimi["thinking_format"]) == (["low", "high", "max"], "kimi")
+    assert "force_reasoning_effort_max" not in kimi["quirks"]
     assert profile.get("retire", {}).get("models", []) == []
 
 

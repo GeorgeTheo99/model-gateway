@@ -305,6 +305,39 @@ def test_zai_glm53_disabled_toggle_becomes_low(thinking):
     }
 
 
+KIMI_LEVELS = ("low", "high", "max")
+
+
+def test_kimi_defaults_to_max():
+    for req in ({"messages": []}, {"messages": [], "thinking": True},
+                {"messages": [], "thinking": {"type": "enabled"}}):
+        enabled, view = _run("kimi", req, thinking_levels=KIMI_LEVELS)
+        assert enabled is True
+        assert view == {"reasoning_effort": "max"}
+
+
+@pytest.mark.parametrize("level", KIMI_LEVELS)
+@pytest.mark.parametrize("field", ["reasoning_effort", "reasoning", "output_config"])
+def test_kimi_forwards_each_level_verbatim(level, field):
+    req = {"messages": []}
+    if field == "reasoning_effort":
+        req["reasoning_effort"] = level
+    elif field == "reasoning":
+        req["reasoning"] = {"effort": level}
+    else:
+        req.update(thinking={"type": "adaptive"}, output_config={"effort": level})
+    enabled, view = _run("kimi", req, thinking_levels=KIMI_LEVELS)
+    assert enabled is True
+    assert view == {"reasoning_effort": level}
+
+
+@pytest.mark.parametrize("level", ["none", "minimal", "medium", "xhigh"])
+def test_kimi_rejects_levels_it_does_not_declare(level):
+    # Moonshot silently accepts unknown efforts, so the gateway must refuse them.
+    with pytest.raises(server_module.ThinkingValidationError, match="not supported"):
+        _run("kimi", {"messages": [], "reasoning_effort": level}, thinking_levels=KIMI_LEVELS)
+
+
 # ── contract: optional models get no params unless the client asks ───────────
 
 def test_optional_model_no_control_is_noop():
@@ -2658,6 +2691,33 @@ def test_debug_thinking_endpoint_matrix(client):
     assert "by_format" in body["summary"]
     assert "gateway_levels" not in body
     assert all("thinking_levels" in row for row in body["models"])
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+@pytest.mark.parametrize("profile_name,provider,base_url", [
+    ("moonshot-kimi-k3.1-pro", "moonshot", "https://api.moonshot.ai/v1"),
+    ("fireworks-kimi-k3", "fireworks", "https://api.fireworks.ai/inference/v1"),
+])
+def test_kimi_profiles_advertise_their_levels_and_max_default(client, monkeypatch, profile_name, provider, base_url):
+    from src.onboarding import load_profile
+
+    profile_path = Path(__file__).resolve().parents[1] / "config" / "onboarding" / f"{profile_name}.yaml"
+    entry = load_profile(profile_path)["models"][0]
+    monkeypatch.setattr(providers, "_config", {
+        "providers": {provider: {"base_url": base_url, "api_key": "test-key"}},
+    })
+    monkeypatch.setattr(
+        providers,
+        "_models",
+        {model_id: entry for model_id in providers._entry_routable_ids(entry)},
+    )
+
+    models_response = client.get("/v1/models")
+    assert models_response.status_code == 200
+    advertised = next(row for row in models_response.json()["data"] if row["id"] == entry["name"])
+    assert advertised["thinking_levels"] == ["low", "high", "max"]
+    assert advertised["default_enabled_level"] == "max"
+    assert advertised["forwarded_params"] == ["reasoning_effort"]
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")

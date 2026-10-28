@@ -1295,12 +1295,15 @@ def _thinking_levels_for_info(info) -> tuple[str, ...]:
         raise ThinkingValidationError(str(exc)) from exc
 
 
-def _default_enabled_thinking_level(levels: tuple[str, ...]) -> str | None:
+def _default_enabled_thinking_level(levels: tuple[str, ...], thinking_format: str = "") -> str | None:
     enabled = [level for level in levels if level != "off"]
     if not enabled:
         return None
+    # Kimi's K3 series defaults to max, its strongest level.
+    if thinking_format == "kimi" and "max" in enabled:
+        return "max"
     # Preserve the historical enabled/default behavior where possible. Models
-    # with a narrower declaration (notably Kimi K3) pick their strongest level.
+    # with a narrower declaration pick their strongest level.
     if "high" in enabled:
         return "high"
     return max(enabled, key=catalog.THINKING_LEVELS.index)
@@ -1574,7 +1577,7 @@ def _extract_reasoning_control(req: dict, info) -> dict:
         if budget and _uses_adaptive_anthropic_thinking(info.provider_model_id):
             effort = _legacy_anthropic_budget_effort(budget)
         else:
-            effort = _default_enabled_thinking_level(levels)
+            effort = _default_enabled_thinking_level(levels, getattr(info, "thinking_format", "") or "")
     elif enabled is False and not effort:
         effort = "off"
 
@@ -2320,6 +2323,14 @@ def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat") -> bool:
             req["reasoning_effort"] = "max" if effort in {"xhigh", "max"} else "high"
         return bool(enabled)
 
+    if fmt == "kimi":
+        # Kimi's K3 series takes low/high/max verbatim (and silently accepts
+        # unknown values); the catalog's levels reject every other level
+        # before dispatch reaches this branch.
+        if enabled:
+            req["reasoning_effort"] = effort
+        return bool(enabled)
+
     if fmt == "deepseek":
         req["thinking"] = {"type": "enabled" if enabled else "disabled"}
         if enabled and effort:
@@ -2359,7 +2370,7 @@ def _forwarded_thinking_keys(req: dict) -> set[str]:
 def _default_enabled_thinking_level_for_entry(entry: dict, levels: tuple[str, ...]) -> str | None:
     if "zai_glm53_thinking" in set(entry.get("quirks") or ()):
         return "max" if "max" in levels else _default_enabled_thinking_level(levels)
-    return _default_enabled_thinking_level(levels)
+    return _default_enabled_thinking_level(levels, entry.get("thinking_format", "") or "")
 
 
 def _probe_forwarded_params(entry: dict, levels: tuple[str, ...]) -> set[str]:

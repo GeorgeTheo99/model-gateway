@@ -21,15 +21,13 @@ models:
     context: 1048576
     max_output_tokens: 131072
     thinking: always
-    thinking_levels: [max]
-    thinking_format: openai
+    thinking_levels: [low, high, max]
+    thinking_format: kimi
     vision: true
     pricing:
       input: 3.0
       output: 15.0
       cache_read: 0.3
-    quirks:
-      - force_reasoning_effort_max
     pi:
       id: kimi-k3
     zdr: true

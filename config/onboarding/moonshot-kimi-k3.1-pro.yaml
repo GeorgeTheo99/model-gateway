@@ -21,8 +21,8 @@ models:
     context: 1048576
     max_output_tokens: 131072
     thinking: always
-    thinking_levels: [max]
-    thinking_format: openai
+    thinking_levels: [low, high, max]
+    thinking_format: kimi
     vision: true
     pricing:
       input: 2.0
@@ -31,7 +31,6 @@ models:
       cache_write: 2.0
       cache_write_1h: 4.0
     quirks:
-      - force_reasoning_effort_max
       - use_max_completion_tokens
       - drop_fixed_sampling_fields
       - named_tool_choice_as_required

@@ -349,7 +349,8 @@ def validate_upstream_completion(profile: dict, api_key: str) -> None:
         "stream": False,
     }
     if not anthropic:
-        if "force_reasoning_effort_max" in quirks:
+        # As live routing does: Kimi's format sends its max default.
+        if "force_reasoning_effort_max" in quirks or model.get("thinking_format") == "kimi":
             body["reasoning_effort"] = "max"
         if "openrouter_zdr" in quirks:
             body["provider"] = {"zdr": True}
