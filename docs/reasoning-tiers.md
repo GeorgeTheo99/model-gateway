@@ -31,11 +31,9 @@ GPT-6 Astra (`low` to `xhigh`; default `high`) gets low, low, high, xhigh.
   `thinking`, `output_config.effort`, `chat_template_kwargs`) is a 400; so is an
   unknown tier. A client that steers a model mid-run sends concrete levels from then on.
 - A tier overrides a consumer profile's default `reasoning_effort`.
-- The tier is placed on the model that serves the request: after a vision reroute,
-  the fallback model's levels.
+- The tier is placed on the levels of the model that serves the request.
 - Federation: the gateway that receives the tier places it once, on the peer's
-  published levels and thinking format, and forwards a concrete level. A peer that then
-  reroutes the request for vision checks that level against its fallback model.
+  published levels and thinking format, and forwards a concrete level.
 
 ## Discovery
 

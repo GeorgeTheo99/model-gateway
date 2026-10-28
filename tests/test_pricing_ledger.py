@@ -369,9 +369,8 @@ def test_semantic_request_records_requested_and_resolved_model_ids(tmp_ledger, m
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
-def test_vision_validation_error_keeps_resolution_receipt(tmp_ledger, monkeypatch):
-    info = _info(provider="omlx", provider_model_id="GLM-5.2-MLX-4.5bit")
-    vision = _info(provider="omlx", provider_model_id="gemma4-26b-upstream", vision=True)
+def test_image_validation_error_keeps_resolution_receipt(tmp_ledger, monkeypatch):
+    info = _info(provider="omlx", provider_model_id="GLM-5.2-MLX-4.5bit", vision=True)
     import src.providers as providers
     monkeypatch.setattr(providers, "_models", {
         "auto-local": {
@@ -381,30 +380,21 @@ def test_vision_validation_error_keeps_resolution_receipt(tmp_ledger, monkeypatc
             "pricing_status": "unmetered",
         },
     })
-    monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
-    monkeypatch.delenv("GATEWAY_VISION_FALLBACK_MODE", raising=False)
-    monkeypatch.delenv("GATEWAY_VISION_FALLBACK_CLOUD", raising=False)
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_LOCAL", "gemma4-26b")
     monkeypatch.setattr(
         server_module,
         "resolve",
-        lambda model, provider_override=None: (
-            info if model == "auto-local" else vision if model == "gemma4-26b" else None
-        ),
+        lambda model, provider_override=None: info if model == "auto-local" else None,
     )
 
     with TestClient(app) as client:
+        # A translated route cannot dereference a Responses file_id.
         response = client.post(
-            "/v1/chat/completions",
+            "/v1/responses",
             json={
                 "model": "auto-local",
-                "messages": [{
-                    "role": "user",
-                    "content": [{
-                        "type": "image_url",
-                        "image_url": {"url": "https://example.test/not-inline.png"},
-                    }],
-                }],
+                "input": [{"type": "message", "role": "user", "content": [
+                    {"type": "input_image", "file_id": "file_123"},
+                ]}],
             },
         )
         assert response.status_code == 400

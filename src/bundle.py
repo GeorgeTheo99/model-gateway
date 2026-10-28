@@ -249,11 +249,9 @@ def restore_rollback(path: Path) -> list[str]:
 def _validate_loaded_gateway() -> None:
     """The checks startup and /admin/api/reload apply to a new registry."""
     from src.auth import validate_credential_separation
-    from src.server import _validate_vision_fallback_policy
 
     providers.reload()
     providers.snapshot_registry()
-    _validate_vision_fallback_policy(log_policy=False)
     validate_credential_separation()
 
 

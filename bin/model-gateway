@@ -135,41 +135,6 @@ CLIENT_KEYS_FILE="${MODEL_GATEWAY_CLIENT_KEYS_FILE-$(installed_plist_env MODEL_G
 # A custom state directory (local AI's home) is recorded in the LaunchAgent; keep it across reinstalls.
 MODEL_GATEWAY_STATE_DIR="${MODEL_GATEWAY_STATE_DIR:-$(installed_plist_env MODEL_GATEWAY_STATE_DIR)}"
 [ -z "$MODEL_GATEWAY_STATE_DIR" ] || export MODEL_GATEWAY_STATE_DIR
-if [ "${GATEWAY_VISION_FALLBACK+x}" = x ]; then
-  VISION_FALLBACK="$GATEWAY_VISION_FALLBACK"
-else
-  VISION_FALLBACK="$(installed_plist_env GATEWAY_VISION_FALLBACK)"
-fi
-if [ "${GATEWAY_VISION_FALLBACK_LOCAL+x}" = x ]; then
-  VISION_FALLBACK_LOCAL="$GATEWAY_VISION_FALLBACK_LOCAL"
-else
-  VISION_FALLBACK_LOCAL="$(installed_plist_env GATEWAY_VISION_FALLBACK_LOCAL)"
-fi
-if [ "${GATEWAY_VISION_FALLBACK_CLOUD+x}" = x ]; then
-  VISION_FALLBACK_CLOUD="$GATEWAY_VISION_FALLBACK_CLOUD"
-else
-  VISION_FALLBACK_CLOUD="$(installed_plist_env GATEWAY_VISION_FALLBACK_CLOUD)"
-fi
-if [ "${GATEWAY_VISION_FALLBACK_MODE+x}" = x ]; then
-  VISION_FALLBACK_MODE="$GATEWAY_VISION_FALLBACK_MODE"
-else
-  VISION_FALLBACK_MODE="$(installed_plist_env GATEWAY_VISION_FALLBACK_MODE)"
-fi
-if [ "${GATEWAY_VISION_FALLBACK_MAX_IMAGES+x}" = x ]; then
-  VISION_FALLBACK_MAX_IMAGES="$GATEWAY_VISION_FALLBACK_MAX_IMAGES"
-else
-  VISION_FALLBACK_MAX_IMAGES="$(installed_plist_env GATEWAY_VISION_FALLBACK_MAX_IMAGES)"
-fi
-if [ "${GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS+x}" = x ]; then
-  VISION_OBSERVATION_CACHE_TTL_SECONDS="$GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS"
-else
-  VISION_OBSERVATION_CACHE_TTL_SECONDS="$(installed_plist_env GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS)"
-fi
-if [ "${GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS+x}" = x ]; then
-  VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS="$GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS"
-else
-  VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS="$(installed_plist_env GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS)"
-fi
 UV_BIN="${UV_BIN:-$(command -v uv 2>/dev/null || true)}"
 
 # Colors (disabled when not a TTY).
@@ -478,7 +443,7 @@ write_plist() {
   ensure_private_dir "$(dirname "$LEDGER_PATH")"
   ensure_private_dir "$BACKUP_DIR"
   ensure_private_file "$LOG_FILE"
-  local plist plist_tmp program_args owner_key="" client_keys="" launchd_keys="" e_label e_plist_dir e_root e_host e_port e_admin_writes e_config e_model_info e_model_info_source e_ledger e_vision_fallback e_vision_local e_vision_cloud e_vision_mode e_vision_max_images e_vision_cache_ttl e_vision_total_timeout e_log_dir e_backup e_legacy_backups e_log
+  local plist plist_tmp program_args owner_key="" client_keys="" launchd_keys="" e_label e_plist_dir e_root e_host e_port e_admin_writes e_config e_model_info e_model_info_source e_ledger e_log_dir e_backup e_legacy_backups e_log
   plist="$(plist_path)"
   plist_tmp="$(mktemp "$PLIST_DIR/.${LABEL}.plist.XXXXXX")"
   chmod 600 "$plist_tmp"
@@ -520,13 +485,6 @@ write_plist() {
   e_model_info="$(xml_escape "$MODEL_INFO_PATH")"
   e_model_info_source="$(xml_escape "$MODEL_INFO_SOURCE_PATH")"
   e_ledger="$(xml_escape "$LEDGER_PATH")"
-  e_vision_fallback="$(xml_escape "$VISION_FALLBACK")"
-  e_vision_local="$(xml_escape "$VISION_FALLBACK_LOCAL")"
-  e_vision_cloud="$(xml_escape "$VISION_FALLBACK_CLOUD")"
-  e_vision_mode="$(xml_escape "$VISION_FALLBACK_MODE")"
-  e_vision_max_images="$(xml_escape "$VISION_FALLBACK_MAX_IMAGES")"
-  e_vision_cache_ttl="$(xml_escape "$VISION_OBSERVATION_CACHE_TTL_SECONDS")"
-  e_vision_total_timeout="$(xml_escape "$VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS")"
   e_log_dir="$(xml_escape "$LOG_DIR")"
   e_backup="$(xml_escape "$BACKUP_DIR")"
   e_legacy_backups="$(xml_escape "$LEGACY_BACKUP_DIRS")"
@@ -548,13 +506,6 @@ write_plist() {
   <key>MODEL_GATEWAY_MODEL_INFO</key><string>${e_model_info}</string>
   <key>MODEL_GATEWAY_MODEL_INFO_SOURCE</key><string>${e_model_info_source}</string>
   <key>MODEL_GATEWAY_LEDGER_PATH</key><string>${e_ledger}</string>${client_keys}
-  <key>GATEWAY_VISION_FALLBACK</key><string>${e_vision_fallback}</string>
-  <key>GATEWAY_VISION_FALLBACK_LOCAL</key><string>${e_vision_local}</string>
-  <key>GATEWAY_VISION_FALLBACK_CLOUD</key><string>${e_vision_cloud}</string>
-  <key>GATEWAY_VISION_FALLBACK_MODE</key><string>${e_vision_mode}</string>
-  <key>GATEWAY_VISION_FALLBACK_MAX_IMAGES</key><string>${e_vision_max_images}</string>
-  <key>GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS</key><string>${e_vision_cache_ttl}</string>
-  <key>GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS</key><string>${e_vision_total_timeout}</string>
   <key>MODEL_GATEWAY_LOG_DIR</key><string>${e_log_dir}</string>
   <key>MODEL_GATEWAY_BACKUP_DIR</key><string>${e_backup}</string>
   <key>MODEL_GATEWAY_LEGACY_BACKUP_DIRS</key><string>${e_legacy_backups}</string>
@@ -723,13 +674,6 @@ MODEL_GATEWAY_CONFIG=$CONFIG_PATH
 MODEL_GATEWAY_MODEL_INFO=$MODEL_INFO_PATH
 MODEL_GATEWAY_MODEL_INFO_SOURCE=$MODEL_INFO_SOURCE_PATH
 MODEL_GATEWAY_LEDGER_PATH=$LEDGER_PATH
-GATEWAY_VISION_FALLBACK=$VISION_FALLBACK
-GATEWAY_VISION_FALLBACK_LOCAL=$VISION_FALLBACK_LOCAL
-GATEWAY_VISION_FALLBACK_CLOUD=$VISION_FALLBACK_CLOUD
-GATEWAY_VISION_FALLBACK_MODE=$VISION_FALLBACK_MODE
-GATEWAY_VISION_FALLBACK_MAX_IMAGES=$VISION_FALLBACK_MAX_IMAGES
-GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS=$VISION_OBSERVATION_CACHE_TTL_SECONDS
-GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS=$VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS
 MODEL_GATEWAY_LOG_DIR=$LOG_DIR
 MODEL_GATEWAY_BACKUP_DIR=$BACKUP_DIR
 MODEL_GATEWAY_LEGACY_BACKUP_DIRS=$LEGACY_BACKUP_DIRS
@@ -923,7 +867,7 @@ cmd_secrets() {
 }
 
 # Run a Python operator helper with the running service's environment, so
-# validation sees the same client keys, backup dir, and vision policy.
+# validation sees the same client keys and backup dir.
 run_service_python() {
   local script="$1" backup_dir
   shift
@@ -935,13 +879,6 @@ run_service_python() {
   MODEL_GATEWAY_PROFILE_REGISTRY="$(installed_plist_env MODEL_GATEWAY_PROFILE_REGISTRY)" \
   MODEL_GATEWAY_MODEL_INFO="$MODEL_INFO_PATH" \
   MODEL_GATEWAY_MODEL_INFO_SOURCE="$MODEL_INFO_SOURCE_PATH" \
-  GATEWAY_VISION_FALLBACK="$VISION_FALLBACK" \
-  GATEWAY_VISION_FALLBACK_LOCAL="$VISION_FALLBACK_LOCAL" \
-  GATEWAY_VISION_FALLBACK_CLOUD="$VISION_FALLBACK_CLOUD" \
-  GATEWAY_VISION_FALLBACK_MODE="$VISION_FALLBACK_MODE" \
-  GATEWAY_VISION_FALLBACK_MAX_IMAGES="$VISION_FALLBACK_MAX_IMAGES" \
-  GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS="$VISION_OBSERVATION_CACHE_TTL_SECONDS" \
-  GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS="$VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS" \
     run_python "$ROOT_DIR/scripts/$script" --config "$CONFIG_PATH" "$@"
 }
 

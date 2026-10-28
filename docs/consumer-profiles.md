@@ -78,7 +78,7 @@ Registration replaces one consumer namespace atomically.
 
 - Root: `schema_version`, `namespace`, `source_revision`, `profiles`.
 - Profile: `id`, `locality`, `credential_policy`, `protocols`, `routes`.
-- `routes.text` is required. `routes.vision` is optional and must name a native vision model (`vision: true`); image requests fail closed when absent.
+- `routes.text` is required. `routes.vision` is optional and must name a native vision model (`vision: true`). Without it, image requests go to the text route; a text-only text route receives a note in place of each image ([deployment](deployment.md#image-input)).
 
 ### Allowed values
 
@@ -103,7 +103,6 @@ Valid combinations are:
 - Provider pools must not mix local and cloud candidates.
 - Every dependency of a `local_only` route must resolve exclusively through trusted local oMLX providers.
 - Every dependency of a `cloud_explicit` route must exclude oMLX and resolve through gateway-configured cloud providers.
-- Process-wide/global vision fallback is never used for a profile request.
 - Cross-model fallback is disabled for profile execution. Same-route transport retry and provider-pool failover are allowed only within the registered route's validated locality closure.
 - The gateway records a digest of the validated route closure, including the effective non-secret endpoint identity and protocol. If catalog/config drift changes that closure, invocation fails closed until re-registration. Re-registering the unchanged manifest creates a new bound version when the closure changed.
 
@@ -203,13 +202,13 @@ Request flow:
 3. Authorize `profiles:invoke` and the selector namespace.
 4. Load the latest registered snapshot.
 5. Verify protocol permission and executable credential/locality policy.
-6. Select text or vision route from the actual request modality.
+6. Select the vision route for a request with images when the profile has one, otherwise the text route.
 7. Revalidate the route binding and defaults against the live catalog/config.
 8. Resolve the route with gateway-local or gateway-managed provider credentials.
 9. Apply missing defaults and execute the concrete model without forwarding the consumer credential upstream.
 10. Keep the original profile identity in gateway audit metadata.
 
-Headers such as `x-gateway-image-handling`, locality hints, or namespace hints cannot relax profile policy. A profile selector received from a federation peer is rejected and is never forwarded.
+Headers such as locality or namespace hints cannot relax profile policy. A profile selector received from a federation peer is rejected and is never forwarded.
 
 ## Error contract
 

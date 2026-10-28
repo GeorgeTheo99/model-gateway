@@ -216,25 +216,7 @@ def _local_ai_error(exc: Exception, *, status: int) -> JSONResponse:
 @router.get("/admin/api/models")
 async def admin_models(request: Request):
     require_admin_auth(request)
-    return {"models": _admin_model_status()}
-
-
-def _admin_model_status() -> list[dict]:
-    """Add configured image routing without probing or exporting private profiles."""
-    # Delayed import avoids the admin/server module cycle at startup.
-    from src.server import _configured_vision_fallback_model, _configured_vision_fallback_mode
-
-    rows = model_status()
-    for row in rows:
-        row["vision_route"] = None
-        if not row.get("vision") and row.get("locality") in {"local", "cloud"}:
-            helper = _configured_vision_fallback_model(row["locality"])
-            if helper:
-                row["vision_route"] = {
-                    "model": helper,
-                    "mode": _configured_vision_fallback_mode(),
-                }
-    return rows
+    return {"models": model_status()}
 
 
 @router.get("/admin/api/workspace-pools")
@@ -326,10 +308,7 @@ def _reload_registry_transactionally(provider_snapshot) -> str | None:
             snapshot_provider_registry()
             # Local import avoids the admin ↔ server module cycle at import time.
             from src.auth import validate_credential_separation
-            from src.server import _clear_vision_observation_cache, _validate_vision_fallback_policy
-            _validate_vision_fallback_policy()
             validate_credential_separation()
-            _clear_vision_observation_cache()
         except Exception as exc:  # noqa: BLE001 — malformed registries must roll back
             restore_provider_registry(provider_snapshot)
             return str(exc)
@@ -577,7 +556,7 @@ async def admin_model_stats(model_name: str, request: Request):
     since, until = _time_bounds(request.query_params)
 
     # Resolve the model config from model_status (find by name).
-    rows = [m for m in _admin_model_status() if (m.get("name") or m.get("id")) == model_name]
+    rows = [m for m in model_status() if (m.get("name") or m.get("id")) == model_name]
     model = rows[0] if rows else None
     # Only query the ledger when the model actually exists; an unknown name
     # would otherwise fall back to a self-named id and return NULL-filled rows.
@@ -5666,17 +5645,9 @@ _ADMIN_HTML = r"""
             .setAttribute("data-mgmt", "");
         }
         function visionRouting(m) {
-          if (m.vision) return "Native image input; no helper needed.";
-          if (!m.vision_route)
-            return "No image helper configured for this route.";
-          return (
-            "Configured helper: " +
-            modelLink(m.vision_route.model) +
-            ". " +
-            (m.vision_route.mode === "extract_then_answer"
-              ? "The helper extracts observations; this model remains the answerer."
-              : "Image requests are answered by the helper instead.")
-          );
+          return m.vision
+            ? "Native image input."
+            : "Text only: each image is replaced with a note saying it was omitted.";
         }
         function renderProviderDetail(id, data) {
           const p = data.provider;

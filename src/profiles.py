@@ -683,10 +683,9 @@ def resolve_execution(selector: object, *, protocol: str, has_image: bool) -> Ex
             raise ProfileError(403, "profile_protocol_denied", "Profile is not enabled for this protocol")
         if not _profile_is_executable(profile):
             raise ProfileError(403, "profile_execution_unavailable", "Profile execution is unavailable for this policy")
-        role = "vision" if has_image else "text"
-        model = profile["routes"].get(role)
-        if not model:
-            raise ProfileError(403, "profile_vision_unavailable", "Profile does not define a vision route")
+        # Without a vision route, images go to the text route, which receives
+        # a note in place of each image when it is text-only.
+        model = (profile["routes"].get("vision") if has_image else None) or profile["routes"]["text"]
         try:
             live_binding = _binding_for(profile, _inventory_by_name())
         except ProfileError as exc:

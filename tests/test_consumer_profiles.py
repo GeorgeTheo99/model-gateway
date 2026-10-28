@@ -65,6 +65,19 @@ def _headers(token=TOKEN):
     return {"Authorization": f"Bearer {token}"}
 
 
+def _record_request(monkeypatch):
+    """Record the request a handler serves, as image handling no longer takes it."""
+    seen = {}
+    set_ledger_ctx = server._set_ledger_ctx
+
+    def record(request, *args, **kwargs):
+        seen["request"] = request
+        return set_ledger_ctx(request, *args, **kwargs)
+
+    monkeypatch.setattr(server, "_set_ledger_ctx", record)
+    return seen
+
+
 def _register(manifest=None):
     return client.put(
         "/v1/profiles/ha/snapshot",
@@ -295,17 +308,18 @@ def test_gateway_managed_cloud_profile_is_executable_with_gateway_credentials(mo
     assert response.status_code == 200
     assert response.json()["profiles"][0]["executable"] is True
     captured = {}
+    seen = _record_request(monkeypatch)
 
-    async def stop_after_profile(request, body, requested_model, info, _endpoint, error_factory):
+    def stop_after_profile(body, requested_model, info, _endpoint, error_factory):
         captured.update({
             "model": requested_model,
             "provider": info.provider,
             "provider_key": info.api_key,
-            "profile_id": request.state.profile_execution.profile_id,
+            "profile_id": seen["request"].state.profile_execution.profile_id,
         })
-        return body, requested_model, info, error_factory(418, "invalid_request_error", "captured")
+        return 0, error_factory(418, "invalid_request_error", "captured")
 
-    monkeypatch.setattr(server, "_apply_chat_vision_fallback", stop_after_profile)
+    monkeypatch.setattr(server, "_prepare_images", stop_after_profile)
     invocation = client.post(
         "/v1/chat/completions",
         headers=_headers(),
@@ -348,13 +362,14 @@ def test_gateway_managed_cloud_uses_provider_credential_for_every_protocol(monke
     )
     assert _register(manifest).status_code == 200
     captured = {}
+    seen = _record_request(monkeypatch)
 
-    async def stop_after_profile(request, body, requested_model, info, _endpoint, error_factory):
+    def stop_after_profile(body, requested_model, info, _endpoint, error_factory):
         captured["provider_key"] = info.api_key
-        captured["profile_id"] = request.state.profile_execution.profile_id
-        return body, requested_model, info, error_factory(418, "invalid_request_error", "captured")
+        captured["profile_id"] = seen["request"].state.profile_execution.profile_id
+        return 0, error_factory(418, "invalid_request_error", "captured")
 
-    monkeypatch.setattr(server, "_apply_chat_vision_fallback", stop_after_profile)
+    monkeypatch.setattr(server, "_prepare_images", stop_after_profile)
     response = client.post(path, headers=_headers(), json={"model": "profile:ha/automatic-local", **payload})
     assert response.status_code == 418
     assert captured == {"provider_key": "provider-secret", "profile_id": "ha/automatic-local"}
@@ -464,12 +479,12 @@ def test_profile_execution_resolves_all_protocols_and_applies_defaults(monkeypat
     assert _register().status_code == 200
     captured = {}
 
-    async def stop_after_profile(_request, body, requested_model, info, _endpoint, error_factory):
+    def stop_after_profile(body, requested_model, info, _endpoint, error_factory):
         captured.update(body)
         captured["resolved_model"] = requested_model
-        return body, requested_model, info, error_factory(418, "invalid_request_error", "captured")
+        return 0, error_factory(418, "invalid_request_error", "captured")
 
-    monkeypatch.setattr(server, "_apply_chat_vision_fallback", stop_after_profile)
+    monkeypatch.setattr(server, "_prepare_images", stop_after_profile)
     response = client.post(path, headers=_headers(), json={"model": "profile:ha/automatic-local", **payload})
     assert response.status_code == 418
     assert captured["resolved_model"] == "test-local"
@@ -496,11 +511,11 @@ def test_explicit_controls_override_profile_defaults(monkeypatch):
     assert _register().status_code == 200
     captured = {}
 
-    async def stop_after_profile(_request, body, requested_model, info, _endpoint, error_factory):
+    def stop_after_profile(body, requested_model, info, _endpoint, error_factory):
         captured.update(body)
-        return body, requested_model, info, error_factory(418, "invalid_request_error", "captured")
+        return 0, error_factory(418, "invalid_request_error", "captured")
 
-    monkeypatch.setattr(server, "_apply_chat_vision_fallback", stop_after_profile)
+    monkeypatch.setattr(server, "_prepare_images", stop_after_profile)
     response = client.post(
         "/v1/chat/completions",
         headers=_headers(),
@@ -519,7 +534,7 @@ def test_explicit_controls_override_profile_defaults(monkeypatch):
     assert captured["reasoning_effort"] == "off"
 
 
-def test_local_vision_route_is_selected_instead_of_global_cloud_fallback(monkeypatch):
+def test_image_request_uses_the_profile_vision_route(monkeypatch):
     models = [
         {
             "name": "local-vision",
@@ -541,16 +556,15 @@ def test_local_vision_route_is_selected_instead_of_global_cloud_fallback(monkeyp
         models=models,
         extra={"providers": {"cloud-test": {"base_url": "https://cloud.invalid/v1", "api_key": "secret"}}},
     )
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "cloud-vision")
     assert _register(_manifest(vision="local-vision")).status_code == 200
     captured = {}
 
-    async def stop_after_profile(_request, body, requested_model, info, _endpoint, error_factory):
+    def stop_after_profile(body, requested_model, info, _endpoint, error_factory):
         captured["model"] = requested_model
         captured["provider"] = info.provider
-        return body, requested_model, info, error_factory(418, "invalid_request_error", "captured")
+        return 0, error_factory(418, "invalid_request_error", "captured")
 
-    monkeypatch.setattr(server, "_apply_chat_vision_fallback", stop_after_profile)
+    monkeypatch.setattr(server, "_prepare_images", stop_after_profile)
     response = client.post(
         "/v1/chat/completions",
         headers=_headers(),
@@ -563,21 +577,18 @@ def test_local_vision_route_is_selected_instead_of_global_cloud_fallback(monkeyp
     assert captured == {"model": "local-vision", "provider": "omlx"}
 
 
-def test_profile_vision_without_declared_route_never_uses_global_fallback(monkeypatch):
-    cloud_vision = {
-        "name": "cloud-vision",
-        "provider": "cloud-test",
-        "provider_model_id": "cloud-vision-native",
-        "vision": True,
-        "pricing": {"input": 1.0, "output": 2.0},
-    }
-    _configure(
-        monkeypatch,
-        models=[cloud_vision],
-        extra={"providers": {"cloud-test": {"base_url": "https://cloud.invalid/v1", "api_key": "secret"}}},
-    )
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "cloud-vision")
+def test_profile_without_vision_route_sends_images_to_text_route_as_notes(monkeypatch):
+    _configure(monkeypatch)
     assert _register().status_code == 200
+    captured = {}
+    prepare_images = server._prepare_images
+
+    def stop_after_images(body, requested_model, info, endpoint, error_factory):
+        omitted, error = prepare_images(body, requested_model, info, endpoint, error_factory)
+        captured.update(model=requested_model, omitted=omitted, content=body["messages"][0]["content"])
+        return omitted, error or error_factory(418, "invalid_request_error", "captured")
+
+    monkeypatch.setattr(server, "_prepare_images", stop_after_images)
     response = client.post(
         "/v1/chat/completions",
         headers=_headers(),
@@ -586,8 +597,12 @@ def test_profile_vision_without_declared_route_never_uses_global_fallback(monkey
             "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://example.invalid/a.png"}}]}],
         },
     )
-    assert response.status_code == 403
-    assert "does not define a vision route" in response.text
+    assert response.status_code == 418
+    assert captured == {
+        "model": "test-local",
+        "omitted": 1,
+        "content": [{"type": "text", "text": server.IMAGE_OMITTED_NOTE}],
+    }
 
 
 def test_cross_namespace_invocation_direct_denial_and_legacy_compatibility(monkeypatch):
@@ -688,10 +703,10 @@ def test_identical_manifest_reregistration_repairs_binding_drift(monkeypatch):
     assert rebound.status_code == 200
     assert rebound.json()["gateway_version"] == 2
 
-    async def stop_after_profile(_request, body, requested_model, info, _endpoint, error_factory):
-        return body, requested_model, info, error_factory(418, "invalid_request_error", "captured")
+    def stop_after_profile(body, requested_model, info, _endpoint, error_factory):
+        return 0, error_factory(418, "invalid_request_error", "captured")
 
-    monkeypatch.setattr(server, "_apply_chat_vision_fallback", stop_after_profile)
+    monkeypatch.setattr(server, "_prepare_images", stop_after_profile)
     repaired = client.post(
         "/v1/chat/completions",
         headers=_headers(),

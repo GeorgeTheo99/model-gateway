@@ -207,21 +207,19 @@ def test_responses_native_passthrough_gets_the_level(client, upstream, monkeypat
     assert response.headers["x-model-gateway-reasoning-level"] == "xhigh"
 
 
-def test_a_vision_reroute_places_the_tier_on_the_served_model(client, upstream, monkeypatch):
+def test_a_tier_is_placed_on_a_text_only_model_that_gets_image_notes(client, upstream):
     routes, sent = upstream
-    routes["text-model"] = _info(("off", "low"), thinking="optional")
-    routes["vision-fallback"] = ProviderInfo(**{**_info(("max",)).__dict__, "vision": True})
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
-    monkeypatch.setattr(server, "pool_candidates", lambda model: [])
+    routes["text-model"] = _info(("off", "low", "high"), thinking="optional")
     response = client.post("/v1/chat/completions", json={
-        "model": "text-model", "model_gateway": {"reasoning_tier": "light"},
+        "model": "text-model", "model_gateway": {"reasoning_tier": "hard"},
         "messages": [{"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
         ]}],
     })
     assert response.status_code == 200
-    assert sent["body"]["reasoning_effort"] == "xhigh"  # the OpenAI format sends max as xhigh
-    assert response.headers["x-model-gateway-reasoning-level"] == "max"
+    assert sent["body"]["messages"][0]["content"] == [{"type": "text", "text": server.IMAGE_OMITTED_NOTE}]
+    assert sent["body"]["reasoning_effort"] == "high"
+    assert response.headers["x-model-gateway-reasoning-level"] == "high"
 
 
 def test_a_tier_overrides_a_profiles_default_level():

@@ -64,22 +64,9 @@ def test_ui_has_honest_routing_and_bounded_activity_copy():
 
 
 
-def test_admin_model_status_exposes_scoped_image_policy_without_probes(monkeypatch):
-    from src import admin
-    rows = [
-        {"name": "local", "locality": "local", "vision": False},
-        {"name": "cloud", "locality": "cloud", "vision": False},
-        {"name": "native", "locality": "cloud", "vision": True},
-        {"name": "mixed", "locality": "mixed", "vision": False},
-    ]
-    monkeypatch.setattr(admin, "model_status", lambda: rows)
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_LOCAL", "local-helper")
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_CLOUD", "cloud-helper")
-    monkeypatch.delenv("GATEWAY_VISION_FALLBACK_MODE", raising=False)
-    result = admin._admin_model_status()
-    assert result[0]["vision_route"] == {"model": "local-helper", "mode": "extract_then_answer"}
-    assert result[1]["vision_route"] == {"model": "cloud-helper", "mode": "extract_then_answer"}
-    assert all(row["vision_route"] is None for row in result[2:])
+def test_model_drawer_describes_image_notes_for_text_only_models():
+    assert "Text only: each image is replaced with a note saying it was omitted." in _ADMIN_HTML
+    assert "vision_route" not in _ADMIN_HTML
 
 
 def test_ui_consumer_changes_are_gated_confirmed_and_show_keys_once():

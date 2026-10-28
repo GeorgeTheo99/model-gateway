@@ -1,6 +1,6 @@
 # ADR 0003: Scoped Model Access and Lightweight Local Models
 
-- **Status:** Accepted; implemented in 0.8.4 (phases 0-1) and 0.8.5 (phases 2-5)
+- **Status:** Accepted; implemented in 0.8.4 (phases 0-1) and 0.8.5 (phases 2-5). Amended 2026-10-28: vision fallback was removed, so section 1's helper check no longer applies; a text-only model receives a note in place of each image
 - **Date:** 2026-10-23
 
 ## Context
@@ -82,7 +82,8 @@ auth:
   - retirement redirect: the successor must be allowed;
   - base-model reroute: allowed by the listed base model;
   - vision fallback (reroute and `extract_then_answer`): the helper model must
-    be allowed, otherwise an image sent to a text-only model fails;
+    be allowed, otherwise an image sent to a text-only model fails (removed
+    2026-10-28 with vision fallback);
   - federation: the imported `<peer>/<id>` name, or under section 4 its base
     model, must be allowed.
 - `model_fallbacks` is disabled for restricted credentials, as for profile

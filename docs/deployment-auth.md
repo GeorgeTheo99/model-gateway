@@ -67,9 +67,8 @@ upstream id permits its catalog entry under any of its identifiers; a listed
 base model permits requests by that base-model name (ADR 0002 R1), not its
 individual routes; a federated `<peer>/<id>` must be listed itself. Every other
 model is `403 direct_model_access_denied`, whether or not it exists. A retired
-name is served only when its successor is permitted too, a vision-fallback
-helper must be permitted, and configured `model_fallbacks` are off for the
-credential. `/v1/models`, `/v1/models/canonical` and `/v1/debug/thinking` list
+name is served only when its successor is permitted too, and configured
+`model_fallbacks` are off for the credential. `/v1/models`, `/v1/models/canonical` and `/v1/debug/thinking` list
 only what it may call. `models` cannot be combined with `profiles:write`,
 `providers:manage` or `models:register`, which could route around it. Admin
 status reports names that match nothing (`auth.unmatched_model_allowlists`) and

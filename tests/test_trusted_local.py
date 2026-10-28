@@ -278,14 +278,14 @@ def test_the_local_path_needs_a_peer_forward(monkeypatch, exporter):
     assert exporter == []
 
 
-def test_the_local_path_never_uses_vision_fallback_or_redirects(monkeypatch, exporter):
+def test_the_local_path_serves_images_to_a_text_model_as_notes_and_never_redirects(monkeypatch, exporter):
     _configure(monkeypatch)
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "qwen-local")
     image = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]}]
-    assert _local("text-local", messages=image).status_code == 409
+    assert _local("text-local", messages=image).status_code == 200
+    assert [served[1] for served in exporter] == ["text-local-mlx"]
     monkeypatch.setattr(server, "retirement_redirect", lambda name: "qwen-local")
     assert _local("old-name").status_code == 409
-    assert exporter == []
+    assert len(exporter) == 1
 
 
 # ── trusted_local profiles ───────────────────────────────────────────────────

@@ -538,7 +538,7 @@ model-gateway bundle import ~/gateway-bundle.tar.gz          # add --force to re
   export those on the gateway host instead.
 - Import refuses to replace existing providers, models, or profiles without
   `--force`, backs up every file it writes, and validates like an admin
-  reload (catalog, vision policy, credentials) before restarting. If the
+  reload (catalog, credentials) before restarting. If the
   restarted gateway fails its health check, the previous files are restored
   and the gateway is restarted on them.
 - Bundles are trusted input: an imported provider's `base_url` receives the
@@ -564,64 +564,26 @@ A model is exposed from `/v1/models` only when its provider is enabled and has t
 
 Databricks is optional and disabled/unconfigured on this machine. A work machine can enable Databricks model serving with Git-ignored catalog/config or environment variables (`DATABRICKS_HOST`, `DATABRICKS_TOKEN`, optional `DATABRICKS_SERVING_BASE_URL`) without changing repository-owned files.
 
-## Vision routing policy
+## Image input
 
-Image input to a raw text-only model fails closed by default. Use a native vision
-model when images are expected, or configure the locality-scoped helpers below.
-Consumer profiles choose image handling with `routes.vision`, which must name a
-native vision model. Catalog `composite` entries are no longer supported; any
-remaining entry is reported unavailable with reason `unsupported_composite`.
+A model receives images only when its catalog entry declares `vision: true`.
+For a text-only model the gateway replaces each image with the note
+`(image omitted: model does not support images)` and serves the request, on
+all three endpoints, so an image left in a conversation's history never makes
+later turns fail. The model sees the note and can tell the user it cannot look
+at the image. Pi already does the same before sending, with the same wording.
 
-For compatibility clients, an operator may configure locality-scoped helpers:
+Consumer profiles send image requests to `routes.vision`, which must name a
+native vision model; a profile without one sends them to its text route,
+images replaced the same way. Catalog `composite` entries are no longer
+supported; any remaining entry is reported unavailable with reason
+`unsupported_composite`.
 
-```text
-GATEWAY_VISION_FALLBACK_LOCAL=<native-local-vision-model>
-GATEWAY_VISION_FALLBACK_CLOUD=<native-cloud-vision-model>
-```
-
-A text-only local route can use only the local helper, and a text-only cloud
-route can use only the cloud helper. If its matching variable is empty, that
-route fails closed. Source or fallback pools that mix local oMLX and cloud
-providers are rejected. Each fallback must be a native vision model supporting
-OpenAI-compatible Chat Completions; the gateway validates every configured pool
-candidate at startup, on admin reload, and again before each fallback request.
-Responses-only models (`api_style: open_responses`, such as Astra) cannot be
-fallback helpers in either mode. They still accept native image requests through
-`/v1/responses`. Cloud helper use is explicit cloud egress and is logged as such.
-
-Scoped fallbacks default to `extract_then_answer`: the helper receives the image
-and returns bounded observations, then the originally requested text model
-answers. A caller can explicitly request `reroute`, or an operator can set
-`GATEWAY_VISION_FALLBACK_MODE=reroute`, to send the complete translated request
-to the fallback instead. The mode must be `reroute` or `extract_then_answer`.
-Only `extract_then_answer` keeps the originally requested text model as the
-answering model; `reroute` lets the fallback model answer the complete request.
-Extraction accepts only inline `data:image/...;base64` payloads so the gateway
-can enforce byte bounds without performing server-side URL fetches. It accepts
-up to 4 images per request by default; operators can adjust the limit with
-`GATEWAY_VISION_FALLBACK_MAX_IMAGES=<1-32>` (validated at startup with the other
-fallback policy checks). Inline images retain the existing 20 MB per-image and
-32 MB aggregate decoded-byte bounds in both fallback
-modes. Gateway API request bodies are streamed into a bounded 64 MB buffer;
-vision-helper responses are streamed with a 1 MB cap before JSON parsing.
-Observation text is capped per image and per request, and the complete
-multi-image extraction is bounded by `GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS`
-(default 900 seconds, range 1-3600).
-
-Successful inline-image observations are cached per process in a 256-entry LRU,
-keyed by decoded image bytes, media/detail options, and the complete
-extractor/provider/prompt identity. Cache entries expire after
-`GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS` (default 3600 seconds, range
-0-86400; 0 disables caching), and a successful admin registry reload clears the
-cache. Pi/session history still owns the original image payloads; this cache
-holds only bounded observation text and does not provide durable image memory.
-
-The legacy `GATEWAY_VISION_FALLBACK=<native-vision-model>` remains supported for
-existing deployments and retains its historical default mode of `reroute`. It
-cannot be combined with either scoped variable. New deployments should use the
-scoped variables so local images cannot cross into cloud providers implicitly.
-Consumer profile requests remain governed by their explicit profile vision
-route and never use these process-wide fallbacks.
+The gateway once had image helpers, where a vision model described images for
+a text-only one (`GATEWAY_VISION_FALLBACK`, `GATEWAY_VISION_FALLBACK_LOCAL`,
+`GATEWAY_VISION_FALLBACK_CLOUD` and their mode and limit settings). They were
+removed: startup logs a warning when any of these is still set and otherwise
+ignores it, and `model-gateway install` drops them from the LaunchAgent.
 
 ## Optional federation
 
@@ -694,13 +656,4 @@ exports:
 
 The gateway regenerates that generic alias file on startup. Render Pi-specific artifacts separately with `pi-shared/bin/pi-catalog`; generated launchers define `pi-restart model-gw`, which now delegates to the portable `model-gateway restart` command when available and falls back to `server-ci restart --model-gw` on the maintainer's dev-server install. Pi-owned generated artifacts should live under `~/.pi/` (for example, `~/.pi/generated/pi-launchers.zsh`), never under this repository or a model-gateway runtime directory.
 
-Pi removes image blocks before transport for models declared text-only. When the running gateway has a validated locality-scoped helper and `extract_then_answer` mode, the alias exporter therefore derives `pi.image_input: gateway-assisted` automatically for every text-only direct route with a stable matching locality. `pi-shared/bin/pi-catalog` preserves image input for those routes and labels them `assisted vision`. Legacy global fallback, `reroute` mode, and mixed-locality pools never receive the derived capability.
-
-A route can explicitly opt out when image processing is unsuitable:
-
-```yaml
-pi:
-  image_input: disabled
-```
-
-Native models continue to use `vision: true`. The automatic capability is deployment-derived: changing fallback policy requires a gateway restart (to regenerate aliases) followed by `pi-regen`.
+Image input follows `vision: true`. Pi replaces images with a note for text-only models before sending, as the gateway does for other clients ([Image input](#image-input)). The exporter no longer writes `pi.image_input` and drops the field from catalog entries that still set it.

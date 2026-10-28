@@ -128,58 +128,6 @@ def test_fresh_install_enables_admin_writes_and_upgrades_keep_read_only(tmp_path
     assert "MODEL_GATEWAY_ADMIN_WRITES must be true or false" in validate
 
 
-def test_env_exposes_scoped_vision_fallback_configuration(tmp_path: Path) -> None:
-    output = _run_env(
-        tmp_path,
-        {
-            "GATEWAY_VISION_FALLBACK_LOCAL": "local-vision",
-            "GATEWAY_VISION_FALLBACK_CLOUD": "cloud-vision",
-            "GATEWAY_VISION_FALLBACK_MODE": "extract_then_answer",
-            "GATEWAY_VISION_FALLBACK_MAX_IMAGES": "12",
-            "GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS": "600",
-            "GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS": "1200",
-        },
-    )
-    assert "GATEWAY_VISION_FALLBACK_LOCAL=local-vision" in output
-    assert "GATEWAY_VISION_FALLBACK_CLOUD=cloud-vision" in output
-    assert "GATEWAY_VISION_FALLBACK_MODE=extract_then_answer" in output
-    assert "GATEWAY_VISION_FALLBACK_MAX_IMAGES=12" in output
-    assert "GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS=600" in output
-    assert "GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS=1200" in output
-
-
-def test_explicit_empty_vision_setting_clears_persisted_plist_value(tmp_path: Path) -> None:
-    plist_dir = tmp_path / "Library" / "LaunchAgents"
-    plist_dir.mkdir(parents=True)
-    (plist_dir / "com.local.model-gateway.plist").write_text(
-        """<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>com.local.model-gateway</string>
-<key>EnvironmentVariables</key><dict>
-  <key>GATEWAY_VISION_FALLBACK</key><string>legacy-vision</string>
-  <key>GATEWAY_VISION_FALLBACK_MODE</key><string>reroute</string>
-</dict>
-</dict></plist>
-""",
-        encoding="utf-8",
-    )
-
-    output = _run_env(
-        tmp_path,
-        {
-            "GATEWAY_VISION_FALLBACK": "",
-            "GATEWAY_VISION_FALLBACK_LOCAL": "local-vision",
-            "GATEWAY_VISION_FALLBACK_MODE": "",
-        },
-    )
-
-    assert "GATEWAY_VISION_FALLBACK=\n" in output
-    assert "GATEWAY_VISION_FALLBACK_LOCAL=local-vision" in output
-    assert "GATEWAY_VISION_FALLBACK_MODE=\n" in output
-    assert "legacy-vision" not in output
-
-
 def test_install_and_post_pull_update_validate_before_atomic_plist_write() -> None:
     script = SCRIPT.read_text(encoding="utf-8")
     install = script.split("cmd_install() {", 1)[1].split("cmd_uninstall() {", 1)[0]
@@ -193,12 +141,8 @@ def test_install_and_post_pull_update_validate_before_atomic_plist_write() -> No
     assert write_plist.index("persist_install_config") < write_plist.index('mv -f "$plist_tmp" "$plist"')
     assert "ensure_private_file" not in persist
     assert persist.index("mktemp") < persist.index('mv -f "$tmp" "$INSTALL_CONFIG"')
-    assert "GATEWAY_VISION_FALLBACK_LOCAL" in write_plist
-    assert "GATEWAY_VISION_FALLBACK_CLOUD" in write_plist
-    assert "GATEWAY_VISION_FALLBACK_MODE" in write_plist
-    assert "GATEWAY_VISION_FALLBACK_MAX_IMAGES" in write_plist
-    assert "GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS" in write_plist
-    assert "GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS" in write_plist
+    # Rewriting the LaunchAgent drops the removed image-helper settings.
+    assert "GATEWAY_VISION" not in write_plist
     assert 'exec "$ROOT_DIR/bin/model-gateway" _update-after-pull' in update
 
 
@@ -309,15 +253,18 @@ def test_bundle_export_and_dry_run_import_through_the_cli(tmp_path: Path) -> Non
     assert json.loads(dry.stdout)["dry_run"] is True
 
 
-def _bundle_import_harness(tmp_path: Path, **failures: str) -> tuple[subprocess.CompletedProcess, Path, Path]:
+def _bundle_import_harness(
+    tmp_path: Path, catalog: dict | None = None, **failures: str,
+) -> tuple[subprocess.CompletedProcess, Path, Path]:
     """Run ``cmd_bundle import`` with launchd steps stubbed out."""
     import json
 
     real = Path(os.path.realpath(tmp_path))
     source, target = real / "source", real / "target"
-    catalog = {"llm": [{"name": "claude-test", "provider": "anthropic", "provider_model_id": "claude-test-1",
-                        "context": 200000, "max_output_tokens": 8192,
-                        "pricing": {"input": 3.0, "output": 15.0}}]}
+    if catalog is None:
+        catalog = {"llm": [{"name": "claude-test", "provider": "anthropic", "provider_model_id": "claude-test-1",
+                            "context": 200000, "max_output_tokens": 8192,
+                            "pricing": {"input": 3.0, "output": 15.0}}]}
     for machine, providers in ((source, "{anthropic: {base_url: 'https://api.anthropic.com/v1'}}"), (target, "{}")):
         machine.mkdir()
         (machine / "config.yaml").write_text(f"auth:\n  client_keys: [client-token]\nproviders: {providers}\n")
@@ -373,9 +320,8 @@ def test_bundle_import_restores_previous_files_when_restart_or_verify_fails(tmp_
 
 
 def test_bundle_import_validation_failure_restores_without_restarting(tmp_path: Path) -> None:
-    result, target, backups = _bundle_import_harness(
-        tmp_path, GATEWAY_VISION_FALLBACK_CLOUD="model-not-in-bundle",
-        GATEWAY_VISION_FALLBACK_MODE="extract_then_answer")
+    # An imported catalog must contain models, so validation rejects this one.
+    result, target, backups = _bundle_import_harness(tmp_path, catalog={"llm": []})
     assert result.returncode != 0
     assert "RESTARTED" not in result.stderr
     assert (target / "config.yaml").read_text() == "auth:\n  client_keys: [client-token]\nproviders: {}\n"

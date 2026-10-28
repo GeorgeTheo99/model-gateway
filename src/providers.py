@@ -868,8 +868,7 @@ def _availability_for_entry(model_id: str, entry: dict | None) -> dict:
             "model": name,
             "provider": provider,
             "message": (
-                f"Model {name!r} uses the removed composite route; use a native vision model "
-                "or GATEWAY_VISION_FALLBACK_LOCAL/GATEWAY_VISION_FALLBACK_CLOUD"
+                f"Model {name!r} uses the removed composite route; use a native vision model"
             ),
         }
 

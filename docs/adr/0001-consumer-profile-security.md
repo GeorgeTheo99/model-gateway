@@ -1,6 +1,6 @@
 # ADR 0001: Consumer-Owned Profiles as a Gateway Security Boundary
 
-- **Status:** Accepted (amended 2026-10-06: gateway catalog composites were removed; profile vision routes must name native vision models)
+- **Status:** Accepted (amended 2026-10-06: gateway catalog composites were removed; profile vision routes must name native vision models. Amended 2026-10-28: the gateway's image helpers were removed; a profile without a vision route sends image requests to its text route, which receives a note in place of each image when it is text-only)
 - **Date:** 2026-08-27
 
 ## Context
@@ -43,7 +43,7 @@ The gateway executes `local_only` + `gateway_local` and `cloud_explicit` + `gate
 
 Locality is derived from the authenticated principal and registered profile. Request headers and body fields cannot weaken it.
 
-For a local-only profile, the gateway validates the complete route closure: selected text/vision models, provider pools, and configured model fallbacks. Every reachable provider must be local oMLX. Runtime checks remain in force after registration. Global vision fallback is disabled for profile execution; a profile must name a native vision model.
+For a local-only profile, the gateway validates the complete route closure: selected text/vision models, provider pools, and configured model fallbacks. Every reachable provider must be local oMLX. Runtime checks remain in force after registration. A profile's vision route must name a native vision model; without one, image requests go to the text route, which never leaves the profile's locality.
 
 Ordinary retries may repeat an already-authorized route. A retry, pool transition, model fallback, or vision route may not change locality or credential class. Cross-model fallback remains disabled for profile requests rather than allowing an unproven transition. Same-route pool failover is permitted only when every candidate remains within the profile's validated locality and credential class.
 

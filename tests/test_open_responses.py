@@ -73,11 +73,6 @@ def open_responses_registry(monkeypatch):
     monkeypatch.setattr(providers, "_config", config)
     monkeypatch.setattr(providers, "_models", None)
     monkeypatch.setattr(circuit, "_circuits", {})
-    for variable in (
-        "GATEWAY_VISION_FALLBACK", "GATEWAY_VISION_FALLBACK_LOCAL",
-        "GATEWAY_VISION_FALLBACK_CLOUD", "GATEWAY_VISION_FALLBACK_MODE",
-    ):
-        monkeypatch.delenv(variable, raising=False)
     monkeypatch.setattr(
         providers, "MODEL_INFO_PATH", providers.Path("/nonexistent-model-info.json")
     )
@@ -273,47 +268,6 @@ def test_messages_route_rejects_responses_only_model(open_responses_registry):
     assert "/v1/responses" in (body["text"] if isinstance(body, dict) else body)
 
 
-# ── vision fallback dependencies ────────────────────────────────────────────
-
-@pytest.mark.parametrize("variable", ["GATEWAY_VISION_FALLBACK", "GATEWAY_VISION_FALLBACK_CLOUD"])
-@pytest.mark.parametrize("mode", ["reroute", "extract_then_answer"])
-def test_vision_policy_rejects_responses_only_dependency(
-    open_responses_registry, monkeypatch, variable, mode,
-):
-    monkeypatch.setenv(variable, "astra")
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_MODE", mode)
-
-    with pytest.raises(RuntimeError, match="Responses-only") as exc:
-        server._validate_vision_fallback_policy(log_policy=False)
-
-    assert variable in str(exc.value)
-    assert "astra" in str(exc.value)
-
-
-@pytest.mark.parametrize("mode", ["reroute", "extract_then_answer"])
-@pytest.mark.parametrize("typed_message", [False, True])
-def test_invalid_vision_dependency_fails_before_upstream_request(
-    open_responses_registry, monkeypatch, mode, typed_message,
-):
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "astra")
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_MODE", mode)
-
-    def no_client(**kwargs):
-        pytest.fail("Invalid vision dependencies must be rejected before opening an upstream client")
-
-    monkeypatch.setattr(server.httpx, "AsyncClient", no_client)
-    result = TestClient(server.app).post("/v1/responses", json={
-        "model": "plain",
-        "input": [{**({"type": "message"} if typed_message else {}), "role": "user", "content": [
-            {"type": "input_text", "text": "Describe this image"},
-            {"type": "input_image", "image_url": "data:image/png;base64,AA=="},
-        ]}],
-    })
-
-    assert result.status_code == 502
-    assert "Responses-only" in result.json()["error"]["message"]
-
-
 # ── full Responses route: error envelopes and workspace failover ─────────────
 
 @pytest.fixture
@@ -463,6 +417,40 @@ def test_astra_native_vision_stays_on_responses_api(
     assert len(seen) == 1
     assert seen[0].url.path == "/serving-endpoints/open-responses"
     assert json.loads(seen[0].content) == {**body, "model": "databricks-gpt-6-astra"}
+
+
+def test_text_only_open_responses_model_keeps_responses_api_with_image_notes(
+    open_responses_registry, mock_responses_upstream,
+):
+    open_responses_registry["models"][0]["vision"] = False
+    seen = []
+    note = {"type": "input_text", "text": server.IMAGE_OMITTED_NOTE}
+    body = {
+        "model": "astra",
+        "input": [
+            {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "Describe this image"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AA=="},
+            ]},
+            {"type": "function_call", "call_id": "c1", "name": "shot", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": [
+                {"type": "input_image", "image_url": "data:image/png;base64,AA=="},
+            ]},
+        ],
+    }
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json={"id": "resp_test", "status": "completed", "output": []})
+
+    mock_responses_upstream(handler)
+    result = TestClient(server.app).post("/v1/responses", json=body)
+
+    assert result.status_code == 200
+    assert seen[0].url.path == "/serving-endpoints/open-responses"
+    sent = json.loads(seen[0].content)["input"]
+    assert sent[0]["content"] == [{"type": "input_text", "text": "Describe this image"}, note]
+    assert sent[2]["output"] == [note]
 
 
 def test_responses_stream_is_not_replayed_after_output_starts(mock_responses_upstream):

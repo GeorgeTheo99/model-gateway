@@ -42,7 +42,6 @@ const model = (name, provider, extra = {}) => ({
   locality: provider === "omlx" ? "local" : "cloud",
   tools: null,
   fallback_model: null,
-  vision_route: null,
   provider_model_id: "upstream-" + name,
   context: 262144,
   max_output_tokens: 8192,
@@ -137,10 +136,7 @@ function fixture() {
     ],
     models: [
       model("local-model", "omlx", { tools: true }),
-      model("cloud-model", "cloud", {
-        vision: false,
-        vision_route: { model: "local-model", mode: "extract_then_answer" },
-      }),
+      model("cloud-model", "cloud", { vision: false }),
       model("pooled-model", "ws-primary", {
         pool: "claude-routing",
         declared_providers: ["ws-primary", "ws-backup"],

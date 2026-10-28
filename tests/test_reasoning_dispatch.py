@@ -627,132 +627,6 @@ def test_endpoints_reject_unsupported_level_with_protocol_error_shape(
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
-@pytest.mark.parametrize("endpoint", ["/v1/chat/completions", "/v1/responses", "/v1/messages"])
-def test_vision_reroute_revalidates_thinking_against_served_model(client, monkeypatch, endpoint):
-    requested = _info(
-        "openai", thinking="optional", thinking_levels=("off", "low"),
-        provider="test", provider_model_id="text-upstream", vision=False,
-    )
-    served = _info(
-        "openai", thinking_levels=("max",), provider="test",
-        provider_model_id="vision-upstream", vision=True,
-    )
-
-    def fake_resolve(model, provider_override=None):
-        return {"text-model": requested, "vision-fallback": served}.get(model)
-
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
-    monkeypatch.setattr(server_module, "pool_candidates", lambda model: [])
-    monkeypatch.setattr(server_module, "resolve", fake_resolve)
-
-    if endpoint == "/v1/responses":
-        payload = {
-            "model": "text-model",
-            "reasoning": {"effort": "low"},
-            "input": [{
-                "type": "message", "role": "user", "content": [
-                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
-                ],
-            }],
-        }
-    elif endpoint == "/v1/messages":
-        payload = {
-            "model": "text-model", "max_tokens": 32,
-            "thinking": {"type": "adaptive"},
-            "output_config": {"effort": "low"},
-            "messages": [{"role": "user", "content": [{
-                "type": "image",
-                "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"},
-            }]}],
-        }
-    else:
-        payload = {
-            "model": "text-model", "reasoning_effort": "low",
-            "messages": [{"role": "user", "content": [{
-                "type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"},
-            }]}],
-        }
-
-    response = client.post(endpoint, json=payload)
-
-    assert response.status_code == 400
-    body = response.json()
-    assert body["error"]["type"] == "invalid_request_error"
-    assert "supported levels: max" in body["error"]["message"]
-    if endpoint == "/v1/messages":
-        assert body["type"] == "error"
-
-
-@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
-def test_glm53_prevalidation_does_not_leak_controls_into_vision_reroute(client, monkeypatch):
-    requested = _info(
-        "zai",
-        thinking_levels=GLM53_LEVELS,
-        provider="zai_coding",
-        provider_model_id="glm-5.2",
-        vision=False,
-        quirks={"zai_glm53_thinking"},
-    )
-    served = _info(
-        "none",
-        thinking="",
-        thinking_levels=(),
-        provider="test",
-        provider_model_id="vision-upstream",
-        vision=True,
-    )
-
-    def fake_resolve(model, provider_override=None):
-        return {"glm-5.3": requested, "vision-fallback": served}.get(model)
-
-    async def fake_passthrough(endpoint, body, headers, **kwargs):
-        assert body["model"] == "vision-upstream"
-        assert "thinking" not in body
-        assert "reasoning_effort" not in body
-        return server_module.JSONResponse(status_code=200, content={"ok": True})
-
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
-    monkeypatch.setattr(server_module, "pool_candidates", lambda model: [])
-    monkeypatch.setattr(server_module, "resolve", fake_resolve)
-    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough)
-
-    response = client.post("/v1/chat/completions", json={
-        "model": "glm-5.3",
-        "messages": [{"role": "user", "content": [{
-            "type": "image_url",
-            "image_url": {"url": "data:image/png;base64,AAAA"},
-        }]}],
-    })
-    assert response.status_code == 200
-    assert response.json() == {"ok": True}
-
-
-@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
-def test_chat_completions_text_request_does_not_500_on_vision_fallback_env(client, monkeypatch):
-    """Regression: the vision-fallback env lookup must not NameError for normal text requests."""
-    info = _info("none", thinking="", provider="test", provider_model_id="upstream-model")
-
-    def fake_resolve(model):
-        return info if model == "text-model" else None
-
-    async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
-        assert endpoint == "http://up/chat/completions"
-        assert body["model"] == "upstream-model"
-        return server_module.JSONResponse(status_code=200, content={"ok": True})
-
-    monkeypatch.setattr(server_module, "resolve", fake_resolve)
-    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough_sync)
-
-    resp = client.post("/v1/chat/completions", json={
-        "model": "text-model",
-        "messages": [{"role": "user", "content": "hello"}],
-    })
-
-    assert resp.status_code == 200
-    assert resp.json() == {"ok": True}
-
-
-@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
 def test_chat_completions_applies_declarative_provider_onboarding_quirks(client, monkeypatch):
     info = _info("openai", provider="new-provider", provider_model_id="new-upstream", vision=True)
     info.quirks = frozenset({
@@ -1089,55 +963,6 @@ def test_fireworks_inline_image_compression(monkeypatch):
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
-def test_chat_completions_image_request_extracts_then_answers_with_opt_in_fallback(client, monkeypatch):
-    text_info = _info("none", thinking="", provider="test", provider_model_id="text-upstream")
-    fallback_info = _info("", thinking="optional", provider="test", provider_model_id="vision-upstream", vision=True)
-
-    def fake_resolve(model):
-        if model == "text-model":
-            return text_info
-        if model == "vision-fallback":
-            return fallback_info
-        return None
-
-    async def fake_extract(request, body, fallback_model, fallback, error_factory, **kwargs):
-        assert fallback_model == "vision-fallback"
-        assert fallback is fallback_info
-        assert server_module._payload_has_image(body)
-        assert kwargs == {"max_images": 4}
-        return ["Visible: a concrete wall with a crack."]
-
-    async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
-        assert endpoint == "http://up/chat/completions"
-        assert body["model"] == "text-upstream"
-        assert not server_module._payload_has_image(body)
-        joined = "\n".join(str(message.get("content", "")) for message in body["messages"])
-        assert "Image observations from vision model" in joined
-        assert "Visible: a concrete wall with a crack." in joined
-        assert "gateway_image_handling" not in body
-        assert "model_gateway" not in body
-        return server_module.JSONResponse(status_code=200, content={"ok": True})
-
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
-    monkeypatch.setattr(server_module, "resolve", fake_resolve)
-    monkeypatch.setattr(server_module, "_extract_image_observations", fake_extract)
-    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough_sync)
-
-    resp = client.post("/v1/chat/completions", json={
-        "model": "text-model",
-        "gateway_image_handling": "extract_then_answer",
-        "model_gateway": {"image_handling": "extract_then_answer"},
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": "what should I do?"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
-        ]}],
-    })
-
-    assert resp.status_code == 200
-    assert resp.json() == {"ok": True}
-
-
-@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
 @pytest.mark.parametrize("control", ["body", "nested", "nested-extra", "nondict"])
 @pytest.mark.parametrize("with_image", [False, True], ids=["text", "native-vision"])
 def test_native_anthropic_body_controls_do_not_trigger_staging_or_forward(
@@ -1224,188 +1049,6 @@ def test_native_openai_responses_body_controls_are_not_forwarded(
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
-def test_chat_completions_image_request_extracts_when_mode_env_configured(client, monkeypatch):
-    """GATEWAY_VISION_FALLBACK_MODE=extract_then_answer makes the text model answer."""
-    text_info = _info("none", thinking="", provider="test", provider_model_id="text-upstream")
-    fallback_info = _info("", thinking="optional", provider="test", provider_model_id="vision-upstream", vision=True)
-
-    def fake_resolve(model):
-        if model == "text-model":
-            return text_info
-        if model == "vision-fallback":
-            return fallback_info
-        return None
-
-    async def fake_extract(request, body, fallback_model, fallback, error_factory, **kwargs):
-        assert kwargs == {"max_images": 4}
-        return ["Visible: a red pixel."]
-
-    async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
-        assert body["model"] == "text-upstream"
-        assert not server_module._payload_has_image(body)
-        assert "Visible: a red pixel." in str(body["messages"])
-        return server_module.JSONResponse(status_code=200, content={"ok": True})
-
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_MODE", "extract_then_answer")
-    monkeypatch.setattr(server_module, "resolve", fake_resolve)
-    monkeypatch.setattr(server_module, "_extract_image_observations", fake_extract)
-    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough_sync)
-
-    resp = client.post("/v1/chat/completions", json={
-        "model": "text-model",
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": "what color is it?"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
-        ]}],
-    })
-
-    assert resp.status_code == 200
-    assert resp.json() == {"ok": True}
-
-
-@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
-def test_chat_completions_image_request_extracts_multiple_images(client, monkeypatch):
-    """Global fallback extraction accepts several images per request by default."""
-    text_info = _info("none", thinking="", provider="test", provider_model_id="text-upstream")
-    fallback_info = _info("", thinking="optional", provider="test", provider_model_id="vision-upstream", vision=True)
-
-    def fake_resolve(model):
-        if model == "text-model":
-            return text_info
-        if model == "vision-fallback":
-            return fallback_info
-        return None
-
-    async def fake_extract(request, body, fallback_model, fallback, error_factory, **kwargs):
-        assert kwargs == {"max_images": 4}
-        return ["Visible: a red pixel.", "Visible: a blue square."]
-
-    async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
-        assert body["model"] == "text-upstream"
-        assert not server_module._payload_has_image(body)
-        joined = str(body["messages"])
-        assert "Visible: a red pixel." in joined
-        assert "Visible: a blue square." in joined
-        return server_module.JSONResponse(status_code=200, content={"ok": True})
-
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_MODE", "extract_then_answer")
-    monkeypatch.delenv("GATEWAY_VISION_FALLBACK_MAX_IMAGES", raising=False)
-    monkeypatch.setattr(server_module, "resolve", fake_resolve)
-    monkeypatch.setattr(server_module, "_extract_image_observations", fake_extract)
-    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough_sync)
-
-    resp = client.post("/v1/chat/completions", json={
-        "model": "text-model",
-        "messages": [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
-            {"type": "text", "text": "and this one?"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBBB"}},
-        ]}],
-    })
-
-    assert resp.status_code == 200
-    assert resp.json() == {"ok": True}
-
-
-@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
-def test_chat_completions_image_request_reroutes_when_mode_env_unset(client, monkeypatch):
-    """Without GATEWAY_VISION_FALLBACK_MODE the global fallback keeps rerouting."""
-    text_info = _info("none", thinking="", provider="test", provider_model_id="text-upstream")
-    fallback_info = _info("", thinking="optional", provider="test", provider_model_id="vision-upstream", vision=True)
-
-    def fake_resolve(model):
-        if model == "text-model":
-            return text_info
-        if model == "vision-fallback":
-            return fallback_info
-        return None
-
-    async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
-        assert body["model"] == "vision-upstream"
-        return server_module.JSONResponse(status_code=200, content={"ok": True})
-
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
-    monkeypatch.delenv("GATEWAY_VISION_FALLBACK_MODE", raising=False)
-    monkeypatch.setattr(server_module, "resolve", fake_resolve)
-    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough_sync)
-
-    resp = client.post("/v1/chat/completions", json={
-        "model": "text-model",
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": "what color is it?"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
-        ]}],
-    })
-
-    assert resp.status_code == 200
-    assert resp.json() == {"ok": True}
-
-
-@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
-@pytest.mark.parametrize(
-    ("text_provider", "expected_fallback", "expected_upstream"),
-    [
-        ("omlx", "local-vision", "local-text-upstream"),
-        ("fireworks", "cloud-vision", "cloud-text-upstream"),
-    ],
-)
-def test_scoped_vision_fallback_matches_request_locality_and_extracts_by_default(
-    client, monkeypatch, text_provider, expected_fallback, expected_upstream,
-):
-    text_info = _info(
-        "none", thinking="", provider=text_provider,
-        provider_model_id=expected_upstream,
-    )
-    fallback_infos = {
-        "local-vision": _info(
-            "", thinking="optional", provider="omlx",
-            provider_model_id="local-vision-upstream", vision=True,
-        ),
-        "cloud-vision": _info(
-            "", thinking="optional", provider="fireworks",
-            provider_model_id="cloud-vision-upstream", vision=True,
-        ),
-    }
-
-    def fake_resolve(model):
-        if model == "text-model":
-            return text_info
-        return fallback_infos.get(model)
-
-    async def fake_extract(request, body, fallback_model, fallback, error_factory, **kwargs):
-        assert fallback_model == expected_fallback
-        assert fallback is fallback_infos[expected_fallback]
-        return ["Visible: a red pixel."]
-
-    async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
-        assert body["model"] == expected_upstream
-        assert not server_module._payload_has_image(body)
-        assert "Visible: a red pixel." in str(body["messages"])
-        return server_module.JSONResponse(status_code=200, content={"ok": True})
-
-    monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
-    monkeypatch.delenv("GATEWAY_VISION_FALLBACK_MODE", raising=False)
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_LOCAL", "local-vision")
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_CLOUD", "cloud-vision")
-    monkeypatch.setattr(server_module, "resolve", fake_resolve)
-    monkeypatch.setattr(server_module, "_extract_image_observations", fake_extract)
-    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough_sync)
-
-    response = client.post("/v1/chat/completions", json={
-        "model": "text-model",
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": "what color is it?"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
-        ]}],
-    })
-
-    assert response.status_code == 200
-    assert response.json() == {"ok": True}
-
-
-@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
 @pytest.mark.parametrize(
     ("path", "payload"),
     [
@@ -1458,7 +1101,7 @@ def test_scoped_vision_fallback_matches_request_locality_and_extracts_by_default
         }),
     ],
 )
-def test_scoped_extraction_keeps_anthropic_text_model_across_endpoints(
+def test_text_only_anthropic_model_gets_image_notes_across_endpoints(
     client, monkeypatch, path, payload,
 ):
     text_info = _info(
@@ -1466,23 +1109,7 @@ def test_scoped_extraction_keeps_anthropic_text_model_across_endpoints(
         provider_model_id="claude-text-upstream",
     )
     text_info.protocol = "anthropic"
-    fallback_info = _info(
-        "", thinking="optional", provider="fireworks",
-        provider_model_id="cloud-vision-upstream", vision=True,
-    )
     captured = {}
-
-    def fake_resolve(model):
-        if model == "anthropic-text":
-            return text_info
-        if model == "cloud-vision":
-            return fallback_info
-        return None
-
-    async def fake_extract(request, body, fallback_model, fallback, error_factory, **kwargs):
-        captured["extractions"] = captured.get("extractions", 0) + 1
-        assert fallback_model == "cloud-vision"
-        return ["Visible: a red pixel."]
 
     async def fake_chat_anthropic(body, info, model, request, is_stream):
         captured.update(model=model, upstream_chat=body)
@@ -1500,11 +1127,7 @@ def test_scoped_extraction_keeps_anthropic_text_model_across_endpoints(
         )
         return server_module.JSONResponse(status_code=200, content={"ok": True})
 
-    monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
-    monkeypatch.delenv("GATEWAY_VISION_FALLBACK_MODE", raising=False)
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_CLOUD", "cloud-vision")
-    monkeypatch.setattr(server_module, "resolve", fake_resolve)
-    monkeypatch.setattr(server_module, "_extract_image_observations", fake_extract)
+    monkeypatch.setattr(server_module, "resolve", lambda model: text_info)
     monkeypatch.setattr(server_module, "_handle_chat_anthropic", fake_chat_anthropic)
     monkeypatch.setattr(server_module, "_handle_responses_anthropic", fake_responses_anthropic)
     monkeypatch.setattr(server_module, "_passthrough_anthropic_sync", fake_messages_sync)
@@ -1513,11 +1136,10 @@ def test_scoped_extraction_keeps_anthropic_text_model_across_endpoints(
 
     assert response.status_code == 200
     assert response.json() == {"ok": True}
-    assert captured["extractions"] == 1
     assert captured["model"] == "anthropic-text"
     assert captured["upstream_chat"] is not None
     assert not server_module._payload_has_image(captured["upstream_chat"])
-    assert "Visible: a red pixel." in str(captured["upstream_chat"]["messages"])
+    assert server_module.IMAGE_OMITTED_NOTE in str(captured["upstream_chat"]["messages"])
     if path == "/v1/messages":
         native = captured["native_anthropic"]
         assert native["system"][0]["cache_control"] == {"type": "ephemeral"}
@@ -1525,301 +1147,80 @@ def test_scoped_extraction_keeps_anthropic_text_model_across_endpoints(
         assert native["tool_choice"]["disable_parallel_tool_use"] is True
         assert native["metadata"] == {"user_id": "vision-regression"}
         replacement = native["messages"][0]["content"][1]
-        assert replacement["type"] == "text"
-        assert replacement["cache_control"] == {"type": "ephemeral"}
+        assert replacement == {
+            "type": "text", "text": server_module.IMAGE_OMITTED_NOTE,
+            "cache_control": {"type": "ephemeral"},
+        }
+
+
+def test_every_chat_image_shape_is_replaced_with_the_note():
+    note = {"type": "text", "text": server_module.IMAGE_OMITTED_NOTE}
+    body = {"messages": [
+        {"role": "user", "content": [
+            {"type": "text", "text": "keep"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+            {"type": "input_image", "image": "data:image/png;base64,AA=="},
+            {"type": "unsupported_input_image_file", "file_id": "file_1"},
+        ]},
+        {"role": "tool", "tool_call_id": "t", "content": [{"type": "image", "source": {}}]},
+    ]}
+    assert server_module._image_count(body) == 4
+    assert server_module._omit_chat_images(body) == 4
+    assert body["messages"][0]["content"] == [{"type": "text", "text": "keep"}, note, note, note]
+    assert body["messages"][1]["content"] == [note]
+
+
+def test_every_responses_image_shape_is_replaced_with_the_note():
+    note = {"type": "input_text", "text": server_module.IMAGE_OMITTED_NOTE}
+    pdf = {"type": "input_file", "file_data": "data:application/pdf;base64,AA==", "filename": "a.pdf"}
+    body = {"input": [
+        {"role": "user", "content": [
+            {"type": "input_text", "text": "keep"},
+            {"type": "input_image", "file_id": "file_1"},
+            {"type": "input_file", "file_data": "data:image/png;base64,AA==", "filename": "a.png"},
+            pdf,
+        ]},
+        {"type": "custom_tool_call_output", "call_id": "c", "output": [
+            {"type": "image_url", "image_url": "data:image/png;base64,AA=="},
+        ]},
+    ]}
+    server_module._omit_responses_images(body)
+    assert body["input"][0]["content"] == [{"type": "input_text", "text": "keep"}, note, note, pdf]
+    assert body["input"][1]["output"] == [note]
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
-def test_chat_completions_image_request_uses_explicit_cloud_vision_fallback(client, monkeypatch):
-    text_info = _info("none", thinking="", provider="test", provider_model_id="text-upstream")
-    fallback_info = _info(
-        "",
-        thinking="optional",
-        provider="fireworks",
-        provider_model_id="accounts/fireworks/models/qwen3p8-max",
-        vision=True,
-    )
+def test_messages_to_a_chat_model_keep_its_system_instruction(client, monkeypatch):
+    info = _info("none", thinking="", provider="test", provider_model_id="text-upstream")
+    info.system_instruction = "Answer briefly."
+    monkeypatch.setattr(server_module, "resolve", lambda model: info)
+    captured = {}
 
-    def fake_resolve(model):
-        if model == "text-model":
-            return text_info
-        if model == "cloud-vision":
-            return fallback_info
-        return None
-
-    async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
-        assert endpoint == "http://up/chat/completions"
-        assert body["model"] == "accounts/fireworks/models/qwen3p8-max"
-        assert "prompt_cache_key" not in body
-        assert "prompt_cache_retention" not in body
-        assert "reasoning" not in body["messages"][0]
-        assert "reasoning_content" not in body["messages"][0]
+    async def fake_sync(endpoint, body, *args, **kwargs):
+        captured["body"] = body
         return server_module.JSONResponse(status_code=200, content={"ok": True})
 
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "cloud-vision")
-    monkeypatch.setattr(server_module, "resolve", fake_resolve)
-    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough_sync)
-
-    resp = client.post("/v1/chat/completions", json={
-        "model": "text-model",
-        "prompt_cache_key": "pi-session",
-        "prompt_cache_retention": "24h",
-        "messages": [
-            {
-                "role": "assistant",
-                "content": "prior answer",
-                "reasoning": "prior hidden reasoning",
-                "reasoning_content": "prior hidden reasoning",
-            },
-            {"role": "user", "content": [
-                {"type": "text", "text": "what is in this image?"},
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
-            ]},
-        ],
+    monkeypatch.setattr(server_module, "_handle_sync", fake_sync)
+    response = client.post("/v1/messages", json={
+        "model": "text-model", "max_tokens": 32, "system": "Be kind.",
+        "messages": [{"role": "user", "content": "hi"}],
     })
 
-    assert resp.status_code == 200
-    assert resp.json() == {"ok": True}
+    assert response.status_code == 200
+    system = captured["body"]["messages"][0]
+    assert system["role"] == "system"
+    assert "Answer briefly." in system["content"] and "Be kind." in system["content"]
 
 
-def test_lifespan_validates_vision_policy_before_initialization(monkeypatch):
-    def reject_policy():
-        raise RuntimeError("invalid vision policy")
-
-    monkeypatch.setattr(server_module, "_validate_vision_fallback_policy", reject_policy)
-
-    async def enter_lifespan():
-        async with server_module._lifespan(server_module.app):
-            pytest.fail("invalid policy must prevent startup")
-
-    with pytest.raises(RuntimeError, match="invalid vision policy"):
-        asyncio.run(enter_lifespan())
-
-
-def test_startup_vision_fallback_disabled_by_default(monkeypatch, caplog):
-    monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
-    monkeypatch.setattr(
-        server_module,
-        "resolve",
-        lambda model: pytest.fail(f"disabled policy must not resolve {model}"),
-    )
-
-    with caplog.at_level(logging.INFO, logger="model-gateway"):
-        server_module._validate_vision_fallback_policy()
-
-    assert "vision fallback policy: disabled" in caplog.text
-    assert "fails closed" in caplog.text
-
-
-@pytest.mark.parametrize(
-    ("fallback_info", "message"),
-    [
-        (None, "is not resolvable"),
-        (_info("none", provider="omlx", vision=False), "is not vision-capable"),
-    ],
-)
-def test_startup_rejects_invalid_opt_in_vision_fallback(
-    monkeypatch, fallback_info, message,
-):
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "bad-fallback")
-    monkeypatch.setattr(server_module, "resolve", lambda model: fallback_info)
-
-    with pytest.raises(RuntimeError, match=message):
-        server_module._validate_vision_fallback_policy()
-
-
-def test_startup_rejects_legacy_and_scoped_fallbacks_together(monkeypatch):
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "legacy-vision")
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_LOCAL", "local-vision")
-
-    with pytest.raises(RuntimeError, match="cannot be combined"):
-        server_module._validate_vision_fallback_policy()
-
-
-def test_startup_rejects_scoped_fallback_with_wrong_locality(monkeypatch):
-    monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_LOCAL", "cloud-vision")
-    monkeypatch.setattr(
-        server_module, "resolve",
-        lambda model: _info("none", provider="fireworks", vision=True),
-    )
-
-    with pytest.raises(RuntimeError, match="requires a local model"):
-        server_module._validate_vision_fallback_policy()
-
-
-def test_startup_rejects_invalid_vision_fallback_mode(monkeypatch):
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_MODE", "side-channel")
-    monkeypatch.setattr(
-        server_module, "resolve",
-        lambda model: pytest.fail("invalid mode must be rejected before resolving"),
-    )
-
-    with pytest.raises(RuntimeError, match="GATEWAY_VISION_FALLBACK_MODE"):
-        server_module._validate_vision_fallback_policy()
-
-
-@pytest.mark.parametrize("raw", ["0", "33", "many"])
-def test_startup_rejects_invalid_vision_fallback_max_images(monkeypatch, raw):
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_MAX_IMAGES", raw)
-    monkeypatch.setattr(
-        server_module, "resolve",
-        lambda model: pytest.fail("invalid image limit must be rejected before resolving"),
-    )
-
-    with pytest.raises(RuntimeError, match="GATEWAY_VISION_FALLBACK_MAX_IMAGES"):
-        server_module._validate_vision_fallback_policy()
-
-
-@pytest.mark.parametrize(
-    ("variable", "raw"),
-    [
-        ("GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS", "-1"),
-        ("GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS", "86401"),
-        ("GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS", "many"),
-        ("GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS", "0"),
-        ("GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS", "3601"),
-        ("GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS", "many"),
-    ],
-)
-def test_startup_rejects_invalid_vision_fallback_resource_bounds(monkeypatch, variable, raw):
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
-    monkeypatch.setenv(variable, raw)
-    monkeypatch.setattr(
-        server_module, "resolve",
-        lambda model: pytest.fail("invalid resource bound must be rejected before resolving"),
-    )
-
-    with pytest.raises(RuntimeError, match=variable):
-        server_module._validate_vision_fallback_policy()
-
-
-def test_startup_validates_shared_extraction_controls_without_global_fallback(monkeypatch):
-    monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
-    monkeypatch.delenv("GATEWAY_VISION_FALLBACK_LOCAL", raising=False)
-    monkeypatch.delenv("GATEWAY_VISION_FALLBACK_CLOUD", raising=False)
-    monkeypatch.setenv("GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS", "invalid")
-
-    with pytest.raises(RuntimeError, match="GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS"):
-        server_module._validate_vision_fallback_policy()
-
-
-def test_startup_rejects_protocol_incompatible_vision_fallback(monkeypatch):
-    fallback_info = _info("none", provider="anthropic", vision=True)
-    fallback_info.protocol = "anthropic"
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "anthropic-vision")
-    monkeypatch.setattr(server_module, "resolve", lambda model: fallback_info)
-
-    with pytest.raises(RuntimeError, match="OpenAI-compatible protocol"):
-        server_module._validate_vision_fallback_policy()
-
-
-def test_startup_rejects_mixed_local_cloud_fallback_pool(monkeypatch):
-    infos = {
-        "omlx": _info("none", provider="omlx", vision=True),
-        "fireworks": _info("none", provider="fireworks", vision=True),
-    }
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "mixed-vision")
-    monkeypatch.setattr(server_module, "pool_candidates", lambda model: list(infos))
-    monkeypatch.setattr(
-        server_module,
-        "resolve",
-        lambda model, provider_override=None: infos[provider_override],
-    )
-
-    with pytest.raises(RuntimeError, match="mixes local and cloud providers"):
-        server_module._validate_vision_fallback_policy()
-
-
-def test_request_revalidates_opt_in_fallback_policy(monkeypatch):
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
-
-    def reject_policy(**kwargs):
-        assert kwargs == {"log_policy": False}
-        raise RuntimeError("mixed locality")
-
-    monkeypatch.setattr(server_module, "_validate_vision_fallback_policy", reject_policy)
-
-    _, _, error = server_module._resolve_vision_fallback(
-        "text-model", _info("none", provider="omlx", vision=False),
-    )
-
-    assert error.status_code == 502
-    assert b"Vision fallback policy is invalid: mixed locality" in error.body
-
-
-@pytest.mark.parametrize(
-    ("provider", "cloud_egress", "level"),
-    [("omlx", "false", logging.INFO), ("fireworks", "true", logging.WARNING)],
-)
-def test_startup_logs_effective_opt_in_vision_policy(
-    monkeypatch, caplog, provider, cloud_egress, level,
-):
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
-    fallback_info = _info("none", provider=provider, vision=True)
-    monkeypatch.setattr(server_module, "resolve", lambda model: fallback_info)
-
-    with caplog.at_level(level, logger="model-gateway"):
-        server_module._validate_vision_fallback_policy()
-
-    assert "vision fallback policy: enabled model=vision-fallback" in caplog.text
-    assert f"providers={provider}" in caplog.text
-    assert f"cloud_egress={cloud_egress}" in caplog.text
-    assert "mode=reroute" in caplog.text
-    assert "max_images=4" in caplog.text
-
-
-def test_startup_logs_both_scoped_vision_policies(monkeypatch, caplog):
-    infos = {
-        "local-vision": _info("none", provider="omlx", vision=True),
-        "cloud-vision": _info("none", provider="fireworks", vision=True),
-    }
-    monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
-    monkeypatch.delenv("GATEWAY_VISION_FALLBACK_MODE", raising=False)
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_LOCAL", "local-vision")
+def test_removed_vision_fallback_settings_only_warn(monkeypatch, caplog):
     monkeypatch.setenv("GATEWAY_VISION_FALLBACK_CLOUD", "cloud-vision")
-    monkeypatch.setattr(server_module, "resolve", lambda model: infos[model])
+    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_LOCAL", "")
 
-    with caplog.at_level(logging.INFO, logger="model-gateway"):
-        server_module._validate_vision_fallback_policy()
+    with caplog.at_level(logging.WARNING, logger="model-gateway"):
+        server_module._warn_removed_vision_fallback_env()
 
-    assert "model=local-vision scope=local providers=omlx cloud_egress=false" in caplog.text
-    assert "model=cloud-vision scope=cloud providers=fireworks cloud_egress=true" in caplog.text
-    assert caplog.text.count("mode=extract_then_answer") == 2
-
-
-def test_mixed_local_cloud_source_pool_cannot_select_scoped_fallback(monkeypatch):
-    text_infos = {
-        "omlx": _info("none", provider="omlx", vision=False),
-        "fireworks": _info("none", provider="fireworks", vision=False),
-    }
-    fallback_infos = {
-        "local-vision": _info("none", provider="omlx", vision=True),
-        "cloud-vision": _info("none", provider="fireworks", vision=True),
-    }
-    monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_LOCAL", "local-vision")
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_CLOUD", "cloud-vision")
-    monkeypatch.setattr(
-        server_module, "pool_candidates",
-        lambda model: list(text_infos) if model == "mixed-text" else [],
-    )
-
-    def fake_resolve(model, provider_override=None):
-        if model == "mixed-text":
-            return text_infos[provider_override]
-        return fallback_infos.get(model)
-
-    monkeypatch.setattr(server_module, "resolve", fake_resolve)
-
-    _, _, error = server_module._resolve_vision_fallback(
-        "mixed-text", text_infos["omlx"],
-    )
-
-    assert error.status_code == 502
-    assert b"mixes local and cloud providers" in error.body
+    assert "ignoring GATEWAY_VISION_FALLBACK_CLOUD:" in caplog.text
+    assert "GATEWAY_VISION_FALLBACK_LOCAL" not in caplog.text
 
 
 def test_historical_image_remains_visible_to_request_local_routing():
@@ -1835,172 +1236,6 @@ def test_historical_image_remains_visible_to_request_local_routing():
     assert server_module._image_count(body) == 1
 
 
-def test_replace_image_preserves_order_and_all_content():
-    body = {"messages": [{"role": "user", "content": [
-        {"type": "text", "text": "before"},
-        {"type": "image_url", "image_url": {"url": "one"}},
-        {"type": "custom", "value": 7},
-        {"type": "text", "text": "after"},
-    ]}]}
-    result = server_module._replace_images_with_extracted_text(body, "visible detail", "vision")
-    parts = result["messages"][0]["content"]
-    assert [part["type"] for part in parts] == ["text", "text", "custom", "text"]
-    assert "image 1" in parts[1]["text"]
-    assert parts[0]["text"] == "before" and parts[3]["text"] == "after"
-    assert body["messages"][0]["content"][1]["type"] == "image_url"
-
-
-def test_replace_multiple_images_uses_matching_observations():
-    result = server_module._replace_images_with_extracted_text(
-        {"messages": [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": "one"}},
-            {"type": "image_url", "image_url": {"url": "two"}},
-        ]}]},
-        ["first detail", "second detail"], "vision",
-    )
-    parts = result["messages"][0]["content"]
-    assert "image 1" in parts[0]["text"] and "first detail" in parts[0]["text"]
-    assert "image 2" in parts[1]["text"] and "second detail" in parts[1]["text"]
-
-
-def test_replace_images_rejects_observation_count_mismatch():
-    with pytest.raises(ValueError, match="count does not match"):
-        server_module._replace_images_with_extracted_text(
-            {"messages": [{"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": "one"}},
-                {"type": "image_url", "image_url": {"url": "two"}},
-            ]}]},
-            ["only one detail"], "vision",
-        )
-
-
-def test_replace_images_rejects_empty_observations():
-    with pytest.raises(ValueError, match="empty observations"):
-        server_module._replace_images_with_extracted_text(
-            {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]},
-            "  ", "vision",
-        )
-
-
-def test_multi_image_extraction_is_bounded_and_ordered(monkeypatch):
-    calls = []
-
-    class FakeResponse:
-        status_code = 200
-
-        def __init__(self, observation):
-            self.observation = observation
-
-        def json(self):
-            return {
-                "choices": [{"finish_reason": "stop", "message": {"content": self.observation}}],
-                "usage": {},
-            }
-
-    class FakeClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return None
-
-        async def post(self, endpoint, json, headers):
-            calls.append((endpoint, json, headers))
-            return FakeResponse(f"observation {len(calls)}")
-
-    monkeypatch.setattr(server_module.httpx, "AsyncClient", lambda **kwargs: FakeClient())
-    monkeypatch.setattr(server_module, "_ledger_record", lambda *args, **kwargs: None)
-    request = SimpleNamespace(state=SimpleNamespace())
-    info = _info("", thinking="", provider="omlx", provider_model_id="gemma-upstream", vision=True)
-    body = {"messages": [{"role": "tool", "content": [
-        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
-        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQID"}},
-    ]}]}
-
-    result = asyncio.run(server_module._extract_image_observations(
-        request, body, "gemma-local", info,
-        max_images=4,
-    ))
-
-    assert result == ["observation 1", "observation 2"]
-    assert len(calls) == 2
-    assert all(server_module._image_count(call[1]) == 1 for call in calls)
-    assert all(len(call[1]["messages"]) == 2 for call in calls)
-
-
-def test_repeated_image_extraction_uses_the_observation_cache(monkeypatch):
-    """Historical images resent each turn must not re-run upstream calls."""
-    calls = []
-
-    class FakeResponse:
-        status_code = 200
-
-        def __init__(self, observation):
-            self.observation = observation
-
-        def json(self):
-            return {
-                "choices": [{"finish_reason": "stop", "message": {"content": self.observation}}],
-                "usage": {},
-            }
-
-    class FakeClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return None
-
-        async def post(self, endpoint, json, headers):
-            calls.append(endpoint)
-            return FakeResponse(f"observation {len(calls)}")
-
-    monkeypatch.setattr(server_module.httpx, "AsyncClient", lambda **kwargs: FakeClient())
-    monkeypatch.setattr(server_module, "_ledger_record", lambda *args, **kwargs: None)
-    request = SimpleNamespace(state=SimpleNamespace())
-    info = _info("", thinking="", provider="omlx", provider_model_id="gemma-upstream", vision=True)
-    body = {"messages": [{"role": "tool", "content": [
-        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
-        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQID"}},
-    ]}]}
-
-    # Turn 1: both images extracted (2 upstream calls).
-    first = asyncio.run(server_module._extract_image_observations(
-        request, copy.deepcopy(body), "gemma-local", info, max_images=4,
-    ))
-    assert first == ["observation 1", "observation 2"]
-    assert len(calls) == 2
-
-    # Turn 2: same conversation resent; only the new image is extracted.
-    second_body = copy.deepcopy(body)
-    second_body["messages"][0]["content"].append(
-        {"type": "image_url", "image_url": {"url": "data:image/png;base64,BQAD"}}
-    )
-    second = asyncio.run(server_module._extract_image_observations(
-        request, second_body, "gemma-local", info, max_images=4,
-    ))
-    assert second == ["observation 1", "observation 2", "observation 3"]
-    assert len(calls) == 3, "cached observations must not re-run upstream extraction"
-
-    # A different extracting model misses the cache even for identical bytes.
-    other_info = _info("", thinking="", provider="omlx", provider_model_id="other-upstream", vision=True)
-    third = asyncio.run(server_module._extract_image_observations(
-        request, copy.deepcopy(body), "other-local", other_info, max_images=4,
-    ))
-    assert third == ["observation 4", "observation 5"]
-    assert len(calls) == 5
-
-    # Failed extractions must not be cached: the responses above always 200;
-    # verify the cache only stores successful observations via the bound entries.
-    assert server_module._vision_observation_cache_get(
-        server_module._vision_observation_cache_key(
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
-            "gemma-local",
-            info,
-        )
-    ) == "observation 1"
-
-
 def test_request_json_reader_enforces_streaming_body_limit(monkeypatch):
     class FakeRequest:
         headers = {}
@@ -2012,334 +1247,6 @@ def test_request_json_reader_enforces_streaming_body_limit(monkeypatch):
     monkeypatch.setattr(server_module, "MODEL_GATEWAY_MAX_REQUEST_BODY_BYTES", 10)
     with pytest.raises(server_module._RequestBodyTooLarge):
         asyncio.run(server_module._read_json_body_bounded(FakeRequest()))
-
-
-class _StreamingExtractionResponse:
-    status_code = 200
-
-    def __init__(self, chunks):
-        self.chunks = chunks
-        self.closed = False
-
-    async def aiter_bytes(self):
-        for chunk in self.chunks:
-            yield chunk
-
-    async def aclose(self):
-        self.closed = True
-
-
-class _StreamingExtractionClient:
-    def __init__(self, response):
-        self.response = response
-
-    def build_request(self, *args, **kwargs):
-        return (args, kwargs)
-
-    async def send(self, request, stream=False):
-        assert stream is True
-        return self.response
-
-
-def test_vision_extraction_response_reader_enforces_streaming_byte_limit(monkeypatch):
-    response = _StreamingExtractionResponse([b'{"choices":', b'[{"message":{"content":"too large"}}]}'])
-    client = _StreamingExtractionClient(response)
-    monkeypatch.setattr(server_module, "VISION_EXTRACTION_UPSTREAM_RESPONSE_MAX_BYTES", 12)
-    request = SimpleNamespace(state=SimpleNamespace())
-
-    with pytest.raises(server_module._VisionExtractionResponseTooLarge):
-        asyncio.run(server_module._post_vision_extraction_json(
-            request, client, "http://up", {}, {},
-        ))
-    assert response.closed is True
-
-
-def test_vision_observation_cache_uses_inline_bytes_and_complete_extractor_identity():
-    inline = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQID"}}
-    same_bytes_different_mime = {
-        "type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AQID"},
-    }
-    remote = {"type": "image_url", "image_url": {"url": "https://example.test/mutable.png"}}
-    info = _info("", provider="omlx", provider_model_id="vision-upstream", vision=True)
-
-    key = server_module._vision_observation_cache_key(inline, "vision-local", info)
-    assert key != server_module._vision_observation_cache_key(
-        same_bytes_different_mime, "vision-local", info,
-    )
-    high_detail = copy.deepcopy(inline)
-    high_detail["image_url"]["detail"] = "high"
-    assert key != server_module._vision_observation_cache_key(
-        high_detail, "vision-local", info,
-    )
-    assert server_module._vision_observation_cache_key(remote, "vision-local", info) is None
-
-    changed_endpoint = copy.copy(info)
-    changed_endpoint.base_url = "http://different-upstream"
-    assert key != server_module._vision_observation_cache_key(
-        inline, "vision-local", changed_endpoint,
-    )
-    changed_instruction = copy.copy(info)
-    changed_instruction.system_instruction = "different extraction contract"
-    assert key != server_module._vision_observation_cache_key(
-        inline, "vision-local", changed_instruction,
-    )
-
-
-def test_vision_observation_cache_ttl_and_disable(monkeypatch):
-    now = [100.0]
-    monkeypatch.setattr(server_module.time, "monotonic", lambda: now[0])
-    monkeypatch.setenv("GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS", "10")
-    generation = server_module._vision_observation_cache_generation
-    key = (generation, "key")
-    server_module._vision_observation_cache_put(key, "observation")
-    assert server_module._vision_observation_cache_get(key) == "observation"
-    now[0] = 111.0
-    assert server_module._vision_observation_cache_get(key) is None
-
-    monkeypatch.setenv("GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS", "0")
-    disabled_key = (generation, "disabled")
-    server_module._vision_observation_cache_put(disabled_key, "observation")
-    assert server_module._vision_observation_cache_get(disabled_key) is None
-
-
-def test_vision_observation_cache_rejects_stale_generation_writes():
-    generation = server_module._vision_observation_cache_generation
-    stale_key = (generation, "stale")
-    server_module._clear_vision_observation_cache()
-    server_module._vision_observation_cache_put(stale_key, "old observation")
-    assert server_module._vision_observation_cache_get(stale_key) is None
-    assert not server_module._vision_observation_cache
-
-
-def test_inflight_old_generation_extraction_cannot_repopulate_cache_after_reload(monkeypatch):
-    async def scenario():
-        started = asyncio.Event()
-        release = asyncio.Event()
-
-        class FakeResponse:
-            status_code = 200
-
-            def json(self):
-                return {
-                    "choices": [{"finish_reason": "stop", "message": {"content": "old observation"}}],
-                    "usage": {},
-                }
-
-        class FakeClient:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                return None
-
-            async def post(self, endpoint, json, headers):
-                started.set()
-                await release.wait()
-                return FakeResponse()
-
-        monkeypatch.setattr(server_module.httpx, "AsyncClient", lambda **kwargs: FakeClient())
-        monkeypatch.setattr(server_module, "_ledger_record", lambda *args, **kwargs: None)
-        request = SimpleNamespace(state=SimpleNamespace())
-        info = _info("", provider="omlx", provider_model_id="vision-upstream", vision=True)
-        body = {"messages": [{"role": "user", "content": [{
-            "type": "image_url", "image_url": {"url": "data:image/png;base64,AQID"},
-        }]}]}
-
-        task = asyncio.create_task(server_module._extract_image_observations(
-            request, body, "vision-local", info, max_images=4,
-        ))
-        await started.wait()
-        server_module._clear_vision_observation_cache()
-        release.set()
-        assert await task == ["old observation"]
-        assert not server_module._vision_observation_cache
-
-    asyncio.run(scenario())
-
-
-def test_startup_accepts_vision_fallback_max_images_up_to_32(monkeypatch, caplog):
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_MAX_IMAGES", "20")
-    fallback_info = _info("none", provider="omlx", vision=True)
-    monkeypatch.setattr(server_module, "resolve", lambda model: fallback_info)
-
-    with caplog.at_level(logging.INFO, logger="model-gateway"):
-        server_module._validate_vision_fallback_policy()
-
-    assert "max_images=20" in caplog.text
-
-
-def test_all_extract_then_answer_modes_reject_remote_images_before_upstream(monkeypatch):
-    class ForbiddenClient:
-        def __init__(self, **kwargs):
-            raise AssertionError("image validation must happen before creating a client")
-
-    monkeypatch.setattr(server_module.httpx, "AsyncClient", ForbiddenClient)
-    request = SimpleNamespace(state=SimpleNamespace())
-    info = _info("", thinking="", provider="omlx", provider_model_id="gemma-upstream", vision=True)
-    result = asyncio.run(server_module._extract_image_observations(
-        request,
-        {"messages": [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": "https://example.test/image.png"}},
-        ]}]},
-        "gemma-local",
-        info,
-        max_images=4,
-    ))
-
-    assert result.status_code == 400
-    assert "inline data:image" in result.body.decode()
-
-
-@pytest.mark.parametrize(
-    ("urls", "max_images", "expected_status", "message"),
-    [
-        (["data:image/png;base64,AAAA"] * 5, 4, 400, "1 through 4"),
-        (["data:image/png;base64,%%%"], 4, 400, "malformed base64"),
-    ],
-)
-def test_extraction_rejects_invalid_image_batches_before_upstream(
-    monkeypatch, urls, max_images, expected_status, message,
-):
-    class ForbiddenClient:
-        def __init__(self, **kwargs):
-            raise AssertionError("image validation must happen before creating a client")
-
-    monkeypatch.setattr(server_module.httpx, "AsyncClient", ForbiddenClient)
-    request = SimpleNamespace(state=SimpleNamespace())
-    info = _info("", thinking="", provider="omlx", provider_model_id="gemma-upstream", vision=True)
-    body = {"messages": [{"role": "user", "content": [
-        {"type": "image_url", "image_url": {"url": url}} for url in urls
-    ]}]}
-
-    result = asyncio.run(server_module._extract_image_observations(
-        request, body, "gemma-local", info,
-        max_images=max_images,
-    ))
-
-    assert result.status_code == expected_status
-    assert message in result.body.decode()
-
-
-def test_all_extraction_modes_enforce_inline_per_image_and_total_byte_limits(monkeypatch):
-    class ForbiddenClient:
-        def __init__(self, **kwargs):
-            raise AssertionError("size validation must happen before creating a client")
-
-    monkeypatch.setattr(server_module.httpx, "AsyncClient", ForbiddenClient)
-    monkeypatch.setattr(server_module, "DEFAULT_VISION_FALLBACK_IMAGE_MAX_BYTES", 2)
-    monkeypatch.setattr(server_module, "DEFAULT_VISION_FALLBACK_IMAGE_TOTAL_MAX_BYTES", 3)
-    request = SimpleNamespace(state=SimpleNamespace())
-    info = _info("", thinking="", provider="omlx", provider_model_id="gemma-upstream", vision=True)
-
-    per_image = asyncio.run(server_module._extract_image_observations(
-        request,
-        {"messages": [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQID"}},
-        ]}]},
-        "gemma-local", info, max_images=4,
-    ))
-    total = asyncio.run(server_module._extract_image_observations(
-        request,
-        {"messages": [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQI="}},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AwQ="}},
-        ]}]},
-        "gemma-local", info, max_images=4,
-    ))
-
-    assert per_image.status_code == 413 and "per-image byte limit" in per_image.body.decode()
-    assert total.status_code == 413 and "total byte limit" in total.body.decode()
-
-
-@pytest.mark.parametrize("finish_reason", ["length", None, ""])
-def test_extraction_rejects_nonterminal_observations(monkeypatch, finish_reason):
-    calls = 0
-
-    class FakeResponse:
-        status_code = 200
-
-        def json(self):
-            return {
-                "choices": [{
-                    "finish_reason": finish_reason,
-                    "message": {"content": "partial observation"},
-                }],
-                "usage": {},
-            }
-
-    class FakeClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return None
-
-        async def post(self, endpoint, json, headers):
-            nonlocal calls
-            calls += 1
-            return FakeResponse()
-
-    monkeypatch.setattr(server_module.httpx, "AsyncClient", lambda **kwargs: FakeClient())
-    monkeypatch.setattr(server_module, "_ledger_record", lambda *args, **kwargs: None)
-    request = SimpleNamespace(state=SimpleNamespace())
-    info = _info("", thinking="", provider="omlx", provider_model_id="gemma-upstream", vision=True)
-
-    result = asyncio.run(server_module._extract_image_observations(
-        request,
-        {"messages": [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
-        ]}]},
-        "gemma-local", info, max_images=4,
-    ))
-
-    assert calls == 1
-    assert result.status_code == 502
-    assert f"finish_reason={finish_reason}" in result.body.decode()
-
-
-@pytest.mark.parametrize("content", [
-    None,
-    {},
-    7,
-    [{"type": "image_url", "image_url": {"url": "x"}}],
-    [{"type": "text", "text": "partial"}, {"type": "image_url", "image_url": {"url": "x"}}],
-])
-def test_extraction_rejects_nontext_observations(monkeypatch, content):
-    class FakeResponse:
-        status_code = 200
-
-        def json(self):
-            return {
-                "choices": [{"finish_reason": "stop", "message": {"content": content}}],
-                "usage": {},
-            }
-
-    class FakeClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return None
-
-        async def post(self, endpoint, json, headers):
-            return FakeResponse()
-
-    monkeypatch.setattr(server_module.httpx, "AsyncClient", lambda **kwargs: FakeClient())
-    monkeypatch.setattr(server_module, "_ledger_record", lambda *args, **kwargs: None)
-    request = SimpleNamespace(state=SimpleNamespace())
-    info = _info("", thinking="", provider="omlx", provider_model_id="gemma-upstream", vision=True)
-
-    result = asyncio.run(server_module._extract_image_observations(
-        request,
-        {"messages": [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
-        ]}]},
-        "gemma-local", info, max_images=4,
-    ))
-
-    assert result.status_code == 502
-    assert "empty observations" in result.body.decode()
 
 
 def test_responses_input_image_translates_to_real_image_block():
@@ -2434,7 +1341,7 @@ def test_responses_tool_output_preserves_images_for_gateway_staging():
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
 def test_responses_file_id_rejected_on_translated_route(client, monkeypatch):
-    monkeypatch.setattr(server_module, "resolve", lambda model: _info("none", provider="test", vision=False))
+    monkeypatch.setattr(server_module, "resolve", lambda model: _info("none", provider="test", vision=True))
     response = client.post("/v1/responses", json={
         "model": "text-model", "input": [{"type": "message", "role": "user", "content": [
             {"type": "input_image", "file_id": "file_123"},
@@ -2446,7 +1353,7 @@ def test_responses_file_id_rejected_on_translated_route(client, monkeypatch):
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
 def test_responses_native_openai_preserves_file_id(client, monkeypatch):
-    native = _info("none", provider="openai", provider_model_id="native-responses", vision=False)
+    native = _info("none", provider="openai", provider_model_id="native-responses", vision=True)
     monkeypatch.setattr(server_module, "resolve", lambda model: native)
 
     async def fake_passthrough(endpoint, body, headers, is_stream, **kwargs):
@@ -2465,82 +1372,53 @@ def test_responses_native_openai_preserves_file_id(client, monkeypatch):
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
-@pytest.mark.parametrize("mode", ["typo", "extract_then_answer"])
-def test_responses_native_file_id_rejects_non_native_handling(client, monkeypatch, mode):
-    native = _info("none", provider="openai", provider_model_id="native-responses", vision=False)
-    monkeypatch.setattr(server_module, "resolve", lambda model: native)
-    response = client.post("/v1/responses", json={
-        "model": "vision-model", "gateway_image_handling": mode,
-        "input": [{"type": "message", "role": "user", "content": [
-            {"type": "input_image", "file_id": "file_123"},
+@pytest.mark.parametrize("path,payload,handler", [
+    ("/v1/chat/completions", {
+        "model": "text-model", "gateway_image_handling": "reroute", "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
         ]}],
-    })
-    assert response.status_code == 400
-
-
-@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
-def test_invalid_image_handling_mode_is_rejected(client, monkeypatch):
-    monkeypatch.setattr(server_module, "resolve", lambda model: _info("none", provider="test", vision=False))
-    response = client.post("/v1/chat/completions", json={
-        "model": "text-model", "gateway_image_handling": "typo", "messages": [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": "x"}},
-        ]}],
-    })
-    assert response.status_code == 400
-    assert "Unsupported" in response.json()["error"]["message"]
-
-
-@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
-@pytest.mark.parametrize("fallback_env", [None, ""], ids=["unset", "empty"])
-def test_chat_text_only_image_fails_closed_by_default(client, monkeypatch, fallback_env):
-    if fallback_env is None:
-        monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
-    else:
-        monkeypatch.setenv("GATEWAY_VISION_FALLBACK", fallback_env)
-    monkeypatch.setattr(server_module, "resolve", lambda model: _info("none", provider="test", vision=False))
-    response = client.post("/v1/chat/completions", json={
-        "model": "text-model", "messages": [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": "x"}},
-        ]}],
-    })
-    assert response.status_code == 400
-    assert set(response.json()) == {"error"}
-    message = response.json()["error"]["message"]
-    assert "text-only" in message
-    assert "GATEWAY_VISION_FALLBACK_CLOUD=<model>" in message
-
-
-@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
-@pytest.mark.parametrize("path,payload", [
+    }, "_passthrough_sync"),
     ("/v1/responses", {
-        "model": "text-model", "input": [{"type": "message", "role": "user", "content": [
-            {"type": "input_image", "image_url": "x"},
+        "model": "text-model", "stream": True, "input": [{"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "what is this?"},
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
         ]}],
-    }),
+    }, "_handle_responses_stream"),
     ("/v1/messages", {
         "model": "text-model", "max_tokens": 32, "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this?"},
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
         ]}],
-    }),
+    }, "_handle_sync"),
 ])
-def test_other_endpoints_text_only_image_fail_closed_when_fallback_empty(client, monkeypatch, path, payload):
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "")
-    monkeypatch.setattr(server_module, "resolve", lambda model: _info("none", provider="test", vision=False))
+def test_text_only_model_gets_a_note_in_place_of_each_image(client, monkeypatch, path, payload, handler):
+    text_info = _info("none", thinking="", provider="test", provider_model_id="text-upstream")
+    monkeypatch.setattr(server_module, "resolve", lambda model: text_info)
+    captured = {}
+
+    async def fake_upstream(endpoint, body, *args, **kwargs):
+        captured["body"] = body
+        return server_module.JSONResponse(status_code=200, content={"ok": True})
+
+    monkeypatch.setattr(server_module, handler, fake_upstream)
     response = client.post(path, json=payload)
-    assert response.status_code == 400
-    error = response.json()
-    if path == "/v1/messages":
-        assert error["type"] == "error"
-        assert error["error"]["type"] == "invalid_request_error"
-    else:
-        assert set(error) == {"error"}
+
+    assert response.status_code == 200
+    body = captured["body"]
+    assert body["model"] == "text-upstream"
+    assert not server_module._payload_has_image(body)
+    assert "gateway_image_handling" not in body
+    parts = [part for message in body["messages"] if isinstance(message.get("content"), list)
+             for part in message["content"]]
+    assert {"type": "text", "text": server_module.IMAGE_OMITTED_NOTE} in parts
+    assert "what is this?" in str(parts)
 
 
 @pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
 @pytest.mark.parametrize("model", ["gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "gpt-5.6"])
-def test_configured_gpt_vision_models_bypass_fallback(client, monkeypatch, model):
+def test_configured_gpt_vision_models_receive_images(client, monkeypatch, model):
     native = _info("openai-responses", provider="databricks", provider_model_id=f"upstream-{model}", vision=True)
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "unavailable-fallback")
     monkeypatch.setattr(server_module, "resolve", lambda requested: native if requested == model else None)
 
     async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
@@ -2558,9 +1436,8 @@ def test_configured_gpt_vision_models_bypass_fallback(client, monkeypatch, model
     assert response.json()["served"] == model
 
 
-def test_chat_native_vision_image_bypasses_fallback(client, monkeypatch):
+def test_chat_native_vision_model_receives_images(client, monkeypatch):
     native = _info("none", thinking="", provider="test", provider_model_id="native-vision", vision=True)
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "missing-fallback")
     monkeypatch.setattr(server_module, "resolve", lambda model: native if model == "vision-model" else None)
 
     async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
@@ -2799,89 +1676,3 @@ def test_debug_thinking_zai_max_reachable(client, monkeypatch):
     assert zai["max_reachable"] is True
 
 
-def test_scoped_extraction_inline_image_bytes_never_appear_in_gateway_logs(monkeypatch, caplog):
-    encoded = base64.b64encode(b"private image sentinel" * 100).decode("ascii")
-    text_info = _info("glm-chat-template", provider="omlx", provider_model_id="glm-upstream")
-    vision_info = _info("", thinking="", provider="omlx", provider_model_id="gemma-upstream", vision=True)
-
-    async def fake_extract(*args, **kwargs):
-        return ["visible wall"]
-
-    monkeypatch.delenv("GATEWAY_VISION_FALLBACK", raising=False)
-    monkeypatch.delenv("GATEWAY_VISION_FALLBACK_MODE", raising=False)
-    monkeypatch.delenv("GATEWAY_VISION_FALLBACK_CLOUD", raising=False)
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_LOCAL", "gemma-local")
-    monkeypatch.setattr(
-        server_module, "resolve",
-        lambda model, provider_override=None: vision_info if model == "gemma-local" else text_info,
-    )
-    monkeypatch.setattr(server_module, "_extract_image_observations", fake_extract)
-    request = SimpleNamespace(headers={}, state=SimpleNamespace())
-    body = {"model": "auto-local", "messages": [{"role": "user", "content": [{
-        "type": "image_url",
-        "image_url": {"url": f"data:image/png;base64,{encoded}"},
-    }]}]}
-
-    caplog.set_level(logging.INFO, logger="model-gateway")
-    rewritten, _model, _info_result, error = asyncio.run(
-        server_module._apply_chat_vision_fallback(
-            request,
-            body,
-            "auto-local",
-            text_info,
-            "/v1/chat/completions",
-        )
-    )
-
-    assert error is None
-    assert not server_module._payload_has_image(rewritten)
-    assert encoded not in caplog.text
-    assert "data:image" not in caplog.text
-
-
-def test_client_bound_operation_skips_work_when_already_disconnected():
-    called = False
-
-    class Request:
-        async def is_disconnected(self):
-            return True
-
-    async def operation():
-        nonlocal called
-        called = True
-        return "unexpected"
-
-    async def exercise():
-        with pytest.raises(asyncio.CancelledError):
-            await server_module._await_client_bound_operation(Request(), operation)
-
-    asyncio.run(exercise())
-    assert called is False
-
-
-def test_client_bound_operation_cancels_inflight_work_on_disconnect(monkeypatch):
-    checks = 0
-    started = asyncio.Event()
-    cancelled = asyncio.Event()
-
-    class Request:
-        async def is_disconnected(self):
-            nonlocal checks
-            checks += 1
-            return checks >= 2
-
-    async def operation():
-        started.set()
-        try:
-            await asyncio.Event().wait()
-        finally:
-            cancelled.set()
-
-    async def exercise():
-        monkeypatch.setattr(server_module, "CLIENT_DISCONNECT_POLL_SECONDS", 0.001)
-        with pytest.raises(asyncio.CancelledError):
-            await server_module._await_client_bound_operation(Request(), operation)
-        assert started.is_set()
-        assert cancelled.is_set()
-
-    asyncio.run(exercise())

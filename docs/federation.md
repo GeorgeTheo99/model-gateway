@@ -184,7 +184,7 @@ These requests go to `/v1/federation/local/{chat/completions,messages,responses}
 which only schema 2 nodes serve, so a peer downgraded since the importer's last
 refresh refuses them instead of running its ordinary pipeline. On that path the
 peer serves exactly the named model, available and local there, with no
-retirement redirect, base-model reroute, `model_fallbacks` or vision fallback;
+retirement redirect, base-model reroute or `model_fallbacks`;
 otherwise it answers `409`. Only authenticated peer forwards may use it, and
 it is recorded in the serving node's ledger under its own path.
 Explicit `<peer>/<id>` requests keep the ordinary forwarding path above, and

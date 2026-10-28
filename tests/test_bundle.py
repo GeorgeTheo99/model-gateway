@@ -256,20 +256,6 @@ def test_rollback_file_restores_the_previous_machine_state(source, tmp_path, mon
     assert not rollback.exists()
 
 
-def test_import_rolls_back_when_vision_policy_rejects_the_catalog(source, tmp_path, monkeypatch):
-    out = source / "bundle.tar.gz"
-    bundle.export_bundle(out)
-    target = Path(os.path.realpath(tmp_path)) / "target"
-    _machine(target, monkeypatch)
-    (target / "config.yaml").write_text("auth:\n  client_keys: [t]\n")
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_CLOUD", "model-not-in-bundle")
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK_MODE", "extract_then_answer")
-    with pytest.raises(Exception):
-        bundle.import_bundle(out)
-    assert (target / "config.yaml").read_text() == "auth:\n  client_keys: [t]\n"
-    assert not (target / "model-info.json").exists()
-
-
 def test_import_restores_files_on_keyboard_interrupt(source, tmp_path, monkeypatch):
     out = source / "bundle.tar.gz"
     bundle.export_bundle(out)

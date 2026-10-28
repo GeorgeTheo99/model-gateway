@@ -235,63 +235,11 @@ def test_unrestricted_credentials_are_unchanged(monkeypatch, dispatched):
 
 # ── vision fallback ─────────────────────────────────────────────────────────
 
-NOT_PERMITTED_VISION = "Model 'allowed-a' is text-only; send images to a vision model this credential may use."
-
-
-@pytest.mark.parametrize("mode", ["reroute", "extract_then_answer"])
-def test_vision_fallback_needs_a_permitted_helper(monkeypatch, dispatched, mode):
+def test_images_to_a_text_only_allowed_model_are_served_by_it_as_notes(monkeypatch, dispatched):
     _configure(monkeypatch)
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-helper")
-    response = client.post(
-        "/v1/chat/completions",
-        headers={"Authorization": f"Bearer {TOKEN}", "x-gateway-image-handling": mode},
-        json={"model": "allowed-a", "messages": IMAGE},
-    )
-    assert response.status_code == 400
-    assert response.json()["error"]["message"] == NOT_PERMITTED_VISION
-    assert "vision-helper" not in response.text and "helper-native" not in response.text
-    assert dispatched == []
-
-
-@pytest.mark.parametrize("path, body", [
-    ("/v1/chat/completions", {"messages": IMAGE}),
-    ("/v1/responses", {"input": [{"role": "user", "content": [
-        {"type": "input_text", "text": "what is this?"},
-        {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="},
-    ]}]}),
-    ("/v1/messages", {"max_tokens": 8, "messages": [{"role": "user", "content": [
-        {"type": "text", "text": "what is this?"},
-        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}},
-    ]}]}),
-])
-def test_every_endpoint_needs_a_permitted_vision_helper(monkeypatch, dispatched, path, body):
-    _configure(monkeypatch)
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-helper")
-    response = client.post(path, headers={"Authorization": f"Bearer {TOKEN}"}, json={"model": "allowed-a", **body})
-    assert response.status_code == 400
-    assert response.json()["error"]["message"] == NOT_PERMITTED_VISION
-    assert dispatched == []
-
-
-def test_vision_fallback_to_a_permitted_helper_reroutes(monkeypatch, dispatched):
-    _configure(monkeypatch, models=["allowed-a", "vision-helper"])
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-helper")
-    response = client.post(
-        "/v1/chat/completions",
-        headers={"Authorization": f"Bearer {TOKEN}", "x-gateway-image-handling": "reroute"},
-        json={"model": "allowed-a", "messages": IMAGE},
-    )
-    assert response.status_code == 200
-    assert dispatched[-1]["model"] == "helper-native"
-
-
-def test_an_unusable_helper_is_not_named_to_a_restricted_credential(monkeypatch, dispatched):
-    _configure(monkeypatch, models=["allowed-a", "missing-helper"])
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "missing-helper")
     response = _chat("allowed-a", messages=IMAGE)
-    assert response.status_code == 400
-    assert response.json()["error"]["message"] == NOT_PERMITTED_VISION
-    assert "missing-helper" not in response.text
+    assert response.status_code == 200
+    assert [call["model"] for call in dispatched] == ["a-native"]
 
 
 # ── federation ──────────────────────────────────────────────────────────────

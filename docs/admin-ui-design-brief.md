@@ -70,8 +70,8 @@ A dedicated model detail view contains:
   example without embedded credentials.
 - **Capabilities & cost**: tools, vision, reasoning, context/output limits, and
   explicit pricing status.
-- **Routing**: direct connection or workspace pool, preference order, and separately
-  identified model/vision fallback behavior.
+- **Routing**: direct connection or workspace pool, preference order, separately
+  identified model fallback behavior, and image handling.
 - **Recent activity**: requests, errors, latency, and cost for this model.
 - **Configuration**: an explicit edit action with advanced fields progressively
   disclosed.

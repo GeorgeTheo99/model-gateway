@@ -1367,39 +1367,6 @@ def test_admin_workspace_pools_report_standalone_providers(
     assert rows["google"]["pool_memberships"] == []
 
 
-def test_admin_reload_rejects_invalid_vision_fallback_and_restores_registry(
-    client, tmp_config, monkeypatch,
-):
-    model_info_path = tmp_config / "model-info.json"
-    valid_catalog = {"llm": [{
-        "name": "vision-fallback",
-        "provider": "omlx",
-        "omlx_id": "vision-upstream",
-        "vision": True,
-        "context": 4096,
-        "max_output_tokens": 512,
-    }]}
-    model_info_path.write_text(json.dumps(valid_catalog))
-    providers.reload()
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
-    assert providers.resolve("vision-fallback").vision is True
-
-    invalid_catalog = json.loads(json.dumps(valid_catalog))
-    invalid_catalog["llm"][0]["vision"] = False
-    model_info_path.write_text(json.dumps(invalid_catalog))
-
-    response = client.post(
-        "/admin/api/reload",
-        headers={"Authorization": "Bearer admin"},
-    )
-
-    assert response.status_code == 400
-    assert "not vision-capable" in response.text
-    restored = providers.resolve("vision-fallback")
-    assert restored is not None
-    assert restored.vision is True
-
-
 def test_admin_reload_malformed_catalog_restores_live_registry(
     client, tmp_config,
 ):
@@ -1414,59 +1381,6 @@ def test_admin_reload_malformed_catalog_restores_live_registry(
     assert response.status_code == 400
     assert "reload rejected" in response.text
     assert providers.resolve("claude-test") is not None
-
-
-def test_admin_mutations_rollback_when_they_invalidate_vision_fallback(
-    client, tmp_config, monkeypatch,
-):
-    import yaml
-
-    model_info_path = tmp_config / "model-info.json"
-    valid_catalog = {"llm": [{
-        "name": "vision-fallback",
-        "provider": "omlx",
-        "omlx_id": "vision-upstream",
-        "vision": True,
-        "context": 4096,
-        "max_output_tokens": 512,
-    }]}
-    model_info_path.write_text(json.dumps(valid_catalog))
-    config_path = tmp_config / "config.yaml"
-    model_info_path.chmod(0o600)
-    config_path.chmod(0o600)
-    providers.reload()
-    monkeypatch.setenv("GATEWAY_VISION_FALLBACK", "vision-fallback")
-    assert providers.resolve("vision-fallback").vision is True
-    headers = {"Authorization": "Bearer admin"}
-
-    update_response = client.post(
-        "/admin/api/models/vision-fallback",
-        headers=headers,
-        json={
-            "provider": "omlx",
-            "omlx_id": "vision-upstream",
-            "vision": False,
-        },
-    )
-
-    assert update_response.status_code == 400
-    assert "changes rolled back" in update_response.text
-    restored_catalog = json.loads(model_info_path.read_text())
-    assert restored_catalog["llm"][0]["vision"] is True
-    assert model_info_path.stat().st_mode & 0o777 == 0o600
-    assert providers.resolve("vision-fallback").vision is True
-
-    disable_response = client.post(
-        "/admin/api/models/vision-fallback/disable",
-        headers=headers,
-    )
-
-    assert disable_response.status_code == 400
-    assert "changes rolled back" in disable_response.text
-    config = yaml.safe_load(config_path.read_text())
-    assert "vision-fallback" not in (config.get("model_overrides") or {})
-    assert config_path.stat().st_mode & 0o777 == 0o600
-    assert providers.resolve("vision-fallback").vision is True
 
 
 def test_registry_mutations_are_serialized_across_validation(tmp_config, monkeypatch):

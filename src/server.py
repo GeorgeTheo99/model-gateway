@@ -19,7 +19,6 @@ import os
 import secrets
 import time
 from contextlib import asynccontextmanager
-from collections import OrderedDict
 from types import SimpleNamespace
 
 import httpx
@@ -30,7 +29,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from src.admin import router as admin_router
 from src.auth import require_client_auth, require_consumer_auth, validate_credential_separation
 from src.errors import upstream_error, upstream_error_openai
-from src.providers import effective_model_inventory, list_available_models, list_models as list_routable_models, model_availability, pool_candidates, pricing_for, pricing_status_for, provider_quirks, resolve, retirement_redirect, base_model_route, snapshot_registry as snapshot_provider_registry
+from src.providers import effective_model_inventory, list_available_models, list_models as list_routable_models, model_availability, pricing_for, pricing_status_for, provider_quirks, resolve, retirement_redirect, base_model_route, snapshot_registry as snapshot_provider_registry
 from src.upstream import (
     PoolContext,
     _retry_post,
@@ -105,7 +104,7 @@ async def _read_json_body_bounded(request: Request) -> dict:
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     """Validate routing policy, initialize state, and start background services."""
-    _validate_vision_fallback_policy()
+    _warn_removed_vision_fallback_env()
     validate_credential_separation()
     migrated_backups = config_io.migrate_legacy_backups()
     if migrated_backups:
@@ -158,336 +157,33 @@ app = FastAPI(
 app.include_router(admin_router)
 app.include_router(media.router)
 
-DEFAULT_VISION_FALLBACK_MODEL = ""
-DEFAULT_VISION_FALLBACK_IMAGE_MAX_BYTES = 20_000_000
-DEFAULT_VISION_FALLBACK_IMAGE_TOTAL_MAX_BYTES = 32_000_000
 DEFAULT_FIREWORKS_IMAGE_MAX_BYTES = 1_000_000
 DEFAULT_FIREWORKS_IMAGE_MAX_DIMENSION = 1600
 DEFAULT_FIREWORKS_IMAGE_TOTAL_MAX_BYTES = 8_000_000
-IMAGE_HANDLING_EXTRACT_THEN_ANSWER = "extract_then_answer"
 STREAM_READ_TIMEOUT_SECONDS = int(os.environ.get("MODEL_GATEWAY_STREAM_READ_TIMEOUT_SECONDS", "900"))
-CLIENT_DISCONNECT_POLL_SECONDS = 0.05
-VISION_OBSERVATION_PROMPT = """You extract visual observations for a separate reasoning model.
-
-Return concise, structured observations only. Do not answer the user's question, do not make recommendations, and do not infer beyond what is visible. Include these sections when applicable:
-1. Visible objects/materials
-2. Spatial layout and relationships
-3. Text/signage/markings if visible
-4. Measurements or relative sizes only if inferable
-5. Visible defects/risks/constraints
-6. Uncertainties / things not visible
-""".strip()
-
-
-def _configured_scoped_vision_fallbacks() -> dict[str, str]:
-    """Return explicit locality-scoped fallbacks, with empty values disabled."""
-    return {
-        "local": os.environ.get("GATEWAY_VISION_FALLBACK_LOCAL", "").strip(),
-        "cloud": os.environ.get("GATEWAY_VISION_FALLBACK_CLOUD", "").strip(),
-    }
-
-
-def _configured_vision_fallback_model(locality: str | None = None) -> str:
-    """Return the scoped fallback for a route, or the legacy global fallback."""
-    scoped = _configured_scoped_vision_fallbacks()
-    if locality is not None and any(scoped.values()):
-        return scoped.get(locality, "")
-    return os.environ.get("GATEWAY_VISION_FALLBACK", DEFAULT_VISION_FALLBACK_MODEL).strip()
-
-
-def _configured_vision_fallback_mode() -> str:
-    """Default image-handling mode for the process-wide vision fallback."""
-    configured = os.environ.get("GATEWAY_VISION_FALLBACK_MODE", "").strip().lower()
-    if configured:
-        return configured
-    # Locality-scoped fallbacks are helpers by default: the original model
-    # answers after receiving bounded observations from the vision model.
-    if any(_configured_scoped_vision_fallbacks().values()):
-        return IMAGE_HANDLING_EXTRACT_THEN_ANSWER
-    # Preserve the legacy global fallback's historical behavior.
-    return "reroute"
-
-
-DEFAULT_VISION_FALLBACK_MAX_IMAGES = 4
-MAX_VISION_FALLBACK_MAX_IMAGES = 32
-VISION_OBSERVATION_CACHE_MAX_ENTRIES = 256
-DEFAULT_VISION_OBSERVATION_CACHE_TTL_SECONDS = 3600
-MAX_VISION_OBSERVATION_CACHE_TTL_SECONDS = 86_400
-DEFAULT_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS = max(1, min(STREAM_READ_TIMEOUT_SECONDS, 3600))
-MAX_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS = 3600
-VISION_OBSERVATION_MAX_CHARS_PER_IMAGE = 16_000
-VISION_OBSERVATION_MAX_TOTAL_CHARS = 256_000
-VISION_EXTRACTION_UPSTREAM_RESPONSE_MAX_BYTES = 1_000_000
 MODEL_GATEWAY_MAX_REQUEST_BODY_BYTES = 64_000_000
-VISION_OBSERVATION_CACHE_POLICY_VERSION = "vision-observation-v2"
-VISION_OBSERVATION_PROMPT_SHA256 = hashlib.sha256(VISION_OBSERVATION_PROMPT.encode()).hexdigest()
-
-# Per-process LRU of successful inline-image observations. Cache generations
-# prevent an extraction started before a registry reload from repopulating the
-# new generation with stale observations.
-_vision_observation_cache: OrderedDict[tuple[int, str], tuple[float, str]] = OrderedDict()
-_vision_observation_cache_generation = 0
-
-
-def _inline_image_bytes(image_part: dict) -> bytes | None:
-    """Return validated inline image bytes, or None for a remote/non-image part."""
-    url = _image_url_value(image_part)
-    if not isinstance(url, str) or not url.startswith("data:image/") or ";base64," not in url:
-        return None
-    encoded = url.split(";base64,", 1)[1]
-    try:
-        return base64.b64decode(encoded, validate=True)
-    except (ValueError, TypeError) as exc:
-        raise ValueError("Vision fallback received malformed base64 image data") from exc
+# A text-only model gets this note in place of each image. It matches Pi's own
+# placeholder, so a conversation reads the same whichever side omitted it.
+IMAGE_OMITTED_NOTE = "(image omitted: model does not support images)"
+# Settings of the removed image helpers; they are ignored.
+REMOVED_VISION_FALLBACK_ENV = (
+    "GATEWAY_VISION_FALLBACK",
+    "GATEWAY_VISION_FALLBACK_LOCAL",
+    "GATEWAY_VISION_FALLBACK_CLOUD",
+    "GATEWAY_VISION_FALLBACK_MODE",
+    "GATEWAY_VISION_FALLBACK_MAX_IMAGES",
+    "GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS",
+    "GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS",
+)
 
 
-def _vision_observation_cache_key(
-    image_part: dict,
-    fallback_model: str,
-    fallback_info,
-    *,
-    generation: int | None = None,
-) -> tuple[int, str] | None:
-    """Key an inline image by bytes, request options, and extractor contract."""
-    image_bytes = _inline_image_bytes(image_part)
-    if image_bytes is None:
-        return None
-    normalized_part = copy.deepcopy(image_part)
-    url = _image_url_value(normalized_part)
-    prefix = url.split(";base64,", 1)[0]
-    _set_image_url_value(
-        normalized_part,
-        f"{prefix};sha256,{hashlib.sha256(image_bytes).hexdigest()}",
-    )
-    extractor = {
-        "version": VISION_OBSERVATION_CACHE_POLICY_VERSION,
-        "fallback_model": fallback_model,
-        "provider": fallback_info.provider,
-        "base_url": fallback_info.base_url,
-        "provider_model_id": fallback_info.provider_model_id,
-        "protocol": fallback_info.protocol,
-        "endpoint_suffix": fallback_info.endpoint_suffix,
-        "system_instruction": fallback_info.system_instruction,
-        "observation_prompt_sha256": VISION_OBSERVATION_PROMPT_SHA256,
-        "max_tokens": 1800,
-        "fireworks_image_max_dimension": _env_int(
-            "GATEWAY_FIREWORKS_IMAGE_MAX_DIMENSION", DEFAULT_FIREWORKS_IMAGE_MAX_DIMENSION,
-        ),
-        "fireworks_image_max_bytes": _env_int(
-            "GATEWAY_FIREWORKS_IMAGE_MAX_BYTES", DEFAULT_FIREWORKS_IMAGE_MAX_BYTES,
-        ),
-        "fireworks_image_total_max_bytes": _env_int(
-            "GATEWAY_FIREWORKS_IMAGE_TOTAL_MAX_BYTES", DEFAULT_FIREWORKS_IMAGE_TOTAL_MAX_BYTES,
-        ),
-        "image_part": normalized_part,
-    }
-    identity = json.dumps(extractor, sort_keys=True, separators=(",", ":")).encode()
-    cache_generation = _vision_observation_cache_generation if generation is None else generation
-    return cache_generation, hashlib.sha256(identity).hexdigest()
-
-
-def _configured_vision_observation_cache_ttl_seconds() -> int:
-    raw = os.environ.get("GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS", "").strip()
-    if not raw:
-        return DEFAULT_VISION_OBSERVATION_CACHE_TTL_SECONDS
-    try:
-        value = int(raw)
-    except ValueError:
-        value = -1
-    if not 0 <= value <= MAX_VISION_OBSERVATION_CACHE_TTL_SECONDS:
-        raise RuntimeError(
-            "GATEWAY_VISION_OBSERVATION_CACHE_TTL_SECONDS must be an integer from 0 through "
-            f"{MAX_VISION_OBSERVATION_CACHE_TTL_SECONDS}, not '{raw}'"
+def _warn_removed_vision_fallback_env() -> None:
+    configured = [name for name in REMOVED_VISION_FALLBACK_ENV if os.environ.get(name, "").strip()]
+    if configured:
+        log.warning(
+            "ignoring %s: image helpers were removed; text-only models receive %r in place of images",
+            ", ".join(configured), IMAGE_OMITTED_NOTE,
         )
-    return value
-
-
-def _configured_vision_extraction_total_timeout_seconds() -> int:
-    raw = os.environ.get("GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS", "").strip()
-    if not raw:
-        return DEFAULT_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS
-    try:
-        value = int(raw)
-    except ValueError:
-        value = -1
-    if not 1 <= value <= MAX_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS:
-        raise RuntimeError(
-            "GATEWAY_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS must be an integer from 1 through "
-            f"{MAX_VISION_EXTRACTION_TOTAL_TIMEOUT_SECONDS}, not '{raw}'"
-        )
-    return value
-
-
-def _vision_observation_cache_get(key: tuple[int, str] | None) -> str | None:
-    if key is None or key[0] != _vision_observation_cache_generation:
-        return None
-    entry = _vision_observation_cache.get(key)
-    if entry is None:
-        return None
-    created_at, value = entry
-    ttl = _configured_vision_observation_cache_ttl_seconds()
-    if ttl == 0 or time.monotonic() - created_at > ttl:
-        _vision_observation_cache.pop(key, None)
-        return None
-    _vision_observation_cache.move_to_end(key)
-    return value
-
-
-def _vision_observation_cache_put(key: tuple[int, str] | None, value: str) -> None:
-    if (
-        key is None
-        or key[0] != _vision_observation_cache_generation
-        or _configured_vision_observation_cache_ttl_seconds() == 0
-    ):
-        return
-    _vision_observation_cache[key] = (time.monotonic(), value)
-    _vision_observation_cache.move_to_end(key)
-    while len(_vision_observation_cache) > VISION_OBSERVATION_CACHE_MAX_ENTRIES:
-        _vision_observation_cache.popitem(last=False)
-
-
-def _clear_vision_observation_cache() -> None:
-    global _vision_observation_cache_generation
-    _vision_observation_cache_generation += 1
-    _vision_observation_cache.clear()
-
-
-def _configured_vision_fallback_max_images() -> int:
-    """Per-request image limit for process-wide fallback extraction."""
-    raw = os.environ.get("GATEWAY_VISION_FALLBACK_MAX_IMAGES", "").strip()
-    if not raw:
-        return DEFAULT_VISION_FALLBACK_MAX_IMAGES
-    error = RuntimeError(
-        f"GATEWAY_VISION_FALLBACK_MAX_IMAGES must be an integer from 1 through "
-        f"{MAX_VISION_FALLBACK_MAX_IMAGES}, not '{raw}'"
-    )
-    try:
-        value = int(raw)
-    except ValueError:
-        raise error from None
-    if not 1 <= value <= MAX_VISION_FALLBACK_MAX_IMAGES:
-        raise error
-    return value
-
-
-def _vision_route_locality(model: str, info=None) -> str:
-    """Classify a model's complete configured provider pool as local or cloud."""
-    candidates = pool_candidates(model)
-    candidate_infos = (
-        [(provider, resolve(model, provider_override=provider)) for provider in candidates]
-        if candidates
-        else [("", info if info is not None else resolve(model))]
-    )
-    if not candidate_infos or any(candidate_info is None for _, candidate_info in candidate_infos):
-        raise RuntimeError(f"model '{model}' is not resolvable across its provider pool")
-    providers = sorted({candidate_info.provider for _, candidate_info in candidate_infos})
-    localities = {"local" if provider == "omlx" else "cloud" for provider in providers}
-    if len(localities) != 1:
-        raise RuntimeError(
-            f"model '{model}' mixes local and cloud providers; choose a locality-stable route"
-        )
-    return next(iter(localities))
-
-
-def _vision_fallback_policies() -> list[tuple[str, str, str | None]]:
-    """Return (environment variable, model, required locality) policies."""
-    legacy = os.environ.get("GATEWAY_VISION_FALLBACK", DEFAULT_VISION_FALLBACK_MODEL).strip()
-    scoped = _configured_scoped_vision_fallbacks()
-    if legacy and any(scoped.values()):
-        raise RuntimeError(
-            "GATEWAY_VISION_FALLBACK cannot be combined with "
-            "GATEWAY_VISION_FALLBACK_LOCAL or GATEWAY_VISION_FALLBACK_CLOUD"
-        )
-    if legacy:
-        return [("GATEWAY_VISION_FALLBACK", legacy, None)]
-    return [
-        (f"GATEWAY_VISION_FALLBACK_{locality.upper()}", model, locality)
-        for locality, model in scoped.items()
-        if model
-    ]
-
-
-def _validate_vision_fallback_policy(*, log_policy: bool = True) -> None:
-    """Fail startup/reload on invalid opt-ins and enforce locality boundaries."""
-    # Validate shared extraction controls even when no fallback is enabled so
-    # a later opt-in cannot expose a latent invalid value.
-    cache_ttl = _configured_vision_observation_cache_ttl_seconds()
-    total_timeout = _configured_vision_extraction_total_timeout_seconds()
-    policies = _vision_fallback_policies()
-    if not policies:
-        if log_policy:
-            log.info(
-                "vision fallback policy: disabled; image input to text-only models fails closed "
-                "cache_ttl_seconds=%d total_timeout_seconds=%d",
-                cache_ttl,
-                total_timeout,
-            )
-        return
-
-    fallback_mode = _configured_vision_fallback_mode()
-    if fallback_mode not in {"reroute", IMAGE_HANDLING_EXTRACT_THEN_ANSWER}:
-        raise RuntimeError(
-            f"GATEWAY_VISION_FALLBACK_MODE must be 'reroute' or 'extract_then_answer', not '{fallback_mode}'"
-        )
-
-    max_images = _configured_vision_fallback_max_images()
-
-    for variable, fallback_model, required_locality in policies:
-        candidates = pool_candidates(fallback_model)
-        candidate_infos = (
-            [(provider, resolve(fallback_model, provider_override=provider)) for provider in candidates]
-            if candidates
-            else [("", resolve(fallback_model))]
-        )
-        if not candidate_infos or any(info is None for _, info in candidate_infos):
-            raise RuntimeError(f"{variable} model '{fallback_model}' is not resolvable")
-        for provider, fallback_info in candidate_infos:
-            provider_label = provider or fallback_info.provider
-            if not fallback_info.vision:
-                raise RuntimeError(
-                    f"{variable} model '{fallback_model}' is not vision-capable "
-                    f"on provider '{provider_label}'"
-                )
-            if getattr(fallback_info, "api_style", "") == "open_responses":
-                raise RuntimeError(
-                    f"{variable} model '{fallback_model}' is Responses-only "
-                    f"on provider '{provider_label}'; vision fallback requires Chat Completions"
-                )
-            if fallback_info.protocol != "openai":
-                raise RuntimeError(
-                    f"{variable} model '{fallback_model}' must use an "
-                    f"OpenAI-compatible protocol on provider '{provider_label}'"
-                )
-
-        effective_providers = sorted({info.provider for _, info in candidate_infos})
-        localities = {"local" if provider == "omlx" else "cloud" for provider in effective_providers}
-        if len(localities) != 1:
-            raise RuntimeError(
-                f"{variable} model '{fallback_model}' mixes local and cloud "
-                "providers; choose a locality-stable fallback"
-            )
-        actual_locality = next(iter(localities))
-        if required_locality is not None and actual_locality != required_locality:
-            raise RuntimeError(
-                f"{variable} model '{fallback_model}' is {actual_locality}, "
-                f"but the policy requires a {required_locality} model"
-            )
-
-        cloud_egress = actual_locality == "cloud"
-        message = (
-            "vision fallback policy: enabled model=%s scope=%s providers=%s "
-            "cloud_egress=%s mode=%s max_images=%d cache_ttl_seconds=%d total_timeout_seconds=%d"
-        )
-        scope = required_locality or "legacy-global"
-        provider_list = ",".join(effective_providers)
-        args = (
-            fallback_model, scope, provider_list, str(cloud_egress).lower(), fallback_mode,
-            max_images, cache_ttl, total_timeout,
-        )
-        if log_policy and cloud_egress:
-            log.warning(message, *args)
-        elif log_policy:
-            log.info(message, *args)
 
 
 def _session_affinity_id(request: Request) -> str:
@@ -1562,11 +1258,9 @@ def _imported_reasoning_inputs(model: dict) -> tuple[str, tuple[str, ...], str |
 
 
 def _thinking_validation_response(request: Request, req: dict, info, error_factory):
-    # Validation occurs before vision routing finalizes the served
-    # model. Normalize a copy so GLM-5.3 defaults cannot leak into a different
-    # fallback model's second validation pass; dispatch mutates only after the
-    # final route is selected. A requested tier is placed on this model's
-    # levels each time, so a vision reroute gets the served model's level.
+    # Place a requested tier on this model's levels, then normalize a copy so
+    # GLM-5.3 defaults cannot leak into the request; dispatch mutates only
+    # after the final route is selected.
     try:
         _apply_reasoning_tier(request, req, info)
     except ThinkingValidationError as exc:
@@ -1736,7 +1430,7 @@ def _image_count(payload: dict) -> int:
             continue
         content = message.get("content", [])
         for part in content if isinstance(content, list) else [content]:
-            if isinstance(part, dict) and (part.get("type") in {"image", "image_url"} or "image_url" in part):
+            if _is_chat_image_part(part):
                 count += 1
     return count
 
@@ -1755,491 +1449,92 @@ def _payload_has_unsupported_image_file(payload: dict) -> bool:
     return False
 
 
-def _gateway_image_handling_mode(request: Request, body: dict) -> str:
-    mode = request.headers.get("x-gateway-image-handling", "")
-    if not mode:
-        mg = body.get("model_gateway")
-        if isinstance(mg, dict):
-            mode = str(mg.get("image_handling") or "")
-    if not mode:
-        mode = str(body.get("gateway_image_handling") or "")
-    return mode.strip().lower()
-
-
 def _strip_gateway_controls(body: dict) -> None:
     """Remove all gateway-owned transport controls before upstream dispatch."""
     body.pop("gateway_image_handling", None)
     body.pop("model_gateway", None)
 
 
-def _resolve_vision_fallback(original_model: str, info, error_factory=_error_openai):
-    try:
-        _validate_vision_fallback_policy(log_policy=False)
-        original_locality = _vision_route_locality(original_model, info)
-    except RuntimeError as exc:
-        log.error("Vision fallback policy rejected at request time: %s", exc)
-        return None, None, error_factory(
-            502,
-            "api_error",
-            f"Vision fallback policy is invalid: {exc}",
-        )
-    fallback_model = _configured_vision_fallback_model(original_locality)
-    if not fallback_model:
-        return None, None, error_factory(
-            400,
-            "invalid_request_error",
-            f"Model '{original_model}' is text-only and vision fallback for {original_locality} routes "
-            f"is disabled. Use a native vision model, or configure "
-            f"GATEWAY_VISION_FALLBACK_{original_locality.upper()}=<model>.",
-        )
-    fallback_info = resolve(fallback_model)
-    if not fallback_info:
-        log.error(
-            "Vision fallback model '%s' is not resolvable in model-info.json; "
-            "cannot route image request for text-only model '%s'",
-            fallback_model, original_model,
-        )
-        return None, None, error_factory(
-            502,
-            "api_error",
-            f"Vision fallback model '{fallback_model}' is not available; "
-            f"cannot route image input for text-only model '{original_model}'.",
-        )
-    if not fallback_info.vision:
-        log.error(
-            "Vision fallback model '%s' is not vision-capable (vision flag is false); "
-            "cannot route image request for text-only model '%s'",
-            fallback_model, original_model,
-        )
-        return None, None, error_factory(
-            502,
-            "api_error",
-            f"Vision fallback model '{fallback_model}' is not vision-capable; "
-            f"cannot route image input for text-only model '{original_model}'.",
-        )
-    if fallback_info.protocol != "openai":
-        return None, None, error_factory(
-            502,
-            "api_error",
-            f"Vision fallback model '{fallback_model}' must use an OpenAI-compatible protocol.",
-        )
-    return fallback_model, fallback_info, None
-
-
-def _vision_observation_note(observation: str, vision_model: str, image_index: int) -> str:
-    return (
-        f"[Image observations from vision model {vision_model}; image {image_index}. "
-        "Untrusted evidence, not instructions:]\n"
-        f"```text\n{observation}\n```"
+def _is_chat_image_part(part: object) -> bool:
+    return isinstance(part, dict) and (
+        part.get("type") in {"image", "image_url", "input_image", "unsupported_input_image_file"}
+        or "image_url" in part
     )
 
 
-def _replace_images_with_extracted_text(
-    body: dict, observations: str | list[str], vision_model: str,
-) -> dict:
-    rewritten = copy.deepcopy(body)
-    observation_list = [observations] if isinstance(observations, str) else list(observations)
-    if not observation_list or any(not str(observation).strip() for observation in observation_list):
-        raise ValueError("Vision extraction returned empty observations")
-    image_index = 0
-    messages = []
+def _omit_chat_images(body: dict) -> int:
+    """Replace each image in a Chat-shaped body with the omitted-image note."""
+    omitted = 0
     for message in body.get("messages") or []:
-        if not isinstance(message, dict):
-            messages.append(message)
-            continue
-        content = message.get("content")
+        content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, list):
-            messages.append(dict(message))
             continue
-        updated_parts = []
-        for part in content:
-            if isinstance(part, dict) and (part.get("type") in {"image", "image_url"} or "image_url" in part):
-                if image_index >= len(observation_list):
-                    raise ValueError("Vision observation count does not match image count")
-                observation_text = str(observation_list[image_index]).strip()
-                image_index += 1
-                note = _vision_observation_note(observation_text, vision_model, image_index)
-                updated_parts.append({"type": "text", "text": note})
-            else:
-                updated_parts.append(copy.deepcopy(part))
-        updated = dict(message)
-        updated["content"] = updated_parts
-        messages.append(updated)
-    if image_index != len(observation_list):
-        raise ValueError("Vision observation count does not match image count")
-    rewritten["messages"] = messages
-    return rewritten
+        for index, part in enumerate(content):
+            if _is_chat_image_part(part):
+                content[index] = {"type": "text", "text": IMAGE_OMITTED_NOTE}
+                omitted += 1
+    return omitted
 
 
-def _replace_anthropic_images_with_extracted_text(
-    body: dict, observations: str | list[str], vision_model: str,
-) -> dict:
-    """Replace only Anthropic image blocks while preserving native controls."""
-    observation_list = [observations] if isinstance(observations, str) else list(observations)
-    if not observation_list or any(not str(observation).strip() for observation in observation_list):
-        raise ValueError("Vision extraction returned empty observations")
-    image_index = 0
-
-    def replace_blocks(blocks: list) -> list:
-        nonlocal image_index
-        replaced = []
-        for block in blocks:
-            if not isinstance(block, dict):
-                replaced.append(copy.deepcopy(block))
+def _omit_responses_images(body: dict) -> None:
+    """Replace each image in a native Responses body's input, tool outputs included."""
+    items = body.get("input")
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        for key in ("content", "output"):
+            parts = item.get(key)
+            if not isinstance(parts, list):
                 continue
-            if block.get("type") == "image":
-                if image_index >= len(observation_list):
-                    raise ValueError("Vision observation count does not match image count")
-                observation_text = str(observation_list[image_index]).strip()
-                image_index += 1
-                replacement = {
-                    "type": "text",
-                    "text": _vision_observation_note(
-                        observation_text, vision_model, image_index,
-                    ),
-                }
-                if "cache_control" in block:
-                    replacement["cache_control"] = copy.deepcopy(block["cache_control"])
-                replaced.append(replacement)
-                continue
-            replacement = copy.deepcopy(block)
-            if block.get("type") == "tool_result" and isinstance(block.get("content"), list):
-                replacement["content"] = replace_blocks(block["content"])
-            replaced.append(replacement)
-        return replaced
+            for index, part in enumerate(parts):
+                if isinstance(part, dict) and (
+                    part.get("type") in {"input_image", "image_url"}
+                    or (part.get("type") == "input_file" and str(part.get("file_data", "")).startswith("data:image/"))
+                ):
+                    parts[index] = {"type": "input_text", "text": IMAGE_OMITTED_NOTE}
 
-    rewritten = copy.deepcopy(body)
-    messages = []
+
+def _omit_anthropic_image_blocks(blocks: list) -> None:
+    for index, block in enumerate(blocks):
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "image":
+            replacement = {"type": "text", "text": IMAGE_OMITTED_NOTE}
+            if "cache_control" in block:
+                replacement["cache_control"] = block["cache_control"]
+            blocks[index] = replacement
+        elif block.get("type") == "tool_result" and isinstance(block.get("content"), list):
+            _omit_anthropic_image_blocks(block["content"])
+
+
+def _omit_anthropic_images(body: dict) -> None:
+    """Replace each image block in a native Messages body, keeping cache controls."""
     for message in body.get("messages") or []:
-        replacement = copy.deepcopy(message)
         if isinstance(message, dict) and isinstance(message.get("content"), list):
-            replacement["content"] = replace_blocks(message["content"])
-        messages.append(replacement)
-    if image_index != len(observation_list):
-        raise ValueError("Vision observation count does not match image count")
-    rewritten["messages"] = messages
-    return rewritten
+            _omit_anthropic_image_blocks(message["content"])
 
 
-async def _await_client_bound_operation(request: Request, operation):
-    """Cancel an in-flight internal request promptly when its client disconnects."""
-    is_disconnected = getattr(request, "is_disconnected", None)
-    if not callable(is_disconnected):
-        return await operation()
-    if await is_disconnected():
-        raise asyncio.CancelledError("client disconnected")
+def _prepare_images(body: dict, model: str, info, endpoint_name: str, error_factory=_error_openai):
+    """Keep images for a vision model; replace them with a note for a text-only one.
 
-    task = asyncio.create_task(operation())
-    try:
-        while True:
-            done, _pending = await asyncio.wait(
-                {task},
-                timeout=CLIENT_DISCONNECT_POLL_SECONDS,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if task in done:
-                return task.result()
-            if await is_disconnected():
-                raise asyncio.CancelledError("client disconnected")
-    finally:
-        if not task.done():
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-
-
-class _VisionExtractionResponseTooLarge(Exception):
-    pass
-
-
-async def _post_vision_extraction_json(
-    request: Request,
-    client,
-    endpoint: str,
-    extraction_body: dict,
-    headers: dict,
-) -> tuple[int, dict]:
-    """POST one extraction request and bound the complete upstream response."""
-
-    async def operation() -> tuple[int, dict]:
-        if hasattr(client, "build_request") and hasattr(client, "send"):
-            upstream_request = client.build_request(
-                "POST", endpoint, json=extraction_body, headers=headers,
-            )
-            response = await client.send(upstream_request, stream=True)
-            raw = bytearray()
-            try:
-                async for chunk in response.aiter_bytes():
-                    if len(raw) + len(chunk) > VISION_EXTRACTION_UPSTREAM_RESPONSE_MAX_BYTES:
-                        raise _VisionExtractionResponseTooLarge
-                    raw.extend(chunk)
-            finally:
-                await response.aclose()
-            try:
-                data = json.loads(raw)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                data = {}
-            return response.status_code, data if isinstance(data, dict) else {}
-
-        # Narrow test-double compatibility path. Production httpx clients use
-        # the bounded streaming branch above.
-        response = await client.post(endpoint, json=extraction_body, headers=headers)
-        try:
-            data = response.json()
-        except Exception:  # noqa: BLE001
-            data = {}
-        return response.status_code, data if isinstance(data, dict) else {}
-
-    return await _await_client_bound_operation(request, operation)
-
-
-async def _extract_image_observations(
-    request: Request,
-    body: dict,
-    fallback_model: str,
-    fallback_info,
-    error_factory=_error_openai,
-    *,
-    max_images: int = 1,
-) -> list[str] | JSONResponse:
-    # Capture before any await. A successful registry reload increments this
-    # generation, causing all writes from an in-flight old-registry extraction
-    # to be rejected even if the request resumes after the reload.
-    cache_generation = _vision_observation_cache_generation
-    # Extraction is an explicit cross-model boundary. Send only image blocks,
-    # never the surrounding conversation, tools, or user text. Extract each
-    # image separately so observations remain aligned with its original place.
-    image_parts = []
-    for message in body.get("messages", []) or []:
-        content = message.get("content", []) if isinstance(message, dict) else []
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if isinstance(part, dict) and (part.get("type") in {"image", "image_url"} or "image_url" in part):
-                image_parts.append(copy.deepcopy(part))
-    if not 1 <= len(image_parts) <= max_images:
-        return error_factory(
-            400,
-            "invalid_request_error",
-            f"extract_then_answer accepts 1 through {max_images} images per request.",
-        )
-    inline_sizes: list[int] = []
-    try:
-        for part in image_parts:
-            image_bytes = _inline_image_bytes(part)
-            if image_bytes is None:
-                raise ValueError(
-                    "extract_then_answer accepts only inline data:image/...;base64 images"
-                )
-            inline_sizes.append(len(image_bytes))
-    except ValueError as exc:
-        return error_factory(400, "invalid_request_error", str(exc))
-    if any(size > DEFAULT_VISION_FALLBACK_IMAGE_MAX_BYTES for size in inline_sizes):
-        return error_factory(413, "invalid_request_error", "A vision fallback image exceeds the per-image byte limit.")
-    if sum(inline_sizes) > DEFAULT_VISION_FALLBACK_IMAGE_TOTAL_MAX_BYTES:
-        return error_factory(413, "invalid_request_error", "Vision fallback images exceed the total byte limit.")
-    if fallback_info.protocol == "anthropic":
-        return error_factory(502, "api_error", f"Vision fallback model '{fallback_model}' does not support Chat Completions")
-
-    had_api_key = hasattr(request.state, "api_key")
-    original_api_key = getattr(request.state, "api_key", None)
-    try:
-        request.state.api_key = fallback_info.api_key
-        headers = _forward_headers(request, protocol=fallback_info.protocol, provider=fallback_info.provider)
-    finally:
-        if had_api_key:
-            request.state.api_key = original_api_key
-        else:
-            del request.state.api_key
-    endpoint = _upstream_endpoint(fallback_info, "/chat/completions")
-    results: list[str] = []
-    cache_hits = 0
-    total_chars = 0
-    deadline = time.monotonic() + _configured_vision_extraction_total_timeout_seconds()
-    async with httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS) as client:
-        for image_index, image_part in enumerate(image_parts, start=1):
-            cache_key = _vision_observation_cache_key(
-                image_part,
-                fallback_model,
-                fallback_info,
-                generation=cache_generation,
-            )
-            cached = _vision_observation_cache_get(cache_key)
-            if cached is not None:
-                if total_chars + len(cached) > VISION_OBSERVATION_MAX_TOTAL_CHARS:
-                    return error_factory(502, "api_error", "Vision fallback observations exceed the total output limit.")
-                cache_hits += 1
-                total_chars += len(cached)
-                results.append(cached)
-                continue
-            extraction_body = {
-                "model": fallback_info.provider_model_id,
-                "messages": [
-                    {"role": "system", "content": VISION_OBSERVATION_PROMPT},
-                    {"role": "user", "content": [image_part]},
-                ],
-                "stream": False,
-                "max_tokens": 1800,
-            }
-            _inject_openai_system_instruction(extraction_body, fallback_info.system_instruction)
-            _strip_fireworks_unsupported_message_fields(extraction_body, fallback_info)
-            _compress_fireworks_inline_images(extraction_body, fallback_info)
-            _remap_max_tokens_for_provider(extraction_body, fallback_info.provider)
-            start = time.time()
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return error_factory(504, "api_error", "Vision fallback exceeded the total extraction timeout.")
-            try:
-                status_code, data = await asyncio.wait_for(
-                    _post_vision_extraction_json(
-                        request, client, endpoint, extraction_body, headers,
-                    ),
-                    timeout=remaining,
-                )
-            except TimeoutError:
-                return error_factory(504, "api_error", "Vision fallback exceeded the total extraction timeout.")
-            except _VisionExtractionResponseTooLarge:
-                return error_factory(502, "api_error", "Vision fallback response exceeds the byte limit.")
-            except httpx.ConnectError:
-                return error_factory(502, "api_error", "Cannot connect to vision model provider")
-            except Exception as exc:  # noqa: BLE001
-                return error_factory(502, "api_error", f"Vision fallback request failed: {type(exc).__name__}")
-            latency_ms = int((time.time() - start) * 1000)
-            usage = data.get("usage") if isinstance(data, dict) and isinstance(data.get("usage"), dict) else None
-            _ledger_record(
-                "/internal/image-extract", "POST", fallback_model, fallback_info.provider,
-                fallback_info.provider_model_id, status_code, latency_ms, False, usage,
-                pricing_for(fallback_model), pricing_status_for(fallback_model),
-            )
-            if status_code >= 400:
-                return error_factory(
-                    502, "api_error",
-                    f"Vision fallback provider returned HTTP {status_code} for image {image_index}.",
-                )
-            choice = (data.get("choices") or [{}])[0] if isinstance(data, dict) else {}
-            finish_reason = choice.get("finish_reason") if isinstance(choice, dict) else None
-            if finish_reason not in {"stop", "end_turn"}:
-                return error_factory(
-                    502,
-                    "api_error",
-                    f"Vision fallback did not complete image {image_index} (finish_reason={finish_reason}).",
-                )
-            message = (choice.get("message") or {}) if isinstance(choice, dict) else {}
-            content = message.get("content", "")
-            if isinstance(content, list):
-                valid_text_parts = bool(content) and all(
-                    isinstance(part, dict)
-                    and part.get("type") in {"text", "output_text"}
-                    and isinstance(part.get("text"), str)
-                    for part in content
-                )
-                result = "\n".join(part["text"] for part in content).strip() if valid_text_parts else ""
-            elif isinstance(content, str):
-                result = content.strip()
-            else:
-                result = ""
-            if not result:
-                return error_factory(502, "api_error", f"Vision fallback returned empty observations for image {image_index}.")
-            if len(result) > VISION_OBSERVATION_MAX_CHARS_PER_IMAGE:
-                return error_factory(502, "api_error", f"Vision fallback observations exceed the per-image output limit for image {image_index}.")
-            if total_chars + len(result) > VISION_OBSERVATION_MAX_TOTAL_CHARS:
-                return error_factory(502, "api_error", "Vision fallback observations exceed the total output limit.")
-            _vision_observation_cache_put(cache_key, result)
-            total_chars += len(result)
-            results.append(result)
-    if image_parts:
-        log.info(
-            "vision_extract model=%s images=%d cache_hits=%d",
-            fallback_model, len(image_parts), cache_hits,
-        )
-    return results
-
-
-async def _apply_chat_vision_fallback(
-    request: Request,
-    body: dict,
-    requested_model: str,
-    info,
-    endpoint_name: str,
-    error_factory=_error_openai,
-):
-    """Apply staged vision handling to a Chat-shaped request."""
-    requested_mode = _gateway_image_handling_mode(request, body)
+    ``body`` is Chat-shaped and changed in place. Returns the number of images
+    omitted and an error response, if any.
+    """
     _strip_gateway_controls(body)
-    mode = requested_mode or _configured_vision_fallback_mode()
-    if mode not in {"reroute", IMAGE_HANDLING_EXTRACT_THEN_ANSWER}:
-        return body, requested_model, info, error_factory(
-            400, "invalid_request_error", f"Unsupported gateway image handling mode '{mode}'.",
-        )
-    if _payload_has_unsupported_image_file(body):
-        # Native OpenAI Responses can dereference file_id itself; translated
-        # Chat routes cannot. The Responses handler keeps the original body.
-        if endpoint_name == "/v1/responses" and info.provider == "openai":
-            # Native Responses can dereference file_id without gateway vision
-            # routing. Only the default native mode is valid for this shape.
-            if mode == "reroute":
-                return body, requested_model, info, None
-            return body, requested_model, info, error_factory(
-                400,
-                "invalid_request_error",
-                "input_image.file_id supports only native reroute handling; use image_url for extract_then_answer.",
-            )
-        return body, requested_model, info, error_factory(
+    if not info.vision:
+        omitted = _omit_chat_images(body)
+        if omitted:
+            log.info("images_omitted endpoint=%s model=%s count=%d", endpoint_name, model, omitted)
+        return omitted, None
+    # Native OpenAI Responses can dereference file_id itself; translated
+    # routes cannot. The Responses handler keeps the original body.
+    if _payload_has_unsupported_image_file(body) and not (
+        endpoint_name == "/v1/responses" and info.provider == "openai"
+    ):
+        return 0, error_factory(
             400, "invalid_request_error", "input_image.file_id is not supported on translated gateway routes; use image_url.",
         )
-    image_count = _image_count(body)
-    if not image_count or info.vision:
-        if image_count:
-            log.info("vision_fallback endpoint=%s requested=%s served=%s mode=native outcome=bypass image_count=%d", endpoint_name, requested_model, requested_model, image_count)
-        return body, requested_model, info, None
-
-    if getattr(request.state, "profile_execution", None) is not None:
-        return body, requested_model, info, error_factory(
-            409,
-            "invalid_request_error",
-            "Profile vision route is no longer vision-capable; re-register the profile.",
-        )
-    if getattr(request.state, "federation_local", False):
-        return body, requested_model, info, error_factory(
-            409, "invalid_request_error", "This local model is text-only; send images to a local vision model.",
-        )
-    fallback_model, fallback_info, error = _resolve_vision_fallback(requested_model, info, error_factory)
-    if _model_allowlist(request) is not None and (error or not _direct_model_permitted(request, fallback_model)):
-        # Neither the helper model nor why it is unusable is named to a restricted credential.
-        log.info("vision_fallback endpoint=%s requested=%s served=none mode=%s outcome=not_permitted image_count=%d", endpoint_name, requested_model, mode, image_count)
-        return body, requested_model, info, error_factory(
-            400, "invalid_request_error",
-            f"Model '{requested_model}' is text-only; send images to a vision model this credential may use.",
-        )
-    if error:
-        log.info("vision_fallback endpoint=%s requested=%s served=none mode=%s outcome=rejected image_count=%d", endpoint_name, requested_model, mode, image_count)
-        return body, requested_model, info, error
-    if mode == IMAGE_HANDLING_EXTRACT_THEN_ANSWER:
-        observations = await _extract_image_observations(
-            request,
-            body,
-            fallback_model,
-            fallback_info,
-            error_factory,
-            max_images=_configured_vision_fallback_max_images(),
-        )
-        if isinstance(observations, JSONResponse):
-            return body, requested_model, info, observations
-        request.state.vision_extraction = {
-            "model": fallback_model,
-            "observations": list(observations),
-        }
-        try:
-            body = _replace_images_with_extracted_text(body, observations, fallback_model)
-        except ValueError as exc:
-            return body, requested_model, info, error_factory(502, "api_error", str(exc))
-        served_model = requested_model
-        outcome = "extracted"
-    else:
-        info = fallback_info
-        served_model = fallback_model
-        outcome = "rerouted"
-    log.info("vision_fallback endpoint=%s requested=%s served=%s mode=%s outcome=%s image_count=%d", endpoint_name, requested_model, served_model, mode, outcome, image_count)
-    return body, served_model, info, None
+    return 0, None
 
 
 def _responses_reasoning_settings(req: dict) -> dict:
@@ -2624,8 +1919,8 @@ def _redirect_retired_model(request: Request, body: dict) -> str:
 def _set_ledger_ctx(request: Request, model: str, info, is_stream: bool = False) -> None:
     """Stash served-model context for the ledger middleware.
 
-    Handlers call this after ``resolve()`` finalizes the served model (after
-    any vision fallback). The middleware reads it after the response is built.
+    Handlers call this after ``resolve()`` finalizes the served model. The
+    middleware reads it after the response is built.
     ``is_stream`` is the client-facing stream flag (whether the client receives
     an SSE stream), which the middleware needs because Starlette wraps every
     response from ``call_next`` in a StreamingResponse regardless of type.
@@ -3463,8 +2758,8 @@ async def federation_catalog(request: Request):
 
 
 async def _local_forward(request: Request, path: str, handler):
-    """A trusted peer's local work: served only by this Mac's own oMLX, with no redirect, reroute,
-    model fallback or vision fallback (ADR 0003 section 4). Only peer forwards may use it."""
+    """A trusted peer's local work: served only by this Mac's own oMLX, with no redirect, reroute
+    or model fallback (ADR 0003 section 4). Only peer forwards may use it."""
     if not federation.manager().has_forwarding_headers(request):
         return _peer_forward_error(path, HTTPException(status_code=403, detail="the local federation path is for peers"))
     request.state.federation_local = True
@@ -3596,52 +2891,24 @@ async def create_response(request: Request):
     if thinking_error is not None:
         return thinking_error
 
-    # Seed a resolution receipt before vision validation/extraction so
-    # rejected image requests still retain the semantic and concrete model IDs.
     _set_ledger_ctx(request, model, info, is_stream=is_stream)
     _inject_responses_instruction(body, info.system_instruction)
-
-    # Convert once for vision inspection. Native-capable models retain their original
-    # Responses protocol path and body unchanged.
-    original_vision_chat = responses_to_chat(body)
-    # Gateway controls live on the original Responses body, not its translated
-    # Chat representation. Copy them only for policy validation; they are
-    # stripped before any translated upstream request.
-    if "gateway_image_handling" in body:
-        original_vision_chat["gateway_image_handling"] = body["gateway_image_handling"]
-    if "model_gateway" in body:
-        original_vision_chat["model_gateway"] = copy.deepcopy(body["model_gateway"])
-    vision_baseline = copy.deepcopy(original_vision_chat)
-    _strip_gateway_controls(vision_baseline)
     _strip_gateway_controls(body)
-    vision_chat, served_model, served_info, vision_error = await _apply_chat_vision_fallback(
-        request, copy.deepcopy(original_vision_chat), model, info, "/v1/responses", _error_openai,
-    )
-    if vision_error:
-        return vision_error
-    vision_rerouted = served_info is not info
-    vision_extracted = not vision_rerouted and vision_chat != vision_baseline
-    vision_changed = vision_rerouted or vision_extracted
-    if vision_changed:
-        info, model = served_info, served_model
-        # An actual reroute must use a Chat-compatible dependency. Extraction
-        # keeps the original model and can translate observations back to its
-        # native Anthropic protocol below.
-        if vision_rerouted and info.protocol == "anthropic":
-            return _error_openai(502, "api_error", "Vision fallback dependency does not support Chat Completions")
-    thinking_error = _thinking_validation_response(request, body, info, _error_openai)
-    if thinking_error is not None:
-        return thinking_error
-    _set_ledger_ctx(request, model, info, is_stream=is_stream)
+    # Images are inspected on the Chat translation. A vision model keeps its
+    # Responses body unchanged; for a text-only one each image becomes a note,
+    # in the native body too, so native Responses routes keep their path.
+    vision_chat = responses_to_chat(body)
+    images_omitted, image_error = _prepare_images(vision_chat, model, info, "/v1/responses", _error_openai)
+    if image_error:
+        return image_error
 
     # Anthropic models don't support Responses API directly — translate via Messages
     if info.protocol == "anthropic":
         # Translate Responses → Anthropic Messages, forward, translate back.
-        # After extraction, use the rewritten image-free Chat representation
-        # so the original text-only model receives observations, not images.
+        # With images omitted, translate the image-free Chat representation.
         return await _handle_responses_anthropic(
             body, info, model, request,
-            chat_body=vision_chat if vision_extracted else None,
+            chat_body=vision_chat if images_omitted else None,
         )
 
     # OpenAI models support Responses natively. Models with api_style
@@ -3649,7 +2916,9 @@ async def create_response(request: Request):
     # gpt-6-astra) take the same native path: their upstream rejects function
     # tools with reasoning on /chat/completions, so do not translate
     # Responses+tools requests down to Chat Completions.
-    if (info.provider == "openai" or getattr(info, "api_style", "") == "open_responses") and not vision_changed:
+    if info.provider == "openai" or getattr(info, "api_style", "") == "open_responses":
+        if not info.vision:
+            _omit_responses_images(body)
         body["model"] = info.provider_model_id
         _apply_gateway_reasoning(body, info, target_api="responses", request=request)
         request.state.api_key = info.api_key
@@ -4002,20 +3271,14 @@ async def chat_completions(request: Request):
     if thinking_error is not None:
         return thinking_error
 
-    _set_ledger_ctx(request, model, info, is_stream=bool(body.get("stream", False)))
-    body, model, info, vision_error = await _apply_chat_vision_fallback(
-        request, body, model, info, "/v1/chat/completions", _error_openai,
-    )
-    if vision_error:
-        return vision_error
-    thinking_error = _thinking_validation_response(request, body, info, _error_openai)
-    if thinking_error is not None:
-        return thinking_error
+    is_stream = body.get("stream", False)
+    _set_ledger_ctx(request, model, info, is_stream=is_stream)
+    _, image_error = _prepare_images(body, model, info, "/v1/chat/completions", _error_openai)
+    if image_error:
+        return image_error
 
     # Swap model to the provider's model ID
     body["model"] = info.provider_model_id
-    is_stream = body.get("stream", False)
-    _set_ledger_ctx(request, model, info, is_stream=is_stream)
 
     _inject_openai_system_instruction(body, info.system_instruction)
 
@@ -4484,48 +3747,18 @@ async def messages(request: Request):
         return thinking_error
 
     _set_ledger_ctx(request, model, info, is_stream=is_stream)
-    # Inspect through the existing lossless Anthropic→Chat translation. Native
-    # vision models keep the Messages path unchanged; text-only models are staged.
-    original_vision_chat = anthropic_to_openai(body)
-    # Gateway controls are transport-level policy, not Anthropic message fields;
-    # preserve them explicitly for the same validation applied on other APIs.
-    if "gateway_image_handling" in body:
-        original_vision_chat["gateway_image_handling"] = body["gateway_image_handling"]
-    if "model_gateway" in body:
-        original_vision_chat["model_gateway"] = copy.deepcopy(body["model_gateway"])
-    vision_baseline = copy.deepcopy(original_vision_chat)
-    _strip_gateway_controls(vision_baseline)
     _strip_gateway_controls(body)
-    vision_chat, served_model, served_info, vision_error = await _apply_chat_vision_fallback(
-        request, copy.deepcopy(original_vision_chat), model, info, "/v1/messages", _error,
-    )
-    if vision_error:
-        return vision_error
-    vision_rerouted = served_info is not info
-    vision_extracted = not vision_rerouted and vision_chat != vision_baseline
-    vision_changed = vision_rerouted or vision_extracted
-    if vision_changed:
-        info, model = served_info, served_model
-        if vision_rerouted and info.protocol == "anthropic":
-            return _error(502, "api_error", "Vision fallback dependency does not support Chat Completions")
-        if vision_extracted and info.protocol == "anthropic":
-            # Preserve native Anthropic request semantics (cache controls,
-            # tool-choice extensions, metadata) and replace only image blocks.
-            extraction = getattr(request.state, "vision_extraction", None) or {}
-            try:
-                body = _replace_anthropic_images_with_extracted_text(
-                    body,
-                    extraction.get("observations") or [],
-                    extraction.get("model") or "vision fallback",
-                )
-            except ValueError as exc:
-                return _error(502, "api_error", str(exc))
-    thinking_error = _thinking_validation_response(request, body, info, _error)
-    if thinking_error is not None:
-        return thinking_error
-
-    _set_ledger_ctx(request, model, info, is_stream=is_stream)
     _inject_anthropic_system_instruction(body, info.system_instruction)
+    # Images are inspected on the lossless Anthropic→Chat translation. A vision
+    # model keeps the Messages body unchanged. For a text-only one each image
+    # becomes a note, in the native body too, so Anthropic routes keep their
+    # request semantics (cache controls, tool-choice extensions, metadata).
+    vision_chat = anthropic_to_openai(body)
+    _, image_error = _prepare_images(vision_chat, model, info, "/v1/messages", _error)
+    if image_error:
+        return image_error
+    if not info.vision and info.protocol == "anthropic":
+        _omit_anthropic_images(body)
 
     # Check/normalize thinking — from request or model config. Native Anthropic
     # requests are normalized here; non-Anthropic requests are normalized after
@@ -4677,8 +3910,8 @@ async def _handle_responses_anthropic(
 
     Used when Codex CLI targets an Anthropic model via the Responses API.
     """
-    # Responses → Anthropic Messages translation. Vision extraction already
-    # produced a faithful image-free Chat request, so reuse it when supplied.
+    # Responses → Anthropic Messages translation. With images omitted, the
+    # handler supplies the image-free Chat request, so reuse it.
     messages_req = (
         openai_chat_to_anthropic(chat_body)
         if chat_body is not None
