@@ -27,8 +27,8 @@ ROOT = Path(__file__).resolve().parents[1]
 COMPONENT = ROOT / "packaging" / "component"
 IDENTIFIER = "com.local.model-gateway.component"
 SUPPORT = Path("payload/Library/Application Support/ModelGateway")
-RUNTIME_TOP = ["LICENSE", "README.md", "bin", "config", "local-models", "local-runtime", "pyproject.toml",
-               "scripts", "src", "uv.lock"]
+RUNTIME_TOP = ["LICENSE", "README.md", "bin", "config", "local-models", "local-runtime", "media-runtime",
+               "pyproject.toml", "scripts", "src", "uv.lock"]
 LABEL = "com.local.model-gateway-pkgtest"
 HEALTH = '{"status":"ok","service":"model-gateway"}'
 SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"

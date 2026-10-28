@@ -53,6 +53,11 @@ _PRICING_RATE_FIELDS = {
 
 # Canonical gateway thinking levels. ``off`` is a real explicit control while
 # Auto is represented by omitting a reasoning control from the request.
+# What a model produces (docs/adr/0004-local-image-and-video-generation.md). Absent is chat;
+# only chat models appear in default discovery or answer the chat endpoints.
+MODALITIES = ("chat", "image", "video")
+# Providers that run on this Mac, whose models may be unmetered.
+LOCAL_PROVIDERS = frozenset({"omlx", "media"})
 THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 ENABLED_THINKING_LEVELS = THINKING_LEVELS[1:]
 _THINKING_MODES = {"", "optional", "always"}
@@ -118,6 +123,11 @@ def normalize_thinking_capabilities(entry: dict) -> dict:
     return normalized
 
 
+def modality(entry: dict) -> str:
+    """``chat``, ``image`` or ``video``; validated at load by :func:`validate_client_metadata`."""
+    return entry.get("modality") or "chat"
+
+
 def canonical_provider(provider: str | None) -> str:
     """Normalize a provider name to its canonical form."""
     raw = (provider or "local").strip().lower()
@@ -170,8 +180,8 @@ def validate_pricing_policy(entry: dict) -> str:
         return "unknown"
     if marker != "unmetered":
         raise ValueError(f"model {entry.get('name')!r} pricing_status must be unmetered when present")
-    if provider != "omlx":
-        raise ValueError(f"model {entry.get('name')!r} unmetered pricing is only valid for local/oMLX models")
+    if provider not in LOCAL_PROVIDERS:
+        raise ValueError(f"model {entry.get('name')!r} unmetered pricing is only valid for local models")
     if entry.get("pool"):
         raise ValueError(f"model {entry.get('name')!r} unmetered pricing cannot use a provider pool")
     return "unmetered"
@@ -217,6 +227,8 @@ def validate_client_metadata(entry: dict) -> None:
             )
     if (entry.get("family") is None) != (entry.get("base_model") is None):
         raise ValueError(f"model {name!r} family and base_model must be set together")
+    if entry.get("modality") is not None and entry["modality"] not in MODALITIES:
+        raise ValueError(f"model {name!r} modality must be one of: {', '.join(MODALITIES)}")
 
 
 def entry_routable_ids(entry: dict) -> list[str]:

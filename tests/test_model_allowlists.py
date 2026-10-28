@@ -127,6 +127,8 @@ def test_a_listed_alias_permits_its_entry(monkeypatch, dispatched):
     ("/v1/chat/completions", "error"),
     ("/v1/responses", "error"),
     ("/v1/messages", "error"),
+    ("/v1/images/generations", "error"),
+    ("/v1/videos", "error"),
 ])
 @pytest.mark.parametrize("model", ["blocked-b", "no-such-model", "glm-x-fw", "peer/remote", 42])
 def test_other_models_are_denied_identically_on_every_endpoint(monkeypatch, path, envelope, model):
@@ -145,6 +147,7 @@ def test_every_model_taking_endpoint_is_covered():
               if route.path.startswith("/v1") and {"POST", "PUT"} & (getattr(route, "methods", None) or set())}
     # The local federation paths admit only authenticated peer forwards, never consumer credentials.
     assert writes == {"/v1/chat/completions", "/v1/responses", "/v1/messages",
+                      "/v1/images/generations", "/v1/videos",
                       "/v1/profiles/{namespace}/snapshot", "/v1/catalog/packs/{namespace}",
                       "/v1/federation/local/chat/completions", "/v1/federation/local/responses",
                       "/v1/federation/local/messages"}

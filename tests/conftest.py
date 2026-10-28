@@ -51,6 +51,9 @@ def _isolate_local_runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(local_runtime, "_port_in_use", lambda port: False)
     for name in ("_run", "_request", "_download_opener"):
         monkeypatch.setattr(local_runtime, name, forbidden)
+    from src import media_runtime
+
+    monkeypatch.setattr(media_runtime, "_run", forbidden)
     yield
 
 

@@ -20,6 +20,7 @@
 #   model-gateway secrets migrate [--dry-run]    move inline provider keys to 0600 key files
 #   model-gateway consumer add|list|revoke       manage consumer credentials (0600 key files)
 #   model-gateway local-ai status|add|cancel|remove  gateway-owned local AI (oMLX + a verified model)
+#   model-gateway media status|add|remove        gateway-owned image and video generation (media-gen)
 #   model-gateway bundle export|import           move config/catalog/profiles (no secrets)
 #   model-gateway env                            print resolved config
 #   model-gateway version [--json]               release version (and capabilities with --json)
@@ -779,6 +780,16 @@ warn_local_ai_installed() {
   warn "remove it and its model with: model-gateway local-ai remove"
 }
 
+# Media generation is its own LaunchAgent too.
+warn_media_installed() {
+  local media="$PLIST_DIR/com.local.media-gen.plist" state="${MODEL_GATEWAY_STATE_DIR:-$APP_DIR}" owner
+  [ -f "$media" ] && [ ! -L "$media" ] && [ -x /usr/libexec/PlistBuddy ] || return 0
+  owner="$(/usr/libexec/PlistBuddy -c 'Print :ModelGatewayRoot' "$media" 2>/dev/null || true)"
+  [ "$owner" = "$state#$LABEL" ] || return 0
+  warn "this gateway's media generation (com.local.media-gen, with its models in $state/media) is still installed and running"
+  warn "remove it and its models with: model-gateway media remove"
+}
+
 cmd_uninstall() {
   log "Uninstalling model-gateway service"
   remove_plist
@@ -793,6 +804,7 @@ cmd_uninstall() {
     ok "Uninstalled (repo and venv retained; rerun 'install' to restore)"
   fi
   warn_local_ai_installed
+  warn_media_installed
 }
 
 cmd_update_after_pull() {
@@ -964,7 +976,13 @@ cmd_consumer() {
 # MODEL_GATEWAY_PACKAGE_ROOT is ROOT_DIR unresolved (a package's `current`), so
 # the job follows an upgrade instead of pinning the release Python imported from.
 run_local_ai() {
-  local backup_dir uv="$UV_BIN"
+  run_runtime_module src.local_runtime "$@"
+}
+
+# Run a gateway-owned runtime's module (src.local_runtime, src.media_runtime) with those values.
+run_runtime_module() {
+  local module="$1" backup_dir uv="$UV_BIN"
+  shift
   backup_dir="$(installed_plist_env MODEL_GATEWAY_BACKUP_DIR)"
   is_packaged && uv="$(package_value UV)"
   (
@@ -979,8 +997,32 @@ run_local_ai() {
     MODEL_GATEWAY_UV_BIN="${MODEL_GATEWAY_UV_BIN:-$uv}" \
     MODEL_GATEWAY_PROFILE_REGISTRY="${MODEL_GATEWAY_PROFILE_REGISTRY:-$(installed_plist_env MODEL_GATEWAY_PROFILE_REGISTRY)}" \
     MODEL_GATEWAY_PACKAGE_ROOT="$ROOT_DIR" \
-      run_python -m src.local_runtime "$@"
+      run_python -m "$module" "$@"
   )
+}
+
+cmd_media() {
+  local usage="usage: model-gateway media {status [--json] | add MODEL | remove [MODEL]}"
+  [ $# -ge 1 ] || die "$usage"
+  case "$1" in
+    status) ;;
+    # add wires the provider into this gateway, which must be this checkout's loaded service.
+    add) check_prereqs; ensure_runtime_paths_safe "media setup" ;;
+    remove)
+      check_prereqs
+      if [ -e "$(plist_path)" ] || [ -L "$(plist_path)" ]; then
+        ensure_runtime_paths_safe "media removal" allow-unloaded
+      fi
+      ;;
+    -h|--help|help) printf '%s\n' "$usage"; return 0 ;;
+    *) die "$usage" ;;
+  esac
+  check_macos
+  is_packaged || UV_BIN="${UV_BIN:-$(command -v uv 2>/dev/null || true)}"
+  is_packaged || [ -n "$UV_BIN" ] || die "required command not found: uv (install it and retry)"
+  local rc=0
+  run_runtime_module src.media_runtime "$@" || rc=$?
+  [ "$rc" = 0 ] || exit "$rc"
 }
 
 cmd_local_ai() {
@@ -1134,6 +1176,7 @@ main() {
     secrets) shift; cmd_secrets "$@" ;;
     consumer) shift; cmd_consumer "$@" ;;
     local-ai) shift; cmd_local_ai "$@" ;;
+    media) shift; cmd_media "$@" ;;
     _local-ai-job) shift; check_macos; run_local_ai job "$@" ;;
     bundle) shift; cmd_bundle "$@" ;;
     env) cmd_env ;;

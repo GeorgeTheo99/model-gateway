@@ -100,6 +100,12 @@ def _local_ai_rows(config: dict, *, installed_only: bool = True) -> list[dict]:
     return local_runtime.catalog_rows(config, installed_only=installed_only)
 
 
+def _media_rows(config: dict, *, installed_only: bool = True) -> list[dict]:
+    from src import media_runtime
+
+    return media_runtime.catalog_rows(config, installed_only=installed_only)
+
+
 def _pinned_local_ai_names() -> set[str]:
     from src import local_runtime
 
@@ -110,7 +116,7 @@ def all_shipped_rows(profiles: dict[str, dict] | None = None) -> list[dict]:
     """Every model a release ships, loaded on this install or not."""
     profiles = _packaged() if profiles is None else profiles
     return [*(model for profile in profiles.values() if profile.get("auto_add") for model in profile["models"]),
-            *_local_ai_rows({}, installed_only=False)]
+            *_local_ai_rows({}, installed_only=False), *_media_rows({}, installed_only=False)]
 
 
 def layer(
@@ -167,6 +173,10 @@ def layer(
                 entries.remove(entry)
         names.add(model["name"])
         entries.append(row)
+    # Gateway media generation (src.media_runtime), likewise once installed (ADR 0004 section 3).
+    for model in _media_rows(config):
+        names.add(model["name"])
+        entries.append({**model, "origin": {"layer": "shipped", "profile": "media"}})
     # A name another profile still ships is alive, whatever an older profile retired.
     retired = {name: successor for name, successor in retired.items() if name not in names}
     if include_packs:

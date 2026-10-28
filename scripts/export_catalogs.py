@@ -133,10 +133,11 @@ def _exported_models(entries: list[dict]) -> list[dict]:
 
     - ``export: false``  → gateway-only model, skip all catalogs.
     - no ``alias``        → launcher functions are alias-derived; skip.
+    - image/video model  → downstream catalogs are chat catalogs (ADR 0004); skip.
     """
     out = []
     for entry in entries:
-        if entry.get("export") is False:
+        if entry.get("export") is False or (entry.get("modality") or "chat") != "chat":
             continue
         if not entry.get("alias"):
             continue
@@ -395,6 +396,8 @@ def render_model_aliases(
     for entry in entries:
         if entry.get("export") is False:
             continue  # gateway-only model; not exposed to any downstream launcher
+        if (entry.get("modality") or "chat") != "chat":
+            continue  # image/video model: launchers and Pi catalogs are chat-only (ADR 0004)
         alias = entry.get("alias")
         supported = entry.get("supported", True)
         provider = _effective_provider(entry, config)

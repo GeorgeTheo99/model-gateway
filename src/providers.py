@@ -69,6 +69,7 @@ CONFIG_PATH = Path(
 
 _DEFAULT_OMLX_BASE_URL = os.environ.get("MODEL_GATEWAY_OMLX_BASE_URL", "http://localhost:9110/v1")
 _DEFAULT_OMLX_API_KEY = os.environ.get("MODEL_GATEWAY_OMLX_API_KEY", "omlx")
+_DEFAULT_MEDIA_BASE_URL = os.environ.get("MODEL_GATEWAY_MEDIA_BASE_URL", "http://127.0.0.1:9112/v1")
 
 
 @dataclass
@@ -101,6 +102,7 @@ class ProviderInfo:
     system_instruction: str = ""
     vision: bool = False  # authoritative: True if the model can natively handle image inputs
     pricing: dict = None  # $/Mtok: input, output, cache_read?, cache_write?, cache_write_1h?, reasoning?
+    modality: str = "chat"  # "chat", "image" or "video" (docs/adr/0004-local-image-and-video-generation.md)
 
 
 _config: dict | None = None
@@ -193,6 +195,9 @@ def _provider_defaults(provider: str) -> dict:
             "api_key": _DEFAULT_OMLX_API_KEY,
             "protocol": "openai",
         }
+    if provider == "media":
+        # media-gen on this Mac. Its key comes from config (api_key_file) or the provider env vars.
+        return {"base_url": _DEFAULT_MEDIA_BASE_URL, "protocol": "openai"}
     return {}
 
 
@@ -1258,6 +1263,7 @@ def resolve(model_id: str, provider_override: str | None = None) -> ProviderInfo
         system_instruction=entry.get("system_instruction", ""),
         vision=bool(entry.get("vision", False)),
         pricing=entry.get("pricing"),
+        modality=catalog.modality(entry),
     )
 
 
@@ -1276,7 +1282,7 @@ def _pricing_status(entry: dict | None) -> str:
     if (
         entry.get("pricing_status") == "unmetered"
         and not entry.get("pool")
-        and catalog.canonical_provider(entry.get("provider")) == "omlx"
+        and catalog.canonical_provider(entry.get("provider")) in catalog.LOCAL_PROVIDERS
     ):
         return "unmetered"
     return "unknown"
@@ -1335,6 +1341,8 @@ def list_models() -> list[dict]:
     """Return all routable identifiers, preserving discovery compatibility."""
     result = []
     for model in effective_model_inventory():
+        if catalog.modality(model) != "chat":
+            continue  # media models are discovered only on request (ADR 0004 section 2)
         for model_id in model["routable_ids"]:
             row = dict(model)
             row["id"] = model_id

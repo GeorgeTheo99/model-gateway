@@ -79,7 +79,7 @@ packaging/component/scripts/verify-component-pkg.sh dist/component/ModelGateway-
 
 - The build needs a clean tree; `--version` must equal `src/version.py` at
   `REF`. It exports only runtime files (`bin/model-gateway`, `src`, `scripts`,
-  `config`, `local-models`, `local-runtime`, `pyproject.toml`, `uv.lock`,
+  `config`, `local-models`, `local-runtime`, `media-runtime`, `pyproject.toml`, `uv.lock`,
   `LICENSE`, `README.md`; regular Git blobs only) to
   `/Library/Application Support/ModelGateway/package/gateway/`, with the helper
   in `ModelGateway/bin/`, a sorted `manifest.sha256` of both, and
@@ -453,6 +453,63 @@ gateway's plist. `add` also refuses when the gateway already has a different
 `omlx` provider or a different model with the same name. Consumers should resolve their
 settings in this order: explicit environment variable, then `endpoint.json`,
 then their built-in default.
+
+## Media generation
+
+Image and video generation is optional and runs in **media-gen**, its own
+loopback service ([ADR 0004](adr/0004-local-image-and-video-generation.md)).
+The release curates the models it can install:
+
+| Model | Kind | Download | Memory to run | M3 Ultra time |
+|---|---|---|---|---|
+| `flux2-klein-4b` | image | 16 GB | 24 GiB (Macs with 40 GiB and up) | ~8 s at 1024² |
+| `z-image-turbo` | image | 33 GB | 40 GiB (56 GiB and up) | ~40 s at 1024² |
+| `ltx-2.3-distilled` | video with audio | 49 GB | 48 GiB (64 GiB and up) | ~95 s for 5 s at 768×512 |
+
+```bash
+model-gateway media status [--json]   # managed, running, every model and whether it is installed
+model-gateway media add MODEL         # build media-gen (first time), download, start, wire the gateway
+model-gateway media remove [MODEL]    # one model, or (none, or the last) the service and all its state
+```
+
+`add` runs in the foreground. It builds media-gen and its engines (mflux,
+mlx-video-with-audio) from the locked `media-runtime/` project with uv into
+`~/Library/Application Support/model-gateway/media/venv`, downloads the
+model's pinned files through `media-gen pull` (HTTPS only, resumable, capped at
+`MODEL_GATEWAY_MEDIA_DOWNLOAD_MBPS`, default 150, each file's SHA-256 or Git
+blob hash verified), installs the `com.local.media-gen` LaunchAgent (loopback,
+port `MODEL_GATEWAY_MEDIA_PORT`, default 9112, key file `media/api.key`, mode
+0600), checks that media-gen serves the model (an image model generates one
+512×512 image), then adds the `media` provider (`managed_by: media`, so admin
+provider edits refuse it) and bumps `local-ai/catalog-generation`, which the
+gateway checks every 5 seconds to reload its catalog. The models load from the
+shipped catalog layer (profile `media`), like local AI's. Adding a later model
+restarts media-gen on the current build, which fails any video still
+generating. With this gateway's own oMLX, media-gen unloads oMLX's least
+recently used idle models when it needs the memory; for an oMLX run outside
+Model Gateway, set `MODEL_GATEWAY_MEDIA_OMLX_URL` (and
+`MODEL_GATEWAY_MEDIA_OMLX_API_KEY_FILE`) when running `media add`. Videos with audio need
+`ffmpeg` on the service's `PATH` (Homebrew's is included); without it, videos
+are silent.
+
+Clients call the OpenAI-shaped endpoints on the gateway:
+
+- `POST /v1/images/generations` (`b64_json` only; extensions `seed`, `steps`, `guidance`).
+- `POST /v1/videos` (JSON, or multipart with an `input_reference` image;
+  `seconds` 1-12; `size` snapped to multiples of 64, so `1280x720` becomes
+  `1280x704`), then
+  poll `GET /v1/videos/{id}` until `completed` and fetch
+  `GET /v1/videos/{id}/content`. `GET /v1/videos` lists the caller's videos,
+  `DELETE /v1/videos/{id}` cancels or deletes one. A video belongs to the
+  credential that created it; videos expire after 24 hours.
+
+Media models are left out of `/v1/models`, `/v1/models/canonical`, profiles,
+federation and the Pi alias export. `?include=modality` lists them, each row
+with `modality` (`chat`, `image` or `video`). Chat endpoints refuse them with
+400, model allowlists apply, and requests are never retried. A media row can
+also be added to an owner catalog by hand (`"modality": "image"`,
+`"provider": "media"`, `"pricing_status": "unmetered"`) for a media-gen the
+gateway does not manage.
 
 ## Moving to another machine
 

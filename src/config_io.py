@@ -77,13 +77,18 @@ def _write_transaction(function):
 # ``managed_by`` value on the provider block that ``model-gateway local-ai``
 # writes (src.local_runtime); its key file and lifecycle belong to local AI.
 LOCAL_AI_MANAGED = "local_ai"
+# ... and on the provider block ``model-gateway media`` writes (src.media_runtime).
+MEDIA_MANAGED = "media"
+_RUNTIME_COMMANDS = {LOCAL_AI_MANAGED: ("local AI", "local-ai"), MEDIA_MANAGED: ("media generation", "media")}
 
 
 def _refuse_local_ai_provider(providers: dict, provider_id: str) -> None:
     for key, block in providers.items():
-        if str(key).lower() == provider_id and isinstance(block, dict) and block.get("managed_by") == LOCAL_AI_MANAGED:
-            raise ValueError(f"provider {provider_id!r} is managed by Model Gateway local AI; "
-                             "change or remove it with 'model-gateway local-ai'")
+        managed = block.get("managed_by") if isinstance(block, dict) else None
+        if str(key).lower() == provider_id and managed in _RUNTIME_COMMANDS:
+            what, command = _RUNTIME_COMMANDS[managed]
+            raise ValueError(f"provider {provider_id!r} is managed by Model Gateway {what}; "
+                             f"change or remove it with 'model-gateway {command}'")
 
 
 
@@ -1116,12 +1121,12 @@ _MODEL_FIELDS = [
     "name", "provider", "provider_model_id", "omlx_id", "alias", "context",
     "max_output_tokens", "thinking", "thinking_levels", "thinking_format", "vision", "quirks",
     "system_instruction", "pricing", "pricing_status", "desc", "display_name", "zdr",
-    "family", "base_model",
+    "family", "base_model", "modality",
 ]
 _PRICING_RATE_FIELDS = {
     "input", "output", "cache_read", "cache_write", "cache_write_1h", "reasoning",
 }
-_LOCAL_PROVIDERS = {"local", "omlx", "mlx"}
+_LOCAL_PROVIDERS = {"local", "omlx", "mlx", "media"}
 
 
 def _validated_pricing(pricing: object) -> dict:

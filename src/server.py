@@ -44,7 +44,7 @@ from src.responses import chat_to_responses, responses_result_events, responses_
 from src.signature_cache import store_from_extra_content
 from src.streaming import _flatten_list_content, translate_stream
 from src.translator import anthropic_to_openai, anthropic_to_openai_chat, openai_chat_to_anthropic, openai_to_anthropic
-from src import catalog, config_io, custom_providers, signature_cache, discovery, federation, ledger, local_runtime, profiles, providers
+from src import catalog, config_io, custom_providers, signature_cache, discovery, federation, ledger, local_runtime, media, profiles, providers
 from src.usage import (
     anthropic_usage_to_openai_chat as convert_anthropic_usage_to_openai_chat,
     anthropic_usage_to_responses,
@@ -156,6 +156,7 @@ app = FastAPI(
     openapi_url=None,
 )
 app.include_router(admin_router)
+app.include_router(media.router)
 
 DEFAULT_VISION_FALLBACK_MODEL = ""
 DEFAULT_VISION_FALLBACK_IMAGE_MAX_BYTES = 20_000_000
@@ -543,6 +544,15 @@ def _responses_only_error_message(model: str, route: str = "/v1/responses") -> s
         f"send requests to POST {route}. Its upstream model rejects function "
         "tools on the Chat Completions API."
     )
+
+
+def _non_chat_model_message(model: str, info) -> str | None:
+    """Why a chat endpoint cannot serve ``model``: it generates images or video (ADR 0004)."""
+    modality = getattr(info, "modality", "chat")
+    if modality == "chat":
+        return None
+    route = "/v1/images/generations" if modality == "image" else "/v1/videos"
+    return f"Model '{model}' generates {modality}s, not chat; send requests to POST {route}"
 
 
 def _model_error_message(model: str) -> str:
@@ -2455,7 +2465,8 @@ def _enable_openrouter_gemini_prompt_cache(req: dict) -> None:
 # ── Request/usage ledger middleware ─────────────────────────────────────────
 
 # The local federation paths are recorded under their own path: a peer's local work.
-_LEDGER_PATHS = {"/v1/chat/completions", "/v1/messages", "/v1/responses",
+# Generation requests are recorded too; reading a video job back is not (ADR 0004 section 2).
+_LEDGER_PATHS = {"/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/images/generations", "/v1/videos",
                  *(f"{federation.LOCAL_FORWARD_PREFIX}/{name}" for name in ("chat/completions", "messages", "responses"))}
 
 
@@ -2624,7 +2635,7 @@ async def ledger_middleware(request: Request, call_next):
         record, and re-emit the buffered bytes.
     Errors before model resolution still produce a row (null model/tokens).
     """
-    if request.url.path not in _LEDGER_PATHS:
+    if request.url.path not in _LEDGER_PATHS or request.method != "POST":
         return await call_next(request)
     start = time.time()
     response = await call_next(request)
@@ -2649,6 +2660,14 @@ async def ledger_middleware(request: Request, call_next):
         pricing = None
         pricing_status = "unknown"
     status = response.status_code
+
+    if ctx.get("record_without_body"):
+        _ledger_record(
+            request.url.path, "POST", model, provider, provider_model_id,
+            status, latency_ms, False, None, pricing, pricing_status,
+            None, profile_id, profile_namespace, profile_version,
+        )
+        return response
 
     if is_stream:
         original_iter = response.body_iterator
@@ -2790,7 +2809,8 @@ def _nonnegative_catalog_int(value: object) -> int:
 
 
 # Optional row fields a client asks for with ``?include=``; older clients keep exact rows.
-CANONICAL_OPTIONAL_FIELDS = ("display_name", "zero_data_retention", "family", "base_model", "local_install")
+CANONICAL_OPTIONAL_FIELDS = ("display_name", "zero_data_retention", "family", "base_model", "local_install",
+                             "modality")
 
 
 def _canonical_includes(request: Request) -> frozenset[str]:
@@ -2819,7 +2839,7 @@ def _canonical_model_rows(inventory: list[dict], include: frozenset[str] = froze
         )
         if not candidates and effective_provider:
             candidates = {effective_provider}
-        scope = "local" if candidates == {"omlx"} else "cloud"
+        scope = "local" if candidates and candidates <= catalog.LOCAL_PROVIDERS else "cloud"
         owner = effective_provider if len(candidates) <= 1 else "model_gateway"
         caps = _thinking_capabilities(model)
         row = {
@@ -2856,6 +2876,8 @@ def _canonical_model_rows(inventory: list[dict], include: frozenset[str] = froze
         if "local_install" in include:
             # "on_demand": a local AI model a request installs (ADR 0003 section 5); "" otherwise.
             row["local_install"] = "on_demand" if model.get("local_install") == "on_demand" else ""
+        if "modality" in include:
+            row["modality"] = catalog.modality(model)
         rows.append(row)
     return rows
 
@@ -3188,20 +3210,54 @@ def _permitted_inventory(principal, inventory: list[dict]) -> list[dict]:
     return rows
 
 
+def _chat_inventory(inventory: list[dict]) -> list[dict]:
+    """Chat models only: media models are discovered on request (ADR 0004 section 2)."""
+    return [model for model in inventory if catalog.modality(model) == "chat"]
+
+
+def _include_modality(request: Request) -> bool:
+    return "modality" in {
+        field.strip() for value in request.query_params.getlist("include") for field in value.split(",")
+    }
+
+
+def _media_model_rows(inventory: list[dict]) -> list[dict]:
+    """``/v1/models`` rows for available image and video models."""
+    return [
+        {
+            "id": route_id,
+            "object": "model",
+            "created": 0,
+            "owned_by": model.get("provider", ""),
+            "modality": catalog.modality(model),
+        }
+        for model in inventory
+        if catalog.modality(model) != "chat" and model.get("available")
+        for route_id in model.get("routable_ids") or []
+    ]
+
+
 @app.get("/v1/models")
 async def list_models(request: Request):
     principal = _restricted_principal(require_client_auth(request))
+    inventory = effective_model_inventory()
+    if principal is not None:
+        inventory = _permitted_inventory(principal, inventory)
     if principal is None:
         data = _direct_model_rows()
     else:
         data = _direct_model_rows([
             {**model, "id": route_id}
-            for model in _permitted_inventory(principal, effective_model_inventory()) if model.get("available")
+            for model in _chat_inventory(inventory) if model.get("available")
             for route_id in model.get("routable_ids") or []
         ])
     local_ids = {m.get("id") for m in list_routable_models()}
     data.extend(row for row in federation.manager().imported_rows()
                 if row["id"] not in local_ids and (principal is None or row["id"] in principal.models))
+    if _include_modality(request):
+        for row in data:
+            row["modality"] = "chat"
+        data.extend(_media_model_rows(inventory))
     return {"object": "list", "data": data}
 
 
@@ -3216,6 +3272,8 @@ async def list_canonical_models(request: Request):
         inventory += [row for row in await run_in_threadpool(_on_demand_inventory) if row["name"] not in names]
     if principal is not None:
         inventory = _permitted_inventory(principal, inventory)
+    if "modality" not in include:
+        inventory = _chat_inventory(inventory)
     rows = _canonical_model_rows(inventory, include)
     auto_models, model_presets = _canonical_cloud_policy(inventory, rows)
     return {
@@ -3308,7 +3366,7 @@ async def debug_thinking(request: Request):
         for m in list_routable_models():
             seen.setdefault(m.get("name") or m["id"], m)
     else:
-        for m in _permitted_inventory(principal, effective_model_inventory()):
+        for m in _chat_inventory(_permitted_inventory(principal, effective_model_inventory())):
             seen.setdefault(m["name"], m)
     rows = []
     for name, m in seen.items():
@@ -3392,6 +3450,8 @@ async def create_response(request: Request):
             return installing
     if not info:
         return _error_openai(404, "invalid_request_error", _model_error_message(model))
+    if (non_chat := _non_chat_model_message(model, info)) is not None:
+        return _error_openai(400, "invalid_request_error", non_chat)
     thinking_error = _thinking_validation_response(body, info, _error_openai)
     if thinking_error is not None:
         return thinking_error
@@ -3785,6 +3845,8 @@ async def chat_completions(request: Request):
             status_code=404,
             content={"error": {"message": _model_error_message(model), "type": "invalid_request_error"}},
         )
+    if (non_chat := _non_chat_model_message(model, info)) is not None:
+        return _error_openai(400, "invalid_request_error", non_chat)
     if getattr(info, "api_style", "") == "open_responses":
         # Responses-only model: its upstream (workspace Open Responses endpoint)
         # rejects function tools on chat/completions, so the gateway serves it
@@ -4267,6 +4329,8 @@ async def messages(request: Request):
             return installing
     if not info:
         return _error(404, "invalid_request_error", _model_error_message(model))
+    if (non_chat := _non_chat_model_message(model, info)) is not None:
+        return _error(400, "invalid_request_error", non_chat)
     if getattr(info, "api_style", "") == "open_responses":
         return _error(400, "invalid_request_error", _responses_only_error_message(model, "/v1/responses"))
     thinking_error = _thinking_validation_response(body, info, _error)

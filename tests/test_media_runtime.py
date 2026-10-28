@@ -1,0 +1,260 @@
+"""Gateway-managed media generation (docs/adr/0004-local-image-and-video-generation.md section 3):
+offline, in tmp, with every system edge faked."""
+
+from __future__ import annotations
+
+import json
+import plistlib
+import subprocess
+from pathlib import Path
+
+import pytest
+import yaml
+
+import src.providers as providers
+from src import config_io, local_runtime as lr, media_runtime as mr, shipped
+
+GIB = 1024**3
+ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture
+def gateway(tmp_path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump({"providers": {"fireworks": {"base_url": "https://api.fireworks.ai/v1"}}}))
+    config.chmod(0o600)
+    info = tmp_path / "model-info.json"
+    info.write_text(json.dumps({"allow_empty": True, "llm": []}))
+    for module in (providers, config_io):
+        monkeypatch.setattr(module, "CONFIG_PATH", config)
+        monkeypatch.setattr(module, "MODEL_INFO_PATH", info)
+        monkeypatch.setattr(module, "MODEL_INFO_SOURCE_PATH", None)
+    monkeypatch.setenv("MODEL_GATEWAY_LAUNCHD_LABEL", lr.GATEWAY_LABEL)
+    providers.reload()
+    return config
+
+
+@pytest.fixture
+def mac(monkeypatch, tmp_path):
+    """An eligible Mac whose launchd, uv, media-gen and network are recorded fakes."""
+    loaded: set[str] = set()
+    calls: list[tuple] = []
+    served: dict[str, bool] = {}
+
+    def launchctl(*args):
+        calls.append(("launchctl", *args))
+        label = args[1].rsplit("/", 1)[-1] if len(args) > 1 else ""
+        if args[0] == "print":
+            output = f"path = {lr.launch_agents_dir() / f'{label}.plist'}\n"
+            return subprocess.CompletedProcess(args, 0 if label in loaded else 113, output, "")
+        if args[0] == "bootstrap":
+            loaded.add(plistlib.loads(Path(args[2]).read_bytes())["Label"])
+        if args[0] == "bootout":
+            loaded.discard(label)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    def run(*args, env=None):
+        calls.append(("run", *args))
+        if len(args) > 2 and args[1] == "pull":
+            served[args[2]] = True
+        if len(args) > 2 and args[1] == "remove":
+            served.pop(args[2], None)
+
+    def request(url, token="", body=None, *, timeout=15):
+        calls.append(("request", url.split("/", 3)[-1], bool(token)))
+        if url.endswith("/health"):
+            return {"status": "ok"}
+        if url.endswith("/v1/models"):
+            return {"data": [{"id": name, "installed": True} for name in served]}
+        if url.endswith("/v1/images/generations"):
+            return {"data": [{"b64_json": "aGk="}]}
+        raise AssertionError(url)
+
+    monkeypatch.setattr(lr, "_launchctl", launchctl)
+    monkeypatch.setattr(lr, "_apple_silicon", lambda: True)
+    monkeypatch.setattr(lr, "_memory_bytes", lambda: 128 * GIB)
+    monkeypatch.setattr(lr, "_disk_free", lambda path: 500 * GIB)
+    monkeypatch.setattr(lr, "_request", request)
+    monkeypatch.setattr(lr, "_uv", lambda: "uv")
+    monkeypatch.setattr(mr, "_run", run)
+    monkeypatch.setattr(lr.time, "sleep", lambda seconds: None)
+    project = tmp_path / "media-runtime"
+    project.mkdir()
+    (project / "uv.lock").write_text("version = 1\n")
+    monkeypatch.setattr(mr, "RUNTIME_PROJECT", project)
+
+    def built_venv(*args, env=None):
+        run(*args, env=env)
+        if args[1:2] == ("sync",):
+            (mr.venv_dir() / "bin").mkdir(parents=True, exist_ok=True)
+            (mr.venv_dir() / "bin" / "media-gen").write_text("")
+
+    monkeypatch.setattr(mr, "_run", built_venv)
+    run.calls, run.loaded, run.served = calls, loaded, served
+    return run
+
+
+def _config() -> dict:
+    return yaml.safe_load(config_io.CONFIG_PATH.read_text())
+
+
+def test_add_builds_downloads_starts_and_wires_the_gateway(gateway, mac):
+    status = mr.add("flux2-klein-4b")
+
+    commands = [c[1:4] for c in mac.calls if c[0] == "run"]
+    assert commands[0] == ("uv", "sync", "--locked")
+    assert commands[2] == (str(mr.venv_dir() / "bin" / "media-gen"), "pull", "flux2-klein-4b")
+    plist = plistlib.loads(mr.plist_path().read_bytes())
+    assert plist[lr.OWNER_KEY] == lr.owner_value()
+    assert plist["ProgramArguments"] == [str(mr.venv_dir() / "bin" / "media-gen"), "serve"]
+    assert plist["EnvironmentVariables"]["MEDIA_GEN_HOST"] == "127.0.0.1"
+    assert "MEDIA_GEN_OMLX_URL" not in plist["EnvironmentVariables"]  # no gateway-managed oMLX here
+    assert mr.api_key_path().stat().st_mode & 0o777 == 0o600
+    # The check generated a real image through media-gen, with its key.
+    assert ("request", "v1/images/generations", True) in mac.calls
+
+    provider = _config()["providers"]["media"]
+    assert provider["managed_by"] == config_io.MEDIA_MANAGED
+    assert provider["base_url"] == "http://127.0.0.1:9112/v1"
+    assert lr.generation()  # the running gateway reloads
+
+    providers.reload()
+    info = providers.resolve("flux2-klein-4b")
+    assert info.provider == "media" and info.modality == "image"
+    assert providers.pricing_status_for("flux2-klein-4b") == "unmetered"
+    assert [m["name"] for m in status["models"] if m["installed"]] == ["flux2-klein-4b"]
+    assert status["managed"] and status["running"]
+
+
+def test_a_second_model_joins_and_video_skips_the_generation_check(gateway, mac):
+    mr.add("flux2-klein-4b")
+    mac.calls.clear()
+    mr.add("ltx-2.3-distilled")
+    assert ("request", "v1/images/generations", True) not in mac.calls
+    # Same build, same plist, service healthy: no rebuild, no restart of running jobs.
+    assert not [c for c in mac.calls if c[0] == "run" and c[2:3] == ("sync",)]
+    assert not [c for c in mac.calls if c[:2] == ("launchctl", "bootstrap")]
+    providers.reload()
+    assert providers.resolve("ltx-2.3-distilled").modality == "video"
+    assert mr.installed() == ["flux2-klein-4b", "ltx-2.3-distilled"]
+
+
+def test_rows_load_only_while_this_gateway_manages_media(gateway, mac):
+    assert mr.catalog_rows(_config()) == []
+    mr.add("z-image-turbo")
+    rows = shipped.layer(_config()).entries
+    [row] = [r for r in rows if r["name"] == "z-image-turbo"]
+    assert row["origin"] == {"layer": "shipped", "profile": "media"}
+    assert row["modality"] == "image"
+    names = {r["name"] for r in shipped.all_shipped_rows({})}
+    assert set(mr.MODELS) <= names
+
+
+def test_refuses_a_foreign_service_or_provider(gateway, mac):
+    mr.plist_path().parent.mkdir(parents=True, exist_ok=True)
+    mr.plist_path().write_bytes(plistlib.dumps({"Label": mr.MEDIA_LABEL}))
+    with pytest.raises(lr.LocalRuntimeError, match="managed outside Model Gateway"):
+        mr.add("flux2-klein-4b")
+    mr.plist_path().unlink()
+    config = _config()
+    config["providers"]["media"] = {"base_url": "http://elsewhere/v1", "api_key": "x"}
+    config_io.CONFIG_PATH.write_text(yaml.safe_dump(config))
+    with pytest.raises(lr.LocalRuntimeError, match="does not manage"):
+        mr.add("flux2-klein-4b")
+    assert [c for c in mac.calls if c[0] == "run"] == []
+
+
+def test_an_external_omlx_can_be_named(gateway, mac, monkeypatch, tmp_path):
+    key = tmp_path / "omlx.key"
+    key.write_text("k")
+    monkeypatch.setenv("MODEL_GATEWAY_MEDIA_OMLX_URL", "http://127.0.0.1:9110")
+    monkeypatch.setenv("MODEL_GATEWAY_MEDIA_OMLX_API_KEY_FILE", str(key))
+    environment = mr.media_plist()["EnvironmentVariables"]
+    assert environment["MEDIA_GEN_OMLX_URL"] == "http://127.0.0.1:9110"
+    assert environment["MEDIA_GEN_OMLX_API_KEY_FILE"] == str(key.resolve())
+    assert "k" not in environment.values()
+
+
+def test_a_failed_gateway_wiring_unlists_the_model(gateway, mac, monkeypatch):
+    def broken_config(config):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(lr, "_write_config", broken_config)
+    with pytest.raises(OSError):
+        mr.add("flux2-klein-4b")
+    assert mr.installed() == []
+    assert "media" not in _config()["providers"]
+
+
+def test_refuses_a_mac_that_is_too_small(gateway, mac, monkeypatch):
+    monkeypatch.setattr(lr, "_memory_bytes", lambda: 48 * GIB)
+    with pytest.raises(lr.LocalRuntimeError, match="at least 64 GB"):
+        mr.add("ltx-2.3-distilled")
+    monkeypatch.setattr(lr, "_memory_bytes", lambda: 128 * GIB)
+    monkeypatch.setattr(lr, "_disk_free", lambda path: 20 * GIB)
+    with pytest.raises(lr.LocalRuntimeError, match="free disk space"):
+        mr.add("ltx-2.3-distilled")
+
+
+def test_failed_check_leaves_the_gateway_unchanged(gateway, mac, monkeypatch):
+    def broken(url, token="", body=None, *, timeout=15):
+        if url.endswith("/health"):
+            return {"status": "ok"}
+        return {"data": []}
+
+    monkeypatch.setattr(lr, "_request", broken)
+    with pytest.raises(lr.LocalRuntimeError, match="does not report"):
+        mr.add("flux2-klein-4b")
+    assert "media" not in _config()["providers"]
+    assert mr.installed() == []
+    # The first install's service is stopped again; the build is kept for a retry.
+    assert mr.MEDIA_LABEL not in mac.loaded
+    assert not mr.plist_path().exists()
+    assert mr._built()
+
+
+def test_a_new_release_rebuilds_and_restarts(gateway, mac):
+    mr.add("flux2-klein-4b")
+    (mr.RUNTIME_PROJECT / "uv.lock").write_text("version = 2\n")
+    mac.calls.clear()
+    mr.add("z-image-turbo")
+    assert [c for c in mac.calls if c[0] == "run" and c[2:3] == ("sync",)]
+    assert [c for c in mac.calls if c[:2] == ("launchctl", "bootstrap")]
+
+
+def test_remove_one_model_then_everything(gateway, mac):
+    mr.add("flux2-klein-4b")
+    mr.add("z-image-turbo")
+    mr.remove("flux2-klein-4b")
+    assert mr.installed() == ["z-image-turbo"]
+    assert ("run", str(mr.venv_dir() / "bin" / "media-gen"), "remove", "flux2-klein-4b") in mac.calls
+    assert "media" in _config()["providers"]
+
+    mr.remove()
+    assert not mr.root().exists()
+    assert not mr.plist_path().exists()
+    assert mr.MEDIA_LABEL not in mac.loaded
+    assert "media" not in _config()["providers"]
+    with pytest.raises(lr.LocalRuntimeError, match="not installed"):
+        mr.remove()
+
+
+def test_admin_cannot_edit_the_managed_provider(gateway, mac):
+    mr.add("flux2-klein-4b")
+    with pytest.raises(ValueError, match="model-gateway media"):
+        config_io._refuse_local_ai_provider(_config()["providers"], "media")
+
+
+def test_cli(gateway, mac, capsys):
+    assert mr.main(["add", "flux2-klein-4b"]) == 0
+    assert "flux2-klein-4b is ready" in capsys.readouterr().out
+    assert mr.main(["status", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["managed"] is True
+    assert mr.main(["remove", "z-image-turbo"]) == 2
+    assert "not installed" in capsys.readouterr().err
+
+
+def test_curated_models_match_the_pinned_media_runtime():
+    project = (ROOT / "media-runtime" / "pyproject.toml").read_text()
+    assert "media-gen[engines]" in project
+    assert set(mr.MODELS) == {"flux2-klein-4b", "z-image-turbo", "ltx-2.3-distilled"}

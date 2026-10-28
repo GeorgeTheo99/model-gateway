@@ -1114,7 +1114,7 @@ def _plan_profile_apply(profile: dict, api_key: str | None) -> dict:
     if location is not None and (
         location[:2] != ("providers", provider_id)
         or not isinstance(location[2], dict)
-        or location[2].get("managed_by") == config_io.LOCAL_AI_MANAGED
+        or location[2].get("managed_by") in (config_io.LOCAL_AI_MANAGED, config_io.MEDIA_MANAGED)
     ):
         raise onboarding.OnboardingConflict(
             "provider_conflict",

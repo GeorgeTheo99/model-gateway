@@ -15,7 +15,7 @@ PRODUCT=0
 HELPER_TIMEOUT=1500
 POSTINSTALL_TIMEOUT=1560
 # Everything the installed gateway needs at runtime, and nothing else.
-RUNTIME_PATHS=(LICENSE README.md bin/model-gateway config local-models local-runtime pyproject.toml scripts src uv.lock)
+RUNTIME_PATHS=(LICENSE README.md bin/model-gateway config local-models local-runtime media-runtime pyproject.toml scripts src uv.lock)
 
 usage() {
   cat <<'USAGE'

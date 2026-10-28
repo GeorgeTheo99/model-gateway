@@ -47,6 +47,10 @@ translation between them.
 - **Usage/cost ledger** — tokens, provider cost, estimates, latency and
   errors per request, in SQLite.
 - **Federation** — explicitly configured gateway-to-gateway routes.
+- **Local image and video generation** — optional `model-gateway media add`
+  installs media-gen (FLUX.2 [klein], Z-Image Turbo, LTX-2.3 video with audio)
+  behind OpenAI-compatible `/v1/images/generations` and `/v1/videos`
+  ([ADR 0004](docs/adr/0004-local-image-and-video-generation.md)).
 - **Consumer profiles** — authenticated, namespace-scoped, immutable routing
   snapshots with enforced gateway-local or gateway-managed cloud execution.
   Consumer repositories own text/vision route and default policy; the gateway

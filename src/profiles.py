@@ -211,7 +211,8 @@ def _inventory_by_name() -> dict[str, dict]:
     return {
         str(row.get("name")): row
         for row in providers.effective_model_inventory()
-        if isinstance(row.get("name"), str) and row.get("name")
+        # Profiles route chat; image and video models are never route targets (ADR 0004).
+        if isinstance(row.get("name"), str) and row.get("name") and catalog.modality(row) == "chat"
     }
 
 

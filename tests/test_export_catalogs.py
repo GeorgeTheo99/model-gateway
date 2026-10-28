@@ -350,6 +350,25 @@ def test_export_false_skips_model(tmp_path):
     assert "cloud:b-id" in aliases
 
 
+def test_media_models_are_not_exported(tmp_path):
+    mi = tmp_path / "model-info.json"
+    _write_model_info(
+        mi,
+        [
+            {"name": "pic", "alias": "pic", "provider": "media", "provider_model_id": "z-image-turbo",
+             "modality": "image", "pricing_status": "unmetered"},
+            {"name": "b", "alias": "b", "provider": "openrouter", "provider_model_id": "b-id"},
+        ],
+    )
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(f"exports:\n  model_aliases: {tmp_path}/aliases.json\n")
+    r = _run(cfg, mi)
+    assert r.returncode == 0, r.stderr
+    aliases = json.loads((tmp_path / "aliases.json").read_text())
+    assert not [key for key in aliases if "z-image-turbo" in key]
+    assert "cloud:b-id" in aliases
+
+
 def test_symlink_safe_write(tmp_path):
     mi = tmp_path / "model-info.json"
     _write_model_info(mi, [{"name": "a", "alias": "a", "provider": "openrouter", "provider_model_id": "a-id"}])

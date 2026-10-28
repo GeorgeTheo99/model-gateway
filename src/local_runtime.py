@@ -331,10 +331,10 @@ def _create_new(path: Path, data: bytes) -> None:
         Path(name).unlink(missing_ok=True)
 
 
-def _key(path: Path, *, create: bool = False) -> str:
-    _regular(path)
+def _key(path: Path, *, create: bool = False, base: Path | None = None) -> str:
+    _regular(path, base)
     if create and not path.exists():
-        _atomic(path, secrets.token_urlsafe(32) + "\n")
+        _atomic(path, secrets.token_urlsafe(32) + "\n", base)
     if stat.S_IMODE(path.stat().st_mode) != 0o600:
         raise LocalRuntimeError(f"Key must have mode 0600: {path}")
     value = path.read_text().strip()
@@ -847,11 +847,15 @@ class Progress:
         self.close()
 
 
-@contextlib.contextmanager
 def _lock(name: str, timeout: float | None, busy: str):
     """Hold an exclusive flock on ``local-ai/<name>``, waiting up to ``timeout`` seconds (None: forever)."""
-    path = runtime_root() / name
-    _regular(path)
+    return _lock_at(runtime_root() / name, timeout, busy, runtime_root())
+
+
+@contextlib.contextmanager
+def _lock_at(path: Path, timeout: float | None, busy: str, base: Path | None = None):
+    """Hold an exclusive flock on ``path`` (a private file under ``base``); see :func:`_lock`."""
+    _regular(path, base or path.parent)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
