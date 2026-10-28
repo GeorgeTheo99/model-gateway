@@ -72,9 +72,9 @@ Installer component package that products (Home Server) embed and that also
 installs on its own:
 
 ```bash
-packaging/component/scripts/build-component-pkg.sh --version 0.8.5 --out-dir dist/component [--ref REF] [--product]
-packaging/component/scripts/build-component-pkg.sh --version 0.8.5 --out-dir dist/component --dry-run
-packaging/component/scripts/verify-component-pkg.sh dist/component/ModelGateway-component-0.8.5.pkg
+packaging/component/scripts/build-component-pkg.sh --version 0.9.0 --out-dir dist/component [--ref REF] [--product]
+packaging/component/scripts/build-component-pkg.sh --version 0.9.0 --out-dir dist/component --dry-run
+packaging/component/scripts/verify-component-pkg.sh dist/component/ModelGateway-component-0.9.0.pkg
 ```
 
 - The build needs a clean tree; `--version` must equal `src/version.py` at
