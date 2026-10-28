@@ -254,7 +254,15 @@ def test_cli(gateway, mac, capsys):
     assert "not installed" in capsys.readouterr().err
 
 
-def test_curated_models_match_the_pinned_media_runtime():
-    project = (ROOT / "media-runtime" / "pyproject.toml").read_text()
-    assert "media-gen[engines]" in project
+def test_the_locked_runtime_pins_media_gen_by_commit():
+    import tomllib
+
+    project = tomllib.loads((mr.RUNTIME_PROJECT / "pyproject.toml").read_text())
+    assert project["project"]["dependencies"] == ["media-gen[engines]"]
+    source = project["tool"]["uv"]["sources"]["media-gen"]
+    assert source["git"] == "https://github.com/GeorgeTheo99/media-gen" and len(source["rev"]) == 40
+    lock = (mr.RUNTIME_PROJECT / "uv.lock").read_text()
+    assert f'source = {{ git = "{source["git"]}?rev={source["rev"]}#{source["rev"]}" }}' in lock
+    for engine in ('name = "mflux"\nversion = "0.24.0"', 'name = "mlx-video-with-audio"\nversion = "0.1.37"'):
+        assert engine in lock
     assert set(mr.MODELS) == {"flux2-klein-4b", "z-image-turbo", "ltx-2.3-distilled"}

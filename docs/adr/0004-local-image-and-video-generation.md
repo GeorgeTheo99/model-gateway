@@ -1,6 +1,6 @@
 # ADR 0004: Local Image and Video Generation
 
-- **Status:** Accepted; phase 1 (routing) implemented, phase 2 (managed install) in progress
+- **Status:** Accepted; implemented in 0.9.0 (media-gen 0.1.0)
 - **Date:** 2026-10-28
 
 ## Context

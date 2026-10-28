@@ -9,4 +9,5 @@ package = false
 required-environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]
 
 [tool.uv.sources]
-media-gen = { git = "https://github.com/GeorgeTheo99/media-gen", tag = "v0.1.0" }
+# media-gen v0.1.0, pinned by commit: a tag can move.
+media-gen = { git = "https://github.com/GeorgeTheo99/media-gen", rev = "c11b6a2d15e7b7e8f853cf9e1e405b06a0564cbf" }
