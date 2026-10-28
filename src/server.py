@@ -44,7 +44,7 @@ from src.responses import chat_to_responses, responses_result_events, responses_
 from src.signature_cache import store_from_extra_content
 from src.streaming import _flatten_list_content, translate_stream
 from src.translator import anthropic_to_openai, anthropic_to_openai_chat, openai_chat_to_anthropic, openai_to_anthropic
-from src import catalog, config_io, custom_providers, signature_cache, discovery, federation, ledger, local_runtime, media, profiles, providers
+from src import catalog, config_io, custom_providers, signature_cache, discovery, federation, ledger, local_runtime, media, profiles, providers, reasoning_tiers
 from src.usage import (
     anthropic_usage_to_openai_chat as convert_anthropic_usage_to_openai_chat,
     anthropic_usage_to_responses,
@@ -619,7 +619,8 @@ def _apply_profile_defaults(body: dict, defaults: dict, protocol: str) -> None:
                 body["max_tokens"] = defaults["max_output_tokens"]
         elif not any(key in body for key in ("max_tokens", "max_completion_tokens")):
             body["max_tokens"] = defaults["max_output_tokens"]
-    if "reasoning_effort" in defaults and not any(
+    # A requested reasoning tier is the client's own choice, so the profile's level yields to it.
+    if "reasoning_effort" in defaults and _requested_reasoning_tier(body) is None and not any(
         key in body for key in ("reasoning_effort", "reasoning", "thinking", "output_config")
     ):
         if protocol == "openai_responses":
@@ -793,7 +794,9 @@ async def _forward_imported_if_known(request: Request, path: str, body: dict) ->
         "provider_model_id": route.direct_model_id,
         "is_stream": body.get("stream") is True,
     }
-    return await federation.manager().forward(request, path, body, route)
+    # Place a tier here, once: the peer gets a concrete level, never a tier it might read differently.
+    _place_reasoning_tier(request, body, *_imported_reasoning_inputs(manager.imported_model(route)))
+    return await manager.forward(request, path, body, route)
 
 
 ADAPTIVE_THINKING_ANTHROPIC_MODELS = {
@@ -1478,11 +1481,96 @@ def _prepare_model_reasoning_control(req: dict, info) -> None:
             req.pop("chat_template_kwargs", None)
 
 
-def _thinking_validation_response(req: dict, info, error_factory):
+def _requested_reasoning_tier(body: dict):
+    controls = body.get("model_gateway")
+    return controls.get("reasoning_tier") if isinstance(controls, dict) else None
+
+
+def _explicit_thinking_control(body: dict) -> str | None:
+    """The first client thinking control in the body, by field name."""
+    for field, _value in _explicit_effort_values(body):
+        return field
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict) and any(reasoning.get(key) is not None for key in ("max_tokens", "enabled")):
+        return "reasoning"
+    thinking = body.get("thinking")
+    if thinking is True or isinstance(thinking, dict):
+        return "thinking"
+    chat_template_kwargs = body.get("chat_template_kwargs")
+    if isinstance(chat_template_kwargs, dict) and "enable_thinking" in chat_template_kwargs:
+        return "chat_template_kwargs.enable_thinking"
+    return None
+
+
+def _take_reasoning_tier(request: Request, body: dict, error_factory):
+    """Take ``model_gateway.reasoning_tier`` off the body; it is placed on the served model's levels."""
+    tier = _requested_reasoning_tier(body)
+    if tier is None:
+        return None
+    controls = {key: value for key, value in body["model_gateway"].items() if key != "reasoning_tier"}
+    if controls:
+        body["model_gateway"] = controls
+    else:
+        body.pop("model_gateway")
+    if tier not in reasoning_tiers.REASONING_TIERS:
+        return error_factory(
+            400, "invalid_request_error",
+            f"Unknown model_gateway.reasoning_tier {tier!r}; expected one of: "
+            + ", ".join(reasoning_tiers.REASONING_TIERS),
+        )
+    explicit = _explicit_thinking_control(body)
+    if explicit:
+        return error_factory(
+            400, "invalid_request_error",
+            f"model_gateway.reasoning_tier cannot be combined with {explicit}; send a tier or a level, not both",
+        )
+    request.state.reasoning_tier = tier
+    return None
+
+
+def _place_reasoning_tier(request: Request, req: dict, thinking: str, levels, default: str | None) -> None:
+    """Send the requested tier as the model's concrete level (none for a model without thinking)."""
+    tier = getattr(request.state, "reasoning_tier", None)
+    if tier is None:
+        return
+    level = reasoning_tiers.tier_level(tier, thinking, levels, default)
+    # Only a previous placement can be here: a tier never arrives with a level.
+    req.pop("reasoning_effort", None)
+    if level is not None:
+        req["reasoning_effort"] = level
+    request.state.reasoning_level = level
+
+
+def _apply_reasoning_tier(request: Request, req: dict, info) -> None:
+    if getattr(request.state, "reasoning_tier", None) is None:
+        return
+    levels = _thinking_levels_for_info(info)
+    default = _default_enabled_thinking_level_for_entry(
+        {"quirks": getattr(info, "quirks", ()), "thinking_format": getattr(info, "thinking_format", "") or ""},
+        levels,
+    )
+    _place_reasoning_tier(request, req, getattr(info, "thinking", "") or "", levels, default)
+    if "force_reasoning_effort_max" in getattr(info, "quirks", ()) and request.state.reasoning_level is not None:
+        request.state.reasoning_level = "max"  # the quirk sends max whatever the level
+
+
+def _imported_reasoning_inputs(model: dict) -> tuple[str, tuple[str, ...], str | None]:
+    """A federated model's thinking mode, levels and default level, from its peer's metadata."""
+    levels = tuple(federation._imported_thinking_levels(model))
+    default = _default_enabled_thinking_level(levels, model.get("thinking_format", "") or "")
+    return model.get("thinking", "") or "", levels, default
+
+
+def _thinking_validation_response(request: Request, req: dict, info, error_factory):
     # Validation occurs before vision routing finalizes the served
     # model. Normalize a copy so GLM-5.3 defaults cannot leak into a different
     # fallback model's second validation pass; dispatch mutates only after the
-    # final route is selected.
+    # final route is selected. A requested tier is placed on this model's
+    # levels each time, so a vision reroute gets the served model's level.
+    try:
+        _apply_reasoning_tier(request, req, info)
+    except ThinkingValidationError as exc:
+        return error_factory(400, "invalid_request_error", str(exc))
     candidate = copy.deepcopy(req)
     _prepare_model_reasoning_control(candidate, info)
     try:
@@ -2154,7 +2242,21 @@ async def _apply_chat_vision_fallback(
     return body, served_model, info, None
 
 
-def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat") -> bool:
+def _responses_reasoning_settings(req: dict) -> dict:
+    """The client's Responses reasoning settings other than the level (its summary)."""
+    reasoning = req.get("reasoning")
+    if not isinstance(reasoning, dict):
+        return {}
+    return {key: reasoning[key] for key in ("summary", "generate_summary") if key in reasoning}
+
+
+def _report_dispatched_level(request: Request | None, level: str | None) -> None:
+    """A quirk that overrides the placed level reports the one actually sent upstream."""
+    if request is not None and getattr(request.state, "reasoning_tier", None) is not None:
+        request.state.reasoning_level = level
+
+
+def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat", request: Request | None = None) -> bool:
     """Normalize common thinking params for the resolved upstream provider.
 
     Returns whether reasoning/thinking should be considered enabled for response
@@ -2185,6 +2287,7 @@ def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat") -> bool:
         _strip_reasoning_controls(req)
         req.pop("reasoning", None)
         req["reasoning_effort"] = "none"
+        _report_dispatched_level(request, "off")
         return False
     if target_api == "chat" and "no_reasoning_params" in quirks:
         # Chat-completions upstream only. Responses-native passthrough
@@ -2193,6 +2296,7 @@ def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat") -> bool:
         # gpt-6-astra) reason natively and reject having the params stripped.
         _strip_reasoning_controls(req)
         req.pop("reasoning", None)
+        _report_dispatched_level(request, None)
         return bool(enabled)
 
     if enabled is None:
@@ -2234,9 +2338,9 @@ def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat") -> bool:
                 forwarded = "low" if effort == "minimal" else effort
             else:
                 forwarded = "low" if effort == "minimal" else ("xhigh" if effort == "max" else effort)
-            req["reasoning"] = {"effort": forwarded}
+            req["reasoning"] = {**_responses_reasoning_settings(req), "effort": forwarded}
         elif effort == "off":
-            req["reasoning"] = {"effort": "none"}
+            req["reasoning"] = {**_responses_reasoning_settings(req), "effort": "none"}
         return bool(enabled)
 
     if fmt == "anthropic":
@@ -2410,6 +2514,18 @@ def _probe_forwarded_params(entry: dict, levels: tuple[str, ...]) -> set[str]:
     return forwarded
 
 
+def _quirk_set(raw) -> frozenset:
+    if isinstance(raw, str):
+        raw = [quirk.strip() for quirk in raw.split(",")]
+    return frozenset(quirk for quirk in raw or () if quirk)
+
+
+def _tier_fields(thinking: str, levels, default: str | None) -> dict:
+    """Discovery's reasoning tier map: each tier's level for this model, under its policy name."""
+    tiers = reasoning_tiers.tier_map(thinking, levels, default)
+    return {"thinking_tiers": tiers, "thinking_tier_policy": reasoning_tiers.TIER_POLICY if tiers else None}
+
+
 def _thinking_capabilities(entry: dict) -> dict:
     """Return validated model-specific capabilities plus dispatch evidence."""
     normalized = catalog.normalize_thinking_capabilities(entry)
@@ -2422,11 +2538,16 @@ def _thinking_capabilities(entry: dict) -> dict:
         thinking_format=normalized.get("thinking_format", ""),
     )
     fmt = normalized.get("thinking_format", "") or _infer_thinking_format(info, target_api="chat")
+    # Dispatch applies the provider's quirks with the model's, so the advertised default does too.
+    quirks = _quirk_set(normalized.get("quirks")) | provider_quirks(normalized.get("provider", ""))
+    default = _default_enabled_thinking_level_for_entry({**normalized, "quirks": quirks}, levels)
+    forced_max = "force_reasoning_effort_max" in quirks
     return {
         "thinking": normalized.get("thinking", ""),
         "thinking_format": fmt,
         "thinking_levels": list(levels),
-        "default_enabled_level": _default_enabled_thinking_level_for_entry(normalized, levels),
+        "default_enabled_level": default,
+        **_tier_fields(normalized.get("thinking", ""), ("max",) if forced_max else levels, "max" if forced_max else default),
         "off_supported": "off" in levels,
         "forwarded_params": sorted(forwarded),
         "max_reachable": bool(forwarded & set(_THINK_LEVEL_KEYS)),
@@ -2643,6 +2764,14 @@ async def ledger_middleware(request: Request, call_next):
     if redirect is not None:
         response.headers["Deprecation"] = "true"
         response.headers["X-Model-Gateway-Model-Redirect"] = f"{redirect[0]} -> {redirect[1]}"
+    tier = getattr(request.state, "reasoning_tier", None)
+    if tier is not None:
+        response.headers["X-Model-Gateway-Reasoning-Tier"] = tier
+        response.headers["X-Model-Gateway-Reasoning-Policy"] = reasoning_tiers.TIER_POLICY
+        # A model without thinking ignores the tier and reports no level.
+        level = getattr(request.state, "reasoning_level", None)
+        if level is not None:
+            response.headers["X-Model-Gateway-Reasoning-Level"] = level
     latency_ms = int((time.time() - start) * 1000)
     ctx = getattr(request.state, "ledger_ctx", None) or {}
     model = ctx.get("model")
@@ -2774,6 +2903,8 @@ def _direct_model_rows(models: list[dict] | None = None) -> list[dict]:
             "thinking_levels": caps["thinking_levels"],
             "off_supported": caps["off_supported"],
             "default_enabled_level": caps["default_enabled_level"],
+            "thinking_tiers": caps["thinking_tiers"],
+            "thinking_tier_policy": caps["thinking_tier_policy"],
             "max_reachable": caps["max_reachable"],
             "forwarded_params": caps["forwarded_params"],
             "vision": bool(m.get("vision")),
@@ -2810,7 +2941,7 @@ def _nonnegative_catalog_int(value: object) -> int:
 
 # Optional row fields a client asks for with ``?include=``; older clients keep exact rows.
 CANONICAL_OPTIONAL_FIELDS = ("display_name", "zero_data_retention", "family", "base_model", "local_install",
-                             "modality")
+                             "modality", "thinking_tiers")
 
 
 def _canonical_includes(request: Request) -> frozenset[str]:
@@ -2864,6 +2995,9 @@ def _canonical_model_rows(inventory: list[dict], include: frozenset[str] = froze
             "default_enabled_level": caps["default_enabled_level"],
             "vision": bool(model.get("vision")),
         }
+        if "thinking_tiers" in include:
+            row["thinking_tiers"] = caps["thinking_tiers"]
+            row["thinking_tier_policy"] = caps["thinking_tier_policy"]
         if "display_name" in include:
             row["display_name"] = _bounded_catalog_string(model.get("display_name"), limit=80)
         if "zero_data_retention" in include:
@@ -3252,7 +3386,8 @@ async def list_models(request: Request):
             for route_id in model.get("routable_ids") or []
         ])
     local_ids = {m.get("id") for m in list_routable_models()}
-    data.extend(row for row in federation.manager().imported_rows()
+    data.extend({**row, **_tier_fields(*_imported_reasoning_inputs(row))}
+                for row in federation.manager().imported_rows()
                 if row["id"] not in local_ids and (principal is None or row["id"] in principal.models))
     if _include_modality(request):
         for row in data:
@@ -3380,6 +3515,8 @@ async def debug_thinking(request: Request):
             "thinking_levels": caps["thinking_levels"],
             "off_supported": caps["off_supported"],
             "default_enabled_level": caps["default_enabled_level"],
+            "thinking_tiers": caps["thinking_tiers"],
+            "thinking_tier_policy": caps["thinking_tier_policy"],
             "forwarded_params": caps["forwarded_params"],
             "max_reachable": caps["max_reachable"],
         })
@@ -3432,6 +3569,9 @@ async def create_response(request: Request):
     )
     if profile_error is not None:
         return profile_error
+    tier_error = _take_reasoning_tier(request, body, _error_openai)
+    if tier_error is not None:
+        return tier_error
     model = _redirect_retired_model(request, body)
     is_stream = body.get("stream", False)
 
@@ -3452,7 +3592,7 @@ async def create_response(request: Request):
         return _error_openai(404, "invalid_request_error", _model_error_message(model))
     if (non_chat := _non_chat_model_message(model, info)) is not None:
         return _error_openai(400, "invalid_request_error", non_chat)
-    thinking_error = _thinking_validation_response(body, info, _error_openai)
+    thinking_error = _thinking_validation_response(request, body, info, _error_openai)
     if thinking_error is not None:
         return thinking_error
 
@@ -3489,7 +3629,7 @@ async def create_response(request: Request):
         # native Anthropic protocol below.
         if vision_rerouted and info.protocol == "anthropic":
             return _error_openai(502, "api_error", "Vision fallback dependency does not support Chat Completions")
-    thinking_error = _thinking_validation_response(body, info, _error_openai)
+    thinking_error = _thinking_validation_response(request, body, info, _error_openai)
     if thinking_error is not None:
         return thinking_error
     _set_ledger_ctx(request, model, info, is_stream=is_stream)
@@ -3511,7 +3651,7 @@ async def create_response(request: Request):
     # Responses+tools requests down to Chat Completions.
     if (info.provider == "openai" or getattr(info, "api_style", "") == "open_responses") and not vision_changed:
         body["model"] = info.provider_model_id
-        _apply_gateway_reasoning(body, info, target_api="responses")
+        _apply_gateway_reasoning(body, info, target_api="responses", request=request)
         request.state.api_key = info.api_key
         fwd = _forward_headers(request, provider=info.provider)
         endpoint = _upstream_endpoint(info, "/responses")
@@ -3528,7 +3668,7 @@ async def create_response(request: Request):
     for key in ("reasoning", "reasoning_effort", "thinking", "output_config", "chat_template_kwargs"):
         if key in body and key not in chat_req:
             chat_req[key] = body[key]
-    thinking_enabled = _apply_gateway_reasoning(chat_req, info, target_api="chat")
+    thinking_enabled = _apply_gateway_reasoning(chat_req, info, target_api="chat", request=request)
     quirk_error = _apply_openai_request_quirks(chat_req, info)
     if quirk_error:
         return _error_openai(400, "invalid_request_error", quirk_error)
@@ -3826,6 +3966,9 @@ async def chat_completions(request: Request):
     )
     if profile_error is not None:
         return profile_error
+    tier_error = _take_reasoning_tier(request, body, _error_openai)
+    if tier_error is not None:
+        return tier_error
     model = _redirect_retired_model(request, body)
     inbound_source = getattr(request.state, "federation_source", None)
     if inbound_source:
@@ -3855,7 +3998,7 @@ async def chat_completions(request: Request):
             status_code=400,
             content={"error": {"message": _responses_only_error_message(model, "/v1/responses"), "type": "invalid_request_error"}},
         )
-    thinking_error = _thinking_validation_response(body, info, _error_openai)
+    thinking_error = _thinking_validation_response(request, body, info, _error_openai)
     if thinking_error is not None:
         return thinking_error
 
@@ -3865,7 +4008,7 @@ async def chat_completions(request: Request):
     )
     if vision_error:
         return vision_error
-    thinking_error = _thinking_validation_response(body, info, _error_openai)
+    thinking_error = _thinking_validation_response(request, body, info, _error_openai)
     if thinking_error is not None:
         return thinking_error
 
@@ -3879,7 +4022,7 @@ async def chat_completions(request: Request):
     if info.protocol == "anthropic":
         return await _handle_chat_anthropic(body, info, model, request, is_stream)
 
-    thinking_enabled = _apply_gateway_reasoning(body, info, target_api="chat")
+    thinking_enabled = _apply_gateway_reasoning(body, info, target_api="chat", request=request)
     quirk_error = _apply_openai_request_quirks(body, info)
     if quirk_error:
         return _error_openai(400, "invalid_request_error", quirk_error)
@@ -3921,7 +4064,7 @@ async def _handle_chat_anthropic(body: dict, info, model: str, request: Request,
     anthropic_req["model"] = info.provider_model_id
     _default_anthropic_max_tokens(anthropic_req, body, info)
     _inject_anthropic_system_instruction(anthropic_req, info.system_instruction)
-    thinking_enabled = _apply_gateway_reasoning(anthropic_req, info, target_api="messages")
+    thinking_enabled = _apply_gateway_reasoning(anthropic_req, info, target_api="messages", request=request)
     _normalize_anthropic_adaptive_thinking(anthropic_req, info)
     request.state.api_key = info.api_key
     headers = _forward_headers(request, protocol="anthropic", provider=info.provider)
@@ -4310,6 +4453,9 @@ async def messages(request: Request):
     )
     if profile_error is not None:
         return profile_error
+    tier_error = _take_reasoning_tier(request, body, _error)
+    if tier_error is not None:
+        return tier_error
     model = _redirect_retired_model(request, body)
     is_stream = body.get("stream", False)
     has_tools = bool(body.get("tools"))
@@ -4333,7 +4479,7 @@ async def messages(request: Request):
         return _error(400, "invalid_request_error", non_chat)
     if getattr(info, "api_style", "") == "open_responses":
         return _error(400, "invalid_request_error", _responses_only_error_message(model, "/v1/responses"))
-    thinking_error = _thinking_validation_response(body, info, _error)
+    thinking_error = _thinking_validation_response(request, body, info, _error)
     if thinking_error is not None:
         return thinking_error
 
@@ -4374,7 +4520,7 @@ async def messages(request: Request):
                 )
             except ValueError as exc:
                 return _error(502, "api_error", str(exc))
-    thinking_error = _thinking_validation_response(body, info, _error)
+    thinking_error = _thinking_validation_response(request, body, info, _error)
     if thinking_error is not None:
         return thinking_error
 
@@ -4385,7 +4531,7 @@ async def messages(request: Request):
     # requests are normalized here; non-Anthropic requests are normalized after
     # translation to the upstream OpenAI-compatible shape.
     if info.protocol == "anthropic":
-        thinking_enabled = _apply_gateway_reasoning(body, info, target_api="messages")
+        thinking_enabled = _apply_gateway_reasoning(body, info, target_api="messages", request=request)
     else:
         control = _extract_reasoning_control(body, info)
         thinking_enabled = bool(control["enabled"])
@@ -4432,7 +4578,7 @@ async def messages(request: Request):
     for key in ("reasoning", "reasoning_effort", "thinking", "output_config", "chat_template_kwargs"):
         if key in body and key not in openai_req:
             openai_req[key] = body[key]
-    thinking_enabled = _apply_gateway_reasoning(openai_req, info, target_api="chat") or thinking_enabled
+    thinking_enabled = _apply_gateway_reasoning(openai_req, info, target_api="chat", request=request) or thinking_enabled
     quirk_error = _apply_openai_request_quirks(openai_req, info)
     if quirk_error:
         return _error(400, "invalid_request_error", quirk_error)
@@ -4548,7 +4694,7 @@ async def _handle_responses_anthropic(
     for key in ("reasoning", "reasoning_effort", "thinking", "output_config", "chat_template_kwargs"):
         if key in body:
             messages_req[key] = copy.deepcopy(body[key])
-    _apply_gateway_reasoning(messages_req, info, target_api="messages")
+    _apply_gateway_reasoning(messages_req, info, target_api="messages", request=request)
     _normalize_anthropic_adaptive_thinking(messages_req, info)
 
     is_stream = body.get("stream", False)

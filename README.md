@@ -32,6 +32,9 @@ translation between them.
   direction.
 - **Unified model catalog** — logical model names, aliases, capability
   metadata (context, vision, reasoning levels), and pricing in one registry.
+- **Reasoning tiers** — a client says how hard a request is
+  (`model_gateway.reasoning_tier`: none, light, normal, hard) and the gateway
+  picks the served model's own level ([docs](docs/reasoning-tiers.md)).
 - **Reliability** — per-provider retries, circuit breakers, provider pools,
   and model-level fallback routes. Pools try a backup on the first transient
   failure, reserving normal retries for the last healthy workspace before
@@ -276,6 +279,7 @@ multi-tenant isolation; run the gateway on loopback or behind a trusted proxy.
 | `docs/provider-onboarding.md` | Provider/model onboarding flow |
 | `docs/workspace-pools-design.md` | Databricks workspace pools and operations |
 | `docs/federation.md` | Gateway-to-gateway federation |
+| `docs/reasoning-tiers.md` | Reasoning tiers: request field, tier-to-level policy, discovery and response headers |
 | `docs/consumer-profiles.md` | Consumer credential, snapshot API, and profile execution contract |
 | `docs/adr/0001-consumer-profile-security.md` | Consumer-profile security boundary decision |
 | `docs/productionization-plan.md` | Admin/control-plane roadmap |

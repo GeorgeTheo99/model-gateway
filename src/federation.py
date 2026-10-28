@@ -835,6 +835,10 @@ class FederationManager:
             return None
         return ImportedRoute(owner_node=owner, direct_model_id=direct_id, peer=peer)
 
+    def imported_model(self, route: ImportedRoute) -> dict[str, Any]:
+        """The peer's published metadata for a resolved route's model."""
+        return self.states[route.owner_node].models[route.direct_model_id]
+
     def imported_rows(self, *, now: float | None = None) -> list[dict[str, Any]]:
         if not self.config:
             return []
