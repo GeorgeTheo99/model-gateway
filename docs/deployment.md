@@ -465,6 +465,7 @@ The release curates the models it can install:
 | `flux3-image-klein` | image | 20 GB | 28 GiB (Macs with 44 GiB and up) | ~31 s at 1024² | FLUX Kommunity (gated) |
 | `qwen-image-2.1` | image, strong text rendering | 33 GB | 74 GiB (90 GiB and up) | ~3.5 min at 1328² | Qwen Research (non-commercial) |
 | `ltx-2.5` | video with audio | 45 GB | 40 GiB (56 GiB and up) | ~3 min for 5 s at 1280×704 | LTX-2 Community (gated) |
+| `wan2.2-i2v-a14b` | silent image-to-video | 43 GB | 128 GiB admission floor (144 GiB and up) | ~5 min 16 s for 1 s at 512×288; larger clips not benchmarked | Apache-2.0 |
 
 Each owner downloads the weights and is bound by the model's license, so `add`
 shows it and asks to accept it (`--accept-license` accepts it without asking).
@@ -478,8 +479,12 @@ model-gateway media add MODEL [--accept-license]   # build media-gen (first time
 model-gateway media remove [MODEL]    # one model, or (none, or the last) the service and all its state
 ```
 
+Wan requires a multipart `input_reference` image. It produces silent 16-fps video,
+accepts 1–5 seconds, and defaults to 832×480. It requires both `ffmpeg` and `ffprobe`.
+The pinned MLX-Video engine comes from Git, **not** the unrelated PyPI package of that name.
+
 `add` runs in the foreground. It builds media-gen and its engines (mflux,
-ltx-2-mlx) from the locked `media-runtime/` project with uv into
+ltx-2-mlx, MLX-Video) from the locked `media-runtime/` project with uv into
 `~/Library/Application Support/model-gateway/media/venv`, downloads the
 model's pinned files through `media-gen pull` (HTTPS only, resumable, capped at
 `MODEL_GATEWAY_MEDIA_DOWNLOAD_MBPS`, default 150, each file's SHA-256 or Git

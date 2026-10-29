@@ -51,7 +51,8 @@ translation between them.
   errors per request, in SQLite.
 - **Federation** — explicitly configured gateway-to-gateway routes.
 - **Local image and video generation** — optional `model-gateway media add`
-  installs media-gen (FLUX 3 Image Klein, Qwen-Image 2.1, LTX-2.5 video with audio)
+  installs media-gen (FLUX 3 Image Klein, Qwen-Image 2.1, LTX-2.5 video with audio,
+  and Wan 2.2 image-to-video)
   behind OpenAI-compatible `/v1/images/generations` and `/v1/videos`
   ([ADR 0004](docs/adr/0004-local-image-and-video-generation.md)).
 - **Consumer profiles** — authenticated, namespace-scoped, immutable routing

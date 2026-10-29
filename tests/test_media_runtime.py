@@ -276,9 +276,17 @@ def test_the_locked_runtime_pins_media_gen_by_commit():
     assert source["git"] == "https://github.com/GeorgeTheo99/media-gen" and len(source["rev"]) == 40
     lock = (mr.RUNTIME_PROJECT / "uv.lock").read_text()
     assert f'source = {{ git = "{source["git"]}?rev={source["rev"]}#{source["rev"]}" }}' in lock
-    for engine in ('name = "mflux"\nversion = "0.24.0"', 'name = "ltx-pipelines-mlx"\nversion = "0.18.0"'):
+    for engine in ('name = "mflux"\nversion = "0.24.0"', 'name = "ltx-pipelines-mlx"\nversion = "0.18.0"',
+                   'name = "media-gen"\nversion = "0.3.0"', 'name = "mlx-video"\nversion = "0.0.1"'):
         assert engine in lock
-    assert set(mr.MODELS) == {"flux3-image-klein", "qwen-image-2.1", "ltx-2.5"}
+    wan_source = project["tool"]["uv"]["sources"]["mlx-video"]
+    assert wan_source["git"] == "https://github.com/Blaizzy/mlx-video"
+    assert len(wan_source["rev"]) == 40
+    assert f'{wan_source["git"]}?rev={wan_source["rev"]}#{wan_source["rev"]}' in lock
+    assert set(mr.MODELS) == {"flux3-image-klein", "qwen-image-2.1", "ltx-2.5", "wan2.2-i2v-a14b"}
+    wan = mr.MODELS["wan2.2-i2v-a14b"]
+    assert wan.modality == "video" and wan.license == "Apache-2.0"
+    assert wan.download_bytes == 42_702_440_820
 
 
 def test_a_new_release_forgets_the_models_it_retired(gateway, mac):
