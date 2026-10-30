@@ -522,6 +522,45 @@ also be added to an owner catalog by hand (`"modality": "image"`,
 `"provider": "media"`, `"pricing_status": "unmetered"`) for a media-gen the
 gateway does not manage.
 
+### Custom LoRA profiles
+
+An owner can add their own LoRA adapter on top of a curated model, on this Mac
+only. Releases never ship or install one, and the curated model stays the
+default. Today LTX-2.5 accepts adapters: a single `.safetensors` file of
+`lora_A`/`lora_B` pairs (ComfyUI `diffusion_model.*` naming, or bare
+`transformer_blocks.*` keys, as ltx-2-mlx reads them).
+
+```bash
+model-gateway media custom import PATH --base ltx-2.5 --name NAME \
+  --license "LICENSE" --source "URL or your own training" [--strength 1.0] [--display-name TEXT]
+model-gateway media custom enable custom-NAME    # route it; disable stops routing it
+model-gateway media custom list [--json]
+model-gateway media custom remove custom-NAME    # forget it and delete its copy
+```
+
+`import` checks the whole file before keeping it: safetensors only (no pickle),
+F16, BF16 or F32 tensors that tile the file exactly, and every tensor half of a
+LoRA pair whose shapes match a layer of the base model. ltx-2-mlx silently skips
+keys it does not recognise, so an adapter for another model or format is refused
+instead of quietly changing nothing. A file that passes is copied, read-only, to
+`media/home/custom/adapters/<sha256>.safetensors`, and the profile is recorded
+with its base model, license, source and strength, **disabled**. `enable`
+checks the base is installed and media-gen serves the profile (otherwise it is
+left disabled), then adds a `custom-NAME` row to the catalog (its `custom_base`
+names the curated model; `/v1/models?include=modality` shows it too). The worker checks the adapter's
+SHA-256 before every generation and fuses it into a separate load of the model,
+so the curated model is never changed. Its memory floor is the base model's plus
+4 GiB and the adapter's size.
+
+Shape checks prove the engine will apply an adapter, not that it was trained for
+this base model: import only adapters made for it. The adapter's license and the
+base model's license both bind its use; keeping the file on this Mac does not
+lift either. Removing the base model stops routing its profiles (removing the
+last installed model is refused while profiles exist); `media remove` without a
+model deletes them with everything else. A video already queued keeps the
+adapter it was queued with. The custom commands need the media-gen this release
+pins: after updating Model Gateway, run `media add` for an installed model first.
+
 ## Moving to another machine
 
 A bundle carries providers, the catalog, and registered profiles without any

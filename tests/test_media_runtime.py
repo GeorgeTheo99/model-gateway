@@ -296,3 +296,159 @@ def test_a_new_release_forgets_the_models_it_retired(gateway, mac):
     mr.add("ltx-2.5")
     assert json.loads(mr.installed_path().read_text()) == ["flux3-image-klein", "ltx-2.5"]
 
+
+
+@pytest.fixture
+def profiles(mac, monkeypatch):
+    """media-gen's `custom` command, faked: its profiles, keyed by id."""
+    state: dict[str, dict] = {}
+    run = mr._run
+
+    def custom_run(*args, env=None):
+        if args[1:2] != ("custom",):
+            return run(*args, env=env)
+        mac.calls.append(("run", *args))
+        action, rest = args[2], args[3:]
+        if action == "import":
+            options = dict(zip(rest[1::2], rest[2::2], strict=False))
+            state[f"custom-{options['--name']}"] = {
+                "id": f"custom-{options['--name']}", "base": options["--base"],
+                "display_name": options.get("--display-name", options["--name"]), "enabled": False,
+                "strength": float(options["--strength"]), "license": options["--license"],
+                "source": options["--source"]}
+        elif action in ("enable", "disable"):
+            state[rest[0]]["enabled"] = action == "enable"
+            if action == "enable":
+                mac.served[rest[0]] = True
+            else:
+                mac.served.pop(rest[0], None)
+        elif action == "remove":
+            state.pop(rest[0])
+            mac.served.pop(rest[0], None)
+
+    def output(*args, env=None):
+        assert args[1:] == ("custom", "list", "--json")
+        assert env["MEDIA_GEN_HOME"] == str(mr.home_dir())
+        return json.dumps(list(state.values()))
+
+    monkeypatch.setattr(mr, "_run", custom_run)
+    monkeypatch.setattr(mr, "_output", output)
+    return state
+
+
+def _custom_rows() -> list[dict]:
+    return [row for row in shipped.layer(_config()).entries if row["name"].startswith("custom-")]
+
+
+def test_custom_profiles_route_only_once_enabled(gateway, mac, profiles):
+    mr.add("ltx-2.5")
+    mr.custom("import", "/tmp/style.safetensors", "--base", "ltx-2.5", "--name", "style", "--license", "MIT",
+              "--source", "my training", "--strength", "0.8", "--display-name", "Style")
+    assert profiles["custom-style"]["enabled"] is False
+    assert _custom_rows() == []
+    assert mr.custom_profiles() == []
+
+    mr.custom("enable", "custom-style")
+    [row] = _custom_rows()
+    assert row["custom_base"] == "ltx-2.5" and row["modality"] == "video"
+    assert row["provider_model_id"] == "custom-style" and row["display_name"] == "Style"
+    assert row["origin"] == {"layer": "shipped", "profile": "media"}
+    providers.reload()
+    assert providers.resolve("custom-style").provider == "media"
+    # Never part of what a release ships.
+    assert "custom-style" not in {r["name"] for r in shipped.all_shipped_rows({})}
+    assert mr.status()["custom"] == [{"name": "custom-style", "base": "ltx-2.5", "display_name": "Style"}]
+    # The vanilla model is unchanged beside it.
+    assert providers.resolve("ltx-2.5").provider_model_id == "ltx-2.5"
+
+    mr.custom("disable", "custom-style")
+    assert _custom_rows() == []
+    mr.custom("enable", "custom-style")
+    mr.custom("remove", "custom-style")
+    assert _custom_rows() == [] and profiles == {}
+
+
+def test_a_custom_profile_follows_its_base_model(gateway, mac, profiles):
+    mr.add("ltx-2.5")
+    mr.add("flux3-image-klein")
+    mr.custom("import", "/tmp/a.safetensors", "--base", "ltx-2.5", "--name", "a", "--license", "MIT",
+              "--source", "x", "--strength", "1.0")
+    mr.custom("enable", "custom-a")
+    mr.remove("ltx-2.5")
+    assert _custom_rows() == []
+    with pytest.raises(lr.LocalRuntimeError, match="not installed"):
+        mr.custom("enable", "custom-a")
+
+
+def test_custom_enable_is_checked_and_rolled_back(gateway, mac, profiles, monkeypatch):
+    mr.add("ltx-2.5")
+    with pytest.raises(lr.LocalRuntimeError, match="No custom profile"):
+        mr.custom("enable", "custom-missing")
+    mr.custom("import", "/tmp/a.safetensors", "--base", "ltx-2.5", "--name", "a", "--license", "MIT",
+              "--source", "x", "--strength", "1.0")
+    request = lr._request
+
+    def unserved(url, token="", body=None, *, timeout=15):
+        if url.endswith("/v1/models"):
+            return {"data": [{"id": "ltx-2.5", "installed": True}]}
+        return request(url, token, body, timeout=timeout)
+
+    monkeypatch.setattr(lr, "_request", unserved)
+    with pytest.raises(lr.LocalRuntimeError, match="left disabled"):
+        mr.custom("enable", "custom-a")
+    assert profiles["custom-a"]["enabled"] is False
+    assert _custom_rows() == []
+
+
+def test_custom_needs_a_current_media_gen(gateway, mac, profiles):
+    with pytest.raises(lr.LocalRuntimeError, match="not installed"):
+        mr.custom("list")
+    mr.add("ltx-2.5")
+    (mr.RUNTIME_PROJECT / "uv.lock").write_text("version = 2\n")
+    with pytest.raises(lr.LocalRuntimeError, match="media add ltx-2.5"):
+        mr.custom("list")
+
+
+def test_custom_cli(gateway, mac, profiles, capsys):
+    mr.add("ltx-2.5")
+    capsys.readouterr()
+    assert mr.main(["custom", "import", "~/style.safetensors", "--base", "ltx-2.5", "--name", "style",
+                    "--license", "MIT", "--source", "my training"]) == 0
+    out = capsys.readouterr().out
+    assert "never publishes or syncs it" in out and "custom enable custom-style" in out
+    [call] = [c for c in mac.calls if c[2:4] == ("custom", "import")]
+    assert call[4] == str(Path("~/style.safetensors").expanduser().resolve())
+    assert mr.main(["custom", "enable", "custom-style"]) == 0
+    assert mr.main(["custom", "list"]) == 0
+    assert "custom-style" in capsys.readouterr().out
+    assert mr.main(["custom", "list", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)[0]["enabled"] is True
+
+
+def test_custom_enable_rolls_back_when_media_gen_is_unreachable(gateway, mac, profiles, monkeypatch):
+    mr.add("ltx-2.5")
+    mr.custom("import", "/tmp/a.safetensors", "--base", "ltx-2.5", "--name", "a", "--license", "MIT",
+              "--source", "x", "--strength", "1.0")
+    generation = (lr.runtime_root() / lr.GENERATION_FILE).read_text()
+
+    def down(url, token="", body=None, *, timeout=15):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(lr, "_request", down)
+    with pytest.raises(OSError):
+        mr.custom("enable", "custom-a")
+    assert profiles["custom-a"]["enabled"] is False
+    assert _custom_rows() == [] and mr.custom_profiles() == []
+    assert (lr.runtime_root() / lr.GENERATION_FILE).read_text() != generation
+
+
+def test_the_last_model_is_kept_while_custom_profiles_exist(gateway, mac, profiles):
+    mr.add("ltx-2.5")
+    adapters = mr.home_dir() / "custom" / "adapters"
+    adapters.mkdir(parents=True)
+    (adapters / f"{'0' * 64}.safetensors").write_bytes(b"x")
+    with pytest.raises(lr.LocalRuntimeError, match="custom profiles"):
+        mr.remove("ltx-2.5")
+    assert mr.installed() == ["ltx-2.5"] and adapters.exists()
+    mr.remove()
+    assert not mr.root().exists()

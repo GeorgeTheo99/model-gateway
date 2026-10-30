@@ -7,7 +7,8 @@ hash-verified files through media-gen, installs the ``com.local.media-gen``
 LaunchAgent (loopback only, with a generated API key), adds the ``media``
 provider to this gateway, loads the model from the shipped catalog layer and
 checks that media-gen serves it. ``remove`` takes one model away, or the whole
-runtime with its files and gateway routes.
+runtime with its files and gateway routes. ``custom`` manages the owner's own LoRA
+profiles on a curated model (media-gen's ``custom`` command), routed only once enabled.
 
 Ownership follows src.local_runtime: the LaunchAgent records this gateway's
 ``ModelGatewayRoot``, a ``com.local.media-gen`` without it is never modified,
@@ -110,6 +111,11 @@ def installed_path() -> Path:
     return root() / "installed.json"
 
 
+def custom_path() -> Path:
+    """The owner's enabled custom profiles, as media-gen last listed them."""
+    return root() / "custom.json"
+
+
 def build_path() -> Path:
     """The digest of the media-runtime lock the venv was built from."""
     return root() / "build.sha256"
@@ -137,6 +143,10 @@ def _run(*args: str, env: dict | None = None) -> None:
     subprocess.run(args, check=True, env=env)
 
 
+def _output(*args: str, env: dict | None = None) -> str:
+    return subprocess.run(args, check=True, env=env, capture_output=True, text=True).stdout
+
+
 # ── state ────────────────────────────────────────────────────────────────────
 
 
@@ -159,6 +169,21 @@ def installed() -> list[str]:
 
 def _write_installed(names: list[str]) -> None:
     lr._atomic(installed_path(), json.dumps(sorted(set(names))) + "\n", root())
+
+
+def custom_profiles() -> list[dict]:
+    """The enabled custom profiles on a curated base model: ``name``, ``base`` and ``display_name``."""
+    path = custom_path()
+    try:
+        lr._regular(path, root())
+        rows = json.loads(path.read_text()) if path.exists() else []
+    except (OSError, ValueError, LocalRuntimeError):
+        return []
+    return [
+        row for row in rows if isinstance(row, dict) and row.get("base") in MODELS
+        and all(isinstance(row.get(key), str) for key in ("name", "base", "display_name"))
+        and row["name"].startswith("custom-")
+    ] if isinstance(rows, list) else []
 
 
 def owner() -> str | None:
@@ -191,11 +216,23 @@ def catalog_rows(config: dict, *, installed_only: bool = True) -> list[dict]:
     if installed_only and not (isinstance(configured, dict) and _our_provider(configured.get("media"))):
         return []
     names = set(installed()) if installed_only else set(MODELS)
-    return [
+    rows = [
         {"name": m.name, "provider": "media", "provider_model_id": m.name, "modality": m.modality,
          "display_name": m.display_name, "desc": m.desc, "pricing_status": "unmetered"}
         for m in MODELS.values() if m.name in names
     ]
+    # The owner's own profiles are never part of a release, so they load only once enabled here,
+    # each under its own name and marked with the curated model it builds on (custom_base).
+    for profile in custom_profiles() if installed_only else []:
+        base = MODELS[profile["base"]]
+        if base.name in names:
+            rows.append({
+                "name": profile["name"], "provider": "media", "provider_model_id": profile["name"],
+                "modality": base.modality, "display_name": profile["display_name"][:80],
+                "desc": f"Owner-supplied LoRA on {base.display_name}, on this Mac only",
+                "pricing_status": "unmetered", "custom_base": base.name,
+            })
+    return rows
 
 
 def _api_key(*, create: bool = False) -> str:
@@ -223,6 +260,7 @@ def status() -> dict:
              "memory_gib": m.memory_gib, "download_gb": round(m.download_bytes / 1e9, 1)}
             for m in MODELS.values()
         ],
+        "custom": custom_profiles(),
     }
 
 
@@ -427,6 +465,11 @@ def add(name: str) -> dict:
     return status()
 
 
+def _has_custom_profiles() -> bool:
+    """Whether the owner keeps any adapter in media-gen's home (media-gen's ``custom/adapters``)."""
+    return any((home_dir() / "custom" / "adapters").glob("*.safetensors"))
+
+
 def _teardown() -> None:
     _unconfigure_gateway()
     if owner() == "gateway":
@@ -448,6 +491,11 @@ def remove(name: str | None = None) -> dict:
             model(name)
             if name not in names:
                 raise LocalRuntimeError(f"{name} is not installed")
+            if names == [name] and _has_custom_profiles():
+                raise LocalRuntimeError(
+                    f"{name} is the last media model, and removing it removes media generation with your custom "
+                    f"profiles: remove them first (`model-gateway media custom remove`), or remove everything "
+                    f"with `model-gateway media remove`")
             if names != [name]:
                 _write_installed([n for n in names if n != name])
                 lr.bump_generation()  # the gateway stops routing to it before its files go
@@ -456,6 +504,80 @@ def remove(name: str | None = None) -> dict:
                 return status()
         _teardown()
     return status()
+
+
+# ── custom profiles ──────────────────────────────────────────────────────────
+
+
+def _media_gen_cli(*args: str, capture: bool = False) -> str:
+    env = dict(os.environ, MEDIA_GEN_HOME=str(home_dir()))
+    command = (str(venv_dir() / "bin" / "media-gen"), "custom", *args)
+    if capture:
+        return _output(*command, env=env)
+    _run(*command, env=env)
+    return ""
+
+
+def _listed() -> list[dict]:
+    rows = json.loads(_media_gen_cli("list", "--json", capture=True))
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        raise LocalRuntimeError("media-gen listed its custom profiles in an unexpected format")
+    return rows
+
+
+def _sync_custom() -> list[dict]:
+    """Record media-gen's enabled profiles and reload the gateway: the routes follow that list."""
+    rows = _listed()
+    enabled = [{"name": row["id"], "base": row["base"], "display_name": row["display_name"]}
+               for row in rows if row.get("enabled")]
+    lr._atomic(custom_path(), json.dumps(enabled, indent=2) + "\n", root())
+    lr.bump_generation()
+    return rows
+
+
+def custom(action: str, *args: str) -> list[dict]:
+    """Run ``media-gen custom ACTION ARGS`` on this gateway's media-gen, then route what it enabled."""
+    _require_owned()
+    if not installed():
+        raise LocalRuntimeError("Media generation is not installed; add a model first")
+    lr._no_symlinks(root(), root())
+    with _lock():
+        if not _built():
+            raise LocalRuntimeError(
+                f"media-gen is older than this release; update it first with `model-gateway media add "
+                f"{installed()[0]}`")
+        if action == "list":
+            return _listed()
+        if action == "enable":
+            (profile_id,) = args
+            row = next((row for row in _listed() if row.get("id") == profile_id), None)
+            if row is None:
+                raise LocalRuntimeError(f"No custom profile {profile_id!r}")
+            if row.get("base") not in installed():
+                raise LocalRuntimeError(f"{profile_id} builds on {row.get('base')}, which is not installed")
+        _media_gen_cli(action, *args)
+        if action == "enable":
+            # Routed only once media-gen serves it; any failure on the way leaves it disabled.
+            try:
+                served = {row.get("id") for row in _media_gen("/v1/models").get("data", [])}
+                if args[0] not in served:
+                    raise LocalRuntimeError(f"media-gen does not serve {args[0]}; it was left disabled")
+                return _sync_custom()
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    _media_gen_cli("disable", args[0])
+                    _sync_custom()
+                raise
+        return _sync_custom()
+
+
+def _print_custom(rows: list[dict]) -> None:
+    if not rows:
+        print("No custom profiles")
+    for row in rows:
+        state = "enabled" if row.get("enabled") else "disabled"
+        print(f"  {row.get('id', ''):<28}{state:<10}on {row.get('base')}, strength {row.get('strength')}  "
+              f"{row.get('license')} ({row.get('source')})")
 
 
 def _print_status(value: dict) -> None:
@@ -486,6 +608,28 @@ def _license_accepted(media: MediaModel, accepted: bool) -> bool:
     return False
 
 
+def _custom_command(args: argparse.Namespace) -> int:
+    if args.action == "list":
+        rows = custom("list")
+        print(json.dumps(rows, indent=2)) if args.json else _print_custom(rows)
+        return 0
+    if args.action == "import":
+        print("The adapter's own license and its base model's license both apply to your use of it; "
+              "Model Gateway keeps it on this Mac and never publishes or syncs it.")
+        options = ["--base", args.base, "--name", args.name, "--license", args.license, "--source", args.source,
+                   "--strength", str(args.strength)]
+        if args.display_name:
+            options += ["--display-name", args.display_name]
+        custom("import", str(Path(args.path).expanduser().resolve()), *options)
+        print(f"custom-{args.name} is imported but not routed; enable it with "
+              f"`model-gateway media custom enable custom-{args.name}`")
+        return 0
+    custom(args.action, args.id)
+    print({"enable": f"{args.id} is enabled: request it by name",
+           "disable": f"{args.id} is disabled", "remove": f"{args.id} removed"}[args.action])
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="model-gateway media", description=__doc__.split("\n\n")[0])
     commands = parser.add_subparsers(dest="command", required=True)
@@ -497,6 +641,21 @@ def main(argv: list[str] | None = None) -> int:
                             help="accept the model's license without being asked")
     drop = commands.add_parser("remove", help="remove one model, or (without a model) everything")
     drop.add_argument("model", nargs="?", choices=sorted(MODELS))
+    own = commands.add_parser("custom", help="your own LoRA profiles on a curated model, on this Mac only")
+    actions = own.add_subparsers(dest="action", required=True)
+    listing = actions.add_parser("list", help="the custom profiles")
+    listing.add_argument("--json", action="store_true")
+    adding = actions.add_parser("import", help="check and copy in a LoRA as a new, disabled profile")
+    adding.add_argument("path", help="a .safetensors LoRA adapter")
+    adding.add_argument("--base", required=True, choices=sorted(MODELS),
+                        help="the curated model it was made for (LTX-2.5 accepts LoRAs)")
+    adding.add_argument("--name", required=True, help="served as custom-NAME")
+    adding.add_argument("--license", required=True, help="the adapter's license, as its publisher states it")
+    adding.add_argument("--source", required=True, help="where it came from (a URL, or your own training)")
+    adding.add_argument("--display-name")
+    adding.add_argument("--strength", type=float, default=1.0)
+    for action in ("enable", "disable", "remove"):
+        actions.add_parser(action).add_argument("id", help="custom-NAME")
     args = parser.parse_args(argv)
     os.umask(0o077)
     try:
@@ -509,6 +668,8 @@ def main(argv: list[str] | None = None) -> int:
             add(args.model)
             print(f"{args.model} is ready: POST /v1/images/generations or /v1/videos on this gateway "
                   f"(list it with GET /v1/models?include=modality)")
+        elif args.command == "custom":
+            return _custom_command(args)
         else:
             remove(args.model)
             print(f"Media model {args.model} removed" if args.model else "Media generation removed")

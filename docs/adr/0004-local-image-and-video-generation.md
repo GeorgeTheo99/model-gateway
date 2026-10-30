@@ -75,6 +75,15 @@ provider and the curated rows in the shipped catalog layer. Before wiring the
 gateway it checks that media-gen serves the model, and an image model must
 generate one image.
 
+### 4. Owner-supplied adapters stay local (0.14.0)
+
+The curated models remain the shipped defaults. An owner may add a LoRA profile
+on a curated model that accepts adapters (`model-gateway media custom`): checked
+for compatibility at import, kept in media-gen's home outside any release,
+disabled until enabled, routed under its own `custom-NAME` name with
+`custom_base`, and never substituted for the curated model.
+[deployment.md](../deployment.md#custom-lora-profiles) has the details.
+
 ## Consequences
 
 - Clients that never ask for `modality` see no change.
