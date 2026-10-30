@@ -302,13 +302,14 @@ def test_a_new_release_forgets_the_models_it_retired(gateway, mac):
 def profiles(mac, monkeypatch):
     """media-gen's `custom` command, faked: its profiles, keyed by id."""
     state: dict[str, dict] = {}
-    run = mr._run
 
-    def custom_run(*args, env=None):
-        if args[1:2] != ("custom",):
-            return run(*args, env=env)
+    def output(*args, env=None):
+        assert args[0] == str(mr.venv_dir() / "bin" / "media-gen") and args[1] == "custom"
+        assert env["MEDIA_GEN_HOME"] == str(mr.home_dir())
         mac.calls.append(("run", *args))
         action, rest = args[2], args[3:]
+        if action == "list":
+            return json.dumps(list(state.values()))
         if action == "import":
             options = dict(zip(rest[1::2], rest[2::2], strict=False))
             state[f"custom-{options['--name']}"] = {
@@ -325,13 +326,8 @@ def profiles(mac, monkeypatch):
         elif action == "remove":
             state.pop(rest[0])
             mac.served.pop(rest[0], None)
+        return f"{action}: media-gen's own message\n"
 
-    def output(*args, env=None):
-        assert args[1:] == ("custom", "list", "--json")
-        assert env["MEDIA_GEN_HOME"] == str(mr.home_dir())
-        return json.dumps(list(state.values()))
-
-    monkeypatch.setattr(mr, "_run", custom_run)
     monkeypatch.setattr(mr, "_output", output)
     return state
 
@@ -416,6 +412,7 @@ def test_custom_cli(gateway, mac, profiles, capsys):
                     "--license", "MIT", "--source", "my training"]) == 0
     out = capsys.readouterr().out
     assert "never publishes or syncs it" in out and "custom enable custom-style" in out
+    assert "media-gen's own message" not in out
     [call] = [c for c in mac.calls if c[2:4] == ("custom", "import")]
     assert call[4] == str(Path("~/style.safetensors").expanduser().resolve())
     assert mr.main(["custom", "enable", "custom-style"]) == 0

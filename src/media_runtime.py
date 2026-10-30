@@ -144,7 +144,8 @@ def _run(*args: str, env: dict | None = None) -> None:
 
 
 def _output(*args: str, env: dict | None = None) -> str:
-    return subprocess.run(args, check=True, env=env, capture_output=True, text=True).stdout
+    """Run a command for its output; its errors still reach the terminal."""
+    return subprocess.run(args, check=True, env=env, stdout=subprocess.PIPE, text=True).stdout
 
 
 # ── state ────────────────────────────────────────────────────────────────────
@@ -509,17 +510,15 @@ def remove(name: str | None = None) -> dict:
 # ── custom profiles ──────────────────────────────────────────────────────────
 
 
-def _media_gen_cli(*args: str, capture: bool = False) -> str:
+def _media_gen_cli(*args: str) -> str:
+    """media-gen's ``custom`` command. Its own messages are not shown: they name media-gen's commands,
+    which would change a profile without routing it."""
     env = dict(os.environ, MEDIA_GEN_HOME=str(home_dir()))
-    command = (str(venv_dir() / "bin" / "media-gen"), "custom", *args)
-    if capture:
-        return _output(*command, env=env)
-    _run(*command, env=env)
-    return ""
+    return _output(str(venv_dir() / "bin" / "media-gen"), "custom", *args, env=env)
 
 
 def _listed() -> list[dict]:
-    rows = json.loads(_media_gen_cli("list", "--json", capture=True))
+    rows = json.loads(_media_gen_cli("list", "--json"))
     if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
         raise LocalRuntimeError("media-gen listed its custom profiles in an unexpected format")
     return rows
@@ -615,13 +614,13 @@ def _custom_command(args: argparse.Namespace) -> int:
         return 0
     if args.action == "import":
         print("The adapter's own license and its base model's license both apply to your use of it; "
-              "Model Gateway keeps it on this Mac and never publishes or syncs it.")
+              "Model Gateway keeps it on this Mac and never publishes or syncs it.", flush=True)
         options = ["--base", args.base, "--name", args.name, "--license", args.license, "--source", args.source,
                    "--strength", str(args.strength)]
         if args.display_name:
             options += ["--display-name", args.display_name]
         custom("import", str(Path(args.path).expanduser().resolve()), *options)
-        print(f"custom-{args.name} is imported but not routed; enable it with "
+        print(f"custom-{args.name} is imported, checked and disabled; enable it with "
               f"`model-gateway media custom enable custom-{args.name}`")
         return 0
     custom(args.action, args.id)
