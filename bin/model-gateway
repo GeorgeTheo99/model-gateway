@@ -20,7 +20,7 @@
 #   model-gateway secrets migrate [--dry-run]    move inline provider keys to 0600 key files
 #   model-gateway consumer add|list|revoke       manage consumer credentials (0600 key files)
 #   model-gateway local-ai status|add|cancel|remove  gateway-owned local AI (oMLX + a verified model)
-#   model-gateway media status|add|remove        gateway-owned image and video generation (media-gen)
+#   model-gateway media status|add|remove|custom gateway-owned image and video generation (media-gen)
 #   model-gateway bundle export|import           move config/catalog/profiles (no secrets)
 #   model-gateway env                            print resolved config
 #   model-gateway version [--json]               release version (and capabilities with --json)
@@ -939,12 +939,14 @@ run_runtime_module() {
 }
 
 cmd_media() {
-  local usage="usage: model-gateway media {status [--json] | add MODEL | remove [MODEL]}"
+  local usage="usage: model-gateway media {status [--json] | add MODEL | remove [MODEL] | custom {list | import PATH ... | enable ID | disable ID | remove ID}}"
   [ $# -ge 1 ] || die "$usage"
   case "$1" in
     status) ;;
     # add wires the provider into this gateway, which must be this checkout's loaded service.
     add) check_prereqs; ensure_runtime_paths_safe "media setup" ;;
+    # Enabling or removing a custom profile reloads this gateway's catalog, like add.
+    custom) check_prereqs; ensure_runtime_paths_safe "media custom profiles" ;;
     remove)
       check_prereqs
       if [ -e "$(plist_path)" ] || [ -L "$(plist_path)" ]; then
