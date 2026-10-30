@@ -768,8 +768,8 @@ wheels = [
 
 [[package]]
 name = "media-gen"
-version = "0.4.0"
-source = { git = "https://github.com/GeorgeTheo99/media-gen?rev=8161d63b6aa4c4df54ee6ec12ddcd44b782bcc13#8161d63b6aa4c4df54ee6ec12ddcd44b782bcc13" }
+version = "0.4.1"
+source = { git = "https://github.com/GeorgeTheo99/media-gen?rev=cb0edd07b77cc342a14bf8aada7bf2e382f7adc9#cb0edd07b77cc342a14bf8aada7bf2e382f7adc9" }
 dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
@@ -976,7 +976,7 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "media-gen", extras = ["engines"], git = "https://github.com/GeorgeTheo99/media-gen?rev=8161d63b6aa4c4df54ee6ec12ddcd44b782bcc13" }]
+requires-dist = [{ name = "media-gen", extras = ["engines"], git = "https://github.com/GeorgeTheo99/media-gen?rev=cb0edd07b77cc342a14bf8aada7bf2e382f7adc9" }]
 
 [[package]]
 name = "mpmath"

@@ -514,7 +514,10 @@ def _media_gen_cli(*args: str) -> str:
     """media-gen's ``custom`` command. Its own messages are not shown: they name media-gen's commands,
     which would change a profile without routing it."""
     env = dict(os.environ, MEDIA_GEN_HOME=str(home_dir()))
-    return _output(str(venv_dir() / "bin" / "media-gen"), "custom", *args, env=env)
+    try:
+        return _output(str(venv_dir() / "bin" / "media-gen"), "custom", *args, env=env)
+    except subprocess.CalledProcessError:
+        raise LocalRuntimeError(f"media-gen custom {args[0]} failed (its reason is above)") from None
 
 
 def _listed() -> list[dict]:
