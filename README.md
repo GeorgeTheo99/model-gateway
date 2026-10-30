@@ -53,7 +53,8 @@ translation between them.
 - **Local image and video generation** — optional `model-gateway media add`
   installs media-gen (FLUX 3 Image Klein, Qwen-Image 2.1, LTX-2.5 video with audio,
   and Wan 2.2 image-to-video)
-  behind OpenAI-compatible `/v1/images/generations` and `/v1/videos`
+  behind OpenAI-compatible `/v1/images/generations` and `/v1/videos`, with
+  optional owner-supplied LoRA profiles kept on that Mac (`model-gateway media custom`)
   ([ADR 0004](docs/adr/0004-local-image-and-video-generation.md)).
 - **Consumer profiles** — authenticated, namespace-scoped, immutable routing
   snapshots with enforced gateway-local or gateway-managed cloud execution.
