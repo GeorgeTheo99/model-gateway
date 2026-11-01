@@ -622,7 +622,9 @@ def _custom_command(args: argparse.Namespace) -> int:
                    "--strength", str(args.strength)]
         if args.display_name:
             options += ["--display-name", args.display_name]
-        custom("import", str(Path(args.path).expanduser().resolve()), *options)
+        # The launcher runs this from its own directory, so a relative path is the caller's.
+        caller_dir = os.environ.get("MODEL_GATEWAY_CALLER_DIR") or os.getcwd()
+        custom("import", str(Path(caller_dir, Path(args.path).expanduser()).resolve()), *options)
         print(f"custom-{args.name} is imported, checked and disabled; enable it with "
               f"`model-gateway media custom enable custom-{args.name}`")
         return 0

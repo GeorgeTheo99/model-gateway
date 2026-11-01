@@ -918,7 +918,7 @@ run_local_ai() {
 
 # Run a gateway-owned runtime's module (src.local_runtime, src.media_runtime) with those values.
 run_runtime_module() {
-  local module="$1" backup_dir uv="$UV_BIN"
+  local module="$1" backup_dir uv="$UV_BIN" caller_dir="$PWD"
   shift
   backup_dir="$(installed_plist_env MODEL_GATEWAY_BACKUP_DIR)"
   is_packaged && uv="$(package_value UV)"
@@ -934,6 +934,7 @@ run_runtime_module() {
     MODEL_GATEWAY_UV_BIN="${MODEL_GATEWAY_UV_BIN:-$uv}" \
     MODEL_GATEWAY_PROFILE_REGISTRY="${MODEL_GATEWAY_PROFILE_REGISTRY:-$(installed_plist_env MODEL_GATEWAY_PROFILE_REGISTRY)}" \
     MODEL_GATEWAY_PACKAGE_ROOT="$ROOT_DIR" \
+    MODEL_GATEWAY_CALLER_DIR="$caller_dir" \
       run_python -m "$module" "$@"
   )
 }

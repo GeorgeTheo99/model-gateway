@@ -434,6 +434,16 @@ def test_custom_cli(gateway, mac, profiles, capsys):
     assert json.loads(capsys.readouterr().out)[0]["enabled"] is True
 
 
+def test_custom_import_reads_a_relative_path_from_the_callers_directory(gateway, mac, profiles, monkeypatch,
+                                                                       tmp_path):
+    mr.add("ltx-2.5")
+    monkeypatch.setenv("MODEL_GATEWAY_CALLER_DIR", str(tmp_path))
+    assert mr.main(["custom", "import", "loras/style.safetensors", "--base", "ltx-2.5", "--name", "style",
+                    "--license", "MIT", "--source", "my training"]) == 0
+    [call] = [c for c in mac.calls if c[2:4] == ("custom", "import")]
+    assert call[4] == str((tmp_path / "loras" / "style.safetensors").resolve())
+
+
 def test_custom_enable_rolls_back_when_media_gen_is_unreachable(gateway, mac, profiles, monkeypatch):
     mr.add("ltx-2.5")
     mr.custom("import", "/tmp/a.safetensors", "--base", "ltx-2.5", "--name", "a", "--license", "MIT",
