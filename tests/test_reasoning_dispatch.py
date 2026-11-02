@@ -102,7 +102,7 @@ CASES = [
                  {"chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True, "reasoning_effort": "high"}},
                  id="glm-ctk-always-default"),
     pytest.param("deepseek-v4-dsml", "chat", {}, True,
-                 {"chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True}},
+                 {"chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True, "reasoning_effort": "high"}},
                  id="deepseek-v4-dsml-always-default"),
     pytest.param("qwen", "chat", {}, True,
                  {"enable_thinking": True}, id="qwen-always-default"),
@@ -130,7 +130,7 @@ CASES = [
                  {"chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True, "reasoning_effort": "max"}},
                  id="glm-ctk-max"),
     pytest.param("deepseek-v4-dsml", "chat", {"reasoning_effort": "max"}, True,
-                 {"chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True}},
+                 {"chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True, "reasoning_effort": "max"}},
                  id="deepseek-v4-dsml-max"),
     pytest.param("qwen", "chat", {"reasoning_effort": "max"}, True,
                  {"enable_thinking": True}, id="qwen-max"),
@@ -162,6 +162,19 @@ CASES = [
                  {"thinking": {"type": "disabled"}}, id="deepseek-disabled"),
     pytest.param("none", "chat", {"reasoning_effort": "none"}, False, {}, id="none-disabled"),
 ]
+
+
+@pytest.mark.parametrize("level,native", [
+    ("minimal", "low"), ("low", "low"), ("medium", "high"), ("high", "high"),
+    ("xhigh", "max"), ("max", "max"),
+])
+def test_deepseek_dsml_maps_every_level_to_native_effort(level, native):
+    levels = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+    enabled, view = _run("deepseek-v4-dsml", {"messages": [], "reasoning_effort": level},
+                         thinking="optional", thinking_levels=levels)
+    assert enabled is True
+    assert view == {"chat_template_kwargs": {
+        "enable_thinking": True, "preserve_thinking": True, "reasoning_effort": native}}
 
 
 @pytest.mark.parametrize("fmt,target_api,fragment,exp_enabled,exp_view", CASES)

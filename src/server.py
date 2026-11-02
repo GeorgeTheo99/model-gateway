@@ -1700,6 +1700,13 @@ def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat", request:
         ctk["enable_thinking"] = bool(enabled)
         if enabled:
             ctk.setdefault("preserve_thinking", True)
+            if effort and effort != "off":
+                # DeepSeek V4/V4.1 chat templates accept low, high and max.
+                ctk["reasoning_effort"] = (
+                    "max" if effort in {"xhigh", "max"}
+                    else "low" if effort in {"minimal", "low"}
+                    else "high"
+                )
         req["chat_template_kwargs"] = ctk
         if budget:
             req["thinking_budget"] = budget
