@@ -4,7 +4,7 @@ Consumers compare these against their own minimum before using the gateway;
 ``/health`` stays version-free because older installers match it exactly.
 """
 
-VERSION = "0.16.0"
+VERSION = "0.17.0"
 
 # Contracts a consumer may require. Add a name when a feature ships; never
 # remove or change the meaning of one.
@@ -23,6 +23,7 @@ CAPABILITIES = (
     "local_runtime_pins.v1",
     "media_custom_profiles.v1",
     "media_generation.v1",
+    "media_image_edits.v1",
     "model_allowlists.v1",
     "onboarding_auto_add.v1",
     "onboarding_profiles.v1",
