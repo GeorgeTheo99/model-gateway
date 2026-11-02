@@ -526,9 +526,12 @@ gateway does not manage.
 
 An owner can add their own LoRA adapter on top of a curated model, on this Mac
 only. Releases never ship or install one, and the curated model stays the
-default. Today LTX-2.5 accepts adapters: a single `.safetensors` file of
-`lora_A`/`lora_B` pairs (ComfyUI `diffusion_model.*` naming, or bare
-`transformer_blocks.*` keys, as ltx-2-mlx reads them).
+default. LTX-2.5 and Qwen-Image 2.1 accept adapters: a single `.safetensors`
+file of `lora_A`/`lora_B` pairs. For LTX-2.5 that is ComfyUI `diffusion_model.*`
+naming, or bare `transformer_blocks.*` keys, as ltx-2-mlx reads them; for
+Qwen-Image 2.1, `diffusion_model.*` or `transformer.*` naming on the layers mflux
+maps (ai-toolkit's fused `img_mlp.gate_up` included). A profile on an image model
+is an image model, on a video model a video model.
 
 ```bash
 model-gateway media custom import PATH --base ltx-2.5 --name NAME \
@@ -540,8 +543,8 @@ model-gateway media custom remove custom-NAME    # forget it and delete its copy
 
 `import` checks the whole file before keeping it: safetensors only (no pickle),
 F16, BF16 or F32 tensors that tile the file exactly, and every tensor half of a
-LoRA pair whose shapes match a layer of the base model. ltx-2-mlx silently skips
-keys it does not recognise, so an adapter for another model or format is refused
+LoRA pair whose shapes match a layer of the base model. The engines skip keys
+they do not recognise, so an adapter for another model or format is refused
 instead of quietly changing nothing. A file that passes is copied, read-only, to
 `media/home/custom/adapters/<sha256>.safetensors`, and the profile is recorded
 with its base model, license, source and strength, **disabled**. `enable`

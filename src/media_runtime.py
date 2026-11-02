@@ -652,7 +652,7 @@ def main(argv: list[str] | None = None) -> int:
     adding = actions.add_parser("import", help="check and copy in a LoRA as a new, disabled profile")
     adding.add_argument("path", help="a .safetensors LoRA adapter")
     adding.add_argument("--base", required=True, choices=sorted(MODELS),
-                        help="the curated model it was made for (LTX-2.5 accepts LoRAs)")
+                        help="the curated model it was made for (LTX-2.5 and Qwen-Image 2.1 accept LoRAs)")
     adding.add_argument("--name", required=True, help="served as custom-NAME")
     adding.add_argument("--license", required=True, help="the adapter's license, as its publisher states it")
     adding.add_argument("--source", required=True, help="where it came from (a URL, or your own training)")

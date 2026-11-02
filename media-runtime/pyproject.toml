@@ -9,8 +9,8 @@ package = false
 required-environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]
 
 [tool.uv.sources]
-# media-gen v0.4.1, pinned by commit: a tag can move.
-media-gen = { git = "https://github.com/GeorgeTheo99/media-gen", rev = "cb0edd07b77cc342a14bf8aada7bf2e382f7adc9" }
+# media-gen v0.5.0, pinned by commit: a tag can move.
+media-gen = { git = "https://github.com/GeorgeTheo99/media-gen", rev = "9cb7212e7d1293004521473d266fce5e720f9bc3" }
 # Pin the actual MLX-Video project; the PyPI name belongs to a different package.
 mlx-video = { git = "https://github.com/Blaizzy/mlx-video", rev = "87db56a51758fefb748a359b90a5283bb8ba4837" }
 # Its LTX-2.5 engine, ltx-2-mlx v0.18.0, is not on PyPI; uv does not inherit media-gen's own sources.
