@@ -277,7 +277,7 @@ def test_the_locked_runtime_pins_media_gen_by_commit():
     lock = (mr.RUNTIME_PROJECT / "uv.lock").read_text()
     assert f'source = {{ git = "{source["git"]}?rev={source["rev"]}#{source["rev"]}" }}' in lock
     for engine in ('name = "mflux"\nversion = "0.24.0"', 'name = "ltx-pipelines-mlx"\nversion = "0.18.0"',
-                   'name = "media-gen"\nversion = "0.5.0"', 'name = "mlx-video"\nversion = "0.0.1"'):
+                   'name = "media-gen"\nversion = "0.6.0"', 'name = "mlx-video"\nversion = "0.0.1"'):
         assert engine in lock
     wan_source = project["tool"]["uv"]["sources"]["mlx-video"]
     assert wan_source["git"] == "https://github.com/Blaizzy/mlx-video"
@@ -316,7 +316,9 @@ def profiles(mac, monkeypatch):
                 "id": f"custom-{options['--name']}", "base": options["--base"],
                 "display_name": options.get("--display-name", options["--name"]), "enabled": False,
                 "strength": float(options["--strength"]), "license": options["--license"],
-                "source": options["--source"]}
+                "source": options["--source"], "description": options.get("--description", "")}
+        elif action == "describe":
+            state[rest[0]]["description"] = rest[1]
         elif action in ("enable", "disable"):
             state[rest[0]]["enabled"] = action == "enable"
             if action == "enable":
@@ -353,9 +355,19 @@ def test_custom_profiles_route_only_once_enabled(gateway, mac, profiles):
     assert providers.resolve("custom-style").provider == "media"
     # Never part of what a release ships.
     assert "custom-style" not in {r["name"] for r in shipped.all_shipped_rows({})}
-    assert mr.status()["custom"] == [{"name": "custom-style", "base": "ltx-2.5", "display_name": "Style"}]
+    assert mr.status()["custom"] == [{"name": "custom-style", "base": "ltx-2.5", "display_name": "Style",
+                                      "description": ""}]
+    assert "custom_description" not in row
     # The vanilla model is unchanged beside it.
     assert providers.resolve("ltx-2.5").provider_model_id == "ltx-2.5"
+
+    # A description reaches the route, for clients that choose models; clearing it removes it.
+    mr.custom("describe", "custom-style", "Watercolor scenes; add the word wtrclr")
+    [row] = _custom_rows()
+    assert row["custom_description"] == "Watercolor scenes; add the word wtrclr"
+    mr.custom("describe", "custom-style", "")
+    [row] = _custom_rows()
+    assert "custom_description" not in row
 
     mr.custom("disable", "custom-style")
     assert _custom_rows() == []
@@ -432,6 +444,14 @@ def test_custom_cli(gateway, mac, profiles, capsys):
     assert "custom-style" in capsys.readouterr().out
     assert mr.main(["custom", "list", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)[0]["enabled"] is True
+    assert mr.main(["custom", "describe", "custom-style", "Watercolor scenes"]) == 0
+    assert "custom-style is described" in capsys.readouterr().out
+    assert mr.main(["custom", "list"]) == 0
+    assert "Watercolor scenes" in capsys.readouterr().out
+    assert mr.main(["custom", "import", "~/ink.safetensors", "--base", "ltx-2.5", "--name", "ink",
+                    "--license", "MIT", "--source", "my training", "--description", "Ink drawings"]) == 0
+    [call] = [c for c in mac.calls if c[2:4] == ("custom", "import") and "ink" in c]
+    assert call[call.index("--description") + 1] == "Ink drawings"
 
 
 def test_custom_import_reads_a_relative_path_from_the_callers_directory(gateway, mac, profiles, monkeypatch,

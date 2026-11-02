@@ -537,9 +537,16 @@ is an image model, on a video model a video model.
 model-gateway media custom import PATH --base ltx-2.5 --name NAME \
   --license "LICENSE" --source "URL or your own training" [--strength 1.0] [--display-name TEXT]
 model-gateway media custom enable custom-NAME    # route it; disable stops routing it
+model-gateway media custom describe custom-NAME "TEXT"   # what it is for, trigger words; "" clears
 model-gateway media custom list [--json]
 model-gateway media custom remove custom-NAME    # forget it and delete its copy
 ```
+
+A description (also `import --description`, up to 500 characters) says what the
+profile is for and how to prompt it. `/v1/models?include=modality` returns it as
+`custom_description` on that profile's row, so a client that picks models for the
+owner, such as Myai Studio, can choose it when a request matches; without one, a
+client should use the profile only when asked for it by name.
 
 `import` checks the whole file before keeping it: safetensors only (no pickle),
 F16, BF16 or F32 tensors that tile the file exactly, and every tensor half of a

@@ -173,7 +173,8 @@ def _write_installed(names: list[str]) -> None:
 
 
 def custom_profiles() -> list[dict]:
-    """The enabled custom profiles on a curated base model: ``name``, ``base`` and ``display_name``."""
+    """The enabled custom profiles on a curated base model: ``name``, ``base``, ``display_name`` and, when
+    the owner wrote one, ``description``."""
     path = custom_path()
     try:
         lr._regular(path, root())
@@ -183,6 +184,7 @@ def custom_profiles() -> list[dict]:
     return [
         row for row in rows if isinstance(row, dict) and row.get("base") in MODELS
         and all(isinstance(row.get(key), str) for key in ("name", "base", "display_name"))
+        and isinstance(row.get("description", ""), str)
         and row["name"].startswith("custom-")
     ] if isinstance(rows, list) else []
 
@@ -224,14 +226,17 @@ def catalog_rows(config: dict, *, installed_only: bool = True) -> list[dict]:
     ]
     # The owner's own profiles are never part of a release, so they load only once enabled here,
     # each under its own name and marked with the curated model it builds on (custom_base).
+    # The owner's description, when there is one, tells clients that choose models what it is for.
     for profile in custom_profiles() if installed_only else []:
         base = MODELS[profile["base"]]
+        description = profile.get("description", "")[:500]
         if base.name in names:
             rows.append({
                 "name": profile["name"], "provider": "media", "provider_model_id": profile["name"],
                 "modality": base.modality, "display_name": profile["display_name"][:80],
                 "desc": f"Owner-supplied LoRA on {base.display_name}, on this Mac only",
                 "pricing_status": "unmetered", "custom_base": base.name,
+                **({"custom_description": description} if description else {}),
             })
     return rows
 
@@ -530,7 +535,8 @@ def _listed() -> list[dict]:
 def _sync_custom() -> list[dict]:
     """Record media-gen's enabled profiles and reload the gateway: the routes follow that list."""
     rows = _listed()
-    enabled = [{"name": row["id"], "base": row["base"], "display_name": row["display_name"]}
+    enabled = [{"name": row["id"], "base": row["base"], "display_name": row["display_name"],
+                "description": row.get("description") if isinstance(row.get("description"), str) else ""}
                for row in rows if row.get("enabled")]
     lr._atomic(custom_path(), json.dumps(enabled, indent=2) + "\n", root())
     lr.bump_generation()
@@ -580,6 +586,8 @@ def _print_custom(rows: list[dict]) -> None:
         state = "enabled" if row.get("enabled") else "disabled"
         print(f"  {row.get('id', ''):<28}{state:<10}on {row.get('base')}, strength {row.get('strength')}  "
               f"{row.get('license')} ({row.get('source')})")
+        if row.get("description"):
+            print(f"  {'':<38}{row['description']}")
 
 
 def _print_status(value: dict) -> None:
@@ -622,11 +630,17 @@ def _custom_command(args: argparse.Namespace) -> int:
                    "--strength", str(args.strength)]
         if args.display_name:
             options += ["--display-name", args.display_name]
+        if args.description:
+            options += ["--description", args.description]
         # The launcher runs this from its own directory, so a relative path is the caller's.
         caller_dir = os.environ.get("MODEL_GATEWAY_CALLER_DIR") or os.getcwd()
         custom("import", str(Path(caller_dir, Path(args.path).expanduser()).resolve()), *options)
         print(f"custom-{args.name} is imported, checked and disabled; enable it with "
               f"`model-gateway media custom enable custom-{args.name}`")
+        return 0
+    if args.action == "describe":
+        custom("describe", args.id, args.text)
+        print(f"{args.id} is described" if args.text.strip() else f"{args.id} has no description")
         return 0
     custom(args.action, args.id)
     print({"enable": f"{args.id} is enabled: request it by name",
@@ -658,6 +672,11 @@ def main(argv: list[str] | None = None) -> int:
     adding.add_argument("--source", required=True, help="where it came from (a URL, or your own training)")
     adding.add_argument("--display-name")
     adding.add_argument("--strength", type=float, default=1.0)
+    adding.add_argument("--description", default="",
+                        help="what it is for and how to prompt it (trigger words), so clients can choose it")
+    describing = actions.add_parser("describe", help="set or clear what a profile is for")
+    describing.add_argument("id", help="custom-NAME")
+    describing.add_argument("text", help="the description; empty clears it")
     for action in ("enable", "disable", "remove"):
         actions.add_parser(action).add_argument("id", help="custom-NAME")
     args = parser.parse_args(argv)

@@ -2652,7 +2652,8 @@ def _include_modality(request: Request) -> bool:
 
 def _media_model_rows(inventory: list[dict]) -> list[dict]:
     """``/v1/models`` rows for available image and video models. An owner's custom profile
-    (src.media_runtime) also names the curated model it builds on, as ``custom_base``."""
+    (src.media_runtime) also names the curated model it builds on, as ``custom_base``, and what it is for,
+    as ``custom_description``, when the owner described it."""
     return [
         {
             "id": route_id,
@@ -2661,6 +2662,8 @@ def _media_model_rows(inventory: list[dict]) -> list[dict]:
             "owned_by": model.get("provider", ""),
             "modality": catalog.modality(model),
             **({"custom_base": model["custom_base"]} if isinstance(model.get("custom_base"), str) else {}),
+            **({"custom_description": model["custom_description"]}
+               if isinstance(model.get("custom_description"), str) and model["custom_description"] else {}),
         }
         for model in inventory
         if catalog.modality(model) != "chat" and model.get("available")

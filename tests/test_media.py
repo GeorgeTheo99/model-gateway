@@ -290,11 +290,13 @@ def test_a_page_of_expired_videos_still_continues(media_gen):
 def test_a_custom_profile_names_its_base(media_gen, monkeypatch):
     providers._config["models"].append(
         {"name": "custom-style", "provider": "media", "provider_model_id": "custom-style", "modality": "video",
-         "pricing_status": "unmetered", "display_name": "Style", "custom_base": "ltx-2.5"})
+         "pricing_status": "unmetered", "display_name": "Style", "custom_base": "ltx-2.5",
+         "custom_description": "Watercolor scenes; add the word wtrclr"})
     monkeypatch.setattr(providers, "_models", None)
     rows = {row["id"]: row for row in
             client.get("/v1/models?include=modality", headers=_auth()).json()["data"]}
     assert rows["custom-style"]["custom_base"] == "ltx-2.5"
-    assert "custom_base" not in rows["clip"]
+    assert rows["custom-style"]["custom_description"] == "Watercolor scenes; add the word wtrclr"
+    assert "custom_base" not in rows["clip"] and "custom_description" not in rows["clip"]
     assert _video(model="custom-style").json()["model"] == "custom-style"
     assert media_gen.videos["video_1"]["model"] == "custom-style"
