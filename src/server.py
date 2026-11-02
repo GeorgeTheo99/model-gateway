@@ -1882,7 +1882,8 @@ def _enable_openrouter_gemini_prompt_cache(req: dict) -> None:
 
 # The local federation paths are recorded under their own path: a peer's local work.
 # Generation requests are recorded too; reading a video job back is not (ADR 0004 section 2).
-_LEDGER_PATHS = {"/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/images/generations", "/v1/videos",
+_LEDGER_PATHS = {"/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/images/generations",
+                 "/v1/images/edits", "/v1/videos",
                  *(f"{federation.LOCAL_FORWARD_PREFIX}/{name}" for name in ("chat/completions", "messages", "responses"))}
 
 

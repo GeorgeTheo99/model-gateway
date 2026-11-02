@@ -84,9 +84,21 @@ disabled until enabled, routed under its own `custom-NAME` name with
 `custom_base`, and never substituted for the curated model.
 [deployment.md](../deployment.md#custom-lora-profiles) has the details.
 
+### 5. Edits from reference images (0.17.0)
+
+`POST /v1/images/edits` takes the OpenAI multipart shape: the generation fields
+plus one to three `image` (or `image[]`) files. The gateway checks it like a
+generation (modality, allowlists), forwards it once to media-gen's
+`/v1/images/edits` and records it in the ledger. media-gen 0.7.0 serves it with
+FLUX 3 Image Klein's edit variant, which shares the text-to-image weights, so
+nothing new is downloaded; a model without references refuses it. It makes
+follow-ups that keep what an image shows ("make it snow"), and one subject
+across several images, possible for clients such as my-ai's Studio. Masks are
+not supported.
+
 ## Consequences
 
 - Clients that never ask for `modality` see no change.
 - The media provider joins oMLX as a local provider for pricing (`unmetered`).
 - Video outputs live on the media-gen host and expire (24 hours by default).
-- Image-to-image, edits and federation of media are out of scope.
+- Federation of media is out of scope. Edits from reference images were added in 0.17.0 (section 5).

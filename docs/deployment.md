@@ -506,6 +506,9 @@ are silent.
 Clients call the OpenAI-shaped endpoints on the gateway:
 
 - `POST /v1/images/generations` (`b64_json` only; extensions `seed`, `steps`, `guidance`).
+- `POST /v1/images/edits` (multipart: the same fields plus one to three `image`
+  or `image[]` files, each up to 20 MiB): an image edited from, or composed of,
+  reference images. FLUX 3 Image Klein only; other image models refuse it.
 - `POST /v1/videos` (JSON, or multipart with an `input_reference` image;
   `seconds` 1-15; `size` snapped to multiples of 64, so `1280x720` becomes
   `1280x704`), then

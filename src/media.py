@@ -35,6 +35,9 @@ router = APIRouter()
 MAX_JSON_BYTES = 1_000_000
 # A reference image (20 MiB at media-gen) plus multipart framing.
 MAX_VIDEO_UPLOAD_BYTES = 21 * 1024 * 1024
+# An edit's reference images: at most three of 20 MiB each at media-gen, plus multipart framing.
+MAX_EDIT_IMAGES = 3
+MAX_EDIT_UPLOAD_BYTES = MAX_EDIT_IMAGES * 20 * 1024 * 1024 + 1024 * 1024
 IMAGE_TIMEOUT = httpx.Timeout(1800, connect=10)
 CALL_TIMEOUT = httpx.Timeout(120, connect=10)
 # Ownership rows outlive any media-gen retention, so a page cursor never points at a purged row.
@@ -242,24 +245,57 @@ async def images_generations(request: Request):
     return _relay(upstream)
 
 
-async def _video_create_request(request: Request) -> tuple[dict, dict | None]:
-    """The create fields, and the multipart reference image if one was sent."""
-    if not request.headers.get("content-type", "").startswith("multipart/form-data"):
-        return await _json_body(request), None
+def _multipart(request: Request) -> bool:
+    return request.headers.get("content-type", "").startswith("multipart/form-data")
+
+
+async def _form(request: Request, file_fields: set[str], max_files: int, max_bytes: int) -> tuple[dict, list]:
+    """A multipart request's text fields, and its files as httpx (field, (name, bytes, type)) pairs."""
     length = request.headers.get("content-length", "")
-    if not length.isdigit() or int(length) > MAX_VIDEO_UPLOAD_BYTES:
+    if not length.isdigit() or int(length) > max_bytes:
         raise _Refused(_error(413, "Request body exceeds the byte limit"))
-    form = await request.form(max_files=1, max_fields=16)
+    form = await request.form(max_files=max_files, max_fields=24)
     fields: dict = {}
-    files = None
+    files: list = []
     for key, value in form.multi_items():
         if isinstance(value, str):
             fields[key] = value
-        elif key == "input_reference":
-            files = {key: (value.filename or "reference", await value.read(), value.content_type)}
+        elif key in file_fields:
+            files.append((key, (value.filename or "reference", await value.read(), value.content_type)))
         else:
             raise _Refused(_error(400, f"Unexpected file field '{key}'"))
     return fields, files
+
+
+@router.post("/v1/images/edits")
+async def images_edits(request: Request):
+    """An image from a prompt and reference images (multipart `image` or `image[]` files), forwarded once."""
+    try:
+        identity = _authenticate(request)
+        if not _multipart(request):
+            raise _Refused(_error(400, "Send the reference images as a multipart upload"))
+        fields, files = await _form(request, {"image", "image[]"}, MAX_EDIT_IMAGES, MAX_EDIT_UPLOAD_BYTES)
+        info = _authorize_model(identity, fields.get("model"), "image")
+    except _Refused as refused:
+        return refused.response
+    model = fields["model"]
+    _set_ledger(request, model, info)
+    fields["model"] = info.provider_model_id
+    log.info("image edit %s -> %s", model, info.provider)
+    try:
+        async with _client(IMAGE_TIMEOUT) as client:
+            upstream = await client.post(_url(info, "/images/edits"), data=fields, files=files,
+                                         headers=_headers(info))
+    except httpx.HTTPError as exc:
+        return _unreachable(info, exc)
+    return _relay(upstream)
+
+
+async def _video_create_request(request: Request) -> tuple[dict, list | None]:
+    """The create fields, and the multipart reference image if one was sent."""
+    if not _multipart(request):
+        return await _json_body(request), None
+    return await _form(request, {"input_reference"}, 1, MAX_VIDEO_UPLOAD_BYTES)
 
 
 @router.post("/v1/videos")

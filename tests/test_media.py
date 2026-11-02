@@ -51,6 +51,10 @@ class FakeMediaGen:
             body = json.loads(request.content)
             return httpx.Response(200, json={"created": 1, "data": [{"b64_json": "aGk="}],
                                              "model_seen": body["model"]})
+        if path == "/v1/images/edits":
+            assert request.headers["content-type"].startswith("multipart/form-data")
+            return httpx.Response(200, json={"created": 1, "data": [{"b64_json": "aGk="}],
+                                             "images_seen": request.content.count(b'name="image[]"')})
         if path == "/v1/videos" and method == "POST":
             video_id = f"video_{len(self.videos) + 1}"
             if request.headers["content-type"].startswith("multipart/form-data"):
@@ -234,6 +238,37 @@ def test_multipart_video_with_reference_image(media_gen):
     )
     assert response.status_code == 200, response.text
     assert media_gen.videos[response.json()["id"]]["model"] == "multipart"
+
+
+def _edit(images: int = 2, model: str = "pic", key: str = ALICE):
+    return client.post(
+        "/v1/images/edits", headers=_auth(key), data={"model": model, "prompt": "make it snow"},
+        files=[("image[]", (f"ref{i}.png", b"\x89PNG fake", "image/png")) for i in range(images)],
+    )
+
+
+def test_image_edit_is_forwarded_once_with_every_reference(media_gen):
+    response = _edit(images=2)
+    assert response.status_code == 200, response.text
+    assert response.json()["images_seen"] == 2
+    [forwarded] = media_gen.requests
+    assert str(forwarded.url) == "http://media.test/v1/images/edits"
+    assert b'name="model"\r\n\r\nqwen-image-2.1' in forwarded.content
+    with ledger._connect() as conn:
+        recorded = conn.execute("SELECT endpoint, model, provider, status FROM requests ORDER BY ts DESC LIMIT 1").fetchall()
+    assert [tuple(r) for r in recorded] == [("/v1/images/edits", "pic", "media", 200)]
+
+
+def test_image_edit_checks_before_forwarding(media_gen):
+    assert _edit(model="clip").json()["error"]["code"] == "wrong_modality"
+    assert _edit(key=LIMITED).status_code == 403
+    assert _edit(images=4).status_code == 400
+    as_json = client.post("/v1/images/edits", headers=_auth(), json={"model": "pic", "prompt": "x"})
+    assert as_json.status_code == 400
+    stray = client.post("/v1/images/edits", headers=_auth(), data={"model": "pic", "prompt": "x"},
+                        files={"mask": ("m.png", b"x", "image/png")})
+    assert stray.status_code == 400
+    assert media_gen.requests == []
 
 
 def test_provider_errors_are_relayed_once(media_gen):

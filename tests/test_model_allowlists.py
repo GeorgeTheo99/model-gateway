@@ -141,13 +141,25 @@ def test_other_models_are_denied_identically_on_every_endpoint(monkeypatch, path
     assert error["message"] == "Consumer principal is not authorized to invoke this model"
 
 
+@pytest.mark.parametrize("model", ["blocked-b", "no-such-model", "glm-x-fw", "peer/remote", "42"])
+def test_other_models_are_denied_identically_on_image_edits(monkeypatch, model):
+    _configure(monkeypatch)
+    response = client.post("/v1/images/edits", headers={"Authorization": f"Bearer {TOKEN}"},
+                           data={"model": model, "prompt": "hi"},
+                           files={"image": ("ref.png", b"\x89PNG fake", "image/png")})
+    assert response.status_code == 403
+    error = response.json()["error"]
+    assert error["code"] == "direct_model_access_denied"
+    assert error["message"] == "Consumer principal is not authorized to invoke this model"
+
+
 def test_every_model_taking_endpoint_is_covered():
-    """A new inference endpoint must be added to the parametrized denial test above."""
+    """A new inference endpoint must be added to a parametrized denial test above."""
     writes = {route.path for route in server.app.routes
               if route.path.startswith("/v1") and {"POST", "PUT"} & (getattr(route, "methods", None) or set())}
     # The local federation paths admit only authenticated peer forwards, never consumer credentials.
     assert writes == {"/v1/chat/completions", "/v1/responses", "/v1/messages",
-                      "/v1/images/generations", "/v1/videos",
+                      "/v1/images/generations", "/v1/images/edits", "/v1/videos",
                       "/v1/profiles/{namespace}/snapshot", "/v1/catalog/packs/{namespace}",
                       "/v1/federation/local/chat/completions", "/v1/federation/local/responses",
                       "/v1/federation/local/messages"}
