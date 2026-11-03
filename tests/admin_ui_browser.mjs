@@ -216,6 +216,40 @@ function fixture() {
       }),
     ],
     profiles: [profileNamespace("ha", 3), profileNamespace("myai", 5)],
+    runtime: {
+      checked_at: now,
+      in_flight: [
+        {
+          id: 1,
+          started_at: now - 12,
+          elapsed_ms: 12000,
+          endpoint: "/v1/messages",
+          model: "cloud-model-alias",
+          catalog_model: "cloud-model",
+          provider: "cloud",
+          provider_model_id: "upstream-cloud-model",
+          is_stream: true,
+        },
+      ],
+      local: {
+        configured: true,
+        reachable: true,
+        memory_bytes: 276e9,
+        memory_limit_bytes: 522e9,
+        models: [
+          {
+            id: "upstream-local-model",
+            catalog_models: ["local-model"],
+            loaded: true,
+            loading: false,
+            size_bytes: 276e9,
+            last_access: now - 120,
+            pinned: false,
+          },
+        ],
+      },
+      media: { configured: false },
+    },
     backups: {
       directory: "/fixture/config-backups",
       exists: true,
@@ -291,15 +325,69 @@ function profileNamespace(ns, version) {
     versions: Array.from({ length: version }, (_, i) => snapshot(version - i)),
   };
 }
-let fixtureKeys = 0;
+let fixtureKeys = 0,
+  runtimeHits = 0;
 const fixtureKey = () => "fixture-generated-key-" + ++fixtureKeys;
 let state = fixture(),
   fail = new Set(),
   delays = new Map(),
   writes = [],
   invalidAuth = false;
+const day = (offset) => {
+  const d = new Date(Date.now() - offset * 86400000);
+  return (
+    d.getFullYear() +
+    "-" +
+    String(d.getMonth() + 1).padStart(2, "0") +
+    "-" +
+    String(d.getDate()).padStart(2, "0")
+  );
+};
+const series = () => ({
+  bucket: "day",
+  points: [6, 5, 4, 3, 2, 1, 0].map((offset, i) => ({
+    t: day(offset),
+    requests: i,
+    errors: 0,
+    cost_usd: i * 0.004,
+  })),
+  cost_by_model: { "cloud-model": [0, 0, 0, 0.012, 0, 0, 0.02] },
+});
 const usage = () => ({
+  range: { since: now - 7 * 86400, until: null, bucket: "day" },
   summary,
+  series: series(),
+  by_catalog_model: [
+    {
+      ...summary,
+      model: "cloud-model",
+      in_catalog: true,
+      locality: "cloud",
+      providers: ["cloud"],
+      cost_usd: 0.032,
+      last_ts: now - 40,
+    },
+    {
+      ...summary,
+      model: "local-model",
+      in_catalog: true,
+      locality: "local",
+      providers: ["omlx"],
+      requests: 7,
+      cost_usd: 0,
+      last_ts: now,
+    },
+    {
+      ...summary,
+      model: "retired-model",
+      in_catalog: false,
+      locality: null,
+      providers: ["cloud"],
+      requests: 1,
+      cost_usd: null,
+      last_ts: now - 3 * 86400,
+    },
+  ],
   by_route: state.models.map((m) => ({
     ...summary,
     dim: m.name,
@@ -477,6 +565,11 @@ const server = createServer(async (req, res) => {
     respond(200, usage());
     return;
   }
+  if (pathname === "/admin/api/runtime") {
+    runtimeHits++;
+    respond(200, state.runtime);
+    return;
+  }
   if (pathname === "/admin/api/consumers") {
     respond(200, {
       consumers: state.consumers,
@@ -518,6 +611,7 @@ const server = createServer(async (req, res) => {
       [kind]: state[match[1]].find((m) => (m.name || m.id) === id) || null,
       routable_ids: [id, id + "-alias"],
       usage: summary,
+      series: series(),
       recent: state.requests,
     });
     return;
@@ -603,6 +697,36 @@ if (process.argv.includes("--serve")) {
         .evaluate((el) => getComputedStyle(el).paddingTop),
       "0px",
     );
+    // Running now: requests in flight and what is in local memory.
+    await page.waitForFunction(() =>
+      document.getElementById("runtimeMeta").textContent.startsWith("Live"),
+    );
+    assert.match(
+      await page.locator("#inFlight").innerText(),
+      /cloud-model[\s\S]*cloud · streaming · \/v1\/messages[\s\S]*12\.0 s/,
+    );
+    assert.match(
+      await page.locator("#loadedModels").innerText(),
+      /local-model[\s\S]*oMLX · 276 GB · last used 2 min ago[\s\S]*In memory/,
+    );
+    assert.match(
+      await page.locator("#localMemory").innerText(),
+      /276 GB of 522 GB/,
+    );
+    assert.match(
+      await page.locator("#overviewTop").innerText(),
+      /cloud-model[\s\S]*\$0\.032[\s\S]*100%/,
+    );
+    assert.match(
+      await page.locator("#overviewChart").innerText(),
+      /Total \$0\.084/,
+    );
+    // Live status keeps polling after a quick round-trip through another tab.
+    await nav("usage");
+    await nav("overview");
+    const hits = runtimeHits;
+    await page.waitForTimeout(5600);
+    assert(runtimeHits > hits, "Running now stopped refreshing");
     // Optional, never-connected providers are not configuration problems.
     const attention = await page.locator("#attention").innerText();
     assert.doesNotMatch(attention, /fireworks|unconnected-model/);
@@ -659,10 +783,35 @@ if (process.argv.includes("--serve")) {
     await page.selectOption("#modelCapability", "tools");
     assert.equal(await page.locator("#models tbody tr").count(), 1);
     await page.selectOption("#modelCapability", "");
+    assert.match(
+      await page.locator('#models tr:has([data-open-model="local-model"])').innerText(),
+      /In memory[\s\S]*just now[\s\S]*7[\s\S]*Local/,
+    );
+    await page.selectOption("#modelUsed", "unused");
+    assert.equal(await page.locator("#models tbody tr").count(), 2);
+    await page.selectOption("#modelUsed", "");
+    await page.selectOption("#modelSort", "cost");
+    assert.equal(
+      await page.locator("#models tbody tr [data-open-model]").first().innerText(),
+      "cloud-model",
+    );
+    await page.selectOption("#modelSort", "");
     await click('#models [data-open-model="cloud-model"]');
     assert.match(
+      await page.locator("#modelUsage").innerText(),
+      /Last 7 days[\s\S]*Known cost per day/,
+    );
+    await click('[data-model-window="30d"]');
+    await page.waitForFunction(() =>
+      document.getElementById("modelUsage")?.textContent.includes("Last 30 days"),
+    );
+    assert.equal(
+      await page.locator(":focus").getAttribute("data-model-window"),
+      "30d",
+    );
+    assert.match(
       await page.locator("#drawerBody").innerText(),
-      /this model remains the answerer/,
+      /Text only: each image is replaced with a note/,
     );
     assert(await page.locator("#appChrome").evaluate((el) => el.inert));
     await click('#drawer [data-open-provider="cloud"]');
@@ -743,14 +892,49 @@ if (process.argv.includes("--serve")) {
     );
     await click("[data-close-detail]");
     await page.selectOption("#requestOutcome", "");
-    await click('[data-activity="usage"]');
-    await click('[data-w="7d"]');
+    assert.match(
+      await page.locator("#recentReq tbody tr").first().innerText(),
+      /just now[\s\S]*local-model[\s\S]*300 \/ 50[\s\S]*Local/,
+    );
+    await nav("usage");
+    await click('[data-w="30d"]');
     await page.waitForFunction(() =>
       document
         .getElementById("usageRange")
-        .textContent.startsWith("Last 7 days ·"),
+        .textContent.startsWith("Last 30 days ("),
     );
-    assert.match(await page.locator("#usageView").innerText(), /4.6 s/);
+    assert.match(await page.locator("#panel-usage").innerText(), /4.6 s/);
+    assert.match(
+      await page.locator("#usageByModel tbody tr").first().innerText(),
+      /cloud-model[\s\S]*cloud · cloud[\s\S]*\$0\.032[\s\S]*100%/,
+    );
+    assert.match(
+      await page.locator("#usageByModel").innerText(),
+      /retired-model[\s\S]*not in the catalog/,
+    );
+    await click('[data-sort="requests"]');
+    assert.equal(
+      await page.locator("#usageByModel tbody tr").first().locator("td").first().innerText().then((t) => t.split("\n")[0]),
+      "local-model",
+    );
+    assert.equal(
+      await page.locator('#usageByModel th[aria-sort="descending"]').innerText(),
+      "Requests",
+    );
+    await page.selectOption("#chartModel", "cloud-model");
+    assert.match(
+      await page.locator("#usageChart").innerText(),
+      /cloud-model · Total \$0\.032/,
+    );
+    await page.fill("#customDays", "14");
+    await click('#customWindow [type="submit"]');
+    await page.waitForFunction(() =>
+      document.getElementById("usageRange").textContent.startsWith("Last 14 days ("),
+    );
+    assert.equal(
+      await page.locator("#winSeg [aria-pressed=true]").count(),
+      0,
+    );
     await nav("consumers");
     assert.equal(await page.locator("#consumers tbody tr").count(), 4);
     assert.equal(
@@ -945,6 +1129,7 @@ if (process.argv.includes("--serve")) {
       for (const tab of [
         "overview",
         "models",
+        "usage",
         "connections",
         "activity",
         "settings",

@@ -39,8 +39,10 @@ translation between them.
   and model-level fallback routes. Pools try a backup on the first transient
   failure, reserving normal retries for the last healthy workspace before
   last-resort circuit-recovery probes.
-- **Admin dashboard** — health, provider/model inventory, Databricks workspace
-  pool routing, usage and cost, and gated write controls at `/admin`.
+- **Admin dashboard** — what is running now (requests in progress, models in
+  local memory), usage and cost per model over any number of days, health,
+  provider/model inventory, Databricks workspace pool routing, and gated write
+  controls at `/admin`.
 - **Transactional onboarding** — `model-gateway onboard` discovers upstream
   models, writes a reviewable secret-free profile, stores credentials in
   0600 files, applies atomically, and rolls back on verification failure.

@@ -322,6 +322,71 @@ def aggregate(
     return [dict(r) for r in rows]
 
 
+_BUCKETS = {
+    "month": "strftime('%Y-%m', ts, 'unixepoch', 'localtime')",
+    "day": "strftime('%Y-%m-%d', ts, 'unixepoch', 'localtime')",
+    "hour": "strftime('%Y-%m-%dT%H:00', ts, 'unixepoch', 'localtime')",
+}
+
+
+def usage_rows(
+    *,
+    since: float | None = None,
+    until: float | None = None,
+    bucket: str | None = None,
+    models: list[str] | None = None,
+) -> list[dict]:
+    """Totals per recorded ``(model, provider, provider_model_id)``, for callers that regroup them.
+
+    ``bucket`` ('month', 'day' or 'hour', in the gateway's local time) adds a ``bucket``
+    label per row. Latency is returned as ``latency_ms_sum``/``latency_count`` so
+    regrouped averages stay exact. ``models`` filters like :func:`summary`.
+    """
+    if bucket is not None and bucket not in _BUCKETS:
+        raise ValueError(f"bucket must be one of {sorted(_BUCKETS)}")
+    clauses = []
+    params: list = []
+    if since is not None:
+        clauses.append("ts >= ?")
+        params.append(since)
+    if until is not None:
+        clauses.append("ts < ?")
+        params.append(until)
+    if models:
+        clauses.append(f"model IN ({','.join('?' for _ in models)})")
+        params.extend(models)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    bucket_sql = f"{_BUCKETS[bucket]} AS bucket, " if bucket else ""
+    group_sql = "bucket, model, provider, provider_model_id" if bucket else "model, provider, provider_model_id"
+    sql = f"""
+        SELECT
+            {bucket_sql}model, provider, provider_model_id,
+            COUNT(*) AS requests,
+            SUM(CASE WHEN status >= 200 AND status < 300 AND error IS NULL THEN 1 ELSE 0 END) AS ok,
+            SUM(CASE WHEN error IS NOT NULL OR (status IS NOT NULL AND status >= 400) THEN 1 ELSE 0 END) AS errors,
+            SUM(input_tokens) AS input_tokens,
+            SUM(output_tokens) AS output_tokens,
+            SUM(cached_read_tokens) AS cached_read_tokens,
+            SUM(cache_write_tokens) AS cache_write_tokens,
+            SUM(reasoning_tokens) AS reasoning_tokens,
+            SUM(cost_usd) AS cost_usd,
+            SUM(CASE WHEN usage_reported = 1 THEN 1 ELSE 0 END) AS usage_reported_requests,
+            SUM(CASE WHEN cost_usd IS NOT NULL THEN 1 ELSE 0 END) AS known_cost_requests,
+            SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END) AS unknown_cost_requests,
+            SUM(CASE WHEN cost_usd IS NOT NULL AND pricing_complete = 0 THEN 1 ELSE 0 END) AS partial_pricing_requests,
+            SUM(latency_ms) AS latency_ms_sum,
+            COUNT(latency_ms) AS latency_count,
+            MAX(ts) AS last_ts
+        FROM requests
+        {where}
+        GROUP BY {group_sql}
+    """
+    with _lock, _connect() as conn:
+        _ensure_schema(conn)
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
 def summary(
     *,
     since: float | None = None,

@@ -1466,6 +1466,19 @@ def provider_status() -> list[dict]:
     return result
 
 
+# Runtimes on this Mac: their models are local in the admin inventory.
+_LOCAL_RUNTIME_PROVIDERS = frozenset({"omlx", "media"})
+
+
+@_registry_locked
+def provider_endpoint(provider: str) -> tuple[str, str] | None:
+    """Base URL and API key of an enabled provider, for admin runtime status probes."""
+    config = _effective_provider_config(_load_config(), _canonical_provider(provider))
+    if config.get("enabled") is False or not config.get("base_url"):
+        return None
+    return str(config["base_url"]).rstrip("/"), str(config.get("api_key") or "")
+
+
 @_registry_locked
 def model_status() -> list[dict]:
     """Return the shared effective inventory in the admin API shape."""
@@ -1480,7 +1493,7 @@ def model_status() -> list[dict]:
         declared_providers = [
             _canonical_provider(member) for member in model.get("declared_providers", [])
         ]
-        localities = {"local" if member == "omlx" else "cloud" for member in declared_providers}
+        localities = {"local" if member in _LOCAL_RUNTIME_PROVIDERS else "cloud" for member in declared_providers}
         locality = next(iter(localities)) if len(localities) == 1 else "mixed" if localities else None
         provider_model_id = model.get("provider_model_id") or model.get("omlx_id") or model.get("name", "")
         fallback = fallback_map.get(provider_model_id)

@@ -43,7 +43,7 @@ from src.responses import chat_to_responses, responses_result_events, responses_
 from src.signature_cache import store_from_extra_content
 from src.streaming import _flatten_list_content, translate_stream
 from src.translator import anthropic_to_openai, anthropic_to_openai_chat, openai_chat_to_anthropic, openai_to_anthropic
-from src import catalog, config_io, custom_providers, signature_cache, discovery, federation, ledger, local_runtime, media, profiles, providers, reasoning_tiers
+from src import catalog, config_io, custom_providers, signature_cache, discovery, federation, inflight, ledger, local_runtime, media, profiles, providers, reasoning_tiers
 from src.usage import (
     anthropic_usage_to_openai_chat as convert_anthropic_usage_to_openai_chat,
     anthropic_usage_to_responses,
@@ -2058,9 +2058,22 @@ async def ledger_middleware(request: Request, call_next):
       - non-streaming: buffer the full body, parse JSON for a usage block,
         record, and re-emit the buffered bytes.
     Errors before model resolution still produce a row (null model/tokens).
+    Until its row is written, the request is listed in :mod:`src.inflight`.
     """
     if request.url.path not in _LEDGER_PATHS or request.method != "POST":
         return await call_next(request)
+    token = inflight.start(request.url.path, request.state)
+    streaming = False
+    try:
+        response, streaming = await _ledger_response(request, call_next, lambda: inflight.finish(token))
+        return response
+    finally:
+        if not streaming:
+            inflight.finish(token)
+
+
+async def _ledger_response(request: Request, call_next, stream_done) -> tuple[Response, bool]:
+    """The response with its ledger row recorded; True when a stream records it (and calls ``stream_done``) later."""
     start = time.time()
     response = await call_next(request)
     redirect = getattr(request.state, "model_redirect", None)
@@ -2099,7 +2112,7 @@ async def ledger_middleware(request: Request, call_next):
             status, latency_ms, False, None, pricing, pricing_status,
             None, profile_id, profile_namespace, profile_version,
         )
-        return response
+        return response, False
 
     if is_stream:
         original_iter = response.body_iterator
@@ -2146,9 +2159,10 @@ async def ledger_middleware(request: Request, call_next):
                     pricing_status, usage_capture["error"],
                     profile_id, profile_namespace, profile_version,
                 )
+                stream_done()
 
         response.body_iterator = wrapped_iter()
-        return response
+        return response, True
 
     # Non-streaming: buffer the full body, parse for a usage block, re-emit.
     chunks: list[bytes] = []
@@ -2177,7 +2191,7 @@ async def ledger_middleware(request: Request, call_next):
         status_code=status,
         headers=dict(response.headers),
         media_type=response.media_type,
-    )
+    ), False
 
 
 @app.get("/health")

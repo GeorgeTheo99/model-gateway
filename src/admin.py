@@ -8,8 +8,10 @@ import logging
 import os
 import sys
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
+import httpx
 import yaml
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
@@ -30,6 +32,7 @@ from src.providers import (
     catalog_status,
     config_validation,
     model_status,
+    provider_endpoint,
     provider_status,
     standalone_provider_status,
     unmatched_model_names,
@@ -40,7 +43,7 @@ from src.providers import (
     routable_ids,
     snapshot_registry as snapshot_provider_registry,
 )
-from src import bundle, config_io, custom_providers, discovery, federation, ledger, local_runtime, onboarding, profiles, shipped
+from src import bundle, config_io, custom_providers, discovery, federation, inflight, ledger, local_runtime, onboarding, profiles, shipped
 from src.version import CAPABILITIES, VERSION
 
 log = logging.getLogger("model-gateway")
@@ -458,16 +461,31 @@ async def _regenerate_catalogs() -> str:
 async def admin_usage(request: Request):
     """Aggregate usage/cost by provider, requested model, route, endpoint, and status.
 
+    ``by_catalog_model`` regroups every recorded alias and upstream ID under its
+    catalog model, and ``series`` holds per-bucket totals (hourly for windows of
+    two days or less, otherwise daily, in the gateway's local time).
+
     Query params:
       since   - epoch seconds (inclusive)
       until   - epoch seconds (exclusive)
-      window  - shorthand: '1h', '24h', '7d', '30d' (sets `since`)
+      window  - '<N>h' or '<N>d', e.g. '24h', '7d', '90d' (sets `since`)
     """
     require_admin_auth(request)
     since, until = _time_bounds(request.query_params)
+    return await run_in_threadpool(_usage_report, since, until)
 
+
+def _usage_report(since: float | None, until: float | None) -> dict:
+    summary = ledger.summary(since=since, until=until)
+    start, bucket = _series_plan(since, until, summary.get("first_ts"))
+    rows = ledger.usage_rows(since=since, until=until, bucket=bucket)
+    inventory = model_status()
+    namer = _catalog_namer(inventory)
     return {
-        "summary": ledger.summary(since=since, until=until),
+        "range": {"since": since, "until": until, "bucket": bucket},
+        "summary": summary,
+        "by_catalog_model": _by_catalog_model(rows, namer, inventory),
+        "series": _series(rows, start, until, bucket, namer),
         "by_provider": ledger.aggregate(since=since, until=until, group_by="provider"),
         # Retain requested-model aggregation for API compatibility. The dashboard
         # uses by_route so aliases for one configured model appear only once.
@@ -491,7 +509,7 @@ async def admin_requests(request: Request):
 
 
 def _time_bounds(params) -> tuple[float | None, float | None]:
-    """Parse window ('1h','24h','7d','30d') / since / until query params."""
+    """Parse window ('<N>h' or '<N>d', e.g. '24h', '90d') / since / until query params."""
     import time as _time
 
     since = None
@@ -554,16 +572,24 @@ async def admin_model_stats(model_name: str, request: Request):
     """
     require_admin_auth(request)
     since, until = _time_bounds(request.query_params)
+    return await run_in_threadpool(_model_stats, model_name, since, until)
 
+
+def _model_stats(model_name: str, since: float | None, until: float | None) -> dict:
     # Resolve the model config from model_status (find by name).
     rows = [m for m in model_status() if (m.get("name") or m.get("id")) == model_name]
     model = rows[0] if rows else None
     # Only query the ledger when the model actually exists; an unknown name
     # would otherwise fall back to a self-named id and return NULL-filled rows.
+    series = None
     if model:
         ids = routable_ids(model_name)
         usage = ledger.summary(since=since, until=until, models=ids) if ids else {}
         recent = ledger.recent(limit=25, models=ids) if ids else []
+        if ids:
+            start, bucket = _series_plan(since, until, usage.get("first_ts"))
+            rows = ledger.usage_rows(since=since, until=until, bucket=bucket, models=ids)
+            series = _series(rows, start, until, bucket)
     else:
         ids = []
         usage = {}
@@ -572,8 +598,249 @@ async def admin_model_stats(model_name: str, request: Request):
         "model": model,
         "routable_ids": ids,
         "usage": usage,
+        "series": series,
         "recent": recent,
     }
+
+
+# ── Usage regrouped by catalog model ─────────────────────────────────────────
+
+_USAGE_SUMS = (
+    "requests", "ok", "errors", "input_tokens", "output_tokens", "cached_read_tokens",
+    "cache_write_tokens", "reasoning_tokens", "usage_reported_requests", "known_cost_requests",
+    "unknown_cost_requests", "partial_pricing_requests", "latency_ms_sum", "latency_count",
+)
+_HOURLY_MAX_SECONDS = 2 * 86400
+_DAILY_MAX_SECONDS = 180 * 86400
+
+
+def _catalog_namer(inventory: list[dict]):
+    """Return ``name(recorded model) -> catalog name | None`` for ledger rows.
+
+    The ledger records whichever alias or upstream ID a client sent; routable
+    IDs are unique across the catalog, and model stats match the same IDs.
+    Names the catalog no longer routes (retired or renamed) stay unmapped.
+    """
+    by_id = {
+        ident: row["name"]
+        for row in inventory if row.get("name")
+        for ident in [row["name"], *(row.get("routable_ids") or [])]
+    }
+    return lambda model: by_id.get(model) if model else None
+
+
+def _by_catalog_model(rows: list[dict], namer, inventory: list[dict]) -> list[dict]:
+    """Ledger rows summed per catalog model (or per recorded name when unmapped), costliest first."""
+    catalog = {row["name"]: row for row in inventory if row.get("name")}
+    groups: dict[str, dict] = {}
+    for row in rows:
+        name = namer(row.get("model"))
+        key = name or row.get("model") or ""
+        group = groups.get(key)
+        if group is None:
+            entry = catalog.get(name) if name else None
+            group = groups[key] = {
+                "model": key or None,
+                "in_catalog": entry is not None,
+                "locality": entry.get("locality") if entry else None,
+                "providers": [],
+                "cost_usd": None,
+                "last_ts": None,
+                **dict.fromkeys(_USAGE_SUMS, 0),
+            }
+        for field in _USAGE_SUMS:
+            group[field] += row.get(field) or 0
+        if row.get("cost_usd") is not None:
+            group["cost_usd"] = (group["cost_usd"] or 0) + row["cost_usd"]
+        group["last_ts"] = max(group["last_ts"] or 0, row.get("last_ts") or 0) or None
+        if row.get("provider") and row["provider"] not in group["providers"]:
+            group["providers"].append(row["provider"])
+    result = []
+    for group in groups.values():
+        count = group.pop("latency_count")
+        total = group.pop("latency_ms_sum")
+        group["avg_latency_ms"] = round(total / count, 1) if count else None
+        if group["cost_usd"] is not None:
+            group["cost_usd"] = round(group["cost_usd"], 6)
+        result.append(group)
+    result.sort(key=lambda g: (-(g["cost_usd"] or 0), -g["requests"]))
+    return result
+
+
+def _series_plan(since: float | None, until: float | None, first_ts: float | None) -> tuple[float | None, str]:
+    """Where a gap-filled series starts and its bucket size.
+
+    Windows up to 180 days are filled from their start; longer ones (and all
+    time) from the first recorded request, so a huge window never expands into
+    empty buckets. Hourly up to two days, monthly beyond 180 days.
+    """
+    end = until if until is not None else time.time()
+    start = since if since is not None and end - since <= _DAILY_MAX_SECONDS else first_ts
+    span = end - start if start is not None else 0
+    bucket = "hour" if span <= _HOURLY_MAX_SECONDS else "day" if span <= _DAILY_MAX_SECONDS else "month"
+    return start, bucket
+
+
+def _bucket_labels(start: float, end: float, bucket: str) -> list[str]:
+    """Every local-time bucket label from ``start`` to ``end``, matching :func:`ledger.usage_rows`."""
+    first, last = datetime.fromtimestamp(start), datetime.fromtimestamp(end)
+    if bucket == "month":
+        months = (last.year - first.year) * 12 + last.month - first.month
+        return [f"{first.year + (first.month - 1 + i) // 12:04d}-{(first.month - 1 + i) % 12 + 1:02d}"
+                for i in range(months + 1)]
+    if bucket == "hour":
+        current, step, fmt = first.replace(minute=0, second=0, microsecond=0), timedelta(hours=1), "%Y-%m-%dT%H:00"
+    else:
+        current, step, fmt = first.replace(hour=0, minute=0, second=0, microsecond=0), timedelta(days=1), "%Y-%m-%d"
+    labels = []
+    while current <= last:
+        labels.append(current.strftime(fmt))
+        current += step
+    return labels
+
+
+def _series(rows: list[dict], start: float | None, until: float | None, bucket: str, namer=None) -> dict:
+    """Per-bucket requests/errors/cost, gap-filled; with ``namer`` also cost per catalog model."""
+    end = until if until is not None else time.time()
+    labels = set(_bucket_labels(start, end, bucket)) if start is not None else set()
+    labels.update(row["bucket"] for row in rows)
+    order = sorted(labels)
+    index = {label: i for i, label in enumerate(order)}
+    points = [{"t": label, "requests": 0, "errors": 0, "cost_usd": 0.0} for label in order]
+    by_model: dict[str, list[float]] = {}
+    for row in rows:
+        point = points[index[row["bucket"]]]
+        point["requests"] += row["requests"] or 0
+        point["errors"] += row["errors"] or 0
+        point["cost_usd"] += row["cost_usd"] or 0
+        if namer is not None and row.get("cost_usd"):
+            key = namer(row.get("model")) or row.get("model") or ""
+            by_model.setdefault(key, [0.0] * len(order))[index[row["bucket"]]] += row["cost_usd"]
+    for point in points:
+        point["cost_usd"] = round(point["cost_usd"], 6)
+    result = {"bucket": bucket, "points": points}
+    if namer is not None:
+        result["cost_by_model"] = {key: [round(v, 6) for v in values] for key, values in by_model.items()}
+    return result
+
+
+# ── Running now ──────────────────────────────────────────────────────────────
+
+# Tests replace this with an httpx.MockTransport; None uses the network.
+_runtime_transport: httpx.AsyncBaseTransport | None = None
+_RUNTIME_TIMEOUT = httpx.Timeout(3.0)
+
+
+async def _probe(url: str, api_key: str = "") -> dict:
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    async with httpx.AsyncClient(timeout=_RUNTIME_TIMEOUT, transport=_runtime_transport) as client:
+        response = await client.get(url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+    if not isinstance(data, dict):
+        raise TypeError("unexpected response")
+    return data
+
+
+def _probe_error(exc: Exception) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"HTTP {exc.response.status_code}"
+    if isinstance(exc, httpx.TimeoutException):
+        return "timed out"
+    if isinstance(exc, httpx.HTTPError):
+        return "not reachable"
+    return "unexpected response"
+
+
+def _served_by(inventory: list[dict], provider: str) -> dict[str, list[str]]:
+    """Upstream model ID -> catalog names, for models routed to ``provider``."""
+    served: dict[str, list[str]] = {}
+    for row in inventory:
+        if provider in (row.get("declared_providers") or [row.get("provider")]) and row.get("enabled", True):
+            upstream = row.get("omlx_id") or row.get("provider_model_id") or row.get("name")
+            served.setdefault(upstream, []).append(row["name"])
+    return served
+
+
+async def _omlx_runtime(inventory: list[dict], endpoint: tuple[str, str] | None) -> dict:
+    """Which models oMLX holds in memory, read from its ``/v1/models/status``."""
+    served = _served_by(inventory, "omlx")
+    if not served or endpoint is None:
+        return {"configured": False}
+    base_url, api_key = endpoint
+    try:
+        data = await _probe(base_url.removesuffix("/v1") + "/v1/models/status", api_key)
+    except (httpx.HTTPError, ValueError, TypeError) as exc:
+        return {"configured": True, "reachable": False, "error": _probe_error(exc)}
+    models = []
+    for row in data.get("models") or []:
+        if not isinstance(row, dict) or not isinstance(row.get("id"), str):
+            continue
+        loaded, loading = row.get("loaded") is True, row.get("is_loading") is True
+        size = row.get("resident_estimated_size") or row.get("estimated_size") or row.get("actual_size") or 0
+        # Runtime helpers with no weights (document converters) are not models in memory.
+        if row["id"] not in served and not ((loaded or loading) and size):
+            continue
+        models.append({
+            "id": row["id"],
+            "catalog_models": served.get(row["id"], []),
+            "loaded": loaded,
+            "loading": loading,
+            "size_bytes": size if isinstance(size, int) else None,
+            "last_access": row.get("last_access") if isinstance(row.get("last_access"), (int, float)) else None,
+            "pinned": row.get("pinned") is True,
+        })
+    memory, limit = data.get("current_model_memory"), data.get("final_ceiling")
+    return {
+        "configured": True,
+        "reachable": True,
+        "models": models,
+        "memory_bytes": memory if isinstance(memory, int) else None,
+        "memory_limit_bytes": limit if isinstance(limit, int) else None,
+    }
+
+
+async def _media_runtime(inventory: list[dict], endpoint: tuple[str, str] | None) -> dict:
+    """media-gen's scheduler: the model it has loaded and whether a generation is running."""
+    served = _served_by(inventory, "media")
+    if not served or endpoint is None:
+        return {"configured": False}
+    try:
+        data = await _probe(endpoint[0].removesuffix("/v1") + "/health")
+    except (httpx.HTTPError, ValueError, TypeError) as exc:
+        return {"configured": True, "reachable": False, "error": _probe_error(exc)}
+    scheduler = data.get("scheduler") if isinstance(data.get("scheduler"), dict) else {}
+    loaded = scheduler.get("loaded_model") if isinstance(scheduler.get("loaded_model"), str) else None
+    queued = scheduler.get("queued")
+    return {
+        "configured": True,
+        "reachable": True,
+        "state": scheduler.get("state") if isinstance(scheduler.get("state"), str) else None,
+        "loaded_model": loaded,
+        "catalog_models": served.get(loaded, []) if loaded else [],
+        "busy": bool(scheduler.get("running")),
+        "queued": queued if isinstance(queued, int) else 0,
+    }
+
+
+@router.get("/admin/api/runtime")
+async def admin_runtime(request: Request):
+    """What is running now: gateway requests in progress, models in local memory, media generation.
+
+    Local runtimes are asked directly (3 s timeout each); an unreachable runtime
+    is reported, never treated as idle.
+    """
+    require_admin_auth(request)
+    inventory, omlx_endpoint, media_endpoint = await run_in_threadpool(
+        lambda: (model_status(), provider_endpoint("omlx"), provider_endpoint("media")))
+    namer = _catalog_namer(inventory)
+    local, media = await asyncio.gather(
+        _omlx_runtime(inventory, omlx_endpoint), _media_runtime(inventory, media_endpoint))
+    in_flight = [
+        {**row, "catalog_model": namer(row["model"])}
+        for row in inflight.snapshot()
+    ]
+    return {"checked_at": time.time(), "in_flight": in_flight, "local": local, "media": media}
 
 
 # ── Provider management (writeable) ──────────────────────────────────────────
@@ -2594,7 +2861,7 @@ _ADMIN_HTML = r"""
         top: 0;
         z-index: 1;
         background: var(--surface);
-        padding-top: 12px;
+        padding-top: 24px;
       }
       .detail-head h2 {
         font-size: 1.375rem;
@@ -2617,7 +2884,7 @@ _ADMIN_HTML = r"""
         background: var(--surface);
         border-left: 1px solid var(--rule);
         overflow: auto;
-        padding: 24px;
+        padding: 0 24px 24px;
       }
       .drawer-scrim {
         position: fixed;
@@ -2658,7 +2925,144 @@ _ADMIN_HTML = r"""
       .locked h1 {
         margin-bottom: 12px;
       }
+      .running-grid {
+        display: grid;
+        gap: 8px 24px;
+      }
+      .running-grid .subhead {
+        margin: 0 0 8px;
+        font-size: 0.875rem;
+        color: var(--muted);
+      }
+      .live-list {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        border: 1px solid var(--rule);
+        border-radius: var(--radius);
+        background: var(--surface);
+      }
+      .live-list li {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        flex-wrap: wrap;
+        gap: 4px 12px;
+        padding: 12px 16px;
+        border-bottom: 1px solid var(--rule);
+      }
+      .live-list li:last-child {
+        border-bottom: 0;
+      }
+      .live-list li > span:last-child {
+        text-align: right;
+      }
+      .live-list .small {
+        display: block;
+      }
+      .chart {
+        margin: 20px 0 8px;
+      }
+      .chart-plot {
+        display: grid;
+        grid-template-columns: 4.5em minmax(0, 1fr);
+        gap: 4px 8px;
+      }
+      .chart-y {
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        font-size: 0.75rem;
+        color: var(--muted);
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+      }
+      .bars {
+        display: flex;
+        align-items: flex-end;
+        gap: 2px;
+        height: 140px;
+        padding: 0 2px;
+        overflow: hidden;
+        border-left: 1px solid var(--rule);
+        border-bottom: 1px solid var(--rule);
+      }
+      .bars.dense {
+        gap: 0;
+      }
+      .bar {
+        flex: 1;
+        min-width: 0;
+        height: var(--h);
+        background: var(--accent);
+        border-radius: 2px 2px 0 0;
+        opacity: 0.8;
+      }
+      .bar:hover {
+        opacity: 1;
+      }
+      .chart-x {
+        grid-column: 2;
+        display: flex;
+        justify-content: space-between;
+        font-size: 0.75rem;
+        color: var(--muted);
+      }
+      .chart-note {
+        font-size: 0.8125rem;
+        color: var(--muted);
+        margin-top: 8px;
+      }
+      .share {
+        display: block;
+        height: 4px;
+        min-width: 64px;
+        margin-top: 8px;
+        background: var(--surface-2);
+        border-radius: 2px;
+      }
+      .share > span {
+        display: block;
+        height: 100%;
+        background: var(--accent);
+        border-radius: 2px;
+      }
+      th .sort {
+        border: 0;
+        background: none;
+        padding: 0;
+        color: inherit;
+        font: inherit;
+        letter-spacing: inherit;
+      }
+      th[aria-sort] .sort {
+        color: var(--text);
+      }
+      th[aria-sort="descending"] .sort::after {
+        content: " ↓";
+      }
+      th[aria-sort="ascending"] .sort::after {
+        content: " ↑";
+      }
+      .range-form {
+        display: flex;
+        align-items: end;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .range-form label {
+        font-size: 0.8125rem;
+        color: var(--muted);
+        display: grid;
+        gap: 4px;
+      }
+      .range-form input {
+        width: 7em;
+      }
       @media (min-width: 700px) {
+        .running-grid {
+          grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        }
         .shell {
           padding-inline: 32px;
         }
@@ -2718,7 +3122,7 @@ _ADMIN_HTML = r"""
           width: 100%;
         }
         .drawer {
-          padding: 20px;
+          padding: 0 20px 20px;
         }
         .inventory thead {
           display: none;
@@ -2842,14 +3246,14 @@ _ADMIN_HTML = r"""
             >
               Models</button
             ><button
-              id="tab-connections"
+              id="tab-usage"
               role="tab"
-              data-tab="connections"
-              aria-controls="panel-connections"
+              data-tab="usage"
+              aria-controls="panel-usage"
               aria-selected="false"
               tabindex="-1"
             >
-              Connections</button
+              Usage</button
             ><button
               id="tab-activity"
               role="tab"
@@ -2858,7 +3262,16 @@ _ADMIN_HTML = r"""
               aria-selected="false"
               tabindex="-1"
             >
-              Activity</button
+              Requests</button
+            ><button
+              id="tab-connections"
+              role="tab"
+              data-tab="connections"
+              aria-controls="panel-connections"
+              aria-selected="false"
+              tabindex="-1"
+            >
+              Connections</button
             ><button
               id="tab-consumers"
               role="tab"
@@ -2898,7 +3311,7 @@ _ADMIN_HTML = r"""
             <div class="page-head">
               <div>
                 <h1>Overview</h1>
-                <p>What needs attention, and what happened recently.</p>
+                <p>What is running, what it costs, and what needs attention.</p>
               </div>
               <div class="actions">
                 <button class="btn secondary" data-go="models">
@@ -2925,6 +3338,27 @@ _ADMIN_HTML = r"""
                 This gateway is read-only. Setup instructions are in Settings.
               </p>
             </div>
+            <section aria-labelledby="runningTitle">
+              <div class="sec-head">
+                <h2 id="runningTitle">Running now</h2>
+                <span class="meta" id="runtimeMeta">Checking…</span>
+              </div>
+              <div class="running-grid">
+                <div>
+                  <h3 class="subhead">Requests in progress</h3>
+                  <ul id="inFlight" class="live-list">
+                    <li class="muted">Checking…</li>
+                  </ul>
+                </div>
+                <div>
+                  <h3 class="subhead">Loaded on this machine</h3>
+                  <ul id="loadedModels" class="live-list">
+                    <li class="muted">Checking…</li>
+                  </ul>
+                  <p class="small" id="localMemory"></p>
+                </div>
+              </div>
+            </section>
             <div class="overview-grid">
               <section>
                 <div class="sec-head">
@@ -2953,8 +3387,8 @@ _ADMIN_HTML = r"""
               </section>
             </div>
             <div class="sec-head">
-              <h2>Last 24 hours</h2>
-              <button class="linklike" data-go="activity">View activity</button>
+              <h2>Last 7 days</h2>
+              <button class="linklike" data-go="usage">View usage & cost</button>
             </div>
             <div id="overviewStats" class="strip">
               <span class="muted">Loading usage…</span>
@@ -2964,23 +3398,48 @@ _ADMIN_HTML = r"""
               id="overviewUsageStatus"
               role="status"
             ></div>
+            <div id="overviewChart"></div>
+            <div class="sec-head">
+              <h2>Top models by cost</h2>
+              <span class="meta">Last 7 days</span>
+            </div>
+            <div class="scroll">
+              <table id="overviewTop" class="inventory">
+                <thead>
+                  <tr>
+                    <th>Model</th>
+                    <th class="num">Requests</th>
+                    <th class="num">Known cost</th>
+                    <th>Share of cost</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr class="empty">
+                    <td colspan="4">Loading usage…</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
             <div class="sec-head">
               <h2>Latest requests</h2>
-              <span class="meta">Latest 5, independent of usage window</span>
+              <button class="linklike" data-go="activity">
+                View all requests
+              </button>
             </div>
             <div class="scroll">
               <table id="overviewRequests" class="inventory">
                 <thead>
                   <tr>
-                    <th>Request</th>
+                    <th>When</th>
                     <th>Model</th>
                     <th>Outcome</th>
                     <th class="num">Duration</th>
+                    <th class="num">Cost</th>
                   </tr>
                 </thead>
                 <tbody>
                   <tr class="empty">
-                    <td colspan="4">Loading requests…</td>
+                    <td colspan="5">Loading requests…</td>
                   </tr>
                 </tbody>
               </table>
@@ -3027,6 +3486,20 @@ _ADMIN_HTML = r"""
                   <option value="vision">Vision</option>
                   <option value="tools">Tools (explicitly recorded)</option>
                 </select></label
+              ><label for="modelUsed"
+                >Last 30 days<select id="modelUsed">
+                  <option value="">Used or not</option>
+                  <option value="used">Used</option>
+                  <option value="unused">Not used</option>
+                </select></label
+              ><label for="modelSort"
+                >Sort<select id="modelSort">
+                  <option value="">Catalog order</option>
+                  <option value="recent">Recently used</option>
+                  <option value="requests">Most requests</option>
+                  <option value="cost">Highest cost</option>
+                  <option value="name">Name</option>
+                </select></label
               ><span id="modelsMeta" class="meta"></span>
             </div>
             <div class="scroll">
@@ -3035,14 +3508,16 @@ _ADMIN_HTML = r"""
                   <tr>
                     <th>Model</th>
                     <th>Location</th>
-                    <th>Capabilities</th>
                     <th>Connection</th>
-                    <th>Availability</th>
+                    <th>Status</th>
+                    <th>Last used</th>
+                    <th class="num">Requests (30d)</th>
+                    <th class="num">Cost (30d)</th>
                   </tr>
                 </thead>
                 <tbody>
                   <tr class="empty">
-                    <td colspan="5">Loading models…</td>
+                    <td colspan="7">Loading models…</td>
                   </tr>
                 </tbody>
               </table>
@@ -3215,8 +3690,8 @@ _ADMIN_HTML = r"""
                     <th>Connection</th>
                     <th>Models</th>
                     <th>Configuration</th>
-                    <th>Recent outcomes</th>
-                    <th>Last check</th>
+                    <th>Requests (7d)</th>
+                    <th class="num">Cost (7d)</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -3356,139 +3831,198 @@ _ADMIN_HTML = r"""
           >
             <div class="page-head">
               <div>
-                <h1>Activity</h1>
-                <p>Trace requests and understand usage and cost.</p>
+                <h1>Requests</h1>
+                <p>Trace individual requests: route, outcome, timing, and cost.</p>
               </div>
             </div>
-            <div class="segmented" aria-label="Activity view">
-              <button data-activity="requests" aria-pressed="true">
-                Requests</button
-              ><button data-activity="usage" aria-pressed="false">
-                Usage & cost
-              </button>
+            <div class="sec-head">
+              <h2>Recent requests</h2>
+              <span class="meta" id="requestsScope">Latest 50 across all time</span>
             </div>
+            <div class="filters">
+              <label for="requestFilter"
+                >Search<input
+                  id="requestFilter"
+                  type="search"
+                  placeholder="Model, connection, or status" /></label
+              ><label for="requestOutcome"
+                >Outcome<select id="requestOutcome">
+                  <option value="">All outcomes</option>
+                  <option value="failed">Failures</option>
+                  <option value="success">Successful</option>
+                </select></label
+              ><label for="requestLimit"
+                >Show<select id="requestLimit">
+                  <option value="50">Latest 50</option>
+                  <option value="200">Latest 200</option>
+                  <option value="500">Latest 500</option>
+                </select></label
+              >
+            </div>
+            <div id="requestsStatus" class="view-status" role="status"></div>
+            <div class="scroll">
+              <table id="recentReq" class="inventory">
+                <thead>
+                  <tr>
+                    <th>When</th>
+                    <th>Model</th>
+                    <th>Recorded connection</th>
+                    <th>Outcome</th>
+                    <th class="num">Tokens in / out</th>
+                    <th class="num">Duration</th>
+                    <th class="num">Cost</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr class="empty">
+                    <td colspan="7">Loading requests…</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+          <section
+            id="panel-usage"
+            class="tab-panel"
+            data-tab-panel="usage"
+            role="tabpanel"
+            aria-labelledby="tab-usage"
+            tabindex="0"
+          >
+            <div class="page-head">
+              <div>
+                <h1>Usage & cost</h1>
+                <p>What each model cost and how much it was used.</p>
+              </div>
+            </div>
+            <div class="sec-head">
+              <div class="segmented" id="winSeg" aria-label="Usage window">
+                <button data-w="24h" aria-pressed="false">24 hours</button
+                ><button data-w="7d" aria-pressed="true">7 days</button
+                ><button data-w="30d" aria-pressed="false">30 days</button
+                ><button data-w="90d" aria-pressed="false">90 days</button
+                ><button data-w="" aria-pressed="false">All time</button>
+              </div>
+              <form class="range-form" id="customWindow">
+                <label for="customDays"
+                  >Last N days<input
+                    id="customDays"
+                    required
+                    type="number"
+                    min="1"
+                    max="3650"
+                    step="1"
+                    inputmode="numeric"
+                /></label>
+                <button class="btn secondary" type="submit">Show</button>
+              </form>
+            </div>
+            <p id="usageRange" class="meta">Last 7 days</p>
             <div id="usageErr" class="inline-err hidden" role="alert"></div>
-            <div id="requestsView">
-              <div class="sec-head">
-                <h2>Recent requests</h2>
-                <span class="meta">Latest 50 across all time</span>
+            <div class="strip">
+              <div class="stat">
+                <span class="label">Known cost</span
+                ><span class="value" id="uCost">Not loaded</span
+                ><span class="detail" id="uCostDetail"></span>
               </div>
-              <div class="filters">
-                <label for="requestFilter"
-                  >Search latest 50<input
-                    id="requestFilter"
-                    type="search"
-                    placeholder="Model, connection, or status" /></label
-                ><label for="requestOutcome"
-                  >Outcome<select id="requestOutcome">
-                    <option value="">All outcomes</option>
-                    <option value="failed">Failures</option>
-                    <option value="success">Successful</option>
-                  </select></label
-                >
+              <div class="stat">
+                <span class="label">Requests</span
+                ><span class="value" id="uRequests">Not loaded</span
+                ><span class="detail" id="uRequestsDetail"></span>
               </div>
-              <div id="requestsStatus" class="view-status" role="status"></div>
-              <div class="scroll">
-                <table id="recentReq" class="inventory">
-                  <thead>
-                    <tr>
-                      <th>Request</th>
-                      <th>Requested model</th>
-                      <th>Recorded connection</th>
-                      <th>Outcome</th>
-                      <th class="num">Duration</th>
-                      <th class="num">Cost</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr class="empty">
-                      <td colspan="6">Loading requests…</td>
-                    </tr>
-                  </tbody>
-                </table>
+              <div class="stat">
+                <span class="label">Tokens</span
+                ><span class="value" id="uTokens">Not loaded</span
+                ><span class="detail" id="uTokensDetail"></span>
+              </div>
+              <div class="stat">
+                <span class="label">Average duration</span
+                ><span class="value" id="uLatency">Not loaded</span
+                ><span class="detail" id="uLatencyDetail"></span>
               </div>
             </div>
-            <div id="usageView" hidden>
-              <div class="sec-head">
-                <h2>Usage & cost</h2>
-                <div class="segmented" id="winSeg" aria-label="Usage window">
-                  <button data-w="1h" aria-pressed="false">1h</button
-                  ><button data-w="24h" aria-pressed="true">24h</button
-                  ><button data-w="7d" aria-pressed="false">7d</button
-                  ><button data-w="30d" aria-pressed="false">30d</button
-                  ><button data-w="" aria-pressed="false">All time</button>
-                </div>
+            <div class="filters">
+              <label for="chartModel"
+                >Chart<select id="chartModel">
+                  <option value="">All models</option>
+                </select></label
+              >
+            </div>
+            <div id="usageChart"></div>
+            <div class="sec-head">
+              <h2>By model</h2>
+              <div class="filters" style="margin: 0">
+                <label for="usageFilter"
+                  >Filter<input
+                    id="usageFilter"
+                    type="search"
+                    placeholder="Model or connection"
+                /></label>
               </div>
-              <p id="usageRange" class="meta">Last 24 hours</p>
-              <div class="strip">
-                <div class="stat">
-                  <span class="label">Requests</span
-                  ><span class="value" id="uRequests">Not loaded</span
-                  ><span class="detail" id="uRequestsDetail"></span>
-                </div>
-                <div class="stat">
-                  <span class="label">Tokens</span
-                  ><span class="value" id="uTokens">Not loaded</span
-                  ><span class="detail" id="uTokensDetail"></span>
-                </div>
-                <div class="stat">
-                  <span class="label">Known cost</span
-                  ><span class="value" id="uCost">Not loaded</span
-                  ><span class="detail" id="uCostDetail"></span>
-                </div>
-                <div class="stat">
-                  <span class="label">Average duration</span
-                  ><span class="value" id="uLatency">Not loaded</span
-                  ><span class="detail" id="uLatencyDetail"></span>
-                </div>
-              </div>
-              <div class="sec-head"><h2>By model route</h2></div>
+            </div>
+            <div class="scroll">
+              <table id="usageByModel" class="inventory">
+                <thead>
+                  <tr>
+                    <th><button class="sort" data-sort="model">Model</button></th>
+                    <th class="num">
+                      <button class="sort" data-sort="requests">Requests</button>
+                    </th>
+                    <th class="num">
+                      <button class="sort" data-sort="errors">Errors</button>
+                    </th>
+                    <th class="num">
+                      <button class="sort" data-sort="tokens">Tokens in / out</button>
+                    </th>
+                    <th class="num">
+                      <button class="sort" data-sort="avg_latency_ms">Avg duration</button>
+                    </th>
+                    <th class="num">
+                      <button class="sort" data-sort="cost_usd">Known cost</button>
+                    </th>
+                    <th>Share of cost</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+            <p class="small" style="margin-top: 8px">
+              Requests are grouped under their catalog model, whichever alias or
+              upstream ID the client sent. Names no longer in the catalog are
+              listed as recorded.
+            </p>
+            <details>
+              <summary>Token accounting by model</summary>
               <div class="scroll">
-                <table id="usageByModel">
+                <table id="tokenAccounting">
                   <thead>
                     <tr>
-                      <th>Model / actual route</th>
-                      <th class="num">Requests</th>
-                      <th class="num">Errors</th>
-                      <th class="num">Known cost</th>
-                      <th class="num">Duration</th>
+                      <th>Model</th>
+                      <th class="num">Input</th>
+                      <th class="num">Output</th>
+                      <th class="num">Cached read</th>
+                      <th class="num">Reasoning</th>
+                      <th class="num">Usage reported</th>
+                      <th class="num">Cost known</th>
                     </tr>
                   </thead>
                   <tbody></tbody>
                 </table>
               </div>
-              <details>
-                <summary>Token accounting by route</summary>
-                <div class="scroll">
-                  <table id="tokenAccounting">
-                    <thead>
-                      <tr>
-                        <th>Model</th>
-                        <th class="num">Input</th>
-                        <th class="num">Output</th>
-                        <th class="num">Cached read</th>
-                        <th class="num">Usage reported</th>
-                        <th class="num">Cost complete</th>
-                      </tr>
-                    </thead>
-                    <tbody></tbody>
-                  </table>
-                </div>
-              </details>
-              <div class="sec-head"><h2>By connection</h2></div>
-              <div class="scroll">
-                <table id="usageByProvider">
-                  <thead>
-                    <tr>
-                      <th>Connection</th>
-                      <th class="num">Requests</th>
-                      <th class="num">Errors</th>
-                      <th class="num">Known cost</th>
-                    </tr>
-                  </thead>
-                  <tbody></tbody>
-                </table>
-              </div>
+            </details>
+            <div class="sec-head"><h2>By connection</h2></div>
+            <div class="scroll">
+              <table id="usageByProvider">
+                <thead>
+                  <tr>
+                    <th>Connection</th>
+                    <th class="num">Requests</th>
+                    <th class="num">Errors</th>
+                    <th class="num">Known cost</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
             </div>
           </section>
           <section
@@ -3783,8 +4317,66 @@ _ADMIN_HTML = r"""
             : String(value);
         const num = (value) =>
           value == null ? "Not recorded" : Number(value).toLocaleString();
-        const cost = (value) =>
-          value == null ? "Unknown" : "$" + Number(value).toFixed(4);
+        function cost(value) {
+          if (value == null) return "Unknown";
+          const v = Number(value);
+          if (v === 0) return "$0";
+          if (v < 0.0001) return "<$0.0001";
+          if (v < 1) return "$" + v.toPrecision(2);
+          return (
+            "$" +
+            v.toLocaleString(undefined, {
+              minimumFractionDigits: 2,
+              maximumFractionDigits: 2,
+            })
+          );
+        }
+        const localProviders = new Set(["omlx", "media"]);
+        // A local runtime's zero cost is "no charge", not a cheap cloud request.
+        const costCell = (value, local) =>
+          value === 0 && local ? '<span class="muted">Local</span>' : cost(value);
+        const compact = (value) =>
+          value == null
+            ? "Not recorded"
+            : new Intl.NumberFormat(undefined, {
+                notation: "compact",
+                maximumFractionDigits: 1,
+              }).format(value);
+        const plural = (n, word) =>
+          num(n) + " " + word + (Number(n) === 1 ? "" : "s");
+        const gigabytes = (bytes) =>
+          bytes == null
+            ? "size not recorded"
+            : (bytes >= 1e11
+                ? Math.round(bytes / 1e9)
+                : (bytes / 1e9).toFixed(1)) + " GB";
+        function ago(ts) {
+          if (!ts) return "Not recorded";
+          const s = Math.max(0, Date.now() / 1000 - ts);
+          if (s < 45) return "just now";
+          if (s < 3600) return Math.max(1, Math.round(s / 60)) + " min ago";
+          if (s < 86400) return Math.round(s / 3600) + " h ago";
+          if (s < 86400 * 7) return Math.round(s / 86400) + " d ago";
+          const d = new Date(ts * 1000);
+          return d.toLocaleDateString([], {
+            month: "short",
+            day: "numeric",
+            ...(d.getFullYear() !== new Date().getFullYear()
+              ? { year: "numeric" }
+              : {}),
+          });
+        }
+        function clock(ts) {
+          const d = new Date(ts * 1000);
+          return d.toDateString() === new Date().toDateString()
+            ? d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+            : d.toLocaleString([], {
+                month: "short",
+                day: "numeric",
+                hour: "numeric",
+                minute: "2-digit",
+              });
+        }
         function duration(value) {
           if (value == null) return "Not recorded";
           const s = Number(value) / 1000;
@@ -3815,18 +4407,24 @@ _ADMIN_HTML = r"""
           '</span><span class="v">' +
           value +
           "</span></div>";
-        const windows = {
-          "1h": "Last hour",
-          "24h": "Last 24 hours",
-          "7d": "Last 7 days",
-          "30d": "Last 30 days",
-          "": "All time",
-        };
+        function windowLabel(w) {
+          if (!w) return "All time";
+          const n = Number(w.slice(0, -1));
+          return w.endsWith("h")
+            ? n === 1
+              ? "Last hour"
+              : "Last " + n + " hours"
+            : n === 1
+              ? "Last day"
+              : "Last " + n + " days";
+        }
+        const RUNTIME_POLL_MS = 5000;
         const tabs = [
           "overview",
           "models",
-          "connections",
+          "usage",
           "activity",
+          "connections",
           "consumers",
           "settings",
         ];
@@ -3834,7 +4432,6 @@ _ADMIN_HTML = r"""
           providers: "connections",
           pools: "connections",
           presets: "models",
-          usage: "activity",
           debug: "settings",
         };
         const cache = {},
@@ -3848,8 +4445,14 @@ _ADMIN_HTML = r"""
           mutationBusy = false,
           refreshing = false,
           currentTab = "overview",
-          currentWindow = "24h",
+          currentWindow = "7d",
           usageSeq = 0,
+          runtimeSeq = 0,
+          runtimeTimer = null,
+          runtimeSignature = "",
+          modelWindow = "7d",
+          modelUsageSeq = 0,
+          usageSort = { key: "cost_usd", dir: -1 },
           detailSeq = 0,
           detailKind = null,
           detailName = null,
@@ -3895,9 +4498,9 @@ _ADMIN_HTML = r"""
           const ids = m.declared_providers || [
             m.configured_provider || m.provider,
           ];
-          const local = ids.some((id) => id === "omlx");
+          const local = ids.some((id) => localProviders.has(id));
           return local
-            ? ids.some((id) => id !== "omlx")
+            ? ids.some((id) => !localProviders.has(id))
               ? "mixed"
               : "local"
             : "cloud";
@@ -4077,6 +4680,7 @@ _ADMIN_HTML = r"""
         }
         function renderAll() {
           renderHealth();
+          renderRuntime();
           renderOverview();
           renderModels();
           renderProviders();
@@ -4160,19 +4764,27 @@ _ADMIN_HTML = r"""
               ),
               loadResource(
                 "requests",
-                "/admin/api/requests?limit=50",
+                "/admin/api/requests?limit=" + $("requestLimit").value,
                 "Requests",
                 "requestsStatus",
                 gen,
               ),
               loadResource(
                 "overviewUsage",
-                "/admin/api/usage?window=24h",
+                "/admin/api/usage?window=7d",
                 "Overview usage",
                 "overviewUsageStatus",
                 gen,
               ),
+              loadResource(
+                "modelUsage",
+                "/admin/api/usage?window=30d",
+                "Model usage",
+                null,
+                gen,
+              ),
               loadUsage(currentWindow, gen),
+              loadRuntime(gen),
               loadResource(
                 "consumers",
                 "/admin/api/consumers",
@@ -4216,6 +4828,9 @@ _ADMIN_HTML = r"""
           ++generation;
           ++detailSeq;
           ++usageSeq;
+          ++runtimeSeq;
+          clearTimeout(runtimeTimer);
+          runtimeSignature = "";
           unlocked = false;
           document.body.dataset.unlocked = "false";
           document.body.dataset.writes = "false";
@@ -4278,9 +4893,14 @@ _ADMIN_HTML = r"""
             p.classList.toggle("active", p.dataset.tabPanel === currentTab);
           if (tab === "pools") $("routingGroups").open = true;
           if (tab === "presets") $("presetSection").open = true;
-          if (tab === "usage") showActivity("usage");
           if (!opts.skipHash) setHash(currentTab);
+          if (!unlocked) return;
+          if (!runtimeTab()) clearTimeout(runtimeTimer);
+          else if (!cache.runtimeAt || Date.now() - cache.runtimeAt > RUNTIME_POLL_MS)
+            loadRuntime();
+          else scheduleRuntime();
         }
+        const runtimeTab = () => ["overview", "models"].includes(currentTab);
         function applyHash() {
           const [tab, raw] = location.hash.replace(/^#/, "").split("/");
           if (tab === "main-content") return;
@@ -4299,12 +4919,6 @@ _ADMIN_HTML = r"""
           else if (name && ["usage", "activity"].includes(tab))
             showRequestDetail(name, { skipHash: true });
           else closeDrawer({ skipHash: true });
-        }
-        function showActivity(view) {
-          $("requestsView").hidden = view !== "requests";
-          $("usageView").hidden = view !== "usage";
-          for (const b of document.querySelectorAll("[data-activity]"))
-            b.setAttribute("aria-pressed", String(b.dataset.activity === view));
         }
         function renderHealth() {
           const s = cache.status,
@@ -4430,35 +5044,351 @@ _ADMIN_HTML = r"""
                 " · " +
                 button("data-go", "connections", "Inspect connections")
               : "Loading connections and models…";
-          const u = cache.overviewUsage?.summary;
+          const usage = cache.overviewUsage,
+            u = usage?.summary;
           $("overviewStats").innerHTML = u
             ? stats(u)
             : '<span class="muted">Usage not loaded.</span>';
+          $("overviewChart").innerHTML = usage
+            ? chartMarkup(usage.series, null, "Known cost per day")
+            : "";
+          const total = u?.cost_usd || 0;
+          $("overviewTop").querySelector("tbody").innerHTML =
+            (usage?.by_catalog_model || [])
+              .filter((g) => g.cost_usd > 0)
+              .slice(0, 5)
+              .map(
+                (g) =>
+                  "<tr><td>" +
+                  usageModelCell(g) +
+                  '</td><td class="num" data-label="Requests">' +
+                  num(g.requests) +
+                  '</td><td class="num" data-label="Known cost">' +
+                  cost(g.cost_usd) +
+                  '</td><td data-label="Share of cost">' +
+                  share(g.cost_usd, total) +
+                  "</td></tr>",
+              )
+              .join("") ||
+            '<tr class="empty"><td colspan="4">' +
+              (usage
+                ? "No known cost in the last 7 days."
+                : "Usage not loaded.") +
+              "</td></tr>";
           $("overviewRequests").querySelector("tbody").innerHTML =
             (cache.requests?.requests || [])
               .slice(0, 5)
               .map(
                 (r) =>
                   "<tr><td>" +
-                  button("data-open-request", r.id, when(r)) +
+                  whenCell(r) +
                   '</td><td data-label="Model">' +
-                  modelLink(r.model) +
+                  requestModel(r) +
                   '</td><td data-label="Outcome">' +
                   outcomePill(r) +
                   '</td><td class="num" data-label="Duration">' +
                   duration(r.latency_ms) +
+                  '</td><td class="num" data-label="Cost">' +
+                  costCell(r.cost_usd, localProviders.has(r.provider)) +
                   "</td></tr>",
               )
               .join("") ||
-            '<tr class="empty"><td colspan="4">' +
+            '<tr class="empty"><td colspan="5">' +
               (cache.requests
                 ? "No requests recorded yet. Send a request using an example from Models."
                 : "Requests not loaded.") +
               "</td></tr>";
         }
+        function whenCell(r) {
+          return r.ts
+            ? button("data-open-request", r.id, ago(r.ts)) +
+                '<span class="small">' +
+                esc(clock(r.ts)) +
+                "</span>"
+            : button("data-open-request", r.id, when(r));
+        }
+        function requestModel(r) {
+          const m = findModel(r.model);
+          if (!m) return esc(text(r.model));
+          return (
+            button("data-open-model", modelName(m), modelName(m)) +
+            (r.model !== modelName(m)
+              ? '<span class="small">as ' + esc(r.model) + "</span>"
+              : "")
+          );
+        }
+        function usageModelCell(g) {
+          const label = g.model
+            ? g.in_catalog
+              ? button("data-open-model", g.model, g.model)
+              : esc(g.model)
+            : "Not recorded";
+          const notes = g.model
+            ? [
+                (g.providers || []).join(", "),
+                g.locality,
+                g.in_catalog ? null : "not in the catalog",
+              ]
+            : ["failed before a model was resolved"];
+          return (
+            label +
+            '<span class="small">' +
+            esc(notes.filter(Boolean).join(" · ")) +
+            "</span>"
+          );
+        }
+        function share(value, total) {
+          if (!(value > 0) || !(total > 0)) return "";
+          const pct = (value / total) * 100;
+          return (
+            '<span class="small">' +
+            (pct < 1 ? "<1" : Math.round(pct)) +
+            '%</span><span class="share" aria-hidden="true"><span style="width:' +
+            pct.toFixed(1) +
+            '%"></span></span>'
+          );
+        }
+        function bucketLabel(t, bucket) {
+          const [y, m, rest = "1"] = t.split("-");
+          const [d, h = "0"] = rest.split("T");
+          return new Date(+y, +m - 1, +d, parseInt(h, 10)).toLocaleString(
+            [],
+            {
+              month: { month: "short", year: "numeric" },
+              day: { month: "short", day: "numeric" },
+              hour: { month: "short", day: "numeric", hour: "numeric" },
+            }[bucket],
+          );
+        }
+        const bucketUnit = (series) => series?.bucket || "day";
+        function chartMarkup(series, model, label) {
+          const points = series?.points || [];
+          if (!points.length)
+            return '<p class="chart-note">No requests in this window.</p>';
+          const unit = bucketUnit(series);
+          const values = model
+            ? series.cost_by_model?.[model] || points.map(() => 0)
+            : points.map((p) => p.cost_usd || 0);
+          const max = Math.max(...values),
+            total = values.reduce((a, b) => a + b, 0),
+            fmt = (t) => bucketLabel(t, unit);
+          const summary =
+            max > 0
+              ? "Total " +
+                cost(total) +
+                " · peak " +
+                cost(max) +
+                " on " +
+                fmt(points[values.indexOf(max)].t) +
+                " · average " +
+                cost(total / values.length) +
+                " per " +
+                unit
+              : "No known cost in this window.";
+          const bars = points
+            .map(
+              (p, i) =>
+                '<div class="bar" style="--h:' +
+                (max > 0 ? (values[i] / max) * 100 : 0).toFixed(1) +
+                '%" title="' +
+                esc(
+                  fmt(p.t) +
+                    " · " +
+                    cost(values[i]) +
+                    (model ? "" : " · " + plural(p.requests, "request")),
+                ) +
+                '"></div>',
+            )
+            .join("");
+          return (
+            '<figure class="chart" role="img" aria-label="' +
+            esc(label + ". " + summary) +
+            '"><div class="chart-plot" aria-hidden="true"><div class="chart-y"><span>' +
+            esc(cost(max)) +
+            '</span><span>$0</span></div><div class="bars' +
+            (points.length > 90 ? " dense" : "") +
+            '">' +
+            bars +
+            '</div><div class="chart-x"><span>' +
+            esc(fmt(points[0].t)) +
+            "</span><span>" +
+            esc(fmt(points.at(-1).t)) +
+            '</span></div></div><figcaption class="chart-note">' +
+            esc(label) +
+            " · " +
+            esc(summary) +
+            "</figcaption></figure>"
+          );
+        }
+        async function loadRuntime(gen = generation) {
+          clearTimeout(runtimeTimer);
+          const seq = ++runtimeSeq;
+          try {
+            const data = await request("/admin/api/runtime");
+            if (seq !== runtimeSeq || gen !== generation || !unlocked) return;
+            cache.runtime = data;
+            cache.runtimeAt = Date.now();
+            cache.runtimeError = null;
+          } catch (e) {
+            if (seq !== runtimeSeq || gen !== generation) return;
+            if (e instanceof AuthError) {
+              lock(e.message);
+              return;
+            }
+            cache.runtimeError = e.message;
+          }
+          renderRuntime();
+          const signature = JSON.stringify([
+            cache.runtime?.local,
+            cache.runtime?.media,
+          ]);
+          if (signature !== runtimeSignature) {
+            runtimeSignature = signature;
+            renderModels();
+          }
+          scheduleRuntime();
+        }
+        function scheduleRuntime() {
+          clearTimeout(runtimeTimer);
+          if (!unlocked || !runtimeTab()) return;
+          runtimeTimer = setTimeout(
+            () => (document.hidden ? scheduleRuntime() : loadRuntime()),
+            RUNTIME_POLL_MS,
+          );
+        }
+        function runtimeRow(main, detail, status) {
+          return (
+            "<li><span>" +
+            main +
+            (detail ? '<span class="small">' + esc(detail) + "</span>" : "") +
+            "</span><span>" +
+            status +
+            "</span></li>"
+          );
+        }
+        function renderRuntime() {
+          const r = cache.runtime,
+            err = cache.runtimeError;
+          $("runtimeMeta").textContent = err
+            ? (r
+                ? "Showing " + new Date(r.checked_at * 1000).toLocaleTimeString() + ". "
+                : "") +
+              "Could not check: " +
+              err
+            : r
+              ? "Live · checked " +
+                new Date(r.checked_at * 1000).toLocaleTimeString()
+              : "Checking…";
+          $("runtimeMeta").classList.toggle("warn-c", !!err);
+          if (!r) {
+            const msg = err ? "Unavailable." : "Checking…";
+            $("inFlight").innerHTML = $("loadedModels").innerHTML =
+              '<li class="muted">' + msg + "</li>";
+            $("localMemory").textContent = "";
+            return;
+          }
+          const names = (list, fallback) =>
+            list?.length ? list.map(modelLink).join(" · ") : esc(fallback);
+          $("inFlight").innerHTML =
+            (r.in_flight || [])
+              .map((f) =>
+                runtimeRow(
+                  f.catalog_model
+                    ? modelLink(f.catalog_model)
+                    : f.model
+                      ? esc(f.model)
+                      : '<span class="muted">Resolving model…</span>',
+                  [f.provider, f.is_stream ? "streaming" : null, f.endpoint]
+                    .filter(Boolean)
+                    .join(" · "),
+                  esc(duration(f.elapsed_ms)) + '<span class="small">so far</span>',
+                ),
+              )
+              .join("") || '<li class="muted">No requests in progress.</li>';
+          const rows = [],
+            local = r.local || {},
+            media = r.media || {};
+          if (local.configured && !local.reachable)
+            rows.push(
+              runtimeRow("oMLX", "Local model server: " + local.error, pill("warn", "Not reachable")),
+            );
+          else if (local.configured) {
+            const live = (local.models || []).filter((m) => m.loaded || m.loading);
+            for (const m of live)
+              rows.push(
+                runtimeRow(
+                  names(m.catalog_models, m.id),
+                  "oMLX · " +
+                    gigabytes(m.size_bytes) +
+                    (m.last_access ? " · last used " + ago(m.last_access) : "") +
+                    (m.pinned ? " · pinned" : ""),
+                  m.loading ? pill("accent", "Loading") : pill("ok", "In memory"),
+                ),
+              );
+            if (!live.length)
+              rows.push(
+                runtimeRow("oMLX", "No model in memory. The next request loads its model.", pill("muted", "Idle")),
+              );
+          }
+          if (media.configured && !media.reachable)
+            rows.push(
+              runtimeRow("media-gen", "Image and video generation: " + media.error, pill("warn", "Not reachable")),
+            );
+          else if (media.configured)
+            rows.push(
+              media.loaded_model
+                ? runtimeRow(
+                    names(media.catalog_models, media.loaded_model),
+                    "media-gen" + (media.queued ? " · " + num(media.queued) + " queued" : ""),
+                    media.busy ? pill("accent", "Generating") : pill("ok", "Loaded, idle"),
+                  )
+                : runtimeRow("media-gen", "No model loaded.", pill("muted", "Idle")),
+            );
+          $("loadedModels").innerHTML =
+            rows.join("") || '<li class="muted">No local runtimes configured.</li>';
+          $("localMemory").textContent =
+            local.reachable && local.memory_bytes != null && local.memory_limit_bytes
+              ? "oMLX memory in use: " +
+                gigabytes(local.memory_bytes) +
+                " of " +
+                gigabytes(local.memory_limit_bytes) +
+                "."
+              : "";
+        }
+        function runtimeState(m) {
+          const r = cache.runtime,
+            name = modelName(m),
+            provider = m.configured_provider || m.provider;
+          if (!r) return null;
+          if ((r.media?.catalog_models || []).includes(name))
+            return r.media.busy
+              ? pill("accent", "Generating")
+              : pill("ok", "Loaded");
+          const row = (r.local?.models || []).find((x) =>
+            (x.catalog_models || []).includes(name),
+          );
+          if (row)
+            return row.loading
+              ? pill("accent", "Loading")
+              : row.loaded
+                ? pill("ok", "In memory")
+                : pill("muted", "Not loaded");
+          const runtime = { omlx: r.local, media: r.media }[provider];
+          if (runtime?.configured && !runtime.reachable)
+            return pill("warn", "Runtime not reachable");
+          if (provider === "media" && runtime?.reachable)
+            return pill("muted", "Not loaded");
+          return null;
+        }
+        function modelStatus(m) {
+          return (
+            (m.enabled !== false && m.available && runtimeState(m)) ||
+            modelAvailability(m)
+          );
+        }
         function stats(u) {
           return [
-            ["Requests", num(u.requests), num(u.errors || 0) + " errors"],
+            ["Requests", num(u.requests), plural(u.errors || 0, "error")],
             [
               "Known cost",
               cost(u.cost_usd),
@@ -4503,7 +5433,12 @@ _ADMIN_HTML = r"""
           const q = $("modelFilter").value.trim().toLowerCase(),
             loc = $("modelLocality").value,
             provider = $("modelProviderFilter").value,
-            cap = $("modelCapability").value;
+            cap = $("modelCapability").value,
+            used = $("modelUsed").value,
+            sort = $("modelSort").value;
+          const usage = cache.modelUsage
+            ? new Map(cache.modelUsage.by_catalog_model.map((u) => [u.model, u]))
+            : null;
           const all = models();
           const rows = all.filter(
             (m) =>
@@ -4521,48 +5456,70 @@ _ADMIN_HTML = r"""
               (!loc || locality(m) === loc) &&
               (!provider ||
                 (m.declared_providers || [m.provider]).includes(provider)) &&
-              (!cap || (cap === "vision" ? m.vision : m.tools === true)),
+              (!cap || (cap === "vision" ? m.vision : m.tools === true)) &&
+              (!used || !usage || usage.has(modelName(m)) === (used === "used")),
           );
+          const u = (m) => usage?.get(modelName(m));
+          const by = {
+            recent: (m) => u(m)?.last_ts || 0,
+            requests: (m) => u(m)?.requests || 0,
+            cost: (m) => u(m)?.cost_usd || 0,
+          }[sort];
+          if (by) rows.sort((a, b) => by(b) - by(a));
+          else if (sort === "name")
+            rows.sort((a, b) => modelName(a).localeCompare(modelName(b)));
+          const usageCell = (value) =>
+            usage ? value : '<span class="muted">Not loaded</span>';
           $("models").querySelector("tbody").innerHTML =
             rows
               .map((m) => {
-                const groups = modelPools(m);
+                const groups = modelPools(m),
+                  stat = u(m),
+                  local = locality(m) === "local";
                 return (
                   '<tr class="clickable-row"><td>' +
                   button("data-open-model", modelName(m), modelName(m)) +
                   '<span class="small">' +
-                  (m.alias ? "Alias: " + esc(m.alias) + " · " : "") +
-                  (m.context
-                    ? esc(
-                        new Intl.NumberFormat(undefined, {
-                          notation: "compact",
-                          maximumFractionDigits: 1,
-                        }).format(m.context),
-                      ) + " context"
-                    : "Context not recorded") +
+                  esc(
+                    [
+                      m.alias ? "Alias: " + m.alias : null,
+                      m.context
+                        ? compact(m.context) + " context"
+                        : "Context not recorded",
+                      m.vision ? "Vision" : "Text",
+                      m.tools === true ? "Tools" : null,
+                      m.thinking ? "Reasoning" : null,
+                    ]
+                      .filter(Boolean)
+                      .join(" · "),
+                  ) +
                   '</span></td><td data-label="Location">' +
                   esc(locality(m)) +
-                  '</td><td data-label="Capabilities">' +
-                  [
-                    m.vision ? "Vision" : "Text",
-                    m.tools === true ? "Tools" : null,
-                    m.thinking ? "Reasoning" : null,
-                  ]
-                    .filter(Boolean)
-                    .join(" · ") +
                   '</td><td data-label="Connection">' +
                   (groups.length
                     ? groups
                         .map((g) => button("data-show-pool", g.id, g.id))
                         .join(" ")
                     : providerLink(m.provider)) +
-                  '</td><td data-label="Availability">' +
-                  modelAvailability(m) +
+                  '</td><td data-label="Status">' +
+                  modelStatus(m) +
+                  '</td><td data-label="Last used">' +
+                  usageCell(
+                    stat
+                      ? esc(ago(stat.last_ts))
+                      : '<span class="muted">Not in 30 days</span>',
+                  ) +
+                  '</td><td class="num" data-label="Requests (30d)">' +
+                  usageCell(num(stat?.requests || 0)) +
+                  '</td><td class="num" data-label="Cost (30d)">' +
+                  usageCell(
+                    stat ? costCell(stat.cost_usd, local) : '<span class="muted">None</span>',
+                  ) +
                   "</td></tr>"
                 );
               })
               .join("") ||
-            '<tr class="empty"><td colspan="5">' +
+            '<tr class="empty"><td colspan="7">' +
               (!cache.models
                 ? "Models not loaded."
                 : all.length
@@ -4587,12 +5544,19 @@ _ADMIN_HTML = r"""
           const rows = providers().filter((p) =>
             (p.id + " " + p.base_url).toLowerCase().includes(q),
           );
+          const usage = cache.overviewUsage
+            ? new Map(cache.overviewUsage.by_provider.map((u) => [u.dim, u]))
+            : null;
           $("providers").querySelector("tbody").innerHTML =
             rows
               .map((p) => {
                 const n = associatedModels(p).length,
                   recent = recentFor(p.id),
-                  check = checks.get(p.id);
+                  check = checks.get(p.id),
+                  u = usage?.get(p.id),
+                  last = recent?.last_request_at
+                    ? "Last request " + ago(recent.last_request_at)
+                    : null;
                 return (
                   '<tr class="clickable-row"><td>' +
                   button("data-open-provider", p.id, p.id) +
@@ -4602,22 +5566,31 @@ _ADMIN_HTML = r"""
                   (n ? num(n) : pill("muted", "Unused")) +
                   '</td><td data-label="Configuration">' +
                   connectionPill(p, "Complete") +
-                  '</td><td data-label="Recent outcomes">' +
-                  (recent?.requests
-                    ? num(recent.failures) +
-                      " failures / " +
-                      num(recent.requests) +
-                      ' recorded<span class="small">Latest 100, all time</span>'
-                    : recent
-                      ? "No recorded requests"
-                      : "Recent outcomes unavailable") +
-                  '</td><td data-label="Last check">' +
                   (check
-                    ? esc(check.label) +
-                      '<span class="small">' +
-                      esc(check.at) +
-                      " · this session</span>"
-                    : "Not recorded") +
+                    ? '<span class="small">' +
+                      esc(check.label + " · " + check.at + " (this session)") +
+                      "</span>"
+                    : "") +
+                  '</td><td data-label="Requests (7d)">' +
+                  (!usage
+                    ? '<span class="muted">Not loaded</span>'
+                    : u
+                      ? num(u.requests) +
+                        '<span class="small">' +
+                        esc(
+                          [plural(u.errors || 0, "failure"), last]
+                            .filter(Boolean)
+                            .join(" · "),
+                        ) +
+                        "</span>"
+                      : "None" +
+                        (last
+                          ? '<span class="small">' + esc(last) + "</span>"
+                          : "")) +
+                  '</td><td class="num" data-label="Cost (7d)">' +
+                  (u
+                    ? costCell(u.cost_usd, localProviders.has(p.id))
+                    : '<span class="muted">None</span>') +
                   "</td></tr>"
                 );
               })
@@ -4848,33 +5821,41 @@ _ADMIN_HTML = r"""
                   .includes(q)) &&
               (!wanted || outcome(r) === wanted),
           );
+          $("requestsScope").textContent =
+            "Latest " + num($("requestLimit").value) + " across all time";
           $("recentReq").querySelector("tbody").innerHTML =
             rows
               .map(
                 (r) =>
                   '<tr class="clickable-row"><td>' +
-                  button("data-open-request", r.id, when(r)) +
-                  '</td><td data-label="Requested">' +
-                  modelLink(r.model) +
+                  whenCell(r) +
+                  '</td><td data-label="Model">' +
+                  requestModel(r) +
                   '</td><td data-label="Recorded connection">' +
                   providerLink(r.provider) +
                   '</td><td data-label="Outcome">' +
                   outcomePill(r) +
+                  '</td><td class="num" data-label="Tokens in / out">' +
+                  (r.usage_reported
+                    ? compact(r.input_tokens) + " / " + compact(r.output_tokens)
+                    : '<span class="muted">Not reported</span>') +
                   '</td><td class="num" data-label="Duration">' +
                   duration(r.latency_ms) +
                   '</td><td class="num" data-label="Cost">' +
-                  cost(r.cost_usd) +
+                  costCell(r.cost_usd, localProviders.has(r.provider)) +
                   (r.cost_usd != null && !r.pricing_complete
-                    ? " · partial"
+                    ? '<span class="small">partial</span>'
                     : "") +
                   "</td></tr>",
               )
               .join("") ||
-            '<tr class="empty"><td colspan="6">' +
+            '<tr class="empty"><td colspan="7">' +
               (!cache.requests
                 ? "Requests not loaded."
                 : all.length
-                  ? "No matching requests in the latest 50. Clear search or choose All outcomes."
+                  ? "No matching requests in the latest " +
+                    num($("requestLimit").value) +
+                    ". Clear search or choose All outcomes."
                   : "No requests recorded yet. Copy an example from a model to get started.") +
               "</td></tr>";
         }
@@ -5262,17 +6243,40 @@ _ADMIN_HTML = r"""
             await refresh();
           });
         }
+        function rangeText(u) {
+          const since = u.range?.since ?? u.summary?.first_ts,
+            day = (ts) => {
+              const d = new Date(ts * 1000);
+              return d.toLocaleDateString([], {
+                month: "short",
+                day: "numeric",
+                ...(d.getFullYear() !== new Date().getFullYear()
+                  ? { year: "numeric" }
+                  : {}),
+              });
+            };
+          if (!since) return "";
+          return u.range?.since == null
+            ? " (since " + day(since) + ")"
+            : u.range.bucket === "day"
+              ? " (" + day(since) + " – " + day(u.range.until ?? Date.now() / 1000) + ")"
+              : "";
+        }
         async function loadUsage(window, gen = generation) {
           currentWindow = window;
           const seq = ++usageSeq;
           for (const b of document.querySelectorAll("#winSeg button"))
             b.setAttribute("aria-pressed", String(b.dataset.w === window));
+          const preset = [...document.querySelectorAll("#winSeg button")].some(
+            (b) => b.dataset.w === window,
+          );
+          $("customDays").value = preset ? "" : window.slice(0, -1);
           $("usageRange").textContent =
             "Loading " +
-            windows[window].toLowerCase() +
+            windowLabel(window).toLowerCase() +
             "…" +
             (cache.usage
-              ? " Previous data: " + windows[cache.usageWindow] + "."
+              ? " Previous data: " + windowLabel(cache.usageWindow) + "."
               : "");
           try {
             const u = await request(
@@ -5284,9 +6288,9 @@ _ADMIN_HTML = r"""
             cache.usageWindow = window;
             delete failures.Usage;
             $("usageErr").classList.add("hidden");
-            renderUsage(u);
+            renderUsage();
             $("usageRange").textContent =
-              windows[window] + " · updated " + stamp();
+              windowLabel(window) + rangeText(u) + " · updated " + stamp();
           } catch (e) {
             if (seq !== usageSeq || gen !== generation) return;
             if (e instanceof AuthError) {
@@ -5298,22 +6302,33 @@ _ADMIN_HTML = r"""
             $("usageErr").classList.remove("hidden");
             $("usageRange").textContent = cache.usage
               ? "Stale data: " +
-                windows[cache.usageWindow] +
+                windowLabel(cache.usageWindow) +
                 ". Retry by choosing a window."
               : "Usage unavailable. Choose a window to retry.";
           } finally {
             if (gen === generation) updateErrors();
           }
         }
-        function renderUsage(u) {
-          const s = u.summary || {};
+        const usageSortValue = {
+          model: (g) => g.model || "",
+          tokens: (g) => (g.input_tokens || 0) + (g.output_tokens || 0),
+        };
+        function renderUsage() {
+          const u = cache.usage;
+          if (!u) return;
+          const s = u.summary || {},
+            groups = u.by_catalog_model || [];
           $("uRequests").textContent = num(s.requests);
           $("uRequestsDetail").textContent =
-            num(s.ok || 0) + " successful / " + num(s.errors || 0) + " errors";
-          $("uTokens").textContent = num(
+            num(s.ok || 0) + " successful · " + plural(s.errors || 0, "error");
+          $("uTokens").textContent = compact(
             (s.input_tokens || 0) + (s.output_tokens || 0),
           );
           $("uTokensDetail").textContent =
+            compact(s.input_tokens || 0) +
+            " in · " +
+            compact(s.output_tokens || 0) +
+            " out · " +
             num(s.usage_reported_requests || 0) +
             "/" +
             num(s.requests || 0) +
@@ -5323,60 +6338,118 @@ _ADMIN_HTML = r"""
             num(s.known_cost_requests || 0) +
             "/" +
             num(s.requests || 0) +
-            " known · " +
-            num(s.partial_pricing_requests || 0) +
-            " partial";
+            " requests with a known cost" +
+            (s.partial_pricing_requests
+              ? " · " + num(s.partial_pricing_requests) + " partial"
+              : "");
           $("uLatency").textContent = duration(s.avg_latency_ms);
           $("uLatencyDetail").textContent = "Recorded request latency";
-          const rows = u.by_route || u.by_model || [];
+          const charted = groups.filter((g) => g.cost_usd > 0 && g.model);
+          const chartSelect = $("chartModel"),
+            selected = chartSelect.value;
+          chartSelect.innerHTML =
+            '<option value="">All models</option>' +
+            charted
+              .map(
+                (g) =>
+                  '<option value="' + esc(g.model) + '">' + esc(g.model) + "</option>",
+              )
+              .join("");
+          chartSelect.value = charted.some((g) => g.model === selected)
+            ? selected
+            : "";
+          const unit = bucketUnit(u.series);
+          $("usageChart").innerHTML = chartMarkup(
+            u.series,
+            chartSelect.value || null,
+            "Known cost per " +
+              unit +
+              (chartSelect.value ? " · " + chartSelect.value : " · all models"),
+          );
+          const q = $("usageFilter").value.trim().toLowerCase(),
+            { key, dir } = usageSort,
+            value = usageSortValue[key] || ((g) => g[key] ?? -1);
+          const rows = groups
+            .filter(
+              (g) =>
+                !q ||
+                [g.model, ...(g.providers || [])]
+                  .join(" ")
+                  .toLowerCase()
+                  .includes(q),
+            )
+            .sort((a, b) => {
+              const x = value(a),
+                y = value(b);
+              return (
+                (typeof x === "string" ? x.localeCompare(y) : x - y) * dir
+              );
+            });
+          for (const th of $("usageByModel").querySelectorAll("th")) {
+            const b = th.querySelector("[data-sort]");
+            if (b?.dataset.sort === key)
+              th.setAttribute("aria-sort", dir < 0 ? "descending" : "ascending");
+            else th.removeAttribute("aria-sort");
+          }
           $("usageByModel").querySelector("tbody").innerHTML =
             rows
               .map(
-                (r) =>
+                (g) =>
                   "<tr><td>" +
-                  modelLink(r.dim) +
-                  '<span class="small">' +
-                  esc(
-                    [r.provider, r.provider_model_id]
-                      .filter(Boolean)
-                      .join(" · ") || "Route not recorded",
-                  ) +
-                  '</span></td><td class="num">' +
-                  num(r.requests) +
-                  '</td><td class="num">' +
-                  num(r.errors || 0) +
-                  '</td><td class="num">' +
-                  cost(r.cost_usd) +
-                  '</td><td class="num">' +
-                  duration(r.avg_latency_ms) +
+                  usageModelCell(g) +
+                  '</td><td class="num" data-label="Requests">' +
+                  num(g.requests) +
+                  '</td><td class="num" data-label="Errors">' +
+                  num(g.errors || 0) +
+                  '</td><td class="num" data-label="Tokens in / out">' +
+                  (g.usage_reported_requests
+                    ? compact(g.input_tokens) + " / " + compact(g.output_tokens)
+                    : '<span class="muted">Not reported</span>') +
+                  '</td><td class="num" data-label="Avg duration">' +
+                  duration(g.avg_latency_ms) +
+                  '</td><td class="num" data-label="Known cost">' +
+                  costCell(g.cost_usd, g.locality === "local") +
+                  (g.unknown_cost_requests
+                    ? '<span class="small">' +
+                      num(g.unknown_cost_requests) +
+                      " unknown</span>"
+                    : "") +
+                  '</td><td data-label="Share of cost">' +
+                  share(g.cost_usd, s.cost_usd) +
                   "</td></tr>",
               )
               .join("") ||
-            '<tr class="empty"><td colspan="5">No requests in this window.</td></tr>';
+            '<tr class="empty"><td colspan="7">' +
+              (groups.length
+                ? "No models match this filter."
+                : "No requests in this window.") +
+              "</td></tr>";
           $("tokenAccounting").querySelector("tbody").innerHTML =
-            rows
+            groups
               .map(
-                (r) =>
+                (g) =>
                   "<tr><td>" +
-                  esc(r.dim) +
+                  esc(text(g.model)) +
                   '</td><td class="num">' +
-                  num(r.input_tokens) +
+                  num(g.input_tokens) +
                   '</td><td class="num">' +
-                  num(r.output_tokens) +
+                  num(g.output_tokens) +
                   '</td><td class="num">' +
-                  num(r.cached_read_tokens) +
+                  num(g.cached_read_tokens) +
                   '</td><td class="num">' +
-                  num(r.usage_reported_requests || 0) +
+                  num(g.reasoning_tokens) +
+                  '</td><td class="num">' +
+                  num(g.usage_reported_requests || 0) +
                   "/" +
-                  num(r.requests) +
+                  num(g.requests) +
                   '</td><td class="num">' +
-                  num(r.complete_pricing_requests || 0) +
+                  num(g.known_cost_requests || 0) +
                   "/" +
-                  num(r.requests) +
+                  num(g.requests) +
                   "</td></tr>",
               )
               .join("") ||
-            '<tr class="empty"><td colspan="6">No accounting data.</td></tr>';
+            '<tr class="empty"><td colspan="7">No accounting data.</td></tr>';
           $("usageByProvider").querySelector("tbody").innerHTML =
             (u.by_provider || [])
               .map(
@@ -5388,7 +6461,7 @@ _ADMIN_HTML = r"""
                   '</td><td class="num">' +
                   num(r.errors || 0) +
                   '</td><td class="num">' +
-                  cost(r.cost_usd) +
+                  costCell(r.cost_usd, localProviders.has(r.dim)) +
                   "</td></tr>",
               )
               .join("") ||
@@ -5478,7 +6551,8 @@ _ADMIN_HTML = r"""
             name,
             "/admin/api/models/" +
               encodeURIComponent(name) +
-              "/stats?window=24h",
+              "/stats?window=" +
+              modelWindow,
             renderModelDetail,
             opts,
           );
@@ -5489,7 +6563,7 @@ _ADMIN_HTML = r"""
             name,
             "/admin/api/providers/" +
               encodeURIComponent(name) +
-              "/stats?window=24h",
+              "/stats?window=7d",
             renderProviderDetail,
             opts,
           );
@@ -5521,24 +6595,91 @@ _ADMIN_HTML = r"""
         }
         function recentTable(rows) {
           return (
-            '<p class="small">Latest 25 recorded requests, independent of the 24-hour usage summary.</p><div class="scroll"><table class="inventory"><thead><tr><th>Request</th><th>Model</th><th>Outcome</th><th>Duration</th></tr></thead><tbody>' +
+            '<p class="small">Latest 25 recorded requests, independent of the usage window.</p><div class="scroll"><table class="inventory"><thead><tr><th>When</th><th>Model</th><th>Outcome</th><th class="num">Duration</th><th class="num">Cost</th></tr></thead><tbody>' +
             ((rows || [])
               .map(
                 (r) =>
                   "<tr><td>" +
-                  button("data-open-request", r.id, when(r)) +
-                  "</td><td>" +
-                  modelLink(r.model) +
-                  "</td><td>" +
+                  whenCell(r) +
+                  '</td><td data-label="Model">' +
+                  requestModel(r) +
+                  '</td><td data-label="Outcome">' +
                   outcomePill(r) +
-                  "</td><td>" +
+                  '</td><td class="num" data-label="Duration">' +
                   duration(r.latency_ms) +
+                  '</td><td class="num" data-label="Cost">' +
+                  costCell(r.cost_usd, localProviders.has(r.provider)) +
                   "</td></tr>",
               )
               .join("") ||
-              '<tr class="empty"><td colspan="4">No requests recorded.</td></tr>') +
+              '<tr class="empty"><td colspan="5">No requests recorded.</td></tr>') +
             "</tbody></table></div>"
           );
+        }
+        const modelWindows = {
+          "24h": "24 hours",
+          "7d": "7 days",
+          "30d": "30 days",
+          "90d": "90 days",
+        };
+        function modelUsageMarkup(data) {
+          const unit = bucketUnit(data.series),
+            last = data.recent?.[0]?.ts;
+          return (
+            '<div class="sec-head" style="margin-top:0"><h3>Usage</h3><div class="segmented" aria-label="Model usage window">' +
+            Object.entries(modelWindows)
+              .map(
+                ([w, label]) =>
+                  '<button type="button" data-model-window="' +
+                  w +
+                  '" aria-pressed="' +
+                  (w === modelWindow) +
+                  '">' +
+                  label +
+                  "</button>",
+              )
+              .join("") +
+            '</div></div><p class="small">' +
+            esc(windowLabel(modelWindow)) +
+            ". Last request: " +
+            esc(last ? ago(last) + " (" + clock(last) + ")" : "Not recorded") +
+            '.</p><div class="strip">' +
+            stats(data.usage || {}) +
+            "</div>" +
+            chartMarkup(data.series, null, "Known cost per " + unit)
+          );
+        }
+        async function loadModelUsage(name, window) {
+          modelWindow = window;
+          const seq = ++modelUsageSeq,
+            detail = detailSeq,
+            gen = generation;
+          for (const b of document.querySelectorAll("[data-model-window]"))
+            b.setAttribute("aria-pressed", String(b.dataset.modelWindow === window));
+          try {
+            const data = await request(
+              "/admin/api/models/" +
+                encodeURIComponent(name) +
+                "/stats?window=" +
+                window,
+            );
+            if (
+              seq !== modelUsageSeq ||
+              detail !== detailSeq ||
+              gen !== generation ||
+              !unlocked ||
+              !$("modelUsage")
+            )
+              return;
+            $("modelUsage").innerHTML = modelUsageMarkup(data);
+            $("modelUsage")
+              .querySelector('[data-model-window="' + window + '"]')
+              ?.focus();
+          } catch (e) {
+            if (seq !== modelUsageSeq || detail !== detailSeq) return;
+            if (e instanceof AuthError) lock(e.message);
+            else toast("Could not load model usage. " + e.message);
+          }
         }
         function renderModelDetail(name, data) {
           if (!data.model) {
@@ -5554,7 +6695,7 @@ _ADMIN_HTML = r"""
           let html =
             detailHeader(name, "Model") +
             '<div class="toolbar">' +
-            modelAvailability(m) +
+            modelStatus(m) +
             button("data-edit-model", name, "Edit model", "btn secondary") +
             "</div>";
           html +=
@@ -5634,9 +6775,9 @@ _ADMIN_HTML = r"""
             kv("Image handling", visionRouting(m)) +
             "</div></section>";
           html +=
-            '<section class="detail-section"><h3>Last 24 hours</h3><div class="strip">' +
-            stats(data.usage || {}) +
-            '</div></section><section class="detail-section"><h3>Recent requests</h3>' +
+            '<section class="detail-section" id="modelUsage">' +
+            modelUsageMarkup(data) +
+            '</section><section class="detail-section"><h3>Recent requests</h3>' +
             recentTable(data.recent) +
             "</section>";
           $("drawerBody").innerHTML = html;
@@ -5710,7 +6851,7 @@ _ADMIN_HTML = r"""
               workspaceMarkup(member) +
               "</section>";
           html +=
-            '<section class="detail-section"><h3>Last 24 hours</h3><div class="strip">' +
+            '<section class="detail-section"><h3>Last 7 days</h3><div class="strip">' +
             stats(data.usage || {}) +
             '</div></section><section class="detail-section"><h3>Recent requests</h3>' +
             recentTable(data.recent) +
@@ -6238,13 +7379,21 @@ _ADMIN_HTML = r"""
           }
           if (b.hasAttribute("data-view-failures")) {
             showTab("activity");
-            showActivity("requests");
             $("requestOutcome").value = "failed";
             renderRequests();
             return;
           }
-          if (b.dataset.activity) {
-            showActivity(b.dataset.activity);
+          if (b.dataset.sort) {
+            usageSort =
+              usageSort.key === b.dataset.sort
+                ? { key: b.dataset.sort, dir: -usageSort.dir }
+                : { key: b.dataset.sort, dir: b.dataset.sort === "model" ? 1 : -1 };
+            renderUsage();
+            return;
+          }
+          if (b.dataset.modelWindow) {
+            if (detailKind === "model")
+              loadModelUsage(detailName, b.dataset.modelWindow);
             return;
           }
           if (b.hasAttribute("data-close-detail")) {
@@ -6357,6 +7506,22 @@ _ADMIN_HTML = r"""
           ["modelLocality", "change", renderModels],
           ["modelProviderFilter", "change", renderModels],
           ["modelCapability", "change", renderModels],
+          ["modelUsed", "change", renderModels],
+          ["modelSort", "change", renderModels],
+          ["usageFilter", "input", renderUsage],
+          ["chartModel", "change", renderUsage],
+          [
+            "requestLimit",
+            "change",
+            () =>
+              loadResource(
+                "requests",
+                "/admin/api/requests?limit=" + $("requestLimit").value,
+                "Requests",
+                "requestsStatus",
+                generation,
+              ),
+          ],
           ["providerFilter", "input", renderProviders],
           ["requestFilter", "input", renderRequests],
           ["requestOutcome", "change", renderRequests],
@@ -6453,6 +7618,12 @@ _ADMIN_HTML = r"""
         });
         for (const b of document.querySelectorAll("#winSeg button"))
           b.addEventListener("click", () => loadUsage(b.dataset.w));
+        $("customWindow").addEventListener("submit", (e) => {
+          e.preventDefault();
+          const days = Number($("customDays").value);
+          if (Number.isInteger(days) && days >= 1 && days <= 3650)
+            loadUsage(days + "d");
+        });
         window.addEventListener("pagehide", clearNewKey);
         window.addEventListener("popstate", applyHash);
         window.addEventListener("hashchange", applyHash);

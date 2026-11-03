@@ -6,16 +6,30 @@ external runtime assets, or framework dependency.
 
 ## Implemented structure
 
-- **Overview**: actionable configuration/routing issues, first-connection guidance,
-  inventory links, fixed 24-hour usage summary, and the latest five requests.
-- **Models**: search and location/connection/capability filters; model details with
-  client IDs, copyable request examples, pricing/capabilities, configured routing,
-  image handling, and recent activity. Gateway-owned presets are a disclosure here.
-- **Connections**: provider/local-runtime inventory, safe edit/discovery flows, and
-  contextual routing groups (workspace pools). Workspace diagnostics are separate
-  from the preference order; each workspace appears once in the group inventory.
-- **Activity**: latest-50 request search/outcome filters and a separate time-windowed
-  usage/cost view. Token accounting is progressively disclosed.
+- **Overview**: **Running now** (requests the gateway is serving, oMLX models in
+  memory with size and last use, the media-gen model and queue; refreshed every
+  5 seconds while Overview or Models is open), actionable configuration/routing
+  issues, first-connection guidance, inventory links, a 7-day summary with a
+  daily cost chart and top models by cost, and the latest five requests.
+- **Models**: search and location/connection/capability/30-day-use filters, and
+  sorting by recent use, requests, or cost. Each row shows live status (in
+  memory, loading, not loaded, configured), last use, and 30-day requests and
+  cost. Model details add client IDs, copyable request examples,
+  pricing/capabilities, configured routing, image handling, and usage with a
+  24-hour/7/30/90-day window and cost chart. Gateway-owned presets are a
+  disclosure here.
+- **Usage**: cost and requests for 24 hours, 7/30/90 days, any number of days,
+  or all time; a per-day (hourly for two days or less) cost chart for all models
+  or one model; a sortable, filterable per-model table with share of cost; token
+  accounting; and per-connection totals. Rows group every alias and upstream ID
+  under its catalog model.
+- **Requests**: the latest 50, 200, or 500 requests with search and outcome
+  filters, relative times, tokens, duration, and cost (local runtimes show
+  "Local").
+- **Connections**: provider/local-runtime inventory with 7-day requests,
+  failures, last request, and cost; safe edit/discovery flows; and contextual
+  routing groups (workspace pools). Workspace diagnostics are separate from the
+  preference order; each workspace appears once in the group inventory.
 - **Consumers**: consumer credentials (role, namespaces, key-file status) with
   add, rotate, and revoke in write mode, and read-only profile namespaces with
   the latest snapshot and version history.
@@ -24,9 +38,20 @@ external runtime assets, or framework dependency.
   protocol diagnostics.
 
 Legacy links remain supported: `#providers[/name]`, `#pools`, `#presets`,
-`#usage[/request-id]`, and `#debug`. New primary links are `#overview`,
-`#models[/name]`, `#connections[/name]`, `#activity[/request-id]`, and
-`#consumers`.
+`#usage/<request-id>`, and `#debug`. Primary links are `#overview`,
+`#models[/name]`, `#usage`, `#activity[/request-id]` (Requests),
+`#connections[/name]`, and `#consumers`.
+
+### Admin APIs behind the dashboard
+
+- `GET /admin/api/runtime`: requests in progress (process-local, from the ledger
+  middleware), oMLX `/v1/models/status`, and media-gen `/health`, each runtime
+  asked with a 3-second timeout. An unreachable runtime is reported, not shown as
+  idle. Runtimes with no catalog models are not asked.
+- `GET /admin/api/usage?window=<N>h|<N>d`: adds `by_catalog_model` and `series`
+  (gap-filled buckets in the gateway's local time, with `cost_by_model`) to the
+  existing aggregates.
+- `GET /admin/api/models/<name>/stats?window=...`: adds the model's `series`.
 
 ## Safety and evidence boundaries
 
@@ -51,8 +76,11 @@ Legacy links remain supported: `#providers[/name]`, `#pools`, `#presets`,
 - Requests contain the recorded route, not a guaranteed final failover workspace or
   full attempt chain. Missing evidence is labelled **Not recorded**. Duration is the
   recorded request latency, not TTFT or guaranteed stream-completion time.
-- Request filters operate on the latest 50 records across all time. Detail histories
-  are the latest 25, independent of their fixed 24-hour usage summaries.
+- Request filters operate on the latest 50, 200, or 500 records across all time.
+  Detail histories are the latest 25, independent of their usage windows.
+- "Running now" lists requests this gateway process is serving; requests sent to
+  oMLX or media-gen directly are not included. oMLX memory figures are its own
+  resident estimates.
 - Known cost is a subtotal; accounting completeness and unknown/partial costs are
   shown separately. No admin or client credentials are embedded in copyable examples.
 - Consumer key values are never listed. A key generated by add or rotate is returned

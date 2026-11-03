@@ -22,10 +22,10 @@ def elements():
     return parser.elements
 
 
-def test_ui_has_five_primary_destinations_and_secondary_settings():
+def test_ui_has_six_primary_destinations_and_secondary_settings():
     tabs = [attrs for _, attrs in elements() if "data-tab" in attrs]
     assert [attrs["data-tab"] for attrs in tabs] == [
-        "overview", "models", "connections", "activity", "consumers", "settings",
+        "overview", "models", "usage", "activity", "connections", "consumers", "settings",
     ]
     assert tabs[0]["aria-selected"] == "true"
     assert "settings-nav" in tabs[-1]["class"]
@@ -62,6 +62,17 @@ def test_ui_has_honest_routing_and_bounded_activity_copy():
     assert 'id="modelFormset"' in _ADMIN_HTML
     assert 'id="providerFormset"' in _ADMIN_HTML
 
+
+
+def test_ui_answers_what_is_running_and_what_it_cost():
+    indexed = {attrs["id"]: attrs for _, attrs in elements() if "id" in attrs}
+    for id_ in ("inFlight", "loadedModels", "overviewTop", "usageChart", "usageByModel", "customDays"):
+        assert id_ in indexed
+    assert '"/admin/api/runtime"' in _ADMIN_HTML
+    assert "/admin/api/usage?window=30d" in _ADMIN_HTML
+    # Polling stops when the dashboard locks.
+    lock_body = _ADMIN_HTML.split("function lock(")[1].split("async function unlock(")[0]
+    assert "clearTimeout(runtimeTimer);" in lock_body
 
 
 def test_model_drawer_describes_image_notes_for_text_only_models():
