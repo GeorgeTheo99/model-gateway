@@ -38,7 +38,9 @@ translation between them.
 - **Reliability** — per-provider retries, circuit breakers, provider pools,
   and model-level fallback routes. Pools try a backup on the first transient
   failure, reserving normal retries for the last healthy workspace before
-  last-resort circuit-recovery probes.
+  last-resort circuit-recovery probes. A local model that oMLX can't load
+  until another model's requests finish waits its turn (up to 45 minutes,
+  `MODEL_GATEWAY_LOCAL_MEMORY_WAIT_SECONDS`) instead of failing.
 - **Admin dashboard** — what is running now (requests in progress, models in
   local memory), usage and cost per model over any number of days, health,
   provider/model inventory, Databricks workspace pool routing, and gated write

@@ -316,3 +316,121 @@ def test_profile_request_keeps_same_route_retries_but_disables_model_fallback(
         assert calls == ["model-a", "model-a"]
     finally:
         providers.reload()
+
+
+# ── oMLX 507: wait while another model holds the memory ─────────────────────
+
+_CANNOT_LOAD = {"error": {"message": "Cannot load glm: projected memory 514GB would exceed the memory ceiling 498GB.",
+                          "type": "server_error"}}
+_TOO_LARGE = {"error": {"message": "Model 'huge' (900GB) does not fit under the memory ceiling (498GB).",
+                        "type": "server_error"}}
+
+
+@pytest.fixture
+def fast_memory_wait(monkeypatch):
+    monkeypatch.setattr(upstream, "_LOCAL_MEMORY_POLL_SECONDS", 0.0)
+
+
+def test_omlx_waits_for_memory_then_answers(fast_retries, fast_memory_wait, clean_circuit):
+    clean_circuit("omlx")
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(507, json=_CANNOT_LOAD) if len(calls) <= 5 else httpx.Response(200, json={"ok": True})
+
+    async def run():
+        async with _client(handler) as client:
+            return await upstream._retry_post(
+                client, "http://localhost:9110/v1/chat/completions", json={"model": "glm"}, headers={}, provider="omlx",
+            )
+
+    resp = asyncio.run(run())
+    # The wait doesn't spend the request's retries.
+    assert resp.status_code == 200
+    assert len(calls) == 6
+
+
+def test_omlx_model_too_large_and_other_providers_fail_at_once(fast_retries, fast_memory_wait, clean_circuit):
+    clean_circuit("omlx")
+    clean_circuit("cloud")
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(507, json=_TOO_LARGE if request.url.host == "localhost" else _CANNOT_LOAD)
+
+    async def run(endpoint: str, provider: str):
+        async with _client(handler) as client:
+            return await upstream._retry_post(client, endpoint, json={"model": "m"}, headers={}, provider=provider)
+
+    assert asyncio.run(run("http://localhost:9110/v1/chat/completions", "omlx")).status_code == 507
+    assert asyncio.run(run("https://up.example.com/v1/chat/completions", "cloud")).status_code == 507
+    assert len(calls) == 2
+
+
+def test_omlx_memory_wait_gives_up_after_its_limit(fast_retries, fast_memory_wait, clean_circuit, monkeypatch):
+    clean_circuit("omlx")
+    monkeypatch.setattr(upstream, "_LOCAL_MEMORY_WAIT_SECONDS", 0.0)
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(507, json=_CANNOT_LOAD)
+
+    async def run():
+        async with _client(handler) as client:
+            return await upstream._retry_post(
+                client, "http://localhost:9110/v1/chat/completions", json={"model": "glm"}, headers={}, provider="omlx",
+            )
+
+    resp = asyncio.run(run())
+    assert resp.status_code == 507
+    assert "Cannot load" in resp.text
+    assert len(calls) == 1
+
+
+def test_omlx_memory_wait_streams_once_memory_frees(fast_retries, fast_memory_wait, clean_circuit):
+    clean_circuit("omlx")
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(507, json=_CANNOT_LOAD)
+        return httpx.Response(200, stream=_SSEStream([b"data: one\n\n", b"data: [DONE]\n\n"]))
+
+    async def run():
+        async with _client(handler) as client:
+            resp = await upstream._retry_send_stream(
+                client, "http://localhost:9110/v1/chat/completions", json={"model": "glm"}, headers={}, provider="omlx",
+            )
+            try:
+                return resp.status_code, b"".join([chunk async for chunk in resp.aiter_bytes()])
+            finally:
+                await resp.aclose()
+
+    status, body = asyncio.run(run())
+    assert status == 200
+    assert body == b"data: one\n\ndata: [DONE]\n\n"
+    assert len(calls) == 2
+
+
+def test_omlx_memory_wait_stops_when_the_client_leaves(fast_retries, fast_memory_wait, clean_circuit):
+    clean_circuit("omlx")
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(507, json=_CANNOT_LOAD)
+
+    async def run():
+        async with _client(handler) as client:
+            await upstream._retry_send_stream(
+                client, "http://localhost:9110/v1/chat/completions", json={"model": "glm"}, headers={}, provider="omlx",
+                request=_DisconnectedRequest(disconnected_after=3),
+            )
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(run())
+    assert len(calls) < 5

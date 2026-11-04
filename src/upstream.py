@@ -12,6 +12,7 @@ The original retry loop was generalized to add:
 import asyncio
 import email.utils
 import logging
+import os
 import random
 import time
 from dataclasses import dataclass
@@ -42,6 +43,43 @@ _RETRY_429_ATTEMPTS = 6  # rate limits get more patience
 _RETRY_TRANSPORT_ATTEMPTS = 4
 _RETRY_TRANSPORT_MAX_DELAY = 15.0  # seconds
 _POOL_CONNECT_TIMEOUT = 5.0  # try a backup promptly if a workspace cannot connect
+# oMLX answers 507 when a model can't load until another model's requests finish ("Cannot load …": a model that
+# is answering can't be unloaded), or when memory pressure unloaded the model before the request ran. Both clear
+# on their own, so the request waits its turn, as it would behind requests to its own model. A model too large
+# for the machine ("does not fit under …") still fails at once.
+_LOCAL_MEMORY_WAIT_SECONDS = float(os.environ.get("MODEL_GATEWAY_LOCAL_MEMORY_WAIT_SECONDS", "2700"))
+_LOCAL_MEMORY_POLL_SECONDS = 15.0
+_LOCAL_MEMORY_WAIT_MARKERS = ("Cannot load ", "after memory pressure drops")
+
+
+class _LocalMemoryWait:
+    """One request's wait for oMLX memory, across its attempts."""
+
+    def __init__(self, model: object) -> None:
+        self.model = model
+        self.started: float | None = None
+
+    async def again(self, provider: str, resp: httpx.Response, request: Request | None) -> bool:
+        """After oMLX refused for memory that frees up on its own: wait a little and say to resend (the response
+        is read). False for any other response, or once the wait has run out."""
+        if provider != "omlx" or resp.status_code != 507:
+            return False
+        await resp.aread()
+        if not any(marker in resp.text for marker in _LOCAL_MEMORY_WAIT_MARKERS):
+            return False
+        now = time.monotonic()
+        if self.started is None:
+            self.started = now
+            log.warning(
+                "oMLX can't take %s until memory frees up (another model is busy); waiting up to %.0f min",
+                self.model, _LOCAL_MEMORY_WAIT_SECONDS / 60,
+            )
+        remaining = self.started + _LOCAL_MEMORY_WAIT_SECONDS - now
+        if remaining <= 0:
+            log.warning("oMLX still can't take %s after %.0f min; giving up", self.model, _LOCAL_MEMORY_WAIT_SECONDS / 60)
+            return False
+        await _sleep_or_disconnect(min(_LOCAL_MEMORY_POLL_SECONDS, remaining), request)
+        return True
 
 
 async def _raise_if_disconnected(request: Request | None) -> None:
@@ -202,6 +240,7 @@ async def _retry_post(
         max_attempts = 1 if fast_failover else _RETRY_MAX
         attempt = 0
         auth_retried = False
+        memory_wait = _LocalMemoryWait(json.get("model") if isinstance(json, dict) else None)
         headers = await _preflight_oauth_token(provider, headers, request, fast_failover=fast_failover)
         while attempt < max_attempts:
             await _raise_if_disconnected(request)
@@ -256,6 +295,8 @@ async def _retry_post(
                         probe_request = False
                     else:
                         record_success(circuit)
+                if await memory_wait.again(provider, resp, request):
+                    continue
                 return resp
 
             if not fast_failover:
@@ -325,6 +366,7 @@ async def _retry_send_stream(
         max_attempts = 1 if fast_failover else _RETRY_MAX
         attempt = 0
         auth_retried = False
+        memory_wait = _LocalMemoryWait(json.get("model") if isinstance(json, dict) else None)
         headers = await _preflight_oauth_token(provider, headers, request, fast_failover=fast_failover)
         while attempt < max_attempts:
             await _raise_if_disconnected(request)
@@ -395,6 +437,14 @@ async def _retry_send_stream(
                         probe_request = False
                     else:
                         record_success(circuit)
+                try:
+                    waiting = await memory_wait.again(provider, resp, request)
+                except BaseException:
+                    await resp.aclose()
+                    raise
+                if waiting:
+                    await resp.aclose()
+                    continue
                 return resp
 
             if not fast_failover:
