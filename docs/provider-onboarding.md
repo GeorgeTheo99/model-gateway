@@ -555,6 +555,10 @@ Supported reusable request quirks are:
 - `openrouter_zdr` — send OpenRouter's `provider: {zdr: true}` routing
   preference so only zero-data-retention endpoints serve the model; requires
   `zdr: true`
+- `openrouter_fireworks_only` — send OpenRouter's
+  `provider: {only: [fireworks], allow_fallbacks: false}` routing preference
+  so only Fireworks serves the model (for example `glm-5.3-flash-or`, which
+  then behaves like `glm-5.3-flash-fw`)
 
 Two optional model fields are for consumers to show:
 

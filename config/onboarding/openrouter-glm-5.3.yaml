@@ -1,0 +1,40 @@
+schema_version: 1
+id: openrouter-glm-5.3
+# Part of the curated list: installs with this provider's key get these models automatically.
+auto_add: true
+
+provider:
+  id: openrouter
+  base_url: https://openrouter.ai/api/v1
+  protocol: openai
+  display_name: OpenRouter
+  secret_name: openrouter.api-key
+
+# The same model as glm-5.3-flash-fw, for owners with an OpenRouter key: only
+# Fireworks' zero-data-retention endpoints serve it (openrouter_zdr plus
+# openrouter_fireworks_only), so behavior matches the direct route. List prices
+# as of 2026-11-04; the key check runs a completion on this model.
+models:
+  - name: glm-5.3-flash-or
+    params: 320B
+    active: 18B
+    provider: openrouter
+    provider_model_id: z-ai/glm-5.3-flash
+    display_name: GLM 5.3 Flash (OpenRouter)
+    family: glm
+    base_model: glm-5.3-flash
+    context: 1048576
+    max_output_tokens: 131072
+    thinking: always
+    thinking_levels: [low, medium, high, xhigh]
+    thinking_format: openrouter
+    vision: true
+    pricing:
+      input: 0.15
+      output: 0.5
+      cache_read: 0.03
+    quirks:
+      - openrouter_zdr
+      - openrouter_fireworks_only
+    zdr: true
+    desc: GLM 5.3 Flash 320B/18B-active multimodal model via OpenRouter, served only by Fireworks, 1M context / 128K max output

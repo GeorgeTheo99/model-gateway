@@ -336,7 +336,7 @@ def validate_upstream_completion(profile: dict, api_key: str) -> None:
     restricted account), so a key that will replace a working one must answer.
     The probe applies the model's request quirks that live routing would.
     """
-    from src.request_options import normalize_token_limit, upstream_auth_headers
+    from src.request_options import apply_openrouter_routing, normalize_token_limit, upstream_auth_headers
 
     provider = profile["provider"]
     anthropic = provider.get("protocol", "openai") == "anthropic"
@@ -352,8 +352,7 @@ def validate_upstream_completion(profile: dict, api_key: str) -> None:
         # As live routing does: Kimi's format sends its max default.
         if "force_reasoning_effort_max" in quirks or model.get("thinking_format") == "kimi":
             body["reasoning_effort"] = "max"
-        if "openrouter_zdr" in quirks:
-            body["provider"] = {"zdr": True}
+        apply_openrouter_routing(body, quirks)
         normalize_token_limit(body, quirks)
         # As live routing does: OpenAI's current models reject max_tokens.
         if canonical_provider(provider["id"]) == "openai" and "max_tokens" in body:

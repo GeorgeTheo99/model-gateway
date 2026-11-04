@@ -1125,3 +1125,10 @@ def test_openrouter_zdr_restricts_routing_and_keeps_other_preferences():
     req = {"messages": [], "provider": {"sort": "price", "zdr": False}}
     assert _apply_openai_request_quirks(req, info) is None
     assert req["provider"] == {"sort": "price", "zdr": True}
+
+
+def test_openrouter_fireworks_only_pins_the_host_without_fallbacks():
+    info = SimpleNamespace(quirks=frozenset({"openrouter_zdr", "openrouter_fireworks_only"}))
+    req = {"messages": [], "provider": {"sort": "price", "only": ["novita"], "allow_fallbacks": True}}
+    assert _apply_openai_request_quirks(req, info) is None
+    assert req["provider"] == {"sort": "price", "only": ["fireworks"], "allow_fallbacks": False, "zdr": True}

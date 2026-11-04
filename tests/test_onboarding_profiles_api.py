@@ -129,7 +129,7 @@ def test_lists_packaged_profiles_filtered_by_allowlist(client):
     assert set(_rows(client, ADMIN)) == {
         "anthropic-claude", "fireworks-glm-5.3", "fireworks-kimi-k3", "moonshot-kimi-k3-rollback",
         "moonshot-kimi-k3.1-pro",
-        "openai-gpt", "openrouter-claude", "openrouter-gemini-4", "openrouter-gpt",
+        "openai-gpt", "openrouter-claude", "openrouter-gemini-4", "openrouter-glm-5.3", "openrouter-gpt",
     }
     rows = _rows(client)
     assert set(rows) == {"fireworks-glm-5.3", "fireworks-kimi-k3"}
@@ -413,6 +413,19 @@ def test_the_completion_check_routes_zdr_profiles_to_zdr_endpoints(monkeypatch):
     assert bodies[0]["model"] == "google/gemini-4-argon" and bodies[0]["provider"] == {"zdr": True}
 
 
+def test_the_completion_check_routes_openrouter_glm_only_to_fireworks(monkeypatch):
+    bodies = []
+
+    def post(url, *, json, headers, timeout):
+        bodies.append(json)
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "OK"}}]})
+
+    monkeypatch.setattr(onboarding.httpx, "post", post)
+    onboarding.validate_upstream_completion(onboarding.packaged_profiles()["openrouter-glm-5.3"], "candidate")
+    assert bodies[0]["model"] == "z-ai/glm-5.3-flash"
+    assert bodies[0]["provider"] == {"zdr": True, "only": ["fireworks"], "allow_fallbacks": False}
+
+
 def _anthropic_profile():
     return onboarding.validate_profile({
         "schema_version": 1,
@@ -490,6 +503,7 @@ def test_packaged_routes_to_one_model_agree_on_its_family():
     assert routes["claude-opus-5.5"] == {"anthropic", "openrouter"}
     assert routes["gpt-6-astra"] == {"openai", "openrouter"}
     assert routes["claude-fable-5.1"] == {"anthropic"}
+    assert routes["glm-5.3-flash"] == {"fireworks", "openrouter"}
 
 
 def test_profiles_reject_an_unknown_protocol():

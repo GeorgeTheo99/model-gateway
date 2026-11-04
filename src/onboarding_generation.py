@@ -52,6 +52,7 @@ ALLOWED_QUIRKS = {
     "gemini_tool_schema",
     "gemini_thought_signatures",
     "openrouter_zdr",
+    "openrouter_fireworks_only",
 }
 ALLOWED_PRICING_FIELDS = {
     "input", "output", "cache_read", "cache_write", "cache_write_1h", "reasoning",

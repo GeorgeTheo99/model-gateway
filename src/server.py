@@ -38,7 +38,7 @@ from src.upstream import (
     _retry_send_stream_with_model_fallback,
 )
 from src.reasoning import reasoning_alias_text
-from src.request_options import upstream_auth_headers, normalize_token_limit
+from src.request_options import apply_openrouter_routing, normalize_token_limit, upstream_auth_headers
 from src.responses import chat_to_responses, responses_result_events, responses_to_chat, translate_responses_stream
 from src.signature_cache import store_from_extra_content
 from src.streaming import _flatten_list_content, translate_stream
@@ -689,10 +689,7 @@ def _apply_openai_request_quirks(req: dict, info) -> str | None:
 
     normalize_token_limit(req, quirks)
 
-    if "openrouter_zdr" in quirks:
-        # OpenRouter provider routing: only zero-data-retention endpoints may serve this model.
-        routing = req.get("provider")
-        req["provider"] = {**routing, "zdr": True} if isinstance(routing, dict) else {"zdr": True}
+    apply_openrouter_routing(req, quirks)
 
     if "drop_fixed_sampling_fields" in quirks:
         for key in ("temperature", "top_p", "n", "presence_penalty", "frequency_penalty"):

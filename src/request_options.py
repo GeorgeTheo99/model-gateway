@@ -26,3 +26,17 @@ def normalize_token_limit(request: dict, quirks) -> None:
         request.pop(key, None)
     if value is not None:
         request["max_completion_tokens"] = value
+
+
+def apply_openrouter_routing(request: dict, quirks) -> None:
+    """OpenRouter provider routing the model's quirks require, keeping the caller's other preferences."""
+    routing = {}
+    if "openrouter_zdr" in quirks:
+        # Only zero-data-retention endpoints may serve the model.
+        routing["zdr"] = True
+    if "openrouter_fireworks_only" in quirks:
+        # Only Fireworks may serve the model, never another host.
+        routing.update(only=["fireworks"], allow_fallbacks=False)
+    if routing:
+        current = request.get("provider")
+        request["provider"] = {**(current if isinstance(current, dict) else {}), **routing}
