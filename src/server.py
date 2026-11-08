@@ -3353,6 +3353,12 @@ async def _handle_chat_anthropic(body: dict, info, model: str, request: Request,
     _inject_anthropic_system_instruction(anthropic_req, info.system_instruction)
     thinking_enabled = _apply_gateway_reasoning(anthropic_req, info, target_api="messages", request=request)
     _normalize_anthropic_adaptive_thinking(anthropic_req, info)
+    # Anthropic's automatic prompt caching: the breakpoint follows the conversation, so each step
+    # of a multi-step agent reply reads the shared prefix (tools, system, earlier turns) from cache.
+    # Only Anthropic's own API: other hosts of the Messages protocol may not accept it. The
+    # translator drops client cache markers, so this cannot conflict with them.
+    if info.provider == "anthropic":
+        anthropic_req.setdefault("cache_control", {"type": "ephemeral"})
     request.state.api_key = info.api_key
     headers = _forward_headers(request, protocol="anthropic", provider=info.provider)
     endpoint = _upstream_endpoint(info, "/messages")

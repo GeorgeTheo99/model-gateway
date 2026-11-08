@@ -11,6 +11,7 @@ import asyncio
 import base64
 import copy
 import io
+import json
 import logging
 from pathlib import Path
 from types import SimpleNamespace
@@ -1689,3 +1690,28 @@ def test_debug_thinking_zai_max_reachable(client, monkeypatch):
     assert zai["max_reachable"] is True
 
 
+
+
+@pytest.mark.parametrize("provider, cached", [("anthropic", True), ("databricks", False)])
+def test_anthropic_chat_turns_on_automatic_prompt_caching_only_on_anthropics_api(monkeypatch, provider, cached):
+    info = _info("anthropic", provider=provider, provider_model_id="claude-opus-5-5", max_output_tokens=128000)
+    captured = {}
+
+    async def fake_stream(endpoint, body, model, headers, **kwargs):
+        captured.update(body)
+        return server_module.JSONResponse(status_code=200, content={"ok": True})
+
+    monkeypatch.setattr(server_module, "_chat_anthropic_stream", fake_stream)
+    monkeypatch.setattr(server_module, "_forward_headers", lambda *args, **kwargs: {})
+    body = {
+        "model": "claude-opus-5-5",
+        # A client marker in OpenAI content parts is dropped by the translator, never doubled.
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "ping", "cache_control": {"type": "ephemeral", "ttl": "1h"}}]}],
+        "stream": True,
+    }
+    request = SimpleNamespace(state=SimpleNamespace())
+
+    asyncio.run(server_module._handle_chat_anthropic(body, info, "claude-opus-5.5", request, True))
+
+    assert captured.get("cache_control") == ({"type": "ephemeral"} if cached else None)
+    assert "cache_control" not in json.dumps(captured["messages"])
