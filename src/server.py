@@ -3345,6 +3345,56 @@ def _default_anthropic_max_tokens(anthropic_req: dict, client_body: dict, info) 
         anthropic_req["max_tokens"] = int(info.max_output_tokens)
 
 
+def _is_anthropic_user_turn(message: dict) -> bool:
+    """A user message the client wrote, not one that only carries tool results back."""
+    if message.get("role") != "user":
+        return False
+    content = message.get("content")
+    if isinstance(content, list):
+        return any(isinstance(block, dict) and block.get("type") != "tool_result" for block in content)
+    return bool(content)
+
+
+def _mark_last_anthropic_block(message: dict, marker: dict) -> None:
+    content = message.get("content")
+    if isinstance(content, str):
+        if content:
+            message["content"] = [{"type": "text", "text": content, "cache_control": dict(marker)}]
+        return
+    # Thinking blocks and empty text can't carry a marker.
+    for block in reversed(content if isinstance(content, list) else []):
+        if not isinstance(block, dict) or block.get("type") in {"thinking", "redacted_thinking"}:
+            continue
+        if block.get("type") == "text" and not block.get("text"):
+            continue
+        block["cache_control"] = dict(marker)
+        return
+
+
+def _mark_anthropic_prompt_cache(req: dict, retention: object) -> None:
+    """Place Anthropic cache breakpoints for an OpenAI chat client, which has no way to.
+
+    Automatic caching (the top-level marker) writes only at the last block, so whatever changes
+    in the newest user message (the time, retrieved context, an inlined attachment) would cost a
+    rewrite of the whole prompt every turn. Explicit breakpoints at the end of the tools, the
+    system prompt and the previous turn give each stretch that stays the same its own entry; with
+    the automatic one that is the API's limit of four. The translator drops client markers, so
+    none are doubled. OpenAI's longest retention ("24h") asks for Anthropic's longest TTL, 1h.
+    """
+    marker = {"type": "ephemeral", "ttl": "1h"} if retention == "24h" else {"type": "ephemeral"}
+    tools = req.get("tools")
+    if tools:
+        tools[-1]["cache_control"] = dict(marker)
+    system = req.get("system")
+    if isinstance(system, str) and system:
+        req["system"] = [{"type": "text", "text": system, "cache_control": dict(marker)}]
+    messages = req.get("messages") or []
+    latest_turn = next((i for i in range(len(messages) - 1, -1, -1) if _is_anthropic_user_turn(messages[i])), 0)
+    if latest_turn > 0:
+        _mark_last_anthropic_block(messages[latest_turn - 1], marker)
+    req["cache_control"] = dict(marker)
+
+
 async def _handle_chat_anthropic(body: dict, info, model: str, request: Request, is_stream: bool):
     """Serve OpenAI Chat Completions clients against native Anthropic models."""
     anthropic_req = openai_chat_to_anthropic(body)
@@ -3353,12 +3403,9 @@ async def _handle_chat_anthropic(body: dict, info, model: str, request: Request,
     _inject_anthropic_system_instruction(anthropic_req, info.system_instruction)
     thinking_enabled = _apply_gateway_reasoning(anthropic_req, info, target_api="messages", request=request)
     _normalize_anthropic_adaptive_thinking(anthropic_req, info)
-    # Anthropic's automatic prompt caching: the breakpoint follows the conversation, so each step
-    # of a multi-step agent reply reads the shared prefix (tools, system, earlier turns) from cache.
-    # Only Anthropic's own API: other hosts of the Messages protocol may not accept it. The
-    # translator drops client cache markers, so this cannot conflict with them.
+    # Only Anthropic's own API: other hosts of the Messages protocol may not accept the markers.
     if info.provider == "anthropic":
-        anthropic_req.setdefault("cache_control", {"type": "ephemeral"})
+        _mark_anthropic_prompt_cache(anthropic_req, body.get("prompt_cache_retention"))
     request.state.api_key = info.api_key
     headers = _forward_headers(request, protocol="anthropic", provider=info.provider)
     endpoint = _upstream_endpoint(info, "/messages")

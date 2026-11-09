@@ -30,6 +30,7 @@ models:
       output: 0.5
       cache_read: 0.01
       cache_write: 0.125
+      cache_write_1h: 0.2
     desc: Claude Haiku 5.5 on the Anthropic API, 1M context / 128K max output
 
   - name: claude-sonnet-5.5
@@ -49,6 +50,7 @@ models:
       output: 10.0
       cache_read: 0.1
       cache_write: 2.5
+      cache_write_1h: 4.0
     desc: Claude Sonnet 5.5 on the Anthropic API, 1M context / 128K max output
 
   - name: claude-opus-5.5
@@ -67,6 +69,7 @@ models:
       output: 20.0
       cache_read: 0.2
       cache_write: 5.0
+      cache_write_1h: 8.0
     desc: Claude Opus 5.5 on the Anthropic API, 1M context / 128K max output
 
   - name: claude-fable-5.1
@@ -85,4 +88,5 @@ models:
       output: 50.0
       cache_read: 0.25
       cache_write: 12.5
+      cache_write_1h: 20.0
     desc: Claude Fable 5.1 on the Anthropic API, 1M context / 128K max output

@@ -1715,3 +1715,53 @@ def test_anthropic_chat_turns_on_automatic_prompt_caching_only_on_anthropics_api
 
     assert captured.get("cache_control") == ({"type": "ephemeral"} if cached else None)
     assert "cache_control" not in json.dumps(captured["messages"])
+
+
+@pytest.mark.parametrize("retention, marker", [
+    (None, {"type": "ephemeral"}),
+    ("24h", {"type": "ephemeral", "ttl": "1h"}),
+])
+def test_anthropic_chat_caches_tools_system_and_the_previous_turn_apart_from_the_newest_message(
+    monkeypatch, retention, marker,
+):
+    info = _info("anthropic", provider="anthropic", provider_model_id="claude-opus-5-5", max_output_tokens=128000)
+    captured = {}
+
+    async def fake_stream(endpoint, body, model, headers, **kwargs):
+        captured.update(body)
+        return server_module.JSONResponse(status_code=200, content={"ok": True})
+
+    monkeypatch.setattr(server_module, "_chat_anthropic_stream", fake_stream)
+    monkeypatch.setattr(server_module, "_forward_headers", lambda *args, **kwargs: {})
+    def tool(name):
+        return {"type": "function", "function": {"name": name, "parameters": {"type": "object"}}}
+
+    body = {
+        "model": "claude-opus-5-5",
+        "messages": [
+            {"role": "system", "content": "Stable instructions."},
+            {"role": "user", "content": "First question"},
+            {"role": "assistant", "content": "First answer"},
+            # The newest question carries what changes every turn (here the time).
+            {"role": "user", "content": "Second question\n\n<turn-context>21:39</turn-context>"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+        ],
+        "tools": [tool("search"), tool("lookup")],
+        "stream": True,
+    }
+    if retention:
+        body["prompt_cache_retention"] = retention
+    request = SimpleNamespace(state=SimpleNamespace())
+
+    asyncio.run(server_module._handle_chat_anthropic(body, info, "claude-opus-5.5", request, True))
+
+    assert captured["cache_control"] == marker
+    assert [tool.get("cache_control") for tool in captured["tools"]] == [None, marker]
+    assert captured["system"] == [{"type": "text", "text": "Stable instructions.", "cache_control": marker}]
+    messages = captured["messages"]
+    # The previous turn's answer ends the stretch the next turn shares; the newest question is outside it.
+    assert messages[1]["content"] == [{"type": "text", "text": "First answer", "cache_control": marker}]
+    assert "cache_control" not in json.dumps([messages[0], *messages[2:]])
