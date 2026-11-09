@@ -786,6 +786,55 @@ def test_refresh_oauth_token_runs_browser_sso_when_cli_cache_is_broken(tmp_confi
     assert "api_key: eyJnew" in text
 
 
+def test_refresh_oauth_token_kills_browser_sso_on_timeout(tmp_config, monkeypatch):
+    """A login nobody completes must not keep its OAuth callback port (8020-8024)."""
+    _write_config(tmp_config, """providers:
+  ws:
+    base_url: https://workspace.example.com/serving-endpoints
+    api_key: eyJold
+    auth_refresh: databricks-cli
+    auth_profile: ws-profile
+""")
+    providers._last_token_refresh_attempt.clear()
+    providers._last_auth_login_attempt.clear()
+    monkeypatch.setattr(providers, "_databricks_cli", lambda: "databricks")
+    monkeypatch.setattr(providers, "_AUTH_LOGIN_TIMEOUT", 0.05)
+    killed = []
+
+    class Proc:
+        def __init__(self, returncode, hang=False, stderr=b""):
+            self.returncode = returncode
+            self._hang = hang
+            self._stderr = stderr
+            self._done = asyncio.Event()
+
+        async def communicate(self):
+            if self._hang:
+                await self._done.wait()
+            return b"", self._stderr
+
+        def kill(self):
+            killed.append(True)
+            self.returncode = -9
+            self._done.set()
+
+        async def wait(self):
+            await self._done.wait()
+            return self.returncode
+
+    async def fake_exec(*args, **kwargs):
+        if args[:3] == ("databricks", "auth", "token"):
+            return Proc(1, stderr=b"refresh token is invalid")
+        if args[:3] == ("databricks", "auth", "login"):
+            return Proc(None, hang=True)
+        raise AssertionError(f"unexpected subprocess args: {args}")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    assert asyncio.run(providers.refresh_oauth_token("ws", force=True)) is None
+    assert killed == [True]
+
+
 def test_refresh_oauth_token_uses_workspace_url_for_ai_gateway_login(tmp_config, monkeypatch):
     _write_config(tmp_config, """providers:
   ws:

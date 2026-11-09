@@ -117,6 +117,28 @@ _load_error: str | None = None
 _AUTH_REFRESH_MIN_INTERVAL = 60.0  # seconds between CLI refresh attempts per provider
 _AUTH_LOGIN_MIN_INTERVAL = 300.0  # seconds between browser SSO attempts per provider
 _AUTH_LOGIN_TIMEOUT = 300.0  # seconds to wait for the browser SSO callback
+
+
+async def _communicate_or_kill(proc, timeout: float) -> tuple[bytes, bytes]:
+    """communicate() with a deadline that also ends the child process.
+
+    asyncio.wait_for only cancels the wait: an abandoned ``databricks auth login``
+    keeps running and holds its OAuth callback port (127.0.0.1:8020-8024), so
+    later sign-ins fail with "no local port was available". Kill and reap it.
+    """
+    try:
+        return await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+        raise
 _token_refresh_locks: dict[str, "asyncio.Lock"] = {}
 _last_token_refresh_attempt: dict[str, float] = {}
 _last_auth_login_attempt: dict[str, float] = {}
@@ -713,7 +735,7 @@ async def refresh_oauth_token(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+            stdout, stderr = await _communicate_or_kill(proc, 30)
             return proc.returncode, stdout, stderr
 
         try:
@@ -745,10 +767,14 @@ async def refresh_oauth_token(
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
-                    login_stdout, login_stderr = await asyncio.wait_for(
-                        login.communicate(), timeout=_AUTH_LOGIN_TIMEOUT,
+                    login_stdout, login_stderr = await _communicate_or_kill(login, _AUTH_LOGIN_TIMEOUT)
+                except asyncio.TimeoutError:
+                    log.error(
+                        "Databricks browser SSO for %r timed out after %.0fs; stopped the login process",
+                        provider, _AUTH_LOGIN_TIMEOUT,
                     )
-                except (OSError, asyncio.TimeoutError) as exc:
+                    return None
+                except OSError as exc:
                     log.error("Databricks browser SSO for %r failed: %s", provider, exc)
                     return None
                 if login.returncode != 0:
