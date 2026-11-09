@@ -1758,10 +1758,39 @@ def test_anthropic_chat_caches_tools_system_and_the_previous_turn_apart_from_the
 
     asyncio.run(server_module._handle_chat_anthropic(body, info, "claude-opus-5.5", request, True))
 
-    assert captured["cache_control"] == marker
+    # The automatic entry ends in the newest message, reused only by the same turn's next step.
+    assert captured["cache_control"] == {"type": "ephemeral"}
     assert [tool.get("cache_control") for tool in captured["tools"]] == [None, marker]
     assert captured["system"] == [{"type": "text", "text": "Stable instructions.", "cache_control": marker}]
     messages = captured["messages"]
     # The previous turn's answer ends the stretch the next turn shares; the newest question is outside it.
     assert messages[1]["content"] == [{"type": "text", "text": "First answer", "cache_control": marker}]
     assert "cache_control" not in json.dumps([messages[0], *messages[2:]])
+
+
+def test_anthropic_chat_marks_the_nearest_earlier_message_that_can_carry_a_marker(monkeypatch):
+    info = _info("anthropic", provider="anthropic", provider_model_id="claude-opus-5-5", max_output_tokens=128000)
+    captured = {}
+
+    async def fake_stream(endpoint, body, model, headers, **kwargs):
+        captured.update(body)
+        return server_module.JSONResponse(status_code=200, content={"ok": True})
+
+    monkeypatch.setattr(server_module, "_chat_anthropic_stream", fake_stream)
+    monkeypatch.setattr(server_module, "_forward_headers", lambda *args, **kwargs: {})
+    body = {
+        "model": "claude-opus-5-5",
+        "messages": [
+            {"role": "user", "content": "First question"},
+            {"role": "assistant", "content": ""},
+            {"role": "user", "content": "Second question"},
+        ],
+        "stream": True,
+    }
+    request = SimpleNamespace(state=SimpleNamespace())
+
+    asyncio.run(server_module._handle_chat_anthropic(body, info, "claude-opus-5.5", request, True))
+
+    messages = captured["messages"]
+    assert messages[0]["content"] == [{"type": "text", "text": "First question", "cache_control": {"type": "ephemeral"}}]
+    assert messages[1]["content"] == ""

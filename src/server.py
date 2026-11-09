@@ -3355,12 +3355,12 @@ def _is_anthropic_user_turn(message: dict) -> bool:
     return bool(content)
 
 
-def _mark_last_anthropic_block(message: dict, marker: dict) -> None:
+def _mark_last_anthropic_block(message: dict, marker: dict) -> bool:
     content = message.get("content")
     if isinstance(content, str):
         if content:
             message["content"] = [{"type": "text", "text": content, "cache_control": dict(marker)}]
-        return
+        return bool(content)
     # Thinking blocks and empty text can't carry a marker.
     for block in reversed(content if isinstance(content, list) else []):
         if not isinstance(block, dict) or block.get("type") in {"thinking", "redacted_thinking"}:
@@ -3368,7 +3368,8 @@ def _mark_last_anthropic_block(message: dict, marker: dict) -> None:
         if block.get("type") == "text" and not block.get("text"):
             continue
         block["cache_control"] = dict(marker)
-        return
+        return True
+    return False
 
 
 def _mark_anthropic_prompt_cache(req: dict, retention: object) -> None:
@@ -3379,7 +3380,9 @@ def _mark_anthropic_prompt_cache(req: dict, retention: object) -> None:
     rewrite of the whole prompt every turn. Explicit breakpoints at the end of the tools, the
     system prompt and the previous turn give each stretch that stays the same its own entry; with
     the automatic one that is the API's limit of four. The translator drops client markers, so
-    none are doubled. OpenAI's longest retention ("24h") asks for Anthropic's longest TTL, 1h.
+    none are doubled. OpenAI's longest retention ("24h") asks for Anthropic's longest TTL, 1h, for
+    those three; the automatic entry ends in the newest message, which only the same turn's next
+    step reuses, so it keeps the cheaper 5-minute TTL (a longer TTL may come before a shorter one).
     """
     marker = {"type": "ephemeral", "ttl": "1h"} if retention == "24h" else {"type": "ephemeral"}
     tools = req.get("tools")
@@ -3390,9 +3393,11 @@ def _mark_anthropic_prompt_cache(req: dict, retention: object) -> None:
         req["system"] = [{"type": "text", "text": system, "cache_control": dict(marker)}]
     messages = req.get("messages") or []
     latest_turn = next((i for i in range(len(messages) - 1, -1, -1) if _is_anthropic_user_turn(messages[i])), 0)
-    if latest_turn > 0:
-        _mark_last_anthropic_block(messages[latest_turn - 1], marker)
-    req["cache_control"] = dict(marker)
+    # The nearest earlier message that can carry the marker (an empty reply can't).
+    for index in range(latest_turn - 1, -1, -1):
+        if _mark_last_anthropic_block(messages[index], marker):
+            break
+    req["cache_control"] = {"type": "ephemeral"}
 
 
 async def _handle_chat_anthropic(body: dict, info, model: str, request: Request, is_stream: bool):
