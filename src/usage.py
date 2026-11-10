@@ -64,6 +64,28 @@ def _anthropic_cache_write_tokens(usage: dict) -> tuple[int, int]:
     return write_5m, write_1h
 
 
+def _openai_cache_write_tokens(details: dict) -> tuple[int, int]:
+    """Return OpenAI-shaped cache writes split into default and extended classes.
+
+    OpenAI reports every write in ``cache_write_tokens`` and splits it by
+    lifetime in ``cache_write_tokens_details`` (``ttl_30m_tokens`` and
+    ``ttl_12h_tokens``). Usage the gateway translates from Anthropic instead
+    reports 1-hour writes separately as ``cache_write_1h_tokens``.
+    """
+    split = details.get("cache_write_tokens_details")
+    if not isinstance(split, dict) or not ({"ttl_30m_tokens", "ttl_12h_tokens"} & set(split)):
+        return (
+            _as_int(details.get("cache_write_tokens")),
+            _as_int(details.get("cache_write_1h_tokens")),
+        )
+    total = _as_int(details.get("cache_write_tokens"))
+    write_30m = _as_int(split.get("ttl_30m_tokens"))
+    write_12h = _as_int(split.get("ttl_12h_tokens"))
+    # Treat any unsplit remainder as the default 30-minute class.
+    write_30m += max(0, total - write_30m - write_12h)
+    return write_30m, write_12h
+
+
 _OPENAI_CHAT_USAGE_KEYS = {
     "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens",
     "prompt_tokens_details", "completion_tokens_details",
@@ -136,8 +158,7 @@ def openai_chat_usage_to_anthropic(usage: object) -> dict | None:
     assert isinstance(usage, dict)
     details = usage.get("prompt_tokens_details") or {}
     cached_read, cache_read_reported = _openai_chat_cached_tokens(usage)
-    cache_write = _as_int(details.get("cache_write_tokens"))
-    cache_write_1h = _as_int(details.get("cache_write_1h_tokens"))
+    cache_write, cache_write_1h = _openai_cache_write_tokens(details)
     completion_details = usage.get("completion_tokens_details") or {}
     result = {
         "input_tokens": max(
@@ -178,6 +199,8 @@ def openai_chat_usage_to_responses(usage: object) -> dict | None:
         input_details["cache_write_tokens"] = _as_int(prompt_details.get("cache_write_tokens"))
     if "cache_write_1h_tokens" in prompt_details:
         input_details["cache_write_1h_tokens"] = _as_int(prompt_details.get("cache_write_1h_tokens"))
+    if isinstance(prompt_details.get("cache_write_tokens_details"), dict):
+        input_details["cache_write_tokens_details"] = prompt_details["cache_write_tokens_details"]
     return _with_provider_cost({
         "input_tokens": prompt,
         "input_tokens_details": input_details,
@@ -267,8 +290,7 @@ def extract_usage(resp: dict | None) -> Usage:
         in_details = usage.get("input_tokens_details") or {}
         out_details = usage.get("output_tokens_details") or {}
         cached = _as_int(in_details.get("cached_tokens"))
-        cache_write = _as_int(in_details.get("cache_write_tokens"))
-        cache_write_1h = _as_int(in_details.get("cache_write_1h_tokens"))
+        cache_write, cache_write_1h = _openai_cache_write_tokens(in_details)
         return Usage(
             input_tokens=max(
                 0,
@@ -307,8 +329,7 @@ def extract_usage(resp: dict | None) -> Usage:
     in_details = usage.get("prompt_tokens_details") or {}
     out_details = usage.get("completion_tokens_details") or {}
     cached, _ = _openai_chat_cached_tokens(usage)
-    cache_write = _as_int(in_details.get("cache_write_tokens"))
-    cache_write_1h = _as_int(in_details.get("cache_write_1h_tokens"))
+    cache_write, cache_write_1h = _openai_cache_write_tokens(in_details)
     return Usage(
         input_tokens=max(
             0,
@@ -375,8 +396,9 @@ def estimate_cost(
     """Estimate USD cost from normalized usage and a model pricing policy.
 
     ``pricing`` keys are $/Mtok: ``input``, ``output``, ``cache_read``,
-    ``cache_write`` (5-minute), ``cache_write_1h``, ``reasoning`` (any may be
-    absent). ``pricing_status`` may
+    ``cache_write`` (default lifetime: Anthropic 5-minute, OpenAI 30-minute),
+    ``cache_write_1h`` (extended lifetime: Anthropic 1-hour, OpenAI 12-hour),
+    ``reasoning`` (any may be absent). ``pricing_status`` may
     be ``unmetered`` for local models whose marginal provider charge is known
     to be zero. Unmetered cost is complete even when token usage was not
     reported; token coverage remains represented separately by

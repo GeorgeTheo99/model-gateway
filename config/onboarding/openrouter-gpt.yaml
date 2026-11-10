@@ -29,6 +29,7 @@ models:
       input: 0.1
       output: 0.5
       cache_read: 0.01
+      cache_write: 0.125
     quirks:
       - openrouter_zdr
     zdr: true
@@ -50,6 +51,7 @@ models:
       input: 2.0
       output: 10.0
       cache_read: 0.1
+      cache_write: 2.5
     quirks:
       - openrouter_zdr
     zdr: true
@@ -71,6 +73,7 @@ models:
       input: 10.0
       output: 50.0
       cache_read: 1.0
+      cache_write: 12.5
     quirks:
       - openrouter_zdr
     zdr: true

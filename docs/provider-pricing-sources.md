@@ -22,15 +22,18 @@ useful only as a cross-check, never as the source of record.
 - `input` and `output` are required for a priced entry.
 - `cache_read` / `cache_write` / `cache_write_1h`: include only when the
   provider reports those token classes **and** the gateway receives them.
-  `cache_write` means the default 5-minute write; `cache_write_1h` means the
-  1-hour write. The gateway receives:
+  `cache_write` means the provider's default-lifetime write (Anthropic 5-minute,
+  OpenAI 30-minute); `cache_write_1h` means its extended-lifetime write
+  (Anthropic 1-hour, OpenAI 12-hour). The gateway receives:
   - Anthropic: `cache_read_input_tokens` + `cache_creation_input_tokens`, split
     by `cache_creation.ephemeral_5m_input_tokens` and
     `cache_creation.ephemeral_1h_input_tokens` ✓
-  - OpenAI / Fireworks / OpenRouter / Z.ai: `prompt_tokens_details.cached_tokens`
-    (cache reads only; cache writes are not reported by these providers) — set
-    `cache_read` when the provider charges a distinct cache-read rate, omit
-    `cache_write`.
+  - OpenAI (GPT-5.6 and later): `cached_tokens` plus `cache_write_tokens`, split
+    by `cache_write_tokens_details.ttl_30m_tokens` and `ttl_12h_tokens` ✓
+  - Fireworks / Z.ai / older OpenAI models: `prompt_tokens_details.cached_tokens`
+    (cache reads only) — set `cache_read` when the provider charges a distinct
+    cache-read rate, omit `cache_write`.
+  - OpenRouter: the upstream's classes, as listed in its models API.
 - `reasoning`: omit unless the provider bills reasoning tokens at a separate
   rate from output. None of the current providers do.
 - If a rate is genuinely unknown, **omit the whole `pricing` field** — the
@@ -45,9 +48,9 @@ useful only as a cross-check, never as the source of record.
 | Provider (in model-info.json) | Official pricing source | Format | Cache fields |
 |---|---|---|---|
 | `anthropic` | https://www.anthropic.com/pricing | HTML, per-model blocks | Write + Read |
-| `openai` | https://platform.openai.com/docs/pricing | HTML table | cached input (read only) |
+| `openai` | https://developers.openai.com/api/docs/pricing | HTML table | cached input, 30m and 12h writes (GPT-5.6+) |
 | `fireworks` | https://docs.fireworks.ai/serverless/pricing | HTML table (per-model: input / cached input / output) | cached input (read only) |
-| `openrouter` | https://openrouter.ai/api/v1/models | **JSON API** (machine-readable) | `prompt_cache_read` / `prompt_cache_write` (often null) |
+| `openrouter` | https://openrouter.ai/api/v1/models | **JSON API** (machine-readable) | `input_cache_read` / `input_cache_write` / `input_cache_write_1h` (when offered) |
 | `moonshot` | https://platform.kimi.ai/docs/pricing/chat | HTML table | cached input, 5m and 1h writes (K3.1) |
 | `zhipuai` | https://open.bigmodel.cn/pricing | HTML (Chinese site) | none reported |
 
@@ -60,11 +63,13 @@ cache hit/refresh→cache_read. Anthropic documents cache_read = 0.1× input,
 cache_write = 1.25× input, and cache_write_1h = 2× input; prefer concrete
 numbers from the current official page.
 
-**OpenAI**: the pricing page lists models in a table with Input / Output /
-Cached input per 1M tokens. GPT-5.x models report a cached-input rate (0.5×
-input typical) but no cache-write field. Map: input→input, output→output,
-Cached input→cache_read. Omit cache_write. Same OpenAI-shape cost-model caveat
-as Fireworks applies (see above).
+**OpenAI** (verified 2026-11-09): the pricing page lists Input / Output /
+Cached input / 30m write / 12h write per 1M tokens. Map: input→input,
+output→output, Cached input→cache_read, 30m write→cache_write and 12h
+write→cache_write_1h. Writes are 1.25× (30m) and 2.5× (12h) input for
+GPT-5.6 and later; older models have no write charge, so omit both write
+fields for them. Same OpenAI-shape cost-model caveat as Fireworks applies (see
+below).
 
 **Fireworks** (verified 2026-08-30): each model page lists three
 per-1M-token figures: **input / cached input / output**. Current GLM rates are
@@ -88,17 +93,22 @@ change that normalization, re-verify the cost math for both shapes.
 > `glm-5.1-fw` got the wrong rate: the Z.ai GLM-5 price $1/$3 was used instead
 > of the Fireworks GLM-5.1 price $1.40/$4.40.)
 
-**OpenRouter** (JSON, verified 2026-06-28): `GET
+**OpenRouter** (JSON, verified 2026-11-09): `GET
 https://openrouter.ai/api/v1/models` returns `{data: [...]}`. Each model has
 `id` (matches `provider_model_id` in model-info.json, e.g.
 `google/gemini-3-flash-preview`) and `pricing` with `prompt`, `completion`
 (both **$/token** — multiply ×1,000,000 for $/Mtok), and optionally
-`prompt_cache_read` / `prompt_cache_write`. Match by `provider_model_id`.
-This is the only provider with a machine-readable source — prefer it for
-`openrouter` models. For `prompt_cache_read`/`prompt_cache_write`: if null,
-omit the cache field (Google via OpenRouter does not report cache tokens
-reliably). Same OpenAI-shape cost-model caveat as Fireworks applies (see
-above) when `prompt_cache_read` is non-null.
+`input_cache_read` / `input_cache_write` / `input_cache_write_1h`. Match by
+`provider_model_id`. This is the only provider with a machine-readable source
+— prefer it for `openrouter` models. Map `input_cache_read`→cache_read and,
+for Anthropic and OpenAI upstreams, `input_cache_write`→cache_write and
+`input_cache_write_1h`→cache_write_1h. Omit cache_write for Google upstreams:
+Gemini via OpenRouter has not reported cache-write tokens to this gateway, and
+its listed `input_cache_write` is not a per-token write rate like Anthropic's
+or OpenAI's. OpenRouter usually returns
+an authoritative `usage.cost`, which the ledger prefers; configured prices are
+the fallback when it is absent. Same OpenAI-shape cost-model caveat as
+Fireworks applies (see above).
 
 **Moonshot** (verified 2026-07-20): Kimi K3 is priced per 1M tokens at
 `$3.00` cache-miss input, `$0.30` cache-hit input, and `$15.00` output. Map

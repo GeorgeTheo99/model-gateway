@@ -6901,7 +6901,7 @@ _ADMIN_HTML = r"""
             kv("Output tokens", num(r.output_tokens)) +
             kv("Cached read", num(r.cached_read_tokens)) +
             kv("Cache write", num(r.cache_write_tokens)) +
-            kv("1-hour cache write", num(r.cache_write_1h_tokens)) +
+            kv("Extended cache write", num(r.cache_write_1h_tokens)) +
             kv("Reasoning tokens", num(r.reasoning_tokens)) +
             kv(
               "Missing pricing classes",

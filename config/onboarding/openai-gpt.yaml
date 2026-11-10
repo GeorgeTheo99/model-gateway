@@ -10,9 +10,10 @@ provider:
   display_name: OpenAI
   secret_name: openai.api-key
 
-# List prices as of 2026-10-17. The key check runs a completion on the first
-# (cheapest) model. OpenAI's API keeps prompts unless the account has a
-# zero-data-retention agreement, so no route declares zdr.
+# List prices as of 2026-10-17; cache writes checked 2026-11-09 (cache_write is
+# the 30-minute write, cache_write_1h the 12-hour write). The key check runs a
+# completion on the first (cheapest) model. OpenAI's API keeps prompts unless
+# the account has a zero-data-retention agreement, so no route declares zdr.
 models:
   - name: gpt-6-luna
     provider: openai
@@ -29,6 +30,8 @@ models:
       input: 0.1
       output: 0.5
       cache_read: 0.01
+      cache_write: 0.125
+      cache_write_1h: 0.25
     desc: GPT-6 Luna on the OpenAI API, 1.05M context / 128K max output
 
   - name: gpt-6.1-sol
@@ -47,6 +50,8 @@ models:
       input: 2.0
       output: 10.0
       cache_read: 0.1
+      cache_write: 2.5
+      cache_write_1h: 5.0
     desc: GPT-6.1 Sol on the OpenAI API, 1.05M context / 128K max output
 
   - name: gpt-6-astra
@@ -64,4 +69,6 @@ models:
       input: 10.0
       output: 50.0
       cache_read: 1.0
+      cache_write: 12.5
+      cache_write_1h: 25.0
     desc: GPT-6 Astra on the OpenAI API, 1.05M context / 128K max output

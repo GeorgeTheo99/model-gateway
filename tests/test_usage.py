@@ -201,6 +201,45 @@ def test_extract_anthropic_cache_write_ttls_and_costs_separately():
     assert cost.pricing_complete is True
 
 
+def test_extract_openai_cache_write_ttls_and_costs_separately():
+    # OpenAI's documented example: 12,000 input = 1,000 ordinary + 4,000 reads
+    # + 7,000 writes, split 3,000 at 30 minutes and 4,000 at 12 hours.
+    details = {
+        "cached_tokens": 4000,
+        "cache_write_tokens": 7000,
+        "cache_write_tokens_details": {"ttl_30m_tokens": 3000, "ttl_12h_tokens": 4000},
+    }
+    expected = Usage(
+        input_tokens=1000, output_tokens=500, cached_read_tokens=4000,
+        cache_write_tokens=3000, cache_write_1h_tokens=4000, reported=True,
+    )
+    responses = {"input_tokens": 12000, "output_tokens": 500, "input_tokens_details": details}
+    chat = {"prompt_tokens": 12000, "completion_tokens": 500, "prompt_tokens_details": details}
+    assert extract_usage({"usage": responses}) == expected
+    assert extract_usage({"usage": chat}) == expected
+    assert extract_usage({"usage": openai_chat_usage_to_responses(chat)}) == expected
+    anthropic = openai_chat_usage_to_anthropic(chat)
+    assert anthropic["input_tokens"] == 1000
+    assert anthropic["cache_creation"] == {
+        "ephemeral_5m_input_tokens": 3000,
+        "ephemeral_1h_input_tokens": 4000,
+    }
+
+    cost = estimate_cost(expected, {
+        "input": 10.0,
+        "output": 50.0,
+        "cache_read": 1.0,
+        "cache_write": 12.5,
+        "cache_write_1h": 25.0,
+    })
+    assert cost.cost_usd == 0.1765
+    assert cost.pricing_complete is True
+
+    # An unsplit remainder bills at the default 30-minute rate.
+    details["cache_write_tokens_details"] = {"ttl_12h_tokens": 4000}
+    assert extract_usage({"usage": responses}) == expected
+
+
 def test_provider_reported_cost_overrides_configured_and_unmetered_pricing():
     usage = Usage(
         input_tokens=250_000,
