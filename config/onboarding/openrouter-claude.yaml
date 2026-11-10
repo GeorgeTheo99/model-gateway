@@ -10,8 +10,8 @@ provider:
   display_name: OpenRouter
   secret_name: openrouter.api-key
 
-# Zero-data-retention endpoints only (openrouter_zdr). Claude Fable 5.1 has none
-# on OpenRouter, so it is offered through Anthropic only. List prices as of
+# Zero-data-retention endpoints only (openrouter_zdr). Claude Fable 5.1 and 5.2
+# have none on OpenRouter, so they are offered through Anthropic only. List prices as of
 # 2026-10-17; the key check runs a completion on the first (cheapest) model.
 models:
   - name: claude-haiku-5.5-or

@@ -503,6 +503,7 @@ def test_packaged_routes_to_one_model_agree_on_its_family():
     assert routes["claude-opus-5.5"] == {"anthropic", "openrouter"}
     assert routes["gpt-6-astra"] == {"openai", "openrouter"}
     assert routes["claude-fable-5.1"] == {"anthropic"}
+    assert routes["claude-fable-5.2"] == {"anthropic"}
     assert routes["glm-5.3-flash"] == {"fireworks", "openrouter"}
 
 

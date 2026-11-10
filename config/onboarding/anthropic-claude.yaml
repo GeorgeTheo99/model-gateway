@@ -90,3 +90,23 @@ models:
       cache_write: 12.5
       cache_write_1h: 20.0
     desc: Claude Fable 5.1 on the Anthropic API, 1M context / 128K max output
+
+  # List prices as of 2026-11-09 (release day).
+  - name: claude-fable-5.2
+    provider: anthropic
+    provider_model_id: claude-fable-5-2
+    display_name: Claude Fable 5.2
+    family: claude
+    base_model: claude-fable-5.2
+    context: 1000000
+    max_output_tokens: 128000
+    thinking: always
+    thinking_levels: [low, medium, high, xhigh, max]
+    vision: true
+    pricing:
+      input: 8.0
+      output: 40.0
+      cache_read: 0.2
+      cache_write: 10.0
+      cache_write_1h: 16.0
+    desc: Claude Fable 5.2 on the Anthropic API, 1M context / 128K max output
