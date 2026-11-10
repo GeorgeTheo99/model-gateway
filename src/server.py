@@ -495,12 +495,18 @@ async def _forward_imported_if_known(request: Request, path: str, body: dict) ->
     return await manager.forward(request, path, body, route)
 
 
+# Models that reject thinking.type "enabled" (checked against the live API).
 ADAPTIVE_THINKING_ANTHROPIC_MODELS = {
     "claude-fable-5",
+    "claude-fable-5-1",
+    "claude-fable-5-2",
     "claude-opus-5",
     "claude-opus-5-5",
     "claude-opus-4-7",
     "claude-opus-4-8",
+    "claude-sonnet-5",
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
 }
 
 

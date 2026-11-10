@@ -784,16 +784,19 @@ def test_chat_completions_anthropic_model_uses_native_handler(client, monkeypatc
     assert resp.json() == {"ok": True}
 
 
+@pytest.mark.parametrize("model_id", [
+    "claude-fable-5", "claude-fable-5-1", "claude-fable-5-2", "claude-sonnet-5-5", "claude-haiku-5-5",
+])
 @pytest.mark.parametrize("effort", ["low", "medium", "high", "max"])
-def test_adaptive_anthropic_chat_preserves_canonical_effort(effort):
+def test_adaptive_anthropic_chat_preserves_canonical_effort(effort, model_id):
     info = _info(
         "anthropic",
         provider="anthropic",
-        provider_model_id="claude-fable-5",
+        provider_model_id=model_id,
         max_output_tokens=2048,
     )
     body = openai_chat_to_anthropic({
-        "model": "anthropic/claude-fable-5",
+        "model": f"anthropic/{model_id}",
         "messages": [{"role": "user", "content": "ping"}],
         "max_tokens": 2048,
         "reasoning_effort": effort,
