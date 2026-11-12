@@ -32,6 +32,7 @@ from src.errors import upstream_error, upstream_error_openai
 from src.providers import effective_model_inventory, list_available_models, list_models as list_routable_models, model_availability, pricing_for, pricing_status_for, provider_quirks, resolve, retirement_redirect, base_model_route, snapshot_registry as snapshot_provider_registry
 from src.upstream import (
     PoolContext,
+    SpotFallback,
     _retry_post,
     _retry_post_with_model_fallback,
     _retry_send_stream,
@@ -360,6 +361,21 @@ def _prepare_profile_execution(
         _apply_profile_defaults(body, execution.defaults, protocol)
         request.state.disable_model_fallback = True
         request.state.profile_execution = execution
+        if execution.fallback_model:
+            spot_info, fallback_info = resolve(execution.model), resolve(execution.fallback_model)
+            same_wire = spot_info is not None and fallback_info is not None and (
+                (spot_info.provider, spot_info.base_url, spot_info.api_key, spot_info.protocol)
+                == (fallback_info.provider, fallback_info.base_url, fallback_info.api_key, fallback_info.protocol))
+            if same_wire:
+                # The fallback reuses spot's prepared request, endpoint and headers (src/upstream.py).
+                request.state.spot_fallback = SpotFallback(
+                    spot_model=execution.model,
+                    spot_upstream_id=spot_info.provider_model_id,
+                    model=execution.fallback_model,
+                    upstream_id=fallback_info.provider_model_id,
+                )
+            else:  # never spot without its fallback: run the route itself
+                body["model"] = execution.fallback_model
         return None
 
     identity = getattr(request.state, "auth_identity", None)
@@ -2083,6 +2099,9 @@ async def _ledger_response(request: Request, call_next, stream_done) -> tuple[Re
     if redirect is not None:
         response.headers["Deprecation"] = "true"
         response.headers["X-Model-Gateway-Model-Redirect"] = f"{redirect[0]} -> {redirect[1]}"
+    spot = getattr(request.state, "spot_fallback_used", None)
+    if spot is not None:
+        response.headers["X-Model-Gateway-Spot-Fallback"] = f"{spot.spot_model} -> {spot.model}"
     tier = getattr(request.state, "reasoning_tier", None)
     if tier is not None:
         response.headers["X-Model-Gateway-Reasoning-Tier"] = tier

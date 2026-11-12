@@ -78,6 +78,7 @@ Registration replaces one consumer namespace atomically.
 
 - Root: `schema_version`, `namespace`, `source_revision`, `profiles`.
 - Profile: `id`, `locality`, `credential_policy`, `protocols`, `routes`.
+- Optional profile fields: `description`, `defaults`, `prefer_spot` (see [Spot tiers](#spot-tiers)).
 - `routes.text` is required. `routes.vision` is optional and must name a native vision model (`vision: true`). Without it, image requests go to the text route; a text-only text route receives a note in place of each image ([deployment](deployment.md#image-input)).
 
 ### Allowed values
@@ -103,8 +104,19 @@ Valid combinations are:
 - Provider pools must not mix local and cloud candidates.
 - Every dependency of a `local_only` route must resolve exclusively through trusted local oMLX providers.
 - Every dependency of a `cloud_explicit` route must exclude oMLX and resolve through gateway-configured cloud providers.
-- Cross-model fallback is disabled for profile execution. Same-route transport retry and provider-pool failover are allowed only within the registered route's validated locality closure.
+- Cross-model fallback is disabled for profile execution, except a `prefer_spot` profile's fallback from a spot tier to its route ([Spot tiers](#spot-tiers)). Same-route transport retry and provider-pool failover are allowed only within the registered route's validated locality closure.
 - The gateway records a digest of the validated route closure, including the effective non-secret endpoint identity and protocol. If catalog/config drift changes that closure, invocation fails closed until re-registration. Re-registering the unchanged manifest creates a new bound version when the closure changed.
+
+### Spot tiers
+
+A `cloud_explicit` profile may set `"prefer_spot": true` (capability `profile_prefer_spot.v1`; an older gateway rejects the field with `422`, so consumers send it only when the gateway advertises the capability). Registration then binds, for each route, the catalog route that declares itself a spot tier of it (`spot_of`, [provider onboarding](provider-onboarding.md)) and is available now; a route without one runs as named, so the manifest stays portable. Execution sends the request to the spot tier once, with no retries, and when spot answers `429`, `502`, `503`, `504`, a missing-model `404`, or cannot be connected to, sends the same request to the route itself with its normal retries. A stream that has started is never replayed.
+
+- The spot tier must share the route's single provider endpoint (so its credential and locality) and its request-shaping capabilities (`thinking`, `thinking_format`, `thinking_levels`, `quirks`, `vision`, `api_style`, `system_instruction`, `context`, `max_output_tokens`, `zdr`); otherwise registration fails with `422`.
+- The spot binding is part of the route closure digest: removing or changing the spot route fails the profile closed (`409`) until re-registration.
+- Spot failures never open the provider's circuit, which the route shares.
+- The ledger names and prices the route that served the request; a fallback response carries `X-Model-Gateway-Spot-Fallback: <spot> -> <route>`.
+- Snapshots stay unchanged: they show the route, never the spot binding or `prefer_spot`.
+- Other profiles, and requests that name a model directly, never use the fallback. A request that names the spot route gets spot alone.
 
 ### Defaults
 

@@ -1,6 +1,6 @@
 # ADR 0001: Consumer-Owned Profiles as a Gateway Security Boundary
 
-- **Status:** Accepted (amended 2026-10-06: gateway catalog composites were removed; profile vision routes must name native vision models. Amended 2026-10-28: the gateway's image helpers were removed; a profile without a vision route sends image requests to its text route, which receives a note in place of each image when it is text-only)
+- **Status:** Accepted (amended 2026-10-06: gateway catalog composites were removed; profile vision routes must name native vision models. Amended 2026-10-28: the gateway's image helpers were removed; a profile without a vision route sends image requests to its text route, which receives a note in place of each image when it is text-only. Amended 2026-11-12: a profile may opt in to one cross-model fallback, from a spot tier to the route it is a tier of, on the same provider endpoint)
 - **Date:** 2026-08-27
 
 ## Context
@@ -45,7 +45,7 @@ Locality is derived from the authenticated principal and registered profile. Req
 
 For a local-only profile, the gateway validates the complete route closure: selected text/vision models, provider pools, and configured model fallbacks. Every reachable provider must be local oMLX. Runtime checks remain in force after registration. A profile's vision route must name a native vision model; without one, image requests go to the text route, which never leaves the profile's locality.
 
-Ordinary retries may repeat an already-authorized route. A retry, pool transition, model fallback, or vision route may not change locality or credential class. Cross-model fallback remains disabled for profile requests rather than allowing an unproven transition. Same-route pool failover is permitted only when every candidate remains within the profile's validated locality and credential class.
+Ordinary retries may repeat an already-authorized route. A retry, pool transition, model fallback, or vision route may not change locality or credential class. Cross-model fallback remains disabled for profile requests rather than allowing an unproven transition, with one proven exception: a profile that sets `prefer_spot` may fall back from a spot tier to the route it is a tier of. Registration proves that transition keeps locality and credential class: both resolve to the same single provider endpoint with the same request-shaping capabilities, and the pair is part of the bound route closure ([consumer profiles](../consumer-profiles.md#spot-tiers)). Same-route pool failover is permitted only when every candidate remains within the profile's validated locality and credential class.
 
 ### Versioning and degraded reads
 

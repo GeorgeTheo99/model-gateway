@@ -7,6 +7,8 @@ The original retry loop was generalized to add:
     ``auth_refresh``).
   - Optional config-driven model fallback (config.yaml ``model_fallbacks:``)
     after saturation/missing-model failures.
+  - A profile's prefer_spot route: one best-effort spot attempt, then the
+    route it is a spot tier of (:class:`SpotFallback`).
 """
 
 import asyncio
@@ -105,6 +107,16 @@ async def _sleep_or_disconnect(delay: float, request: Request | None) -> None:
 
 def _circuit_key(provider: str) -> str:
     return provider or ""
+
+
+def _is_spot_upstream(json: object) -> bool:
+    """A request for a spot route (catalog ``spot_of``). Spot capacity can fall to zero (503)
+    while the provider is healthy, so its failures must not open the circuit that the provider's
+    other routes, including the standard route spot is a tier of, share."""
+    from src.providers import is_spot_route  # runtime import: avoid cycle
+
+    model = json.get("model") if isinstance(json, dict) else None
+    return isinstance(model, str) and is_spot_route(model)
 
 
 def _compute_retry_delay(resp: httpx.Response, attempt: int) -> float:
@@ -223,8 +235,9 @@ async def _retry_post(
     errors inside the gateway so the coding harness never sees them.
     With a pool backup, skip recovery waits and same-workspace backoff retries.
     A cached OAuth refresh still gets one immediate authenticated retry.
+    A spot route neither waits for nor charges the provider's circuit.
     """
-    circuit = _circuit_key(provider)
+    circuit = "" if _is_spot_upstream(json) else _circuit_key(provider)
     probe_request = False
     if circuit and is_tripped(circuit):
         if fast_failover:
@@ -350,7 +363,7 @@ async def _retry_send_stream(
     return the buffered response, never a duplicate POST just to reopen it.
     Same circuit breaker and fast-failover semantics as _retry_post.
     """
-    circuit = _circuit_key(provider)
+    circuit = "" if _is_spot_upstream(json) else _circuit_key(provider)
     probe_request = False
     if circuit and is_tripped(circuit):
         if fast_failover:
@@ -713,6 +726,73 @@ async def _send_with_pool(
             await resp.aclose()
 
 
+# Statuses that reject the request itself, which the standard route would reject alike.
+_SPOT_REQUEST_ERRORS = frozenset({400, 413, 422})
+
+
+@dataclass(frozen=True)
+class SpotFallback:
+    """A profile's prefer_spot execution: the spot route and the route it is a tier of."""
+
+    spot_model: str
+    spot_upstream_id: str
+    model: str
+    upstream_id: str
+
+
+def _spot_fallback_for(request: Request | None, json: dict) -> SpotFallback | None:
+    spot = getattr(request.state, "spot_fallback", None) if request is not None else None
+    return spot if isinstance(spot, SpotFallback) and json.get("model") == spot.spot_upstream_id else None
+
+
+async def _send_spot_first(
+    send,
+    client: httpx.AsyncClient,
+    endpoint: str,
+    *,
+    json: dict,
+    headers: dict,
+    provider: str,
+    request: Request,
+    spot: SpotFallback,
+) -> httpx.Response:
+    """One best-effort attempt on the spot route, then the route it is a tier of.
+
+    Spot capacity can fall to zero (503) or be rate limited (429): that is the
+    tier working as sold, not the provider failing. So the attempt is not
+    retried and, like every spot request, never waits for or charges the
+    provider's circuit (:func:`_is_spot_upstream`). Any spot failure before a
+    response starts (a status, a transport error, or an account without spot)
+    produced no output, so the request moves to the standard route (validated to
+    share the endpoint, credential and capabilities, src/profiles.py) with its
+    normal retries; only a request the standard route would reject alike is
+    answered as is. A stream that has started is never replayed.
+    """
+    try:
+        resp = await send(
+            client, endpoint, json=json, headers=headers, provider=provider,
+            request=request, fast_failover=True,
+        )
+    except Exception as exc:
+        if not _is_retryable_exception(exc):
+            raise
+        reason = f"transport {type(exc).__name__}"
+    else:
+        if resp.status_code == 200 or resp.status_code in _SPOT_REQUEST_ERRORS:
+            return resp
+        reason = f"spot status {resp.status_code}"
+        await resp.aclose()
+    log.warning("spot-fallback: %s -> %s after %s", spot.spot_model, spot.model, reason)
+    request.state.spot_fallback_used = spot
+    ctx = getattr(request.state, "ledger_ctx", None)
+    if isinstance(ctx, dict):  # the ledger prices and names the route that served the request
+        ctx.update(model=spot.model, provider_model_id=spot.upstream_id)
+    return await send(
+        client, endpoint, json={**json, "model": spot.upstream_id}, headers=headers,
+        provider=provider, request=request,
+    )
+
+
 async def _retry_post_with_model_fallback(
     client: httpx.AsyncClient,
     endpoint: str,
@@ -723,6 +803,12 @@ async def _retry_post_with_model_fallback(
     request: Request | None = None,
     pool: PoolContext | None = None,
 ) -> httpx.Response:
+    spot = _spot_fallback_for(request, json)
+    if spot is not None:
+        return await _send_spot_first(
+            _retry_post, client, endpoint, json=json, headers=headers,
+            provider=provider, request=request, spot=spot,
+        )
     resp = await _send_with_pool(
         _retry_post, client, endpoint,
         json=json, headers=headers, provider=provider, request=request,
@@ -770,6 +856,12 @@ async def _retry_send_stream_with_model_fallback(
     request: Request | None = None,
     pool: PoolContext | None = None,
 ) -> httpx.Response:
+    spot = _spot_fallback_for(request, json)
+    if spot is not None:
+        return await _send_spot_first(
+            _retry_send_stream, client, endpoint, json=json, headers=headers,
+            provider=provider, request=request, spot=spot,
+        )
     resp = await _send_with_pool(
         _retry_send_stream, client, endpoint,
         json=json, headers=headers, provider=provider, request=request,

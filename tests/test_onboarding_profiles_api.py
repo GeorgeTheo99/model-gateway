@@ -24,6 +24,7 @@ URL = f"/admin/api/onboarding/profiles/{GLM}"
 GLM_MODELS = {
     "glm-5.3-fw": "accounts/fireworks/models/glm-5p3",
     "glm-5.3-flash-fw": "accounts/fireworks/models/glm-5p3-flash",
+    "glm-5.3-spot-fw": "accounts/fireworks/models/glm-5p3-spot",
 }
 
 
@@ -141,6 +142,8 @@ def test_lists_packaged_profiles_filtered_by_allowlist(client):
              "base_model": "glm-5.3"},
             {"name": "glm-5.3-flash-fw", "display_name": "GLM 5.3 Flash (Fireworks)", "zero_data_retention": True,
              "base_model": "glm-5.3-flash"},
+            {"name": "glm-5.3-spot-fw", "display_name": "GLM 5.3 Spot (Fireworks)", "zero_data_retention": True,
+             "base_model": None},
         ],
         "provider_defined": True, "has_api_key": False, "applied": False,
     }
@@ -231,7 +234,7 @@ def test_owner_rows_are_left_untouched(client, cfg, upstream):
     _seed_models(cfg, present)
     response = client.post(URL, headers=ADMIN, json={"api_key": "fw-key"})
     assert response.status_code == 200, response.text
-    assert response.json()["added_models"] == ["glm-5.3-flash-fw"]
+    assert response.json()["added_models"] == ["glm-5.3-flash-fw", "glm-5.3-spot-fw"]
     assert response.json()["already_present"] == ["glm-5.3-fw"]
     assert _catalog(cfg) == [present]
     entry = providers._load_models()["glm-5.3-fw"]
@@ -562,7 +565,7 @@ def test_curated_models_load_only_for_keyed_providers(cfg, monkeypatch):
     monkeypatch.setenv("MODEL_GATEWAY_PROVIDER_FIREWORKS_API_KEY", "fw-key")
     providers.reload()
     # The Moonshot rollback profile is not curated, and OpenRouter has no key.
-    assert _loaded() == ["glm-5.3-fw", "glm-5.3-flash-fw", "kimi-k3"]
+    assert _loaded() == ["glm-5.3-fw", "glm-5.3-flash-fw", "glm-5.3-spot-fw", "kimi-k3"]
     assert providers._load_models()["kimi3"]["name"] == "kimi-k3"
     assert _catalog(cfg) == []
 
@@ -606,14 +609,14 @@ def test_curated_models_load_with_admin_writes_off(cfg, monkeypatch):
     monkeypatch.setenv("MODEL_GATEWAY_PROVIDER_FIREWORKS_API_KEY", "fw-key")
     monkeypatch.setenv("MODEL_GATEWAY_ADMIN_WRITES", "false")
     providers.reload()
-    assert _loaded() == ["glm-5.3-fw", "glm-5.3-flash-fw", "kimi-k3"]
+    assert _loaded() == ["glm-5.3-fw", "glm-5.3-flash-fw", "glm-5.3-spot-fw", "kimi-k3"]
     assert _catalog(cfg) == []
 
 
 def test_adding_a_provider_key_brings_its_curated_models(client, cfg, upstream):
     response = client.post("/admin/api/providers/fireworks", headers=ADMIN, json={"base_url": FIREWORKS, "api_key": "fw-key"})
     assert response.status_code == 200, response.text
-    assert response.json()["auto_added_models"] == ["glm-5.3-fw", "glm-5.3-flash-fw", "kimi-k3"]
+    assert response.json()["auto_added_models"] == ["glm-5.3-fw", "glm-5.3-flash-fw", "glm-5.3-spot-fw", "kimi-k3"]
 
 
 def test_startup_migrates_copied_curated_rows(cfg, monkeypatch):

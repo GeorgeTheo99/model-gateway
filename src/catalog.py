@@ -227,6 +227,14 @@ def validate_client_metadata(entry: dict) -> None:
             )
     if (entry.get("family") is None) != (entry.get("base_model") is None):
         raise ValueError(f"model {name!r} family and base_model must be set together")
+    # A best-effort (spot) tier of another route; only a profile's prefer_spot uses it.
+    spot_of = entry.get("spot_of")
+    if spot_of is not None and (not isinstance(spot_of, str) or not spot_of.strip() or spot_of == name):
+        raise ValueError(f"model {name!r} spot_of must name another model")
+    if spot_of is not None and (entry.get("base_model") is not None or entry.get("alternate_ids")):
+        raise ValueError(
+            f"model {name!r} spot_of routes take no base_model or alternate_ids: another name never binds one"
+        )
     if entry.get("modality") is not None and entry["modality"] not in MODALITIES:
         raise ValueError(f"model {name!r} modality must be one of: {', '.join(MODALITIES)}")
 

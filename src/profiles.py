@@ -39,7 +39,7 @@ _LOCALITIES = {"local_only", "trusted_local", "cloud_explicit"}
 _LOCAL_LOCALITIES = frozenset({"local_only", "trusted_local"})
 _CREDENTIAL_POLICIES = {"gateway_local", "gateway_managed", "consumer_byok"}
 _ROOT_FIELDS = {"schema_version", "namespace", "source_revision", "default_profile", "profiles"}
-_PROFILE_FIELDS = {"id", "description", "locality", "credential_policy", "protocols", "routes", "defaults"}
+_PROFILE_FIELDS = {"id", "description", "locality", "credential_policy", "protocols", "routes", "defaults", "prefer_spot"}
 _ROUTE_FIELDS = {"text", "vision"}
 _DEFAULT_FIELDS = {"temperature", "max_output_tokens", "reasoning_effort"}
 _CACHE_LATEST = "private, max-age=60, stale-if-error=86400"
@@ -69,6 +69,8 @@ class ExecutionProfile:
     model: str
     defaults: dict
     locality: str = "local_only"
+    # With prefer_spot, ``model`` is a spot route and this is the route it falls back to.
+    fallback_model: str | None = None
 
 
 def is_selector(value: object) -> bool:
@@ -273,6 +275,49 @@ def _fallback_target(entry: dict, inventory: dict[str, dict]) -> str | None:
     return matches[0]
 
 
+# Request-shaping fields a spot route must share with the route it is a tier of, so the
+# prepared request is valid for both and a fallback changes nothing but the model id.
+_SPOT_MATCH_FIELDS = (
+    "provider", "thinking", "thinking_format", "thinking_levels", "quirks", "vision", "api_style",
+    "system_instruction", "context", "max_output_tokens", "zdr",
+)
+
+
+def _spot_route(model: str, inventory: dict[str, dict]) -> str | None:
+    """The available spot tier of ``model`` (a catalog route with ``spot_of: model``), if any."""
+    matches = sorted(
+        name for name, row in inventory.items()
+        if row.get("spot_of") == model and row.get("available")
+    )
+    if len(matches) > 1:
+        raise ProfileError(422, "invalid_profile_route", f"Route target '{model}' has more than one spot route")
+    return matches[0] if matches else None
+
+
+def _spot_closure(spot: str, primary: str, primary_closure: dict, *, locality: str, inventory: dict[str, dict]) -> dict:
+    """Bind a spot route that falls back to ``primary``: the same model on the same provider
+    endpoint and credential, so the fallback changes neither locality nor credential class
+    (docs/adr/0001-consumer-profile-security.md)."""
+    entry = inventory.get(spot)
+    if entry is None or entry.get("spot_of") != primary:
+        raise ProfileError(422, "invalid_profile_route", f"Spot route '{spot}' is not a spot tier of '{primary}'")
+    closure = _route_closure(spot, locality=locality, inventory=inventory, stack=(primary,))
+    primary_entry = inventory[primary]
+    if (
+        closure["providers"] != primary_closure["providers"]
+        or closure["endpoints"] != primary_closure["endpoints"]
+        or len(closure["endpoints"]) != 1
+        or "fallback" in closure
+        or any(entry.get(field) != primary_entry.get(field) for field in _SPOT_MATCH_FIELDS)
+    ):
+        raise ProfileError(
+            422,
+            "invalid_profile_route",
+            f"Spot route '{spot}' must match '{primary}' on one provider endpoint with the same capabilities",
+        )
+    return closure
+
+
 # What a peer route binds: what the model is, not release details such as forwarded_params.
 _PEER_BINDING_FIELDS = ("direct_model_id", "locality", "base_model", "vision", "thinking")
 
@@ -391,6 +436,10 @@ def _binding_for(profile: dict, inventory: dict[str, dict]) -> str:
         role: _route_closure(model, locality=profile["locality"], inventory=inventory)
         for role, model in sorted(profile["routes"].items())
     }
+    for role, spot in sorted((profile.get("spot_routes") or {}).items()):
+        closure[role]["spot"] = _spot_closure(
+            spot, profile["routes"][role], closure[role], locality=profile["locality"], inventory=inventory,
+        )
     vision_model = profile["routes"].get("vision")
     if vision_model:
         vision_entry = _route_entry(vision_model, inventory)
@@ -478,6 +527,11 @@ def validate_manifest(raw: object) -> tuple[dict, dict[str, str]]:
             raise ProfileError(422, "invalid_profile_manifest", "max_output_tokens default must be a positive integer")
         if "reasoning_effort" in defaults and defaults["reasoning_effort"] not in catalog.THINKING_LEVELS:
             raise ProfileError(422, "invalid_profile_manifest", "reasoning_effort default is invalid")
+        prefer_spot = value.get("prefer_spot", False)
+        if not isinstance(prefer_spot, bool):
+            raise ProfileError(422, "invalid_profile_manifest", f"profiles[{index}].prefer_spot must be true or false")
+        if prefer_spot and locality != "cloud_explicit":
+            raise ProfileError(422, "invalid_profile_manifest", f"profiles[{index}].prefer_spot needs a cloud_explicit profile")
         profile = {
             "id": profile_id,
             "locality": locality,
@@ -488,6 +542,8 @@ def validate_manifest(raw: object) -> tuple[dict, dict[str, str]]:
         }
         if "description" in value:
             profile["description"] = _bounded_text(value["description"], f"profiles[{index}].description", maximum=1024, required=False)
+        if prefer_spot:
+            profile["prefer_spot"] = True
         normalized_profiles.append(profile)
 
     default_profile = raw.get("default_profile")
@@ -521,6 +577,12 @@ def validate_manifest(raw: object) -> tuple[dict, dict[str, str]]:
                 # Bind only a route available now; the last-known-good row is for serving through outages.
                 raise ProfileError(422, "invalid_profile_route",
                                    f"Route target '{profile['routes'][role]}' is on a peer that is not reachable now")
+        if profile.get("prefer_spot"):
+            # Bound like the routes: the spot tiers available now. A route without one runs as named.
+            spot_routes = {role: spot for role, model in sorted(profile["routes"].items())
+                           if (spot := _spot_route(model, inventory)) is not None}
+            if spot_routes:
+                profile["spot_routes"] = spot_routes
     bindings = {profile["id"]: _binding_for(profile, inventory) for profile in normalized_profiles}
     return manifest, bindings
 
@@ -685,7 +747,9 @@ def resolve_execution(selector: object, *, protocol: str, has_image: bool) -> Ex
             raise ProfileError(403, "profile_execution_unavailable", "Profile execution is unavailable for this policy")
         # Without a vision route, images go to the text route, which receives
         # a note in place of each image when it is text-only.
-        model = (profile["routes"].get("vision") if has_image else None) or profile["routes"]["text"]
+        role = "vision" if has_image and "vision" in profile["routes"] else "text"
+        model = profile["routes"][role]
+        spot = (profile.get("spot_routes") or {}).get(role)
         try:
             live_binding = _binding_for(profile, _inventory_by_name())
         except ProfileError as exc:
@@ -695,12 +759,16 @@ def resolve_execution(selector: object, *, protocol: str, has_image: bool) -> Ex
         peer = federation.manager().trusted_local_row(model) if profile["locality"] == "trusted_local" else None
         if not (peer[1] if peer is not None else providers.resolve(model)):
             raise ProfileError(503, "profile_route_unavailable", "Profile route is unavailable")
+        # prefer_spot: run the spot tier (resolvable: the binding check above resolved it) first;
+        # the request falls back to the route itself when spot has no capacity (src/upstream.py).
+        fallback_model = model if spot else None
         return ExecutionProfile(
             selector=str(selector),
             profile_id=profile_id,
             namespace=namespace,
             gateway_version=record["gateway_version"],
-            model=model,
+            model=spot if fallback_model else model,
             defaults=copy.deepcopy(profile.get("defaults") or {}),
             locality=profile["locality"],
+            fallback_model=fallback_model,
         )

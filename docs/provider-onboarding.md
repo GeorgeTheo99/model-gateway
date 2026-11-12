@@ -574,5 +574,16 @@ Two optional model fields are for consumers to show:
   the models a client offers one provider choice for. Clients show one row per
   `base_model` and route it through the provider chosen for its family.
 
+One optional field describes a best-effort tier:
+
+- `spot_of` — names the route this one is a cheaper, best-effort (spot) tier
+  of, for example `glm-5.3-spot-fw` with `spot_of: glm-5.3-fw` (Fireworks Spot:
+  the same model at 30% off, answering 503 when it has no capacity). A spot
+  route takes no `base_model`, so a base-model name never binds it. Requested
+  by name it runs alone, with no fallback. Its failures never open the
+  provider's circuit, which its standard route shares. Only a consumer profile
+  that sets `prefer_spot` runs it first and falls back to the standard route
+  ([consumer profiles](consumer-profiles.md#spot-tiers)).
+
 Provider-specific request code should only be added when the upstream cannot
 be described by these generic compatibility flags.

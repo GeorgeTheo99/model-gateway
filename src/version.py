@@ -28,6 +28,7 @@ CAPABILITIES = (
     "onboarding_auto_add.v1",
     "onboarding_profiles.v1",
     "profiles.v1",
+    "profile_prefer_spot.v1",
     "reasoning_tiers.v1",
     "scoped_manager.v1",
     "text_only_image_notes.v1",

@@ -1116,6 +1116,16 @@ _REROUTABLE = frozenset({"model_not_found", "provider_not_configured"})
 
 
 @_registry_locked
+def is_spot_route(model_id: str) -> bool:
+    """Whether ``model_id`` (any routable id) names a spot route (catalog ``spot_of``)."""
+    try:
+        entry = _load_models().get(model_id)
+    except Exception:  # noqa: BLE001 — no catalog means no spot routes; never fail a request on it
+        return False
+    return bool(entry and entry.get("spot_of"))
+
+
+@_registry_locked
 def base_model_route(model_id: str, *, locality: str | None = None) -> str | None:
     """The route serving ``model_id`` as a base-model reference, when it is not served as named.
 

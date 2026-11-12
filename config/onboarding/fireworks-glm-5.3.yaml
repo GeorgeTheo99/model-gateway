@@ -59,6 +59,31 @@ models:
       aliases: [glm53flash]
     zdr: true
     desc: GLM 5.3 Flash 320B/18B-active multimodal model on Fireworks, 1M context / 128K max output
+  # Fireworks Spot: the same GLM 5.3 at 30% off, best effort (503 when it has no
+  # capacity; Fireworks never falls back). Requested by name it gets no fallback.
+  # spot_of lets a profile that sets prefer_spot run it first and fall back to
+  # glm-5.3-fw (docs/consumer-profiles.md). No family/base_model: a base-model
+  # name never binds a best-effort route. Prices checked 2026-11-12 against
+  # docs.fireworks.ai/guides/spot-serverless.
+  - name: glm-5.3-spot-fw
+    params: 743B
+    provider: fireworks
+    provider_model_id: accounts/fireworks/models/glm-5p3-spot
+    alias: glm53spotfw
+    display_name: GLM 5.3 Spot (Fireworks)
+    spot_of: glm-5.3-fw
+    context: 1048576
+    max_output_tokens: 131072
+    thinking: always
+    thinking_levels: [minimal, low, medium, high, xhigh, max]
+    thinking_format: openai
+    vision: false
+    pricing:
+      input: 0.98
+      output: 3.08
+      cache_read: 0.182
+    zdr: true
+    desc: GLM 5.3 743B MoE on Fireworks Spot (best effort, no fallback when named), text and tools, 1M context / 128K max output
 
 retire:
   models:

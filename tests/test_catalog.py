@@ -378,6 +378,20 @@ def test_committed_fireworks_glm53_profile_uses_exact_serverless_routes():
     assert flash["thinking_format"] == "openai"
     assert flash["vision"] is True
     assert flash["pricing"] == {"input": 0.15, "output": 0.5, "cache_read": 0.029}
+
+    from src.profiles import _SPOT_MATCH_FIELDS
+
+    spot = models["glm-5.3-spot-fw"]
+    assert spot["provider"] == "fireworks"
+    assert spot["provider_model_id"] == "accounts/fireworks/models/glm-5p3-spot"
+    assert spot["alias"] == "glm53spotfw"
+    assert spot["spot_of"] == "glm-5.3-fw"
+    # Never a base-model answer, and a valid spot tier of the standard route.
+    assert "base_model" not in spot and "alternate_ids" not in spot
+    assert all(spot.get(field) == full.get(field) for field in _SPOT_MATCH_FIELDS)
+    assert spot["pricing"] == {"input": 0.98, "output": 3.08, "cache_read": 0.182}
+    # The key check probes the first model, which stays the standard route.
+    assert profile["models"][0]["name"] == "glm-5.3-fw"
     assert flash["pi"] == {"aliases": ["glm53flash"]}
 
     assert profile["retire"]["models"] == [
