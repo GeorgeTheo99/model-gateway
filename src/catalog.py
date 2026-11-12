@@ -244,10 +244,12 @@ def entry_routable_ids(entry: dict) -> list[str]:
 
     Mirrors ``src.providers._entry_routable_ids`` so the merge keys the same way
     the router does. An owner-added (``custom-``) provider's upstream id is not
-    one: it could otherwise claim another route's identifier.
+    one: it could otherwise claim another route's identifier. Nor is a ChatGPT
+    plan's: ``gpt-6.1-sol`` stays the API-key route, so a name never switches billing.
     """
     ids = []
-    custom = canonical_provider(entry.get("provider")).startswith("custom-")
+    provider = canonical_provider(entry.get("provider"))
+    custom = provider.startswith("custom-") or provider == "chatgpt"
     for field in ("name", "alias", "provider_model_id", "omlx_id"):
         value = entry.get(field)
         if value is not None and not isinstance(value, str):
@@ -630,7 +632,10 @@ def load_catalog_entries(
         if by_id[primary].get("name") not in excluded
         or (by_id[primary].get("origin") or {}).get("layer") not in LOWER_LAYERS
     ]
-    if require_nonempty and not result and not allows_empty(model_info_path):
+    # A ChatGPT plan's row loads on every install, signed in or not (src/shipped.py), so it alone
+    # doesn't make a catalog non-empty.
+    if (require_nonempty and not any(canonical_provider(e.get("provider")) != "chatgpt" for e in result)
+            and not allows_empty(model_info_path)):
         raise ValueError("effective model catalog is empty")
     return result
 

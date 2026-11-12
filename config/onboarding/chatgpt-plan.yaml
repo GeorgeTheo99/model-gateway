@@ -1,0 +1,30 @@
+schema_version: 1
+id: chatgpt-plan
+# Part of the curated list: signing in with ChatGPT (src/chatgpt_auth.py) adds these models.
+# There is no API key: requests use the owner's ChatGPT plan allowance, so they are priced
+# at zero here and metered in ChatGPT > Settings > Usage. Names end in -chatgpt and the
+# upstream id is not routable (src/catalog.py), so gpt-6.1-sol stays the API-key route.
+auto_add: true
+
+provider:
+  id: chatgpt
+  base_url: https://api.openai.com/v1
+  protocol: openai
+  display_name: ChatGPT plan
+  auth: chatgpt
+
+models:
+  - name: gpt-6.1-sol-chatgpt
+    provider: chatgpt
+    provider_model_id: gpt-6.1-sol
+    display_name: GPT-6.1 Sol (ChatGPT plan)
+    context: 1050000
+    max_output_tokens: 128000
+    # reasoning_effort has no "none" for this model.
+    thinking: always
+    thinking_levels: [low, medium, high, xhigh]
+    vision: true
+    pricing:
+      input: 0
+      output: 0
+    desc: GPT-6.1 Sol on the owner's ChatGPT plan (Sign in with ChatGPT), 1.05M context / 128K max output

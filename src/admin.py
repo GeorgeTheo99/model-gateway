@@ -43,7 +43,7 @@ from src.providers import (
     routable_ids,
     snapshot_registry as snapshot_provider_registry,
 )
-from src import bundle, config_io, custom_providers, discovery, federation, inflight, ledger, local_runtime, onboarding, profiles, shipped
+from src import bundle, chatgpt_auth, config_io, custom_providers, discovery, federation, inflight, ledger, local_runtime, onboarding, profiles, shipped
 from src.version import CAPABILITIES, VERSION
 
 log = logging.getLogger("model-gateway")
@@ -1502,8 +1502,81 @@ async def admin_onboarding_profiles(request: Request):
             "provider_defined": matches,
             "has_api_key": bool(effective.get("api_key")),
             "applied": applied,
+            # "chatgpt": connected by signing in (/admin/api/chatgpt), never by a key.
+            "auth": profile["provider"].get("auth") or "api_key",
         })
     return {"profiles": rows}
+
+
+def _require_chatgpt_access(request: Request):
+    """An admin (None) or a manager scoped to the chatgpt provider."""
+    principal = _require_onboarding_access(request)
+    _require_provider_scope(principal, chatgpt_auth.PROVIDER)
+    return principal
+
+
+def _chatgpt_refusal(exc: chatgpt_auth.ChatGPTAuthError) -> JSONResponse:
+    return JSONResponse(status_code=exc.status, content={"detail": str(exc), "code": exc.code})
+
+
+@router.get("/admin/api/chatgpt")
+async def admin_chatgpt_status(request: Request):
+    """Whether the owner's ChatGPT plan is signed in (src/chatgpt_auth.py); never a token."""
+    _require_chatgpt_access(request)
+    return chatgpt_auth.status()
+
+
+@router.post("/admin/api/chatgpt/sign-in")
+async def admin_chatgpt_sign_in(request: Request):
+    """Start Sign in with ChatGPT. Body: {agent_name?: string, new_account?: bool}.
+
+    Returns the URL to open in a browser on this Mac; its callback finishes the sign-in.
+    From another device, post the final callback URL to /admin/api/chatgpt/callback.
+    """
+    principal = _require_chatgpt_access(request)
+    require_admin_writes()
+    raw = await request.body()
+    try:
+        body = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        return _onboarding_refusal(400, "invalid_body", "Invalid JSON body")
+    agent_name = body.get("agent_name")
+    if agent_name is not None and (not isinstance(agent_name, str) or not agent_name.strip().isprintable()):
+        return _onboarding_refusal(400, "invalid_body", "agent_name must be printable text")
+    try:
+        # The consumer whose manager signs the plan in may use it (docs/chatgpt-plan.md).
+        return await chatgpt_auth.start(agent_name=agent_name, new_account=body.get("new_account") is True,
+                                        consumer=principal.consumer if principal is not None else None)
+    except chatgpt_auth.ChatGPTAuthError as exc:
+        return _chatgpt_refusal(exc)
+
+
+@router.post("/admin/api/chatgpt/callback")
+async def admin_chatgpt_callback(request: Request):
+    """Finish a sign-in with the callback URL the browser landed on. Body: {url: string}."""
+    _require_chatgpt_access(request)
+    require_admin_writes()
+    try:
+        body = json.loads(await request.body())
+    except ValueError:
+        body = None
+    url = body.get("url") if isinstance(body, dict) else None
+    if not isinstance(url, str) or not url.strip() or len(url) > 8192:
+        return _onboarding_refusal(400, "invalid_body", "url must be the callback URL")
+    try:
+        return await chatgpt_auth.complete(url)
+    except chatgpt_auth.ChatGPTAuthError as exc:
+        return _chatgpt_refusal(exc)
+
+
+@router.post("/admin/api/chatgpt/sign-out")
+async def admin_chatgpt_sign_out(request: Request):
+    """Revoke the plan's session and forget its tokens."""
+    _require_chatgpt_access(request)
+    require_admin_writes()
+    return await chatgpt_auth.sign_out()
 
 
 @router.post("/admin/api/onboarding/profiles/{profile_id}")
@@ -1522,6 +1595,8 @@ async def admin_apply_onboarding_profile(profile_id: str, request: Request):
         return _onboarding_refusal(404, "profile_not_found", f"unknown onboarding profile {profile_id!r}")
     _require_provider_scope(principal, profile["provider"]["id"])
     require_admin_writes()
+    if profile["provider"].get("auth") == "chatgpt":
+        return _onboarding_refusal(400, "sign_in_required", "This provider connects by signing in with ChatGPT, not a key")
     raw = await request.body()
     try:
         body = json.loads(raw) if raw.strip() else {}
@@ -4525,7 +4600,9 @@ _ADMIN_HTML = r"""
             env: "Present (hidden) · environment variable",
             inline: "Present (hidden) · inline in config.yaml",
             default: "Built-in local default",
+            chatgpt_sign_in: "Signed in with ChatGPT",
           };
+          if (p.api_key_source === "chatgpt_sign_in" && !p.has_api_key) return "Not signed in with ChatGPT";
           return (p.has_api_key && sources[p.api_key_source]) ||
             (p.has_api_key ? "Present (hidden)" : "Missing");
         }

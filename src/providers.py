@@ -17,7 +17,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 import yaml
 
-from src import catalog, shipped
+from src import catalog, chatgpt_auth, shipped
 from src.config_lock import config_write_lock
 from src.secret_files import read_api_key_file
 
@@ -220,6 +220,9 @@ def _provider_defaults(provider: str) -> dict:
     if provider == "media":
         # media-gen on this Mac. Its key comes from config (api_key_file) or the provider env vars.
         return {"base_url": _DEFAULT_MEDIA_BASE_URL, "protocol": "openai"}
+    if provider == chatgpt_auth.PROVIDER:
+        # The owner's ChatGPT plan (src/chatgpt_auth.py): its key is the signed-in access token.
+        return {"base_url": chatgpt_auth.RESOURCE, "protocol": "openai", "auth": "chatgpt"}
     return {}
 
 
@@ -290,6 +293,11 @@ def _effective_provider_config(config: dict, provider: str) -> dict:
     effective = _provider_defaults(provider)
     effective.update(_resolve_provider_config(config, provider))
     effective.update(_provider_env_config(provider))
+    if provider == chatgpt_auth.PROVIDER:
+        # Only a ChatGPT sign-in authorizes this provider, never a configured key.
+        effective.update(_provider_defaults(provider))
+        effective["api_key"] = chatgpt_auth.access_token()
+        return effective
     if not effective.get("api_key") and effective.get("api_key_file"):
         try:
             effective["api_key"] = read_api_key_file(effective["api_key_file"], CONFIG_PATH)
@@ -520,6 +528,9 @@ def reload():
     _retired = {}
 
 
+chatgpt_auth.on_change(reload)
+
+
 def _databricks_cli() -> str:
     """Path to the databricks CLI (launchd PATH may not include homebrew)."""
     from shutil import which
@@ -658,8 +669,27 @@ def _persist_api_key(
                 return False
 
 
+def provider_consumers(provider: str) -> frozenset[str] | None:
+    """The consumers a provider's config limits it to (``consumers: [...]``), or None for any.
+
+    A ChatGPT plan is the owner's: without ``consumers`` only the consumer that signed it in
+    through its manager may use it (src/chatgpt_auth.py), and an admin.
+    """
+    provider = _canonical_provider(provider)
+    raw = _effective_provider_config(_load_config(), provider).get("consumers")
+    if raw is None:
+        return chatgpt_auth.granted_consumers() if provider == chatgpt_auth.PROVIDER else None
+    if isinstance(raw, str):
+        raw = [part.strip() for part in raw.split(",")]
+    return frozenset(str(item) for item in raw if item) if isinstance(raw, list) else frozenset()
+
+
+def _uses_chatgpt_auth(provider: str) -> bool:
+    return _canonical_provider(provider) == chatgpt_auth.PROVIDER
+
+
 async def refresh_oauth_token(
-    provider: str, *, force: bool = False, allow_login: bool = True,
+    provider: str, *, force: bool = False, allow_login: bool = True, failed_token: str | None = None,
 ) -> str | None:
     """Refresh an expired OAuth token via an external CLI token cache.
 
@@ -678,6 +708,8 @@ async def refresh_oauth_token(
     so requests with a backup workspace never wait for browser SSO.
     Returns the new token if one was obtained, else None.
     """
+    if _uses_chatgpt_auth(provider):
+        return await chatgpt_auth.refresh(force=True, failed_token=failed_token)
     config = _load_config()
     found = _find_provider_entry(config, provider)
     if not found:
@@ -827,6 +859,8 @@ async def ensure_fresh_oauth_token(
     lightweight preflight used by request routing so OAuth-backed Databricks
     workspaces do not depend on an external timer job.
     """
+    if _uses_chatgpt_auth(provider):
+        return await chatgpt_auth.refresh()
     config = _load_config()
     found = _find_provider_entry(config, provider)
     if not found:
@@ -914,6 +948,14 @@ def _availability_for_entry(model_id: str, entry: dict | None) -> dict:
             "message": f"Provider {provider!r} is disabled by runtime config",
         }
 
+    if provider == chatgpt_auth.PROVIDER:
+        return {
+            "available": False,
+            "reason": "chatgpt_signed_out",
+            "model": name,
+            "provider": provider,
+            "message": "Sign in with ChatGPT to use this model on your ChatGPT plan",
+        }
     missing = []
     if not provider_config.get("base_url"):
         missing.append("base_url")
@@ -1422,6 +1464,8 @@ def _safe_url(value: str) -> str:
 
 def _api_key_source(explicit_config: dict, env_config: dict, provider: str) -> str:
     """Where a provider's effective key comes from, without reading it."""
+    if provider == chatgpt_auth.PROVIDER:
+        return "chatgpt_sign_in"
     if env_config.get("api_key"):
         return "env"
     if explicit_config.get("api_key"):

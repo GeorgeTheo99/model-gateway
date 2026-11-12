@@ -128,7 +128,7 @@ def _rows(client, headers=MANAGER) -> dict[str, dict]:
 
 def test_lists_packaged_profiles_filtered_by_allowlist(client):
     assert set(_rows(client, ADMIN)) == {
-        "anthropic-claude", "fireworks-glm-5.3", "fireworks-kimi-k3", "moonshot-kimi-k3-rollback",
+        "anthropic-claude", "chatgpt-plan", "fireworks-glm-5.3", "fireworks-kimi-k3", "moonshot-kimi-k3-rollback",
         "moonshot-kimi-k3.1-pro",
         "openai-gpt", "openrouter-claude", "openrouter-gemini-4", "openrouter-glm-5.3", "openrouter-gpt",
     }
@@ -145,7 +145,7 @@ def test_lists_packaged_profiles_filtered_by_allowlist(client):
             {"name": "glm-5.3-spot-fw", "display_name": "GLM 5.3 Spot (Fireworks)", "zero_data_retention": True,
              "base_model": None},
         ],
-        "provider_defined": True, "has_api_key": False, "applied": False,
+        "provider_defined": True, "has_api_key": False, "applied": False, "auth": "api_key",
     }
 
 
@@ -557,7 +557,8 @@ def _names(cfg) -> list[str]:
 
 
 def _loaded() -> list[str]:
-    return admin._catalog_names(shipped_only=True)
+    """Curated rows a key brought in (a ChatGPT plan's rows load signed out: test_chatgpt_plan.py)."""
+    return [name for name in admin._catalog_names(shipped_only=True) if not name.endswith("-chatgpt")]
 
 
 def test_curated_models_load_only_for_keyed_providers(cfg, monkeypatch):

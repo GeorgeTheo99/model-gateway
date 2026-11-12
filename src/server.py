@@ -44,7 +44,7 @@ from src.responses import chat_to_responses, responses_result_events, responses_
 from src.signature_cache import store_from_extra_content
 from src.streaming import _flatten_list_content, translate_stream
 from src.translator import anthropic_to_openai, anthropic_to_openai_chat, openai_chat_to_anthropic, openai_to_anthropic
-from src import catalog, config_io, custom_providers, signature_cache, discovery, federation, inflight, ledger, local_runtime, media, profiles, providers, reasoning_tiers
+from src import catalog, chatgpt_auth, chatgpt_responses, config_io, custom_providers, signature_cache, discovery, federation, inflight, ledger, local_runtime, media, profiles, providers, reasoning_tiers
 from src.usage import (
     anthropic_usage_to_openai_chat as convert_anthropic_usage_to_openai_chat,
     anthropic_usage_to_responses,
@@ -243,6 +243,11 @@ def _responses_only_error_message(model: str, route: str = "/v1/responses") -> s
     )
 
 
+def _chat_only_message(model: str, route: str) -> str:
+    """Client-facing error for a ChatGPT plan route on an endpoint other than Chat Completions."""
+    return f"Model '{model}' runs on a ChatGPT plan and is served only through POST /v1/chat/completions, not {route}"
+
+
 def _non_chat_model_message(model: str, info) -> str | None:
     """Why a chat endpoint cannot serve ``model``: it generates images or video (ADR 0004)."""
     modality = getattr(info, "modality", "chat")
@@ -413,6 +418,22 @@ def _direct_model_permitted(request: Request, model: object) -> bool:
     return principal is None or providers.direct_model_permitted(model, principal.models, principal.namespaces)
 
 
+def _provider_permitted(request: Request, provider: str) -> bool:
+    """Whether this caller may use ``provider``: its config's ``consumers`` list, when set,
+    names the consumers allowed (an admin key is the owner). A federation peer never
+    reaches a ChatGPT plan, which is the owner's own."""
+    if provider == chatgpt_auth.PROVIDER and getattr(request.state, "federation_source", None):
+        return False
+    allowed = providers.provider_consumers(provider)
+    if allowed is None:
+        return True
+    identity = getattr(request.state, "auth_identity", None)
+    if identity is not None and identity.kind == "admin":
+        return True
+    principal = getattr(identity, "principal", None)
+    return principal is not None and principal.consumer in allowed
+
+
 def _resolve_for(request: Request, model: object):
     """``resolve(model)``, except that a trusted_local profile's peer route is never resolved here
     (it is forwarded), and the local federation path takes only loopback oMLX."""
@@ -427,6 +448,9 @@ def _resolve_for(request: Request, model: object):
         if successor is not None and not _direct_model_permitted(request, successor):
             return None
     info = resolve(model)
+    if info is not None and not _provider_permitted(request, info.provider):
+        log.warning("Provider %r refused for this caller (model %r)", info.provider, model)
+        return None
     if info is not None and getattr(request.state, "federation_local", False):
         try:
             profiles._effective_endpoint_binding(model, locality="local_only")
@@ -2777,11 +2801,13 @@ def _local_route(model: str, inventory: dict[str, dict]) -> bool:
 
 
 def _federation_rows(schema_version: int) -> list[dict]:
-    rows = _direct_model_rows()
+    # A ChatGPT plan is the owner's: peers can't use it (_provider_permitted), so it isn't offered.
+    models = providers._load_models()
+    rows = [row for row in _direct_model_rows()
+            if catalog.canonical_provider((models.get(row["id"]) or {}).get("provider")) != chatgpt_auth.PROVIDER]
     if schema_version < 2:
         return rows
     inventory = profiles._inventory_by_name()
-    models = providers._load_models()
     for row in rows:
         row["locality"] = "local" if _local_route(row["id"], inventory) else "cloud"
         entry = models.get(row["id"]) or {}
@@ -2936,6 +2962,8 @@ async def create_response(request: Request):
         return _error_openai(404, "invalid_request_error", _model_error_message(model))
     if (non_chat := _non_chat_model_message(model, info)) is not None:
         return _error_openai(400, "invalid_request_error", non_chat)
+    if info.provider == chatgpt_auth.PROVIDER:
+        return _error_openai(400, "invalid_request_error", _chat_only_message(model, "/v1/responses"))
     thinking_error = _thinking_validation_response(request, body, info, _error_openai)
     if thinking_error is not None:
         return thinking_error
@@ -3333,6 +3361,8 @@ async def chat_completions(request: Request):
 
     if info.protocol == "anthropic":
         return await _handle_chat_anthropic(body, info, model, request, is_stream)
+    if info.provider == chatgpt_auth.PROVIDER:
+        return await _handle_chat_chatgpt(body, info, model, request, is_stream)
 
     thinking_enabled = _apply_gateway_reasoning(body, info, target_api="chat", request=request)
     quirk_error = _apply_openai_request_quirks(body, info)
@@ -3423,6 +3453,88 @@ def _mark_anthropic_prompt_cache(req: dict, retention: object) -> None:
         if _mark_last_anthropic_block(messages[index], marker):
             break
     req["cache_control"] = {"type": "ephemeral"}
+
+
+# A plan usage limit stops the request; it is never retried on another route (src/chatgpt_auth.py).
+# The code is also a header, so a client can tell it from a rate limit without reading the body.
+_CHATGPT_LIMIT_CODE = "subscription_sharing_usage_limit_exceeded"
+_CHATGPT_UNAVAILABLE_CODE = "subscription_sharing_usage_unavailable"
+_ERROR_CODE_HEADER = "X-Model-Gateway-Error-Code"
+
+
+def _chatgpt_error_response(status: int, error: dict) -> JSONResponse:
+    code = str(error.get("code") or "")
+    headers = {_ERROR_CODE_HEADER: code} if code.startswith("subscription_sharing_") else None
+    return JSONResponse(status_code=status, content={"error": error}, headers=headers)
+
+
+async def _handle_chat_chatgpt(body: dict, info, model: str, request: Request, is_stream: bool):
+    """Serve Chat Completions clients from the owner's ChatGPT plan (src/chatgpt_responses.py)."""
+    if not info.api_key:
+        return _error_openai(401, "authentication_error", "The ChatGPT plan is signed out: sign in again in the gateway's settings")
+    thinking_enabled = _apply_gateway_reasoning(body, info, target_api="responses", request=request)
+    try:
+        upstream = chatgpt_responses.chat_to_responses_request(body, info.provider_model_id, body.get("reasoning"))
+    except chatgpt_responses.TranslationError as exc:
+        return _error_openai(400, "invalid_request_error", str(exc))
+    request.state.api_key = info.api_key
+    headers = _forward_headers(request, provider=info.provider)
+    endpoint = _upstream_endpoint(info, "/responses")
+    log.info("OpenAI chat %s -> %s Responses (stream=%s, thinking=%s)", model, info.provider, is_stream, thinking_enabled)
+    client = httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS)
+    try:
+        resp = await _retry_send_stream_with_model_fallback(
+            client, endpoint, json=upstream, headers=headers, provider=info.provider, request=request,
+        )
+    except httpx.ConnectError:
+        await client.aclose()
+        return _error_openai(502, "api_error", "Cannot connect to the ChatGPT plan")
+    except Exception as exc:  # noqa: BLE001
+        await client.aclose()
+        return _error_openai(502, "api_error", f"ChatGPT plan error: {type(exc).__name__}")
+    if resp.status_code != 200:
+        err_body = await resp.aread()
+        await resp.aclose()
+        await client.aclose()
+        refused = upstream_error_openai(resp, err_body.decode(errors="replace"), "ChatGPT")
+        try:
+            error = json.loads(refused.body)["error"]
+        except (ValueError, KeyError, TypeError):
+            return refused
+        return _chatgpt_error_response(refused.status_code, error)
+
+    if not is_stream:
+        try:
+            result, error = await chatgpt_responses.responses_sse_to_chat_completion(resp.aiter_bytes(), model)
+        except httpx.HTTPError as exc:
+            result, error = None, {"type": "api_error", "message": f"Provider stream failed: {type(exc).__name__}"}
+        finally:
+            await resp.aclose()
+            await client.aclose()
+        if error is not None:
+            status = {_CHATGPT_LIMIT_CODE: 429, _CHATGPT_UNAVAILABLE_CODE: 503}.get(error.get("code"), 502)
+            return _chatgpt_error_response(status, error)
+        return JSONResponse(content=result)
+
+    async def stream_generator():
+        try:
+            async for event in chatgpt_responses.responses_sse_to_chat(resp.aiter_bytes(), model):
+                yield event
+        except httpx.TimeoutException as exc:
+            log.warning("ChatGPT plan stream timed out for %s: %s", model, exc)
+            yield _stream_error_event("Provider stream timed out before completing")
+        except httpx.HTTPError as exc:
+            log.warning("ChatGPT plan stream failed for %s: %s", model, exc)
+            yield _stream_error_event(f"Provider stream failed: {type(exc).__name__}")
+        finally:
+            await resp.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        stream_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
 
 
 async def _handle_chat_anthropic(body: dict, info, model: str, request: Request, is_stream: bool):
@@ -3849,6 +3961,8 @@ async def messages(request: Request):
         return _error(400, "invalid_request_error", non_chat)
     if getattr(info, "api_style", "") == "open_responses":
         return _error(400, "invalid_request_error", _responses_only_error_message(model, "/v1/responses"))
+    if info.provider == chatgpt_auth.PROVIDER:
+        return _error(400, "invalid_request_error", _chat_only_message(model, "/v1/messages"))
     thinking_error = _thinking_validation_response(request, body, info, _error)
     if thinking_error is not None:
         return thinking_error

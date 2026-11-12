@@ -4,7 +4,7 @@ Consumers compare these against their own minimum before using the gateway;
 ``/health`` stays version-free because older installers match it exactly.
 """
 
-VERSION = "0.18.2"
+VERSION = "0.19.0"
 
 # Contracts a consumer may require. Add a name when a feature ships; never
 # remove or change the meaning of one.
@@ -12,6 +12,7 @@ CAPABILITIES = (
     "consumer_credentials.v1",
     "create_only_model_registration",
     "catalog_packs.v1",
+    "chatgpt_plan.v1",
     "custom_providers.v1",
     "endpoint_file.v1",
     "federation_catalog.v2",

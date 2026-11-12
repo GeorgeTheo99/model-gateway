@@ -162,13 +162,31 @@ def _is_retryable_exception(exc: Exception) -> bool:
     )
 
 
-def _is_retryable_status(status_code: int) -> bool:
+# A ChatGPT plan's 429 is its usage limit (src/chatgpt_auth.py), which retrying can't clear, and
+# its 403s are eligibility refusals OpenAI says never to answer by signing in again.
+_CHATGPT_PROVIDER = "chatgpt"
+
+
+def _is_retryable_status(status_code: int, provider: str = "") -> bool:
+    if provider == _CHATGPT_PROVIDER and status_code == 429:
+        return False
     return status_code in (408, 409, 425, 429, 500, 502, 503, 504)
 
 
-def _is_auth_status(status_code: int) -> bool:
+def _is_auth_status(status_code: int, provider: str = "") -> bool:
     """Auth failures that may be a stale short-lived OAuth token (some gateways return 403)."""
+    if provider == _CHATGPT_PROVIDER:
+        return status_code == 401
     return status_code in (401, 403)
+
+
+def _refused_token(provider: str, headers: dict) -> dict:
+    """The refused token for a ChatGPT plan's refresh, which skips it when another request already
+    refreshed (its refresh tokens rotate); other providers' refreshers don't take it."""
+    value = headers.get("Authorization") or ""
+    if provider != _CHATGPT_PROVIDER or not value.startswith("Bearer "):
+        return {}
+    return {"failed_token": value[7:]}
 
 
 def _apply_refreshed_token(headers: dict, token: str, request: Request | None) -> dict:
@@ -283,11 +301,11 @@ async def _retry_post(
                 attempt += 1
                 continue
 
-            if _is_auth_status(resp.status_code) and not auth_retried and provider:
+            if _is_auth_status(resp.status_code, provider) and not auth_retried and provider:
                 auth_retried = True
                 await resp.aread()
                 token = await refresh_oauth_token(
-                    provider, force=True, allow_login=not fast_failover,
+                    provider, force=True, allow_login=not fast_failover, **_refused_token(provider, headers),
                 )
                 if token:
                     headers = _apply_refreshed_token(headers, token, request)
@@ -301,7 +319,7 @@ async def _retry_post(
                     probe_request = False
                 return resp
 
-            if not _is_retryable_status(resp.status_code):
+            if not _is_retryable_status(resp.status_code, provider):
                 if circuit:
                     if probe_request:
                         probe_done(circuit, success=True)
@@ -412,7 +430,7 @@ async def _retry_send_stream(
                 attempt += 1
                 continue
 
-            if _is_auth_status(resp.status_code) and not auth_retried and provider:
+            if _is_auth_status(resp.status_code, provider) and not auth_retried and provider:
                 auth_retried = True
                 if not fast_failover:
                     try:
@@ -421,7 +439,7 @@ async def _retry_send_stream(
                         await resp.aclose()
                 try:
                     token = await refresh_oauth_token(
-                        provider, force=True, allow_login=not fast_failover,
+                        provider, force=True, allow_login=not fast_failover, **_refused_token(provider, headers),
                     )
                 except BaseException:
                     # This response has not reached the pool owner yet. Cancellation
@@ -443,7 +461,7 @@ async def _retry_send_stream(
                     probe_request = False
                 return resp
 
-            if not _is_retryable_status(resp.status_code):
+            if not _is_retryable_status(resp.status_code, provider):
                 if circuit:
                     if probe_request:
                         probe_done(circuit, success=True)

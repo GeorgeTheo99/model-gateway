@@ -68,11 +68,10 @@ and which local models fit their Mac, and applies the owner's choices.
   (`home-automation/src/api/settings_gateway.py`).
 - **Myai:** the same prompt and re-snapshot flow in Settings.
 
-## Related: a `chatgpt` provider
+## Related: the `chatgpt` provider
 
-A provider using OpenAI's Sign in with ChatGPT (open-source, locally hosted apps; Responses API
-with `store: false`) would give every gateway client GPT from the owner's ChatGPT plan. Pi itself
-already has the same flow: its `openai` provider's Sign in with ChatGPT (Pi 1.0.3).
+Shipped in 0.19.0: Sign in with ChatGPT gives the owner's consumers GPT from their ChatGPT plan
+([chatgpt-plan.md](chatgpt-plan.md)).
 
 ## Out of scope
 

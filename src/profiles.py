@@ -16,6 +16,7 @@ import logging
 import math
 import os
 import re
+from types import SimpleNamespace
 import subprocess
 import tempfile
 import threading
@@ -26,7 +27,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from src import catalog, federation, providers
+from src import catalog, chatgpt_auth, federation, providers
 
 log = logging.getLogger("model-gateway")
 
@@ -225,6 +226,11 @@ def _effective_endpoint_binding(
     provider_override: str | None = None,
 ) -> dict:
     info = providers.resolve(model, provider_override=provider_override)
+    if info is None and providers.model_availability(model).get("reason") == "chatgpt_signed_out":
+        # A ChatGPT plan's endpoint is fixed, so its binding holds signed out too: a profile that
+        # names it registers and stays registered, and fails only while it runs signed out.
+        info = SimpleNamespace(provider=chatgpt_auth.PROVIDER, base_url=chatgpt_auth.RESOURCE,
+                               protocol="openai", endpoint_suffix=None)
     if info is None:
         raise ProfileError(422, "invalid_profile_route", f"Route target '{model}' is unavailable")
     parsed = urlsplit(info.base_url)
@@ -758,6 +764,9 @@ def resolve_execution(selector: object, *, protocol: str, has_image: bool) -> Ex
             raise ProfileError(409, "profile_binding_changed", "Profile route binding changed; re-register the profile")
         peer = federation.manager().trusted_local_row(model) if profile["locality"] == "trusted_local" else None
         if not (peer[1] if peer is not None else providers.resolve(model)):
+            availability = providers.model_availability(model) if peer is None else {}
+            if availability.get("reason") == "chatgpt_signed_out":
+                raise ProfileError(503, "chatgpt_signed_out", availability["message"])
             raise ProfileError(503, "profile_route_unavailable", "Profile route is unavailable")
         # prefer_spot: run the spot tier (resolvable: the binding check above resolved it) first;
         # the request falls back to the route itself when spot has no capacity (src/upstream.py).

@@ -60,6 +60,8 @@ translation between them.
   behind OpenAI-compatible `/v1/images/generations` and `/v1/videos`, with
   optional owner-supplied LoRA profiles kept on that Mac (`model-gateway media custom`)
   ([ADR 0004](docs/adr/0004-local-image-and-video-generation.md)).
+- **ChatGPT plan** — Sign in with ChatGPT serves GPT models on the owner's
+  plan allowance, limited to the owner's consumers ([docs](docs/chatgpt-plan.md)).
 - **Consumer profiles** — authenticated, namespace-scoped, immutable routing
   snapshots with enforced gateway-local or gateway-managed cloud execution.
   Consumer repositories own text/vision route and default policy; the gateway
@@ -283,6 +285,7 @@ multi-tenant isolation; run the gateway on loopback or behind a trusted proxy.
 | `docs/unity-gateway.md` | Unity Gateway model-service routing and migration checks |
 | `docs/deployment-auth.md` | Inbound auth configuration |
 | `docs/provider-onboarding.md` | Provider/model onboarding flow |
+| `docs/chatgpt-plan.md` | The ChatGPT plan provider: sign-in, consumer limit, Chat-to-Responses translation |
 | `docs/workspace-pools-design.md` | Databricks workspace pools and operations |
 | `docs/federation.md` | Gateway-to-gateway federation |
 | `docs/reasoning-tiers.md` | Reasoning tiers: request field, tier-to-level policy, discovery and response headers |

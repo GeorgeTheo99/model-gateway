@@ -66,7 +66,11 @@ def settings(config: dict) -> tuple[str | frozenset[str], frozenset[str], frozen
 
 
 def provider_ready(profile: dict, config: dict) -> bool:
-    """Whether this install serves the profile's provider: on, at the profile's endpoint, with a key."""
+    """Whether this install serves the profile's provider: on, at the profile's endpoint, with a key.
+
+    A ChatGPT plan's rows load signed out too, unavailable until the owner signs in, so a routing
+    profile that names one stays valid when its session ends (src/chatgpt_auth.py).
+    """
     import src.providers as providers
 
     wanted = profile["provider"]
@@ -78,7 +82,7 @@ def provider_ready(profile: dict, config: dict) -> bool:
     return (
         str(effective.get("base_url") or "").rstrip("/") == str(wanted["base_url"]).rstrip("/")
         and (effective.get("protocol") or "openai") == wanted.get("protocol", "openai")
-        and bool(str(effective.get("api_key") or "").strip())
+        and (wanted.get("auth") == "chatgpt" or bool(str(effective.get("api_key") or "").strip()))
     )
 
 
