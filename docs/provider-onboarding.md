@@ -562,8 +562,10 @@ Supported reusable request quirks are:
 
 Two optional model fields are for consumers to show:
 
-- `display_name` — a friendly label (1–80 printable characters), e.g.
-  `Gemini 4 Argon (OpenRouter)`.
+- `display_name` — a friendly label (1–80 printable characters) naming the
+  model and, in parentheses, the route that serves it, e.g.
+  `Gemini 4 Argon (OpenRouter)`, `GPT-6.1 Sol (OpenAI)` or
+  `GPT-6.1 Sol (ChatGPT plan)`, so the same model on two routes reads apart.
 - `zdr` — `true` declares the route keeps zero data retention upstream (for
   example Fireworks serverless open models, or OpenRouter with
   `openrouter_zdr`). Leave it unset when the provider may retain prompts.
