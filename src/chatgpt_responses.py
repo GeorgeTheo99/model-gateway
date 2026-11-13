@@ -141,13 +141,18 @@ def _tools(tools) -> list[dict]:
     return [{"type": "namespace", "name": NAMESPACE, "description": _NAMESPACE_DESCRIPTION, "tools": functions}]
 
 
-def _tool_choice(choice):
+def _tool_choice(choice) -> tuple[str | None, str | None]:
+    """(the Responses tool_choice, the one function a named choice forces, if any).
+
+    The plan's Responses API can't name a function inside a namespace (checked 2026-11-12:
+    "Tool choice 'x' not found"), so a named choice sends only that function, required.
+    """
     if choice in (None, "auto", "none", "required"):
-        return choice
+        return choice, None
     if isinstance(choice, dict) and choice.get("type") == "function":
         name = (choice.get("function") or {}).get("name") if isinstance(choice.get("function"), dict) else None
         if name:
-            return {"type": "function", "name": name, "namespace": NAMESPACE}
+            return "required", name
     raise TranslationError("Unsupported tool_choice for this model")
 
 
@@ -194,13 +199,14 @@ def chat_to_responses_request(body: dict, upstream_model: str, reasoning: dict |
             if parts:
                 items.append({"type": "message", "role": "user", "content": parts})
         elif role == "assistant":
+            calls = [call for call in message.get("tool_calls") or [] if isinstance(call, dict)]
+            if calls:
+                # In the order the model wrote them: its reasoning, then any text, then the calls.
+                items.extend(_recall_reasoning(str(calls[0].get("id") or "")))
             text = _text_of(content)
             if text:
                 items.append({"type": "message", "role": "assistant",
                               "content": [{"type": "output_text", "text": text}]})
-            calls = [call for call in message.get("tool_calls") or [] if isinstance(call, dict)]
-            if calls:
-                items.extend(_recall_reasoning(str(calls[0].get("id") or "")))
             for call in calls:
                 function = call.get("function") or {}
                 arguments = function.get("arguments")
@@ -221,8 +227,13 @@ def chat_to_responses_request(body: dict, upstream_model: str, reasoning: dict |
         request["instructions"] = "\n\n".join(instructions)
     tools = _tools(body.get("tools"))
     if tools:
+        choice, forced = _tool_choice(body.get("tool_choice"))
+        if forced is not None:
+            functions = [tool for tool in tools[0]["tools"] if tool["name"] == forced]
+            if not functions:
+                raise TranslationError(f"tool_choice names {forced!r}, which isn't in tools")
+            tools = [{**tools[0], "tools": functions}]
         request["tools"] = tools
-        choice = _tool_choice(body.get("tool_choice"))
         if choice is not None:
             request["tool_choice"] = choice
         if isinstance(body.get("parallel_tool_calls"), bool):

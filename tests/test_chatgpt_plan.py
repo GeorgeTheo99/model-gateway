@@ -281,11 +281,17 @@ def test_chat_request_becomes_a_plan_responses_request():
 
 
 def test_named_tool_choice_and_unsupported_content():
-    tools = [{"type": "function", "function": {"name": "f"}}]
+    tools = [{"type": "function", "function": {"name": "f"}}, {"type": "function", "function": {"name": "g"}}]
     request = chatgpt_responses.chat_to_responses_request(
         {"messages": [{"role": "user", "content": "hi"}], "tools": tools,
          "tool_choice": {"type": "function", "function": {"name": "f"}}}, "m", None)
-    assert request["tool_choice"] == {"type": "function", "name": "f", "namespace": "app"}
+    # The plan can't name a namespaced function: only that one is sent, required.
+    assert request["tool_choice"] == "required"
+    assert [tool["name"] for tool in request["tools"][0]["tools"]] == ["f"]
+    with pytest.raises(chatgpt_responses.TranslationError):
+        chatgpt_responses.chat_to_responses_request(
+            {"messages": [{"role": "user", "content": "hi"}], "tools": tools,
+             "tool_choice": {"type": "function", "function": {"name": "h"}}}, "m", None)
     assert "reasoning" not in request
     with pytest.raises(chatgpt_responses.TranslationError):
         chatgpt_responses.chat_to_responses_request(
