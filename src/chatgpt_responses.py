@@ -133,8 +133,9 @@ def _tools(tools) -> list[dict]:
                     "parameters": spec.get("parameters") or {"type": "object", "properties": {}}}
         if spec.get("description"):
             function["description"] = spec["description"]
-        if isinstance(spec.get("strict"), bool):
-            function["strict"] = spec["strict"]
+        # Chat Completions tools are strict only on request; Responses tools are strict unless
+        # told otherwise, and a strict call fills every optional parameter (checked live 2026-11-13).
+        function["strict"] = spec.get("strict") is True
         functions.append(function)
     if not functions:
         return []

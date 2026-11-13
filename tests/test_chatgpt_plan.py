@@ -262,7 +262,7 @@ def test_chat_request_becomes_a_plan_responses_request():
     assert request["include"] == ["reasoning.encrypted_content"]
     assert request["tools"] == [{"type": "namespace", "name": "app", "description": chatgpt_responses._NAMESPACE_DESCRIPTION,
                                  "tools": [{"type": "function", "name": "look", "description": "Look",
-                                            "parameters": {"type": "object"}}]}]
+                                            "parameters": {"type": "object"}, "strict": False}]}]
     assert request["tool_choice"] == "auto" and request["parallel_tool_calls"] is False
     assert request["text"] == {"format": {"type": "json_schema", "name": "r", "schema": {"type": "object"}, "strict": True}}
     assert request["prompt_cache_key"] == "conv-1"
@@ -359,6 +359,14 @@ def test_stream_translation_of_a_tool_call_keeps_reasoning_for_the_next_turn():
     ]}, "m", None)
     assert follow_up["input"][1] == {"type": "reasoning", "summary": [], "encrypted_content": "enc-1"}
     assert follow_up["input"][2]["type"] == "function_call"
+
+
+@pytest.mark.parametrize("asked,sent", [(None, False), (False, False), (True, True)])
+def test_a_tool_is_strict_only_when_the_request_says_so(asked, sent):
+    function = {"name": "look", "parameters": {"type": "object"}, **({} if asked is None else {"strict": asked})}
+    request = chatgpt_responses.chat_to_responses_request(
+        {"messages": [{"role": "user", "content": "hi"}], "tools": [{"type": "function", "function": function}]}, "m", None)
+    assert request["tools"][0]["tools"][0]["strict"] is sent
 
 
 def _call_events(output_index, call_id, name, arguments, *, deltas=(), done=("arguments", "item")):
