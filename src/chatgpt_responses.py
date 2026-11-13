@@ -311,6 +311,7 @@ async def responses_sse_to_chat(byte_iter, model: str):
     chat_id = "chatcmpl_" + secrets.token_hex(12)
     created = int(time.time())
     tool_index: dict[int, int] = {}  # output_index -> chat tool_calls index
+    sent_arguments: dict[int, str] = {}  # chat tool_calls index -> arguments sent so far
     call_ids: list[str] = []
     reasoning_items: list[dict] = []
     summary_parts = 0
@@ -324,6 +325,23 @@ async def responses_sse_to_chat(byte_iter, model: str):
 
     def error(payload: dict) -> bytes:
         return f"data: {json.dumps({'error': payload})}\n\n".encode()
+
+    def arguments(output_index: object, text: object, *, whole: bool = False) -> bytes | None:
+        """A call's next arguments chunk: a delta, or what a ``whole`` value adds to those sent.
+
+        The plan sends a parallel call's arguments only whole, in its done events, with no
+        deltas (checked live 2026-11-13); a single call's arrive as deltas and then whole.
+        """
+        index = tool_index.get(int(output_index or 0))
+        if index is None or not isinstance(text, str):
+            return None
+        sent = sent_arguments[index]
+        if whole:
+            text = text[len(sent):] if text.startswith(sent) else ""
+        if not text:
+            return None
+        sent_arguments[index] = sent + text
+        return chunk({"tool_calls": [{"index": index, "function": {"arguments": text}}]})
 
     yield chunk({"role": "assistant"})
     async for data in _events(byte_iter):
@@ -343,17 +361,25 @@ async def responses_sse_to_chat(byte_iter, model: str):
             if item.get("type") == "function_call":
                 index = len(tool_index)
                 tool_index[int(data.get("output_index") or 0)] = index
+                sent_arguments[index] = ""
                 call_ids.append(str(item.get("call_id") or ""))
                 yield chunk({"tool_calls": [{"index": index, "id": item.get("call_id") or "", "type": "function",
                                              "function": {"name": item.get("name") or "", "arguments": ""}}]})
+                if (rest := arguments(data.get("output_index"), item.get("arguments"), whole=True)) is not None:
+                    yield rest
         elif kind == "response.function_call_arguments.delta":
-            index = tool_index.get(int(data.get("output_index") or 0))
-            if index is not None and data.get("delta"):
-                yield chunk({"tool_calls": [{"index": index, "function": {"arguments": data["delta"]}}]})
+            if (rest := arguments(data.get("output_index"), data.get("delta"))) is not None:
+                yield rest
+        elif kind == "response.function_call_arguments.done":
+            if (rest := arguments(data.get("output_index"), data.get("arguments"), whole=True)) is not None:
+                yield rest
         elif kind == "response.output_item.done":
             item = data.get("item") or {}
             if item.get("type") == "reasoning" and (replay := _replayable(item)) is not None:
                 reasoning_items.append(replay)
+            elif item.get("type") == "function_call":
+                if (rest := arguments(data.get("output_index"), item.get("arguments"), whole=True)) is not None:
+                    yield rest
         elif kind in ("response.completed", "response.incomplete"):
             response = data.get("response") or {}
             if call_ids:

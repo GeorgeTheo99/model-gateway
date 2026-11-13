@@ -82,6 +82,9 @@ return 400. Each request is translated to the plan's Responses API:
   messages.
 - **Tools.** Function tools are grouped in one namespace (`app`), and calls carry it. Hosted tools
   are refused.
+- **Tool call arguments.** A single call's arguments stream as deltas. Parallel calls send
+  theirs only whole, in `response.function_call_arguments.done` and `response.output_item.done`,
+  so the translation sends whatever part of the whole arguments the deltas didn't.
 - **Dropped fields.** `temperature`, `top_p`, `max_tokens`, `metadata`, `user` and
   `prompt_cache_retention` are not sent.
 - **Kept fields.** `prompt_cache_key`, `parallel_tool_calls`, `tool_choice`, `response_format`

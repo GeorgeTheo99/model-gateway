@@ -361,6 +361,50 @@ def test_stream_translation_of_a_tool_call_keeps_reasoning_for_the_next_turn():
     assert follow_up["input"][2]["type"] == "function_call"
 
 
+def _call_events(output_index, call_id, name, arguments, *, deltas=(), done=("arguments", "item")):
+    """One function call's events; the plan sends a parallel call's arguments only in ``done``."""
+    item = {"type": "function_call", "call_id": call_id, "name": name, "namespace": "app"}
+    events = [{"type": "response.output_item.added", "output_index": output_index, "item": {**item, "arguments": ""}}]
+    events += [{"type": "response.function_call_arguments.delta", "output_index": output_index, "delta": delta}
+               for delta in deltas]
+    if "arguments" in done:
+        events.append({"type": "response.function_call_arguments.done", "output_index": output_index,
+                       "arguments": arguments})
+    if "item" in done:
+        events.append({"type": "response.output_item.done", "output_index": output_index,
+                       "item": {**item, "arguments": arguments}})
+    return events
+
+
+def _calls(events) -> list[dict]:
+    result, error = asyncio.run(chatgpt_responses.responses_sse_to_chat_completion(_aiter(events), "m"))
+    assert error is None
+    return [{"id": call["id"], **call["function"]} for call in result["choices"][0]["message"]["tool_calls"]]
+
+
+@pytest.mark.parametrize("done", [("arguments", "item"), ("arguments",), ("item",)])
+def test_parallel_calls_take_their_arguments_from_the_done_events(done):
+    calls = _calls(_sse(
+        {"type": "response.output_item.done", "output_index": 0, "item": REASONING},
+        *_call_events(1, "call_1", "search", '{"query":"weather"}', done=done),
+        *_call_events(2, "call_2", "recall", '{"query":"city"}', done=done),
+        *_call_events(3, "call_3", "list", "{}", done=done),
+        {"type": "response.completed", "response": {"usage": USAGE}},
+    ))
+    assert calls == [{"id": "call_1", "name": "search", "arguments": '{"query":"weather"}'},
+                     {"id": "call_2", "name": "recall", "arguments": '{"query":"city"}'},
+                     {"id": "call_3", "name": "list", "arguments": "{}"}]
+
+
+@pytest.mark.parametrize("deltas", [('{"q"', ":2}"), ('{"q"',)])
+def test_done_events_add_only_the_arguments_the_deltas_did_not_send(deltas):
+    events = _collect(_sse(*_call_events(0, "call_9", "look", '{"q":2}', deltas=deltas),
+                           {"type": "response.completed", "response": {}}))
+    sent = [call["function"]["arguments"] for event in events[1:-2]
+            for call in event["choices"][0]["delta"]["tool_calls"]]
+    assert sent == ["", *deltas, *([":2}"] if len(deltas) == 1 else [])]
+
+
 @pytest.mark.parametrize("events,expected", [
     (_sse({"type": "response.output_text.delta", "delta": "Hel"},
           {"type": "response.failed", "response": {"error": {"code": "subscription_sharing_usage_limit_exceeded",
