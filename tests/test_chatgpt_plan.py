@@ -521,6 +521,39 @@ def test_chat_completions_run_on_the_plan(plan_upstream, stream):
         assert result.json()["usage"]["prompt_tokens"] == 100
 
 
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_tool_using_chat_on_an_openai_key_runs_on_responses(plan_upstream, stream):
+    """Chat Completions refuses gpt-6.1-sol's tools with reasoning, and more than 128 tools."""
+    seen, _ = plan_upstream
+    tools = [{"type": "function", "function": {"name": f"t{i}", "parameters": {"type": "object"}}} for i in range(140)]
+    result = TestClient(server.app).post(
+        "/v1/chat/completions", headers={"Authorization": f"Bearer {MYAI}"},
+        json={"model": "gpt-6.1-sol", "stream": stream, "reasoning_effort": "high", "max_tokens": 900,
+              "temperature": 0.2, "prompt_cache_retention": "24h", "tools": tools,
+              "messages": [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]})
+    assert result.status_code == 200
+    assert seen[0]["url"] == "https://api.openai.com/v1/responses" and seen[0]["auth"] == "Bearer sk-api"
+    sent = seen[0]["body"]
+    assert sent["model"] == "gpt-6.1-sol" and sent["store"] is False and sent["instructions"] == "sys"
+    assert sent["reasoning"]["effort"] == "high" and len(sent["tools"][0]["tools"]) == 140
+    assert (sent["max_output_tokens"], sent["temperature"], sent["prompt_cache_retention"]) == (900, 0.2, "24h")
+    if stream:
+        assert '"finish_reason": "tool_calls"' in result.text and result.text.rstrip().endswith("data: [DONE]")
+    else:
+        assert result.json()["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "look"
+        assert result.json()["usage"]["prompt_tokens"] == 100
+
+
+def test_chat_without_tools_on_an_openai_key_stays_on_chat_completions(plan_upstream):
+    seen, state = plan_upstream
+    state["events"] = [b'data: {"id":"c","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n', b"data: [DONE]\n\n"]
+    result = TestClient(server.app).post(
+        "/v1/chat/completions", headers={"Authorization": f"Bearer {MYAI}"},
+        json={"model": "gpt-6.1-sol", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+    assert result.status_code == 200
+    assert seen[0]["url"] == "https://api.openai.com/v1/chat/completions" and seen[0]["auth"] == "Bearer sk-api"
+
 def test_usage_limit_is_an_error_without_a_fallback(plan_upstream):
     _, state = plan_upstream
     state["events"] = _sse({"type": "response.failed", "response": {"error": {

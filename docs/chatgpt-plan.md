@@ -100,3 +100,9 @@ return 400. Each request is translated to the plan's Responses API:
   - Error responses name `subscription_sharing_*` codes in an `X-Model-Gateway-Error-Code` header.
 - **Signed out.** A profile that names the plan registers and stays registered while signed out
   (its endpoint is fixed). Running it then returns 503 `chatgpt_signed_out`.
+
+The same translation serves Chat Completions requests with tools to the `openai` provider (an
+API key): OpenAI's Chat Completions takes at most 128 tools and refuses tools with reasoning on
+`gpt-6.1-sol`. That route also carries `max_tokens` (as `max_output_tokens`), `temperature`,
+`top_p`, `prompt_cache_retention`, `service_tier`, `safety_identifier` and `user`, which the plan
+refuses. Requests without tools stay on Chat Completions.

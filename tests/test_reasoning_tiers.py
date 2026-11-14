@@ -177,7 +177,8 @@ def test_messages_native_anthropic_gets_the_level(client, upstream, monkeypatch)
 ])
 def test_a_quirk_that_overrides_the_level_reports_what_was_sent(client, upstream, quirk, tools, level):
     routes, sent = upstream
-    routes["quirky"] = _info(ASTRA, quirks=frozenset({quirk}))
+    # Not OpenAI's own API, whose tool-using chat goes to Responses.
+    routes["quirky"] = _info(ASTRA, provider="custom-up", quirks=frozenset({quirk}))
     tool = {"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}
     response = client.post("/v1/chat/completions", json={
         "model": "quirky", "messages": [{"role": "user", "content": "hi"}],

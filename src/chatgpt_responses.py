@@ -1,5 +1,9 @@
 """Chat Completions over the ChatGPT plan's Responses API (``src.chatgpt_auth``).
 
+The same translation serves tool-using requests to OpenAI models on an API key, whose Chat
+Completions refuses more than 128 tools and tools with reasoning on its newest models; that
+route adds back the fields only the plan refuses (``src.server._RESPONSES_API_FIELDS``).
+
 The plan serves only ``POST /v1/responses`` with OpenAI's preview rules
 (developers.openai.com/siwc/token-sharing-open-source/preview-limitations, 2026-11-12):
 

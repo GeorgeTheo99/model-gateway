@@ -111,6 +111,9 @@ def _is_context_overflow(status_code: int, message: str) -> bool:
     if status_code not in (400, 413, 422):
         return False
     lowered = (message or "").lower()
+    # A list past a parameter's limit ("Invalid 'tools': array too long", OpenAI) isn't the context.
+    if "array too long" in lowered:
+        return False
     return any(marker in lowered for marker in _CONTEXT_OVERFLOW_MARKERS)
 
 

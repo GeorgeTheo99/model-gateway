@@ -3361,8 +3361,10 @@ async def chat_completions(request: Request):
 
     if info.protocol == "anthropic":
         return await _handle_chat_anthropic(body, info, model, request, is_stream)
-    if info.provider == chatgpt_auth.PROVIDER:
-        return await _handle_chat_chatgpt(body, info, model, request, is_stream)
+    # OpenAI's Chat Completions takes at most 128 tools and refuses tools with reasoning on its
+    # newest models (gpt-6.1-sol, checked 2026-11-14); its Responses API takes both.
+    if info.provider == chatgpt_auth.PROVIDER or (info.provider == "openai" and body.get("tools")):
+        return await _handle_chat_responses(body, info, model, request, is_stream)
 
     thinking_enabled = _apply_gateway_reasoning(body, info, target_api="chat", request=request)
     quirk_error = _apply_openai_request_quirks(body, info)
@@ -3468,15 +3470,29 @@ def _chatgpt_error_response(status: int, error: dict) -> JSONResponse:
     return JSONResponse(status_code=status, content={"error": error}, headers=headers)
 
 
-async def _handle_chat_chatgpt(body: dict, info, model: str, request: Request, is_stream: bool):
-    """Serve Chat Completions clients from the owner's ChatGPT plan (src/chatgpt_responses.py)."""
+# Chat Completions fields the API-key Responses route carries over; the plan takes none of them.
+_RESPONSES_API_FIELDS = ("temperature", "top_p", "prompt_cache_retention", "service_tier", "safety_identifier", "user")
+
+
+async def _handle_chat_responses(body: dict, info, model: str, request: Request, is_stream: bool):
+    """Serve Chat Completions clients through the Responses API (src/chatgpt_responses.py): the
+    owner's ChatGPT plan, and tool-using requests to OpenAI models on an API key."""
+    plan = info.provider == chatgpt_auth.PROVIDER
+    label = "the ChatGPT plan" if plan else "OpenAI"
     if not info.api_key:
-        return _error_openai(401, "authentication_error", "The ChatGPT plan is signed out: sign in again in the gateway's settings")
+        if plan:
+            return _error_openai(401, "authentication_error", "The ChatGPT plan is signed out: sign in again in the gateway's settings")
+        return _error_openai(401, "authentication_error", "No API key is set for OpenAI")
     thinking_enabled = _apply_gateway_reasoning(body, info, target_api="responses", request=request)
     try:
         upstream = chatgpt_responses.chat_to_responses_request(body, info.provider_model_id, body.get("reasoning"))
     except chatgpt_responses.TranslationError as exc:
         return _error_openai(400, "invalid_request_error", str(exc))
+    if not plan:
+        upstream.update({key: body[key] for key in _RESPONSES_API_FIELDS if body.get(key) is not None})
+        cap = body.get("max_completion_tokens") or body.get("max_tokens")
+        if isinstance(cap, int) and cap > 0:
+            upstream["max_output_tokens"] = cap
     request.state.api_key = info.api_key
     headers = _forward_headers(request, provider=info.provider)
     endpoint = _upstream_endpoint(info, "/responses")
@@ -3488,15 +3504,15 @@ async def _handle_chat_chatgpt(body: dict, info, model: str, request: Request, i
         )
     except httpx.ConnectError:
         await client.aclose()
-        return _error_openai(502, "api_error", "Cannot connect to the ChatGPT plan")
+        return _error_openai(502, "api_error", f"Cannot connect to {label}")
     except Exception as exc:  # noqa: BLE001
         await client.aclose()
-        return _error_openai(502, "api_error", f"ChatGPT plan error: {type(exc).__name__}")
+        return _error_openai(502, "api_error", f"{label[0].upper()}{label[1:]} error: {type(exc).__name__}")
     if resp.status_code != 200:
         err_body = await resp.aread()
         await resp.aclose()
         await client.aclose()
-        refused = upstream_error_openai(resp, err_body.decode(errors="replace"), "ChatGPT")
+        refused = upstream_error_openai(resp, err_body.decode(errors="replace"), "ChatGPT" if plan else "OpenAI")
         try:
             error = json.loads(refused.body)["error"]
         except (ValueError, KeyError, TypeError):

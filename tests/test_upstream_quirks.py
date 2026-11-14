@@ -451,6 +451,11 @@ def test_is_context_overflow_true_for_400_prompt_too_long():
     assert errors._is_context_overflow(400, "prompt is too long") is True
 
 
+
+def test_is_context_overflow_false_for_a_parameter_list_past_its_limit():
+    message = "Invalid 'tools': array too long. Expected an array with maximum length 128, but got an array with length 140 instead."
+    assert errors._is_context_overflow(400, message) is False
+
 def test_is_context_overflow_false_for_500():
     assert errors._is_context_overflow(500, "prompt is too long") is False
 
