@@ -16,6 +16,7 @@ import io
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -2066,13 +2067,32 @@ def _sse_error_from_line(line: str) -> str | None:
     return None
 
 
+USAGE_TAG_HEADER = "X-Model-Gateway-Usage-Tag"
+_USAGE_TAG = re.compile(r"^[A-Za-z0-9._:-]{1,120}$")
+
+
+def _usage_tag(request: Request) -> str | None:
+    """The client's label for this request (docs/usage-tags.md); an invalid one is ignored, never an error."""
+    value = request.headers.get(USAGE_TAG_HEADER, "").strip()
+    return value if _USAGE_TAG.fullmatch(value) else None
+
+
+def _usage_owner(request: Request) -> str | None:
+    """Who may read back a tagged request: the consumer credential that sent it, else the kind of key."""
+    identity = getattr(request.state, "auth_identity", None)
+    if identity is None:
+        return None
+    principal = getattr(identity, "principal", None)
+    return f"consumer:{principal.credential_id}" if principal is not None else identity.kind
+
+
 def _ledger_record(
     endpoint: str, method: str, model: str | None, provider: str | None,
     provider_model_id: str | None, status: int | None, latency_ms: int | None,
     is_stream: bool, usage_dict: dict | None, pricing: dict | None,
     pricing_status: str = "unknown", error: str | None = None,
     profile_id: str | None = None, profile_namespace: str | None = None,
-    profile_version: int | None = None,
+    profile_version: int | None = None, usage_tag: str | None = None, usage_owner: str | None = None,
 ) -> None:
     """Best-effort: normalize usage, estimate cost, insert a ledger row."""
     try:
@@ -2084,6 +2104,7 @@ def _ledger_record(
             is_stream=is_stream, usage=usage, cost=cost, error=error,
             profile_id=profile_id, profile_namespace=profile_namespace,
             profile_version=profile_version,
+            usage_tag=usage_tag if usage_owner else None, usage_owner=usage_owner if usage_tag else None,
         )
     except Exception as exc:  # noqa: BLE001 - ledger must never break requests
         log.warning("ledger record failed: %s", exc)
@@ -2152,11 +2173,12 @@ async def _ledger_response(request: Request, call_next, stream_done) -> tuple[Re
         pricing_status = "unknown"
     status = response.status_code
 
+    tagged = {"usage_tag": _usage_tag(request), "usage_owner": _usage_owner(request)}
     if ctx.get("record_without_body"):
         _ledger_record(
             request.url.path, "POST", model, provider, provider_model_id,
             status, latency_ms, False, None, pricing, pricing_status,
-            None, profile_id, profile_namespace, profile_version,
+            None, profile_id, profile_namespace, profile_version, **tagged,
         )
         return response, False
 
@@ -2203,7 +2225,7 @@ async def _ledger_response(request: Request, call_next, stream_done) -> tuple[Re
                     request.url.path, "POST", model, provider, provider_model_id,
                     status, latency_ms, True, usage_capture["usage"], pricing,
                     pricing_status, usage_capture["error"],
-                    profile_id, profile_namespace, profile_version,
+                    profile_id, profile_namespace, profile_version, **tagged,
                 )
                 stream_done()
 
@@ -2229,7 +2251,7 @@ async def _ledger_response(request: Request, call_next, stream_done) -> tuple[Re
     _ledger_record(
         request.url.path, "POST", model, provider, provider_model_id,
         status, latency_ms, False, usage_dict, pricing, pricing_status,
-        None, profile_id, profile_namespace, profile_version,
+        None, profile_id, profile_namespace, profile_version, **tagged,
     )
 
     return Response(
@@ -2238,6 +2260,27 @@ async def _ledger_response(request: Request, call_next, stream_done) -> tuple[Re
         headers=dict(response.headers),
         media_type=response.media_type,
     ), False
+
+
+@app.get("/v1/usage")
+async def tagged_usage(
+    request: Request, tag: str | None = None, tag_prefix: str | None = None, since: float | None = None,
+):
+    """What this client's tagged requests cost (docs/usage-tags.md): exactly ``tag``, or every tag starting with
+    ``tag_prefix`` (at least 8 characters), optionally since ``since`` (epoch seconds)."""
+    require_client_auth(request)
+    owner = _usage_owner(request)
+    if (tag is None) == (tag_prefix is None):
+        raise HTTPException(status_code=400, detail="Pass exactly one of tag and tag_prefix")
+    value = tag if tag is not None else tag_prefix
+    if not _USAGE_TAG.fullmatch(value or "") or (tag_prefix is not None and len(tag_prefix) < 8):
+        raise HTTPException(status_code=400, detail="Invalid usage tag")
+    if owner is None:
+        raise HTTPException(status_code=401, detail="Missing or invalid model-gateway client key")
+    return JSONResponse(
+        ledger.tagged_usage(owner, tag=tag, tag_prefix=tag_prefix, since=since),
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/health")

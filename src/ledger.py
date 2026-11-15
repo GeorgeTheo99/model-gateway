@@ -39,6 +39,10 @@ _ADDITIVE_COLUMNS: dict[str, str] = {
     "profile_id": "TEXT",
     "profile_namespace": "TEXT",
     "profile_version": "INTEGER",
+    # A client's own label for the request (X-Model-Gateway-Usage-Tag) and who sent it, so a client can read back
+    # what its requests cost (GET /v1/usage).
+    "usage_tag": "TEXT",
+    "usage_owner": "TEXT",
 }
 
 
@@ -115,6 +119,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     for col, decl in _ADDITIVE_COLUMNS.items():
         if col not in cols:
             conn.execute(f"ALTER TABLE requests ADD COLUMN {col} {decl}")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_usage_tag ON requests(usage_owner, usage_tag, ts)")
 
 
 def init() -> None:
@@ -139,6 +144,8 @@ def record(
     profile_id: str | None = None,
     profile_namespace: str | None = None,
     profile_version: int | None = None,
+    usage_tag: str | None = None,
+    usage_owner: str | None = None,
 ) -> str:
     """Insert one ledger row. Best-effort: logs and never raises.
 
@@ -158,8 +165,8 @@ def record(
                     cache_write_tokens, cache_write_1h_tokens, reasoning_tokens,
                     usage_reported, cost_usd, pricing_complete,
                     missing_pricing_classes, error,
-                    profile_id, profile_namespace, profile_version
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    profile_id, profile_namespace, profile_version, usage_tag, usage_owner
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     rid,
@@ -186,6 +193,8 @@ def record(
                     profile_id,
                     profile_namespace,
                     profile_version,
+                    usage_tag,
+                    usage_owner,
                 ),
             )
     except Exception as exc:  # noqa: BLE001 - ledger must never break requests
@@ -475,3 +484,45 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
     if "ts" in d and d["ts"] is not None:
         d["ts_iso"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(d["ts"]))
     return d
+
+
+def tagged_usage(owner: str, *, tag: str | None = None, tag_prefix: str | None = None, since: float | None = None) -> dict:
+    """What one owner's requests with a usage tag (exactly ``tag``, or starting with ``tag_prefix``) cost, since
+    ``since`` (epoch seconds) when given. ``cost_usd`` sums the priced requests; ``unpriced_requests`` counts the
+    rest, so a caller can tell an incomplete total from a complete one."""
+    if (tag is None) == (tag_prefix is None):
+        raise ValueError("exactly one of tag and tag_prefix")
+    clauses = ["usage_owner = ?"]
+    params: list = [owner]
+    if tag is not None:
+        clauses.append("usage_tag = ?")
+        params.append(tag)
+    else:
+        escaped = tag_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        clauses.append("usage_tag LIKE ? ESCAPE '\\'")
+        params.append(f"{escaped}%")
+    if since is not None:
+        clauses.append("ts >= ?")
+        params.append(float(since))
+    with _lock, _connect() as conn:
+        _ensure_schema(conn)
+        row = conn.execute(
+            f"""
+            SELECT COUNT(*) AS requests,
+                   COALESCE(SUM(cost_usd), 0) AS cost_usd,
+                   SUM(CASE WHEN cost_usd IS NULL OR pricing_complete = 0 THEN 1 ELSE 0 END) AS unpriced_requests,
+                   COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                   COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                   COALESCE(SUM(cached_read_tokens), 0) AS cached_read_tokens
+            FROM requests WHERE {" AND ".join(clauses)}
+            """,
+            params,
+        ).fetchone()
+    return {
+        "requests": int(row["requests"]),
+        "cost_usd": round(float(row["cost_usd"]), 6),
+        "unpriced_requests": int(row["unpriced_requests"] or 0),
+        "input_tokens": int(row["input_tokens"]),
+        "output_tokens": int(row["output_tokens"]),
+        "cached_read_tokens": int(row["cached_read_tokens"]),
+    }

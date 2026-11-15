@@ -709,3 +709,60 @@ def test_admin_usage_exposes_configured_route_aggregation(monkeypatch, tmp_ledge
     assert route["requests"] == 2
     assert route["input_tokens"] == 20
     assert route["cost_usd"] == pytest.approx(0.02)
+
+
+@pytest.mark.skipif(TestClient is None, reason="fastapi not installed")
+def test_a_client_reads_back_what_its_tagged_requests_cost(tmp_ledger, monkeypatch):
+    """docs/usage-tags.md: X-Model-Gateway-Usage-Tag labels a request; GET /v1/usage sums the label's cost."""
+    info = _info(provider="anthropic", provider_model_id="claude-sonnet-4-6")
+    import src.providers as providers
+    monkeypatch.setattr(providers, "_models", {
+        "priced-model": {
+            "name": "priced-model", "provider": "anthropic", "provider_model_id": "claude-sonnet-4-6",
+            "pricing": {"input": 3.0, "output": 15.0},
+        },
+    })
+    monkeypatch.setattr(server_module, "resolve", lambda model: info if model == "priced-model" else None)
+
+    async def fake_passthrough_sync(endpoint, body, headers, **kwargs):
+        return server_module.JSONResponse(status_code=200, content={
+            "choices": [{"message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 100000, "completion_tokens": 10000},
+        })
+
+    monkeypatch.setattr(server_module, "_passthrough_sync", fake_passthrough_sync)
+    request = {"model": "priced-model", "messages": [{"role": "user", "content": "hi"}]}
+    with TestClient(app) as c:
+        for tag in ("myai-abc123:run:1", "myai-abc123:run:1", "myai-abc123:run:2", "bad tag!", None):
+            headers = {"X-Model-Gateway-Usage-Tag": tag} if tag else {}
+            assert c.post("/v1/chat/completions", json=request, headers=headers).status_code == 200
+        one = c.get("/v1/usage", params={"tag": "myai-abc123:run:1"}).json()
+        assert one["requests"] == 2
+        assert one["cost_usd"] == pytest.approx(2 * (0.3 + 0.15))
+        assert (one["unpriced_requests"], one["input_tokens"], one["output_tokens"]) == (0, 200000, 20000)
+        every = c.get("/v1/usage", params={"tag_prefix": "myai-abc123:", "since": 0}).json()
+        assert every["requests"] == 3
+        later = c.get("/v1/usage", params={"tag_prefix": "myai-abc123:", "since": 4102444800}).json()
+        assert later["requests"] == 0
+        for params in ({}, {"tag": "a", "tag_prefix": "abcdefgh"}, {"tag_prefix": "short"}, {"tag": "bad tag!"}):
+            assert c.get("/v1/usage", params=params).status_code == 400
+    # The invalid tag and the untagged request carry no tag.
+    assert sorted(row["usage_tag"] or "" for row in ledger.recent()) == [
+        "", "", "myai-abc123:run:1", "myai-abc123:run:1", "myai-abc123:run:2",
+    ]
+
+
+def test_tagged_usage_is_read_only_by_its_owner(tmp_ledger):
+    usage = Usage(input_tokens=10, output_tokens=5, cached_read_tokens=0, cache_write_tokens=0,
+                  reasoning_tokens=0, reported=True)
+    for owner, cost in (("consumer:a", 0.5), ("consumer:b", 0.25), ("consumer:a", None)):
+        ledger.record(
+            endpoint="/v1/chat/completions", method="POST", model="m", provider="p", provider_model_id="m",
+            status=200, latency_ms=1, is_stream=False, usage=usage,
+            cost=CostEstimate(cost, cost is not None, []), usage_tag="t:1", usage_owner=owner,
+        )
+    mine = ledger.tagged_usage("consumer:a", tag="t:1")
+    assert (mine["requests"], mine["cost_usd"], mine["unpriced_requests"]) == (2, 0.5, 1)
+    assert ledger.tagged_usage("consumer:c", tag="t:1")["requests"] == 0
+    # A prefix is a prefix: LIKE wildcards in it match only themselves.
+    assert ledger.tagged_usage("consumer:a", tag_prefix="t_")["requests"] == 0

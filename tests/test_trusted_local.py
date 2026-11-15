@@ -343,7 +343,7 @@ def test_local_only_profiles_never_bind_a_peer(monkeypatch, importer):
 def test_local_path_requests_are_recorded_in_the_serving_nodes_ledger(monkeypatch, exporter):
     _configure(monkeypatch)
     recorded = []
-    monkeypatch.setattr(server, "_ledger_record", lambda path, method, model, *args: recorded.append((path, model)))
+    monkeypatch.setattr(server, "_ledger_record", lambda path, method, model, *args, **kwargs: recorded.append((path, model)))
     assert _local("qwen-local").status_code == 200
     assert recorded == [("/v1/federation/local/chat/completions", "qwen-local")]
 
