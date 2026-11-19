@@ -22,10 +22,10 @@ def elements():
     return parser.elements
 
 
-def test_ui_has_six_primary_destinations_and_secondary_settings():
+def test_ui_has_seven_primary_destinations_and_secondary_settings():
     tabs = [attrs for _, attrs in elements() if "data-tab" in attrs]
     assert [attrs["data-tab"] for attrs in tabs] == [
-        "overview", "models", "usage", "activity", "connections", "consumers", "settings",
+        "overview", "models", "catalog", "usage", "activity", "connections", "consumers", "settings",
     ]
     assert tabs[0]["aria-selected"] == "true"
     assert "settings-nav" in tabs[-1]["class"]
@@ -94,3 +94,11 @@ def test_ui_consumer_changes_are_gated_confirmed_and_show_keys_once():
     assert _ADMIN_HTML.count("sessionStorage.setItem(") == 1
     assert 'sessionStorage.setItem(STORAGE_KEY, $("adminKey").value.trim())' in _ADMIN_HTML
     assert "localStorage" not in _ADMIN_HTML
+
+
+def test_catalog_changes_are_gated_to_write_mode():
+    indexed = {attrs["id"]: attrs for _, attrs in elements() if "id" in attrs}
+    for id_ in ("catalogSyncBtn", "catalogResetRanking"):
+        assert "data-mgmt" in indexed[id_]
+    assert "Zero-retention routes only" in _ADMIN_HTML
+    assert "Allow OpenRouter routes that keep prompts?" in _ADMIN_HTML

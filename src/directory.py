@@ -470,6 +470,12 @@ def slug(text: str) -> str:
     return re.sub(r"-{2,}", "-", value)
 
 
+def line_label(lab_name: str) -> str:
+    """A readable line name from a model name: ``GPT-6.2 Sol`` -> ``GPT Sol``."""
+    words = (re.sub(r"[-\s]?\d+(?:\.\d+)*", "", word) for word in lab_name.split())
+    return " ".join(word for word in words if len(word) > 1) or lab_name
+
+
 def line_key(lab: str, lab_name: str) -> str:
     """A model line: the lab plus the version-free words of the name (ADR 0005)."""
     words = [word for word in re.split(r"[\s\-_/()]+", lab_name.lower()) if word and not re.search(r"\d", word)]

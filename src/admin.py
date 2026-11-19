@@ -1078,6 +1078,8 @@ async def admin_directory_status(request: Request):
     def build() -> dict:
         mapped, snapshot, origin = _directory_mapped()
         current = directory.current_models(mapped)
+        names = {canonical: lab.get("name") for canonical, lab in ((snapshot or {}).get("labs") or {}).items()
+                 if lab.get("name")}
         offered: dict[str, set[str]] = {}
         for item in mapped:
             if item.row is not None:
@@ -1111,7 +1113,9 @@ async def admin_directory_status(request: Request):
                 "models": directory.model_count(snapshot or {}),
                 "offered": sum(1 for item in mapped if item.row is not None),
             },
-            "lines": [{"line": line, "current": canonical, "providers": sorted(offered.get(canonical, ())),
+            "lines": [{"line": line, "current": canonical, "current_name": names.get(canonical, canonical),
+                       "label": directory.line_label(names.get(canonical, canonical)),
+                       "providers": sorted(offered.get(canonical, ())),
                        "followed": line in followed, "owner": owner["lines"].get(line)}
                       for line, canonical in sorted(current.items())],
         }
@@ -3591,6 +3595,15 @@ _ADMIN_HTML = r"""
             >
               Models</button
             ><button
+              id="tab-catalog"
+              role="tab"
+              data-tab="catalog"
+              aria-controls="panel-catalog"
+              aria-selected="false"
+              tabindex="-1"
+            >
+              Catalog</button
+            ><button
               id="tab-usage"
               role="tab"
               data-tab="usage"
@@ -4227,6 +4240,130 @@ _ADMIN_HTML = r"""
             </div>
           </section>
           <section
+            id="panel-catalog"
+            class="tab-panel"
+            data-tab-panel="catalog"
+            role="tabpanel"
+            aria-labelledby="tab-catalog"
+            tabindex="0"
+          >
+            <div class="page-head">
+              <div>
+                <h1>Catalog</h1>
+                <p>
+                  Where cloud models come from: models.dev, your provider
+                  order, and the model lines the gateway keeps up to date.
+                </p>
+              </div>
+              <button class="btn" data-mgmt id="catalogSyncBtn">Sync now</button>
+            </div>
+            <div id="catalogStatus" class="view-status" role="status"></div>
+            <div id="catalogMsg" class="msg" role="status"></div>
+            <p id="catalogSummary" class="small"></p>
+            <div id="catalogReview"></div>
+            <div class="sec-head">
+              <h2>Providers</h2>
+              <button class="btn secondary" data-mgmt id="catalogResetRanking">
+                Use default order
+              </button>
+            </div>
+            <p class="small">
+              A model is served by the first ready provider in this order that
+              offers it. If that route is unavailable, the next one takes over.
+            </p>
+            <div class="scroll">
+              <table id="catalogProviders" class="inventory">
+                <thead>
+                  <tr>
+                    <th>Order</th>
+                    <th>Provider</th>
+                    <th>Status</th>
+                    <th>Rule</th>
+                    <th data-mgmt>Move</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr class="empty">
+                    <td colspan="5">Loading providers…</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="sec-head"><h2>Model lines</h2></div>
+            <p class="small">
+              A line is one model across its versions, such as Claude Opus or
+              Gemini Neon. A followed line loads its newest model; requests for
+              its older models go to the newest one, unless you pin them or an
+              app's profile uses them.
+            </p>
+            <div class="filters">
+              <label for="lineFilter"
+                >Search<input
+                  id="lineFilter"
+                  type="search"
+                  placeholder="Lab, line or model" /></label
+              ><label for="lineShow"
+                >Show<select id="lineShow">
+                  <option value="followed">Followed lines</option>
+                  <option value="">All lines</option>
+                </select></label
+              >
+            </div>
+            <div class="scroll">
+              <table id="catalogLines" class="inventory">
+                <thead>
+                  <tr>
+                    <th>Line</th>
+                    <th>Newest model</th>
+                    <th>Following</th>
+                    <th data-mgmt>Change</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr class="empty">
+                    <td colspan="4">Loading model lines…</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="sec-head"><h2>Browse models.dev</h2></div>
+            <p class="small">
+              Every model your connected providers offer. Turn one on to load
+              it without following its line.
+            </p>
+            <div class="filters">
+              <label for="dirSearch"
+                >Search<input
+                  id="dirSearch"
+                  type="search"
+                  placeholder="Model, lab or line" /></label
+              ><label for="dirProvider"
+                >Provider<select id="dirProvider">
+                  <option value="">All providers</option>
+                </select></label
+              >
+            </div>
+            <div id="dirStatus" class="view-status" role="status"></div>
+            <div class="scroll">
+              <table id="dirModels" class="inventory">
+                <thead>
+                  <tr>
+                    <th>Model</th>
+                    <th>Price per million tokens</th>
+                    <th>Context</th>
+                    <th>Status</th>
+                    <th data-mgmt>Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr class="empty">
+                    <td colspan="5">Open this tab to browse.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+          <section
             id="panel-usage"
             class="tab-panel"
             data-tab-panel="usage"
@@ -4767,6 +4904,7 @@ _ADMIN_HTML = r"""
         const tabs = [
           "overview",
           "models",
+          "catalog",
           "usage",
           "activity",
           "connections",
@@ -5037,6 +5175,7 @@ _ADMIN_HTML = r"""
           renderConsumers();
           renderProfiles();
           renderBackups();
+          renderCatalog();
         }
         async function loadResource(key, path, label, statusId, gen) {
           setStatus(statusId, "Refreshing " + label.toLowerCase() + "…");
@@ -5137,6 +5276,13 @@ _ADMIN_HTML = r"""
                 "/admin/api/consumers",
                 "Consumers",
                 "consumersStatus",
+                gen,
+              ),
+              loadResource(
+                "directory",
+                "/admin/api/directory",
+                "Catalog",
+                "catalogStatus",
                 gen,
               ),
               loadResource(
@@ -5242,6 +5388,7 @@ _ADMIN_HTML = r"""
           if (tab === "presets") $("presetSection").open = true;
           if (!opts.skipHash) setHash(currentTab);
           if (!unlocked) return;
+          if (currentTab === "catalog" && !cache.directoryModels) loadDirectoryModels();
           if (!runtimeTab()) clearTimeout(runtimeTimer);
           else if (!cache.runtimeAt || Date.now() - cache.runtimeAt > RUNTIME_POLL_MS)
             loadRuntime();
@@ -6353,6 +6500,220 @@ _ADMIN_HTML = r"""
               );
             })
             .join("");
+        }
+        const holdKinds = {
+          price_change: "Price moved by more than half",
+          price_missing: "Price disappeared",
+          removed: "Removed from models.dev",
+        };
+        const perMillion = (pricing) =>
+          pricing
+            ? "$" + Number(pricing.input) + " in / $" + Number(pricing.output) + " out"
+            : "Not priced";
+        const lineLabel = (line) => {
+          const [lab, words] = String(line).split("/");
+          return (words || lab) + " (" + lab + ")";
+        };
+        function renderCatalog() {
+          const d = cache.directory;
+          if (!d) {
+            $("catalogSummary").textContent = "";
+            return;
+          }
+          const st = d.state || {},
+            snap = d.snapshot || {};
+          $("catalogSummary").textContent =
+            (snap.origin === "synced"
+              ? "models.dev snapshot from " + new Date(snap.fetched_at).toLocaleString()
+              : snap.origin === "bundled"
+                ? "Using the snapshot this release shipped (not synced yet)"
+                : "No models.dev snapshot") +
+            " · " + plural(snap.offered, "model") + " offered · " +
+            plural((d.loaded || []).length, "route") + " loaded · " +
+            (d.settings?.sync === "off" ? "Daily sync off" : "Syncs daily") +
+            (st.error ? " · Last sync failed: " + st.error : "");
+          const holds = d.holds || [],
+            failed = Object.entries(d.smoke_failures || {});
+          $("catalogReview").innerHTML =
+            holds.length || failed.length
+              ? '<section class="notice warn" aria-labelledby="catalogReviewTitle"><h2 id="catalogReviewTitle">Needs your review</h2>' +
+                holds
+                  .map(
+                    (h) =>
+                      "<p><strong>" + esc(h.provider + " · " + h.model_id) + "</strong> " +
+                      pill(h.status === "rejected" ? "muted" : "warn", h.status === "rejected" ? "Kept previous" : "Held") +
+                      '<span class="small"> ' + esc(holdKinds[h.kind] || h.kind) + ": " +
+                      esc(perMillion(h.previous?.cost)) + " → " +
+                      esc(h.proposed ? perMillion(h.proposed.cost) : "removed") +
+                      '</span></p><div class="actions" data-mgmt>' +
+                      button("data-hold-approve", h.id, "Apply the change", "btn secondary") +
+                      (h.status === "rejected" ? "" : button("data-hold-reject", h.id, "Keep previous", "btn secondary")) +
+                      "</div>",
+                  )
+                  .join("") +
+                failed
+                  .map(
+                    ([name, r]) =>
+                      "<p><strong>" + esc(name) + "</strong> " + pill("bad", "Test failed") +
+                      '<span class="small"> ' + esc(r.error || "") + " · retried after the next sync</span></p>",
+                  )
+                  .join("") +
+                "</section>"
+              : "";
+          const ready = new Map((d.providers || []).map((p) => [p.id, p]));
+          const order = d.ranking || [];
+          $("catalogProviders").querySelector("tbody").innerHTML =
+            order
+              .map((id, i) => {
+                const p = ready.get(id) || { id, display_name: id };
+                const zdr = d.provider_policy?.[id]?.zero_retention_only;
+                return (
+                  "<tr><td>" + (i + 1) + "</td><td><strong>" + esc(p.display_name) +
+                  '</strong><span class="small id">' + esc(id) + '</span></td><td data-label="Status">' +
+                  pill(p.ready ? "ok" : "muted", p.ready ? "Ready" : "Not connected") +
+                  '</td><td data-label="Rule">' +
+                  (id === "openrouter"
+                    ? '<label class="small"><input type="checkbox" data-zdr-toggle ' +
+                      (zdr ? "checked " : "") +
+                      (document.body.dataset.writes === "true" ? "" : "disabled ") +
+                      '/> Zero-retention routes only</label>'
+                    : '<span class="muted">—</span>') +
+                  '</td><td data-mgmt data-label="Move"><div class="actions">' +
+                  (i > 0 ? button("data-rank-up", id, "Up", "btn secondary") : "") +
+                  (i < order.length - 1 ? button("data-rank-down", id, "Down", "btn secondary") : "") +
+                  "</div></td></tr>"
+                );
+              })
+              .join("") ||
+            '<tr class="empty"><td colspan="5">No providers.</td></tr>';
+          const q = $("lineFilter").value.trim().toLowerCase(),
+            show = $("lineShow").value;
+          const lines = (d.lines || []).filter(
+            (l) =>
+              (!show || l.followed) &&
+              (!q || (l.line + " " + l.current).toLowerCase().includes(q)),
+          );
+          $("catalogLines").querySelector("tbody").innerHTML =
+            lines
+              .slice(0, 300)
+              .map(
+                (l) =>
+                  "<tr><td><strong>" + esc(l.label || lineLabel(l.line)) + '</strong><span class="small">' +
+                  esc(l.line.split("/")[0]) + '</span></td><td data-label="Newest model">' +
+                  esc(l.current_name || l.current.split("/").slice(1).join("/")) +
+                  '<span class="small">' + esc((l.providers || []).join(", ") || "No connected provider") +
+                  '</span></td><td data-label="Following">' +
+                  pill(l.followed ? "ok" : "muted", l.followed ? "Following" : "Not following") +
+                  '<span class="small">' + (l.owner == null ? "Default" : "Your choice") +
+                  '</span></td><td data-mgmt data-label="Change"><div class="actions">' +
+                  button(
+                    l.followed ? "data-line-unfollow" : "data-line-follow",
+                    l.line,
+                    l.followed ? "Stop following" : "Follow",
+                    "btn secondary",
+                  ) +
+                  (l.owner == null ? "" : button("data-line-default", l.line, "Use default", "linklike")) +
+                  "</div></td></tr>",
+              )
+              .join("") ||
+            '<tr class="empty"><td colspan="4">No lines match.</td></tr>';
+          const sel = $("dirProvider"),
+            current = sel.value;
+          const ids = (d.providers || []).filter((p) => p.ready).map((p) => p.id);
+          if (sel.options.length - 1 !== ids.length) {
+            sel.innerHTML =
+              '<option value="">All providers</option>' +
+              ids.map((id) => '<option value="' + esc(id) + '">' + esc(id) + "</option>").join("");
+            sel.value = ids.includes(current) ? current : "";
+          }
+          renderDirectoryModels();
+        }
+        let dirTimer;
+        async function loadDirectoryModels() {
+          if (!unlocked) return;
+          const params = new URLSearchParams({ limit: "100", offered: "1" });
+          const q = $("dirSearch").value.trim();
+          if (q) params.set("q", q);
+          if ($("dirProvider").value) params.set("provider", $("dirProvider").value);
+          setStatus("dirStatus", "Searching…");
+          try {
+            cache.directoryModels = await request("/admin/api/directory/models?" + params);
+            setStatus("dirStatus", plural(cache.directoryModels.total, "model") + (cache.directoryModels.total > 100 ? " · showing the newest 100" : ""));
+          } catch (e) {
+            if (e instanceof AuthError) return lock(e.message);
+            setStatus("dirStatus", e.message, true);
+          }
+          renderDirectoryModels();
+        }
+        function renderDirectoryModels() {
+          const list = cache.directoryModels?.models;
+          if (!list) return;
+          const on = new Set(cache.directory?.settings?.models || []);
+          const retired = cache.directory?.retired || {};
+          $("dirModels").querySelector("tbody").innerHTML =
+            list
+              .map((m) => {
+                const name = m.row?.name || m.model_id;
+                const status = m.loaded
+                  ? pill("ok", "Loaded")
+                  : retired[name] !== undefined
+                    ? pill("muted", "Replaced by " + (retired[name] || "a newer model"))
+                    : pill("muted", m.current ? "Newest in its line" : "Available");
+                return (
+                  "<tr><td><strong>" + esc(name) + '</strong><span class="small">' +
+                  esc(m.provider + " · " + m.model_id + (m.release_date ? " · " + m.release_date : "")) +
+                  '</span></td><td data-label="Price">' + esc(perMillion(m.row?.pricing)) +
+                  '</td><td data-label="Context">' + compact(m.row?.context) +
+                  '</td><td data-label="Status">' + status +
+                  '</td><td data-mgmt data-label="Action"><div class="actions">' +
+                  (on.has(name)
+                    ? button("data-dir-off", name, "Turn off", "btn secondary")
+                    : m.loaded
+                      ? '<span class="muted small">Via its line</span>'
+                      : button("data-dir-on", name, "Turn on", "btn secondary")) +
+                  "</div></td></tr>"
+                );
+              })
+              .join("") ||
+            '<tr class="empty"><td colspan="5">No models match.</td></tr>';
+        }
+        async function catalogChange(body, done) {
+          if (document.body.dataset.writes !== "true" || mutationBusy) return;
+          mutationBusy = true;
+          setMsg("catalogMsg", "Saving…", true);
+          try {
+            await request("/admin/api/directory/settings", "PUT", body);
+            setMsg("catalogMsg", done, true);
+            await refresh();
+            if (cache.directoryModels) loadDirectoryModels();
+          } catch (e) {
+            if (e instanceof AuthError) lock(e.message);
+            else setMsg("catalogMsg", e.message);
+          } finally {
+            mutationBusy = false;
+          }
+        }
+        async function catalogPost(path, body, done) {
+          if (document.body.dataset.writes !== "true" || mutationBusy) return;
+          mutationBusy = true;
+          setMsg("catalogMsg", "Working…", true);
+          try {
+            await request(path, "POST", body);
+            setMsg("catalogMsg", done, true);
+            await refresh();
+          } catch (e) {
+            if (e instanceof AuthError) lock(e.message);
+            else setMsg("catalogMsg", e.message);
+          } finally {
+            mutationBusy = false;
+          }
+        }
+        function moveProvider(id, step) {
+          const order = [...(cache.directory?.ranking || [])];
+          const i = order.indexOf(id);
+          if (i < 0 || !order[i + step]) return;
+          [order[i], order[i + step]] = [order[i + step], order[i]];
+          catalogChange({ provider_preference: order }, "Provider order saved.");
         }
         function renderBackups() {
           const b = cache.backups,
@@ -7819,6 +8180,44 @@ _ADMIN_HTML = r"""
             openConsumerConfirm("revoke", b.dataset.revokeConsumer);
             return;
           }
+          if (b.id === "catalogSyncBtn") {
+            catalogPost("/admin/api/directory/sync", undefined, "Synced with models.dev.");
+            return;
+          }
+          if (b.id === "catalogResetRanking") {
+            catalogChange({ provider_preference: [] }, "Default provider order restored.");
+            return;
+          }
+          if (b.dataset.rankUp || b.dataset.rankDown) {
+            moveProvider(b.dataset.rankUp || b.dataset.rankDown, b.dataset.rankUp ? -1 : 1);
+            return;
+          }
+          if (b.dataset.lineFollow || b.dataset.lineUnfollow || b.dataset.lineDefault) {
+            const line = b.dataset.lineFollow || b.dataset.lineUnfollow || b.dataset.lineDefault;
+            const value = b.dataset.lineDefault ? null : !!b.dataset.lineFollow;
+            catalogChange(
+              { lines: { [line]: value } },
+              value === null ? "Line back to its default." : value ? "Following " + line + "." : "Stopped following " + line + ".",
+            );
+            return;
+          }
+          if (b.dataset.dirOn || b.dataset.dirOff) {
+            const name = b.dataset.dirOn || b.dataset.dirOff;
+            const models = new Set(cache.directory?.settings?.models || []);
+            if (b.dataset.dirOn) models.add(name);
+            else models.delete(name);
+            catalogChange({ models: [...models] }, (b.dataset.dirOn ? "Turned on " : "Turned off ") + name + ".");
+            return;
+          }
+          if (b.dataset.holdApprove || b.dataset.holdReject) {
+            const id = b.dataset.holdApprove || b.dataset.holdReject;
+            catalogPost(
+              "/admin/api/directory/holds/" + id.split("/").map(encodeURIComponent).join("/"),
+              { approve: !!b.dataset.holdApprove },
+              b.dataset.holdApprove ? "Change applied." : "Kept the previous entry.",
+            );
+            return;
+          }
           if (b.hasAttribute("data-cancel-consumer-confirm")) {
             resetConsumerConfirm();
             return;
@@ -7856,8 +8255,36 @@ _ADMIN_HTML = r"""
             f?.(detailName);
           }
         });
+        document.addEventListener("change", (e) => {
+          const box = e.target.closest?.("input[data-zdr-toggle]");
+          if (!box) return;
+          if (
+            !box.checked &&
+            !confirm(
+              "Allow OpenRouter routes that keep prompts? Some providers behind OpenRouter store or train on requests.",
+            )
+          ) {
+            box.checked = true;
+            return;
+          }
+          catalogChange(
+            { provider_policy: { openrouter: { zero_retention_only: box.checked } } },
+            box.checked ? "OpenRouter: zero-retention routes only." : "OpenRouter: all routes allowed.",
+          );
+        });
         for (const [id, event, fn] of [
           ["modelFilter", "input", renderModels],
+          ["lineFilter", "input", renderCatalog],
+          ["lineShow", "change", renderCatalog],
+          [
+            "dirSearch",
+            "input",
+            () => {
+              clearTimeout(dirTimer);
+              dirTimer = setTimeout(loadDirectoryModels, 250);
+            },
+          ],
+          ["dirProvider", "change", loadDirectoryModels],
           ["modelLocality", "change", renderModels],
           ["modelProviderFilter", "change", renderModels],
           ["modelCapability", "change", renderModels],

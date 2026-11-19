@@ -260,6 +260,53 @@ function fixture() {
       ],
       other: { count: 3, newest: now - 86400 * 30 },
     },
+    directory: {
+      settings: { sync: "daily", lines: {}, models: [] },
+      ranking: ["anthropic", "openai", "openrouter"],
+      default_ranking: ["anthropic", "openai", "openrouter"],
+      provider_policy: { openrouter: { zero_retention_only: true } },
+      providers: [
+        { id: "anthropic", display_name: "Anthropic", ready: true },
+        { id: "openai", display_name: "OpenAI", ready: false },
+        { id: "openrouter", display_name: "OpenRouter", ready: true },
+      ],
+      loaded: ["claude-opus-5.5", "claude-opus-5.5-or"],
+      retired: { "claude-opus-5": "claude-opus-5.5" },
+      state: { last_success: "2026-01-01T12:00:00Z", error: null },
+      holds: [
+        {
+          id: "openrouter:google/gemini-x",
+          provider: "openrouter",
+          model_id: "google/gemini-x",
+          kind: "price_change",
+          status: "pending",
+          previous: { cost: { input: 2, output: 10 } },
+          proposed: { cost: { input: 20, output: 100 } },
+        },
+      ],
+      smoke_failures: {
+        "claude-fable-5.2-or": { ok: false, error: "No endpoints found matching your data policy" },
+      },
+      snapshot: { origin: "synced", fetched_at: "2026-01-01T12:00:00Z", models: 559, offered: 496 },
+      lines: [
+        { line: "anthropic/claude opus", current: "anthropic/claude-opus-5-5", providers: ["anthropic", "openrouter"], followed: true, owner: null },
+        { line: "openai/gpt sol", current: "openai/gpt-6.2-sol", providers: ["openrouter"], followed: false, owner: false },
+      ],
+    },
+    directoryModels: [
+      {
+        provider: "anthropic", model_id: "claude-opus-5-5", canonical: "anthropic/claude-opus-5-5",
+        lab: "anthropic", line: "anthropic/claude opus", release_date: "2026-09-22", offered: true,
+        current: true, loaded: true,
+        row: { name: "claude-opus-5.5", pricing: { input: 4, output: 20 }, context: 1000000 },
+      },
+      {
+        provider: "openrouter", model_id: "openai/gpt-6.2-sol", canonical: "openai/gpt-6.2-sol",
+        lab: "openai", line: "openai/gpt sol", release_date: "2026-11-17", offered: true,
+        current: true, loaded: false,
+        row: { name: "gpt-6.2-sol-or", pricing: { input: 2, output: 10 }, context: 1050000 },
+      },
+    ],
     bundle: {
       format: 1,
       created_at: "2026-01-01T12:00:00Z",
@@ -464,6 +511,34 @@ const server = createServer(async (req, res) => {
       });
       return;
     }
+    if (pathname === "/admin/api/directory/settings") {
+      const d = state.directory;
+      if (body.lines)
+        for (const [line, value] of Object.entries(body.lines)) {
+          if (value === null) delete d.settings.lines[line];
+          else d.settings.lines[line] = value;
+          const row = d.lines.find((l) => l.line === line);
+          if (row) {
+            row.owner = value;
+            row.followed = value === null ? row.line.startsWith("anthropic") : value;
+          }
+        }
+      if (body.models) d.settings.models = body.models;
+      if (body.provider_preference)
+        d.ranking = body.provider_preference.length ? body.provider_preference : d.default_ranking;
+      if (body.provider_policy) d.provider_policy = body.provider_policy;
+      respond(200, { settings: d.settings, catalogs: "regenerated" });
+      return;
+    }
+    if (pathname === "/admin/api/directory/sync") {
+      respond(200, { error: null, changed: false });
+      return;
+    }
+    if (pathname.startsWith("/admin/api/directory/holds/")) {
+      state.directory.holds = [];
+      respond(200, { hold: { status: body.approve ? "approved" : "rejected" } });
+      return;
+    }
     if (pathname.startsWith("/admin/api/providers/")) {
       const id = decodeURIComponent(pathname.split("/").at(-1));
       const found = state.providers.find((p) => p.id === id);
@@ -587,6 +662,18 @@ const server = createServer(async (req, res) => {
   }
   if (pathname === "/admin/api/backups") {
     respond(200, state.backups);
+    return;
+  }
+  if (pathname === "/admin/api/directory") {
+    respond(200, state.directory);
+    return;
+  }
+  if (pathname === "/admin/api/directory/models") {
+    const q = (url.searchParams.get("q") || "").toLowerCase();
+    const models = state.directoryModels.filter(
+      (m) => !q || (m.model_id + " " + m.line).toLowerCase().includes(q),
+    );
+    respond(200, { total: models.length, offset: 0, models });
     return;
   }
   if (pathname === "/admin/api/bundle/manifest") {
@@ -1048,6 +1135,49 @@ if (process.argv.includes("--serve")) {
       /providers\.cloud\.base_url/,
     );
     state.bundle = fixture().bundle;
+    await nav("catalog");
+    await page.waitForFunction(
+      () => document.querySelectorAll("#dirModels tbody tr").length === 2,
+    );
+    assert.match(await page.locator("#catalogSummary").innerText(), /496 models offered[\s\S]*2 routes loaded/);
+    assert.match(
+      await page.locator("#catalogReview").innerText(),
+      /Price moved by more than half[\s\S]*\$2 in \/ \$10 out → \$20 in \/ \$100 out[\s\S]*claude-fable-5.2-or[\s\S]*Test failed/,
+    );
+    assert.equal(await page.locator("#catalogProviders tbody tr").count(), 3);
+    assert.equal(await page.locator("#catalogLines tbody tr").count(), 1);
+    await page.selectOption("#lineShow", "");
+    assert.equal(await page.locator("#catalogLines tbody tr").count(), 2);
+    await click('[data-line-unfollow="anthropic/claude opus"]');
+    await page.waitForFunction(() =>
+      document.getElementById("catalogMsg").textContent.includes("Stopped following"),
+    );
+    assert.deepEqual(writes.at(-1), {
+      path: "/admin/api/directory/settings",
+      method: "PUT",
+      body: { lines: { "anthropic/claude opus": false } },
+    });
+    await click('[data-rank-down="anthropic"]');
+    await page.waitForFunction(() =>
+      document.getElementById("catalogMsg").textContent.includes("Provider order saved"),
+    );
+    assert.deepEqual(writes.at(-1).body, { provider_preference: ["openai", "anthropic", "openrouter"] });
+    await click('[data-dir-on="gpt-6.2-sol-or"]');
+    await page.waitForFunction(() =>
+      document.getElementById("catalogMsg").textContent.includes("Turned on gpt-6.2-sol-or"),
+    );
+    assert.deepEqual(writes.at(-1).body, { models: ["gpt-6.2-sol-or"] });
+    await click('[data-hold-reject="openrouter:google/gemini-x"]');
+    await page.waitForFunction(() =>
+      document.getElementById("catalogMsg").textContent.includes("Kept the previous entry"),
+    );
+    assert.deepEqual(writes.at(-1), {
+      path: "/admin/api/directory/holds/openrouter%3Agoogle/gemini-x",
+      method: "POST",
+      body: { approve: false },
+    });
+    state.directory = fixture().directory;
+    await refresh();
     await nav("consumers");
     await click('[data-rotate-consumer="myai-runtime"]');
     await page.fill("#cConfirm", "myai-runtime");

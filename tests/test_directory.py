@@ -274,8 +274,8 @@ def client(tmp_path, monkeypatch, state_dir, corrections):
 def test_admin_directory_status_and_browse(client):
     status = client.get("/admin/api/directory", headers=ADMIN).json()
     assert status["snapshot"] == {"origin": "bundled", "fetched_at": "2026-11-19T00:00:00Z", "models": 3, "offered": 2}
-    assert status["lines"] == [{"line": "openai/gpt sol", "current": "openai/gpt-6.2-sol", "providers": ["openai"],
-                                "followed": True, "owner": None}]
+    assert status["lines"] == [{"line": "openai/gpt sol", "current": "openai/gpt-6.2-sol", "current_name": "GPT-6.2 Sol",
+                                "label": "GPT Sol", "providers": ["openai"], "followed": True, "owner": None}]
     assert status["loaded"] == [] and status["ranking"][0] == "anthropic"  # openai has no key here
     browse = client.get("/admin/api/directory/models", headers=ADMIN, params={"offered": "1"}).json()
     assert browse["total"] == 2
@@ -549,3 +549,11 @@ def test_a_base_named_route_that_failed_its_test_falls_back_to_the_next_ranked_r
     monkeypatch.setattr(providers, "resolve_base_model",
                         lambda base, locality=None: "kimi-k3.1-pro-fw" if base == "kimi-k3.1-pro" else None)
     assert providers.base_model_route("kimi-k3.1-pro") == "kimi-k3.1-pro-fw"
+
+
+@pytest.mark.parametrize("name, label", [
+    ("GPT-6.2 Sol", "GPT Sol"), ("Claude Opus 5.5", "Claude Opus"), ("Kimi K3.1 Pro", "Kimi Pro"),
+    ("GLM-5.3-Flash", "GLM-Flash"), ("DeepSeek V4.1 Flash", "DeepSeek Flash"), ("Gemini 4 Neon", "Gemini Neon"),
+])
+def test_line_labels_drop_versions(name, label):
+    assert directory.line_label(name) == label
