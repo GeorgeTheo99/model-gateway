@@ -90,9 +90,11 @@ Corrections win over directory fields; owner rows still win over both (ADR 0002)
   `google/gemini neon`. A line's newest model (by `release_date`, ignoring
   preview, experimental, `-latest` and `alpha`/`beta` models) is its current model.
 - **Followed lines** load their current model on every ready, ranked provider that
-  serves it. The default follows every line of the featured labs (Anthropic,
-  OpenAI, Google, Zhipu, Moonshot, DeepSeek, xAI) whose current model is under a
-  year old. The owner follows or unfollows lines and turns individual models on in
+  serves it (a lower-ranked route whose upstream id is a loaded route's name or alias is
+  left out). The default follows every line of the featured labs (Anthropic,
+  OpenAI, Google, Zhipu, Moonshot, DeepSeek, xAI) whose current model is under six
+  months old, except special-purpose lines (cyber, coding, realtime, mini and similar;
+  `featured` in the corrections). The owner follows or unfollows lines and turns individual models on in
   Settings (`catalog.directory.lines`, `catalog.directory.models`).
 - When a line's current model changes, the previous one is **retired** with
   `replaced_by` its successor (ADR 0002 R3 redirects), unless it is pinned

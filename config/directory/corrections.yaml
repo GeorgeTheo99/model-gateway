@@ -9,16 +9,21 @@ providers:
   anthropic:
     models_dev: anthropic
     display_name: Anthropic
+    base_url: https://api.anthropic.com/v1
+    protocol: anthropic
   openai:
     models_dev: openai
     display_name: OpenAI
+    base_url: https://api.openai.com/v1
   google:
     models_dev: google
     display_name: Google
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai
     route_suffix: -google
   openrouter:
     models_dev: openrouter
     display_name: OpenRouter
+    base_url: https://openrouter.ai/api/v1
     route_suffix: -or
     thinking_format: openrouter
     # Zero-data-retention endpoints only, enforced per request (provider.zdr).
@@ -27,12 +32,14 @@ providers:
   fireworks:
     models_dev: fireworks-ai
     display_name: Fireworks
+    base_url: https://api.fireworks.ai/inference/v1
     route_suffix: -fw
     # Fireworks serverless keeps no prompts or outputs.
     zdr: true
   moonshot:
     models_dev: moonshotai
     display_name: Moonshot
+    base_url: https://api.moonshot.ai/v1
     route_suffix: -moonshot
     thinking_format: kimi
     quirks: [use_max_completion_tokens, drop_fixed_sampling_fields, named_tool_choice_as_required,
@@ -40,16 +47,33 @@ providers:
   zhipuai:
     models_dev: zhipuai
     display_name: Z.ai
+    base_url: https://open.bigmodel.cn/api/paas/v4
     route_suffix: -zai
     thinking_format: zai
   deepseek:
     models_dev: deepseek
     display_name: DeepSeek
+    base_url: https://api.deepseek.com/v1
     route_suffix: -deepseek
   xai:
     models_dev: xai
     display_name: xAI
+    base_url: https://api.x.ai/v1
     route_suffix: -xai
+
+# Default provider ranking (catalog.provider_preference overrides it): a model is served by the
+# first ready provider that offers it. The lab's own API first, then Fireworks (open weights,
+# no retention), then OpenRouter.
+ranking: [anthropic, openai, google, fireworks, moonshot, zhipuai, deepseek, xai, openrouter]
+
+# Lines followed by default: these labs' lines whose current model is under max_age_days old,
+# except special-purpose lines (any of exclude_words in the line).
+featured:
+  labs: [anthropic, openai, google, zhipuai, moonshotai, deepseek, xai]
+  max_age_days: 180
+  exclude_words: [cyber, rosalind, law, robotics, research, image, tts, live, audio, realtime, search,
+                  transcribe, translate, embedding, computer, codex, code, mini, nano, chat, instant, fast,
+                  highspeed, build, vision]
 
 # models.dev lab id -> the provider whose routes take the bare base-model name, and the
 # catalog family. Gemini is served through OpenRouter's Google Vertex routes, which keep the
@@ -118,6 +142,12 @@ rules:
       thinking_levels: [low, medium, high, xhigh]
   - match: {provider: openrouter, id: google/gemini-4-argon}
     set: {alias: gemini4, thinking_levels: [minimal, low, medium, high, xhigh, max]}
+  - match: {provider: openrouter, id: google/gemini-4-carbon}
+    set: {alias: gemini}
+  - match: {provider: openrouter, id: google/gemini-4-neon}
+    set: {alias: gneon}
+  - match: {provider: openrouter, id: google/gemini-4-hydrogen}
+    set: {alias: ghydrogen}
   # kimi-k3 is the established Fireworks route; Moonshot's own K3 takes a suffix.
   - match: {provider: moonshot, id: kimi-k3}
     set: {name: kimi-k3-moonshot}

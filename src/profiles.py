@@ -632,6 +632,31 @@ def _local_routes(namespaces: dict) -> set[str]:
             for model in profile["routes"].values()}
 
 
+def routed_models(config_path=None) -> set[str]:
+    """Every model the current snapshots' profiles route to.
+
+    Read without the profile locks: the catalog build calls this under the provider registry
+    lock, which registration takes inside them. Snapshots are replaced atomically.
+    """
+    path = registry_path() if config_path is None else Path(config_path).parent / "consumer-profiles-registry.json"
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    namespaces = data.get("namespaces") if isinstance(data, dict) else None
+    if not isinstance(namespaces, dict):
+        return set()
+    found = set()
+    for versions in namespaces.values():
+        if not isinstance(versions, list) or not versions:
+            continue
+        for profile in ((versions[-1].get("manifest") or {}).get("profiles") or []):
+            for model in (profile.get("routes") or {}).values():
+                if isinstance(model, str):
+                    found.add(model)
+    return found
+
+
 def local_route_models() -> set[str]:
     """Models the current snapshots' local profiles route to
     (docs/adr/0003-scoped-access-and-lightweight-local-models.md section 3)."""

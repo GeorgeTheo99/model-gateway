@@ -12,7 +12,8 @@ The owner's choices live in the config ``catalog:`` block::
       hidden: [model-name]    # deleted shipped models; never loaded
       pinned: [model-name]    # kept even when a release retires them
       provider_preference: [provider-id]  # route order for base-model references
-      directory: {sync: daily}  # models.dev directory sync, or off (src.directory)
+      directory: {sync: daily, lines: {line: bool}, models: [name]}  # models.dev (src.directory)
+      provider_policy: {openrouter: {zero_retention_only: true}}
 """
 
 from __future__ import annotations
@@ -40,9 +41,12 @@ def _names(settings: dict, key: str) -> frozenset[str]:
 
 
 def provider_preference(config: dict) -> list[str]:
-    """The owner's provider order for resolving a base-model reference (ADR 0002 R1)."""
+    """The provider order for resolving a base-model reference (ADR 0002 R1): the owner's,
+    else the directory's default ranking (docs/adr/0005-models-dev-directory.md)."""
     settings(config)
-    return list((config.get("catalog") or {}).get("provider_preference") or [])
+    from src import directory
+
+    return directory.ranking(config, directory.load_corrections())
 
 
 def settings(config: dict) -> tuple[str | frozenset[str], frozenset[str], frozenset[str]]:
@@ -52,7 +56,7 @@ def settings(config: dict) -> tuple[str | frozenset[str], frozenset[str], frozen
         raw = {}
     if not isinstance(raw, dict):
         raise ValueError("config catalog must be an object")
-    unknown = set(raw) - {"shipped", "hidden", "pinned", "provider_preference", "directory"}
+    unknown = set(raw) - {"shipped", "hidden", "pinned", "provider_preference", "directory", "provider_policy"}
     if unknown:
         raise ValueError("config catalog has unknown field(s): " + ", ".join(sorted(unknown)))
     selection = raw.get("shipped", "all")
@@ -66,6 +70,7 @@ def settings(config: dict) -> tuple[str | frozenset[str], frozenset[str], frozen
     from src import directory
 
     directory.settings(config)
+    directory.provider_policy(config)
     return selection, _names(raw, "hidden"), _names(raw, "pinned")
 
 
@@ -88,6 +93,25 @@ def provider_ready(profile: dict, config: dict) -> bool:
         and (effective.get("protocol") or "openai") == wanted.get("protocol", "openai")
         and (wanted.get("auth") == "chatgpt" or bool(str(effective.get("api_key") or "").strip()))
     )
+
+
+def _directory(config: dict, ready: Callable[[dict, dict], bool], keep: frozenset[str], config_path=None):
+    from src import directory
+
+    return directory.layer(config, ready=ready, keep=keep, config_path=config_path)
+
+
+def _bound_routes(config_path=None) -> frozenset[str]:
+    """Route names registered consumer profiles use: kept when the directory retires them."""
+    from src import profiles
+
+    return frozenset(profiles.routed_models(config_path))
+
+
+def providers_canonical(provider: str) -> str:
+    from src.catalog import canonical_provider
+
+    return canonical_provider(provider)
 
 
 def _packaged() -> dict[str, dict]:
@@ -142,6 +166,15 @@ def layer(
     entries: list[dict] = []
     names: set[str] = set()
     retired: dict[str, str | None] = {}
+    # models.dev directory rows (docs/adr/0005-models-dev-directory.md) load as shipped rows of
+    # the pseudo-profile "models.dev"; a curated row for a route the directory maps yields to it.
+    found = _directory(config, ready, frozenset(pinned) | _bound_routes(config_path), config_path)
+    if selection != "none":
+        directory_rows = [row for row in found.rows if selection == "all" or "models.dev" in selection
+                          or row["name"] in selection]
+        entries.extend(directory_rows)
+        names.update(row["name"] for row in directory_rows)
+    retired.update({name: successor for name, successor in found.retired.items() if name not in pinned})
     for profile_id, profile in profiles.items():
         if not profile.get("auto_add"):
             continue
@@ -150,7 +183,8 @@ def layer(
         for name in retire.get("models") or []:
             if name not in pinned:
                 retired[name] = replaced_by.get(name)
-        models = profile["models"]
+        models = [model for model in profile["models"]
+                  if (providers_canonical(model["provider"]), model.get("provider_model_id")) not in found.known_routes]
         names.update(model["name"] for model in models)
         if selection == "none":
             continue

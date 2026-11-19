@@ -1218,6 +1218,63 @@ def _update_catalog_names(add: dict[str, str] | None = None, remove: dict[str, s
 
 
 @_write_transaction
+def update_directory_settings(changes: dict) -> dict:
+    """Apply owner choices for the models.dev directory (docs/adr/0005-models-dev-directory.md).
+
+    ``changes`` may set ``sync``, ``lines`` (``{line: true|false|null}``; null restores the
+    default), ``models`` (route names turned on), ``provider_preference`` (ranking; empty
+    restores the default) and ``provider_policy``. Returns the stored settings.
+    """
+    from src import directory
+
+    unknown = set(changes) - {"sync", "lines", "models", "provider_preference", "provider_policy"}
+    if unknown:
+        raise ValueError("unknown directory setting(s): " + ", ".join(sorted(unknown)))
+    config = load_config_full()
+    block = dict(config.get("catalog") or {})
+    section = dict(block.get("directory") or {})
+    if "sync" in changes:
+        section["sync"] = changes["sync"]
+    if "lines" in changes:
+        if not isinstance(changes["lines"], dict):
+            raise ValueError("lines must map line names to true, false or null")
+        lines = dict(section.get("lines") or {})
+        for line, value in changes["lines"].items():
+            if value is None:
+                lines.pop(line, None)
+            else:
+                lines[line] = value
+        section["lines"] = lines
+    if "models" in changes:
+        section["models"] = sorted(set(changes["models"] or []))
+    section = {key: value for key, value in section.items() if value not in (None, {}, [])}
+    if section:
+        block["directory"] = section
+    else:
+        block.pop("directory", None)
+    if "provider_preference" in changes:
+        if changes["provider_preference"]:
+            block["provider_preference"] = list(changes["provider_preference"])
+        else:
+            block.pop("provider_preference", None)
+    if "provider_policy" in changes:
+        if changes["provider_policy"]:
+            block["provider_policy"] = changes["provider_policy"]
+        else:
+            block.pop("provider_policy", None)
+    candidate = {**config, "catalog": block} if block else {k: v for k, v in config.items() if k != "catalog"}
+    stored = directory.settings(candidate)
+    directory.provider_policy(candidate)
+    ranking = (candidate.get("catalog") or {}).get("provider_preference") or []
+    if not isinstance(ranking, list) or any(not isinstance(p, str) or not p for p in ranking) \
+            or len(set(ranking)) != len(ranking):
+        raise ValueError("provider_preference must be a list of distinct provider ids")
+    _backup(CONFIG_PATH)
+    _atomic_write(CONFIG_PATH, yaml.safe_dump(candidate, sort_keys=False, default_flow_style=False))
+    return stored
+
+
+@_write_transaction
 def upsert_model(name: str, **fields) -> dict:
     """Create or update a model entry in model-info.json.
 

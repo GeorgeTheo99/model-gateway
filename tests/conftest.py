@@ -72,10 +72,12 @@ def _no_real_upstreams(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _isolate_shipped_layer(monkeypatch):
-    """Released curated profiles load only in tests that opt in (patch ``shipped._packaged``)."""
-    from src import shipped
+    """Released curated profiles and models.dev directory rows load only in tests that opt in
+    (patch ``shipped._packaged`` / ``shipped._directory``)."""
+    from src import directory, shipped
 
     monkeypatch.setattr(shipped, "_packaged", lambda: {})
+    monkeypatch.setattr(shipped, "_directory", lambda *args, **kwargs: directory.DirectoryLayer())
     yield
 
 

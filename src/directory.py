@@ -47,6 +47,7 @@ _MODEL_FIELDS = (
 )
 _LAB_FIELDS = ("name", "family", "release_date", "status")
 _SKIPPED_ID = re.compile(r"(?:^|[-_/.])(?:preview|exp|experimental|latest)(?:$|[-_/.])")
+_SKIPPED_WORDS = frozenset({"preview", "exp", "experimental", "latest"})
 _SLUG_OK = re.compile(r"^[a-z0-9][a-z0-9.-]{0,63}$")
 
 
@@ -64,6 +65,10 @@ class Corrections:
     labs: dict[str, dict]
     """models.dev lab id -> lab facts (home provider, family)."""
     rules: list[dict] = field(default_factory=list)
+    ranking: tuple[str, ...] = ()
+    """Default provider ranking."""
+    featured: dict = field(default_factory=dict)
+    """Lines followed by default: ``labs``, ``max_age_days``, ``exclude_words``."""
 
     @property
     def by_models_dev_id(self) -> dict[str, str]:
@@ -89,7 +94,13 @@ def load_corrections(path: Path = CORRECTIONS_PATH) -> Corrections:
         if set(rule) - {"match", "set", "quirks", "drop_pricing", "extended_cache_write", "max_output_tokens",
                         "route_suffix"}:
             raise DirectoryError(f"{path}: rule {match} has unknown field(s)")
-    return Corrections(providers=providers, labs=labs, rules=rules)
+    ranking = tuple(data.get("ranking") or ())
+    if set(ranking) - set(providers):
+        raise DirectoryError(f"{path}: ranking names unknown providers")
+    featured = data.get("featured") or {}
+    if not isinstance(featured, dict) or set(featured) - {"labs", "max_age_days", "exclude_words"}:
+        raise DirectoryError(f"{path}: featured takes labs, max_age_days and exclude_words")
+    return Corrections(providers=providers, labs=labs, rules=rules, ranking=ranking, featured=featured)
 
 
 # ── Snapshot ───────────────────────────────────────────────────────────────
@@ -148,15 +159,15 @@ def validate_update(new: dict, old: dict | None) -> None:
         raise DirectoryError(f"{gone} of {len(old_keys)} models would disappear at once")
 
 
-def directory_dir() -> Path:
+def directory_dir(config_path: Path | None = None) -> Path:
     """Runtime directory state, beside ``config.yaml`` (never the release's ``config/directory``)."""
     from src import providers
 
-    return Path(providers.CONFIG_PATH).parent / "models-dev"
+    return Path(config_path or providers.CONFIG_PATH).parent / "models-dev"
 
 
-def snapshot_path() -> Path:
-    return directory_dir() / "snapshot.json"
+def snapshot_path(config_path: Path | None = None) -> Path:
+    return directory_dir(config_path) / "snapshot.json"
 
 
 def state_path() -> Path:
@@ -181,9 +192,9 @@ def _read_json(path: Path) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
-def load_snapshot() -> tuple[dict | None, str]:
+def load_snapshot(config_path: Path | None = None) -> tuple[dict | None, str]:
     """The last good synced snapshot, else the release's bundled one; with which it is."""
-    synced = _read_json(snapshot_path())
+    synced = _read_json(snapshot_path(config_path))
     if synced and synced.get("schema") == SNAPSHOT_SCHEMA:
         return synced, "synced"
     bundled = _read_json(BUNDLED_SNAPSHOT)
@@ -200,19 +211,50 @@ def load_state() -> dict:
 
 
 def settings(config: dict) -> dict:
-    """Validated ``catalog.directory`` settings: ``{"sync": "daily" | "off"}``."""
+    """Validated ``catalog.directory`` settings.
+
+    ``sync``: ``daily`` (default) or ``off``. ``lines``: ``{line: true|false}`` follows or
+    unfollows a model line over the default. ``models``: route names turned on individually.
+    """
     raw = (config.get("catalog") or {}).get("directory")
     if raw is None:
         raw = {}
     if not isinstance(raw, dict):
         raise ValueError("config catalog.directory must be an object")
-    unknown = set(raw) - {"sync"}
+    unknown = set(raw) - {"sync", "lines", "models"}
     if unknown:
         raise ValueError("config catalog.directory has unknown field(s): " + ", ".join(sorted(unknown)))
     sync_mode = raw.get("sync", "daily")
     if sync_mode not in ("daily", "off"):
         raise ValueError("config catalog.directory.sync must be daily or off")
-    return {"sync": sync_mode}
+    lines = raw.get("lines") or {}
+    if not isinstance(lines, dict) or any(not isinstance(k, str) or not isinstance(v, bool) for k, v in lines.items()):
+        raise ValueError("config catalog.directory.lines must map line names to true or false")
+    models = raw.get("models") or []
+    if not isinstance(models, list) or any(not isinstance(name, str) or not name for name in models):
+        raise ValueError("config catalog.directory.models must be a list of model names")
+    return {"sync": sync_mode, "lines": dict(lines), "models": list(models)}
+
+
+def provider_policy(config: dict) -> dict[str, dict]:
+    """Validated ``catalog.provider_policy``: ``{provider: {zero_retention_only: bool}}``.
+
+    OpenRouter defaults to zero-retention routes only (the ``openrouter_zdr`` quirk).
+    """
+    raw = (config.get("catalog") or {}).get("provider_policy")
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("config catalog.provider_policy must be an object")
+    policy = {"openrouter": {"zero_retention_only": True}}
+    for provider, rules in raw.items():
+        if not isinstance(rules, dict) or set(rules) - {"zero_retention_only"} or \
+                any(not isinstance(value, bool) for value in rules.values()):
+            raise ValueError(f"config catalog.provider_policy.{provider} takes zero_retention_only: true or false")
+        if "zero_retention_only" in rules and provider != "openrouter":
+            raise ValueError("zero_retention_only applies to openrouter only")
+        policy.setdefault(provider, {}).update(rules)
+    return policy
 
 
 # ── Sync ───────────────────────────────────────────────────────────────────
@@ -265,6 +307,15 @@ def sync(*, fetch: Callable[[str], bytes] = _download, corrections: Corrections 
     return state
 
 
+def record_error(message: str) -> dict:
+    """Mark the last sync failed (its snapshot was rolled back) and return the state."""
+    state = load_state()
+    state.update(error=message, changed=False)
+    _atomic_json(state_path(), state)
+    log.warning("directory sync rolled back: %s", message)
+    return state
+
+
 def sync_due(state: dict, now: float | None = None, interval: float = SYNC_INTERVAL_SECONDS) -> bool:
     last = state.get("last_attempt")
     if not last:
@@ -303,12 +354,15 @@ class Mapped:
     skipped: str | None = None
     notes: tuple[str, ...] = ()
     status: str = ""
+    primary: bool = False
+    """The route that serves this lab model on this provider (others are dated or alias ids)."""
 
     @property
     def followable(self) -> bool:
         """Whether this model can be a line's current model: not preview, experimental or alpha/beta."""
         return (self.row is not None and self.status not in ("alpha", "beta")
-                and not _SKIPPED_ID.search(self.model_id.lower()) and not _SKIPPED_ID.search(self.canonical.lower()))
+                and not _SKIPPED_ID.search(self.model_id.lower()) and not _SKIPPED_ID.search(self.canonical.lower())
+                and not _SKIPPED_WORDS.intersection(self.line.partition("/")[2].split()))
 
 
 def _rules_for(corrections: Corrections, provider: str, lab: str, model_id: str) -> list[dict]:
@@ -482,6 +536,7 @@ def map_snapshot(snapshot: dict, corrections: Corrections) -> list[Mapped]:
         for model_id in sorted(entry["models"]):
             mapped.append(map_model(dev_id, entry["models"][model_id], snapshot, corrections, names))
     claimed: dict[str, Mapped] = {}
+    served: set[tuple[str, str]] = set()
     result = []
     def precedence(m: Mapped) -> tuple:
         own_id = m.row is not None and slug(m.model_id.rsplit("/", 1)[-1]) in (m.row["base_model"], m.row["name"])
@@ -499,6 +554,9 @@ def map_snapshot(snapshot: dict, corrections: Corrections) -> list[Mapped]:
             item = renamed or replace(item, row=None, skipped="name_conflict")
         if item.row is not None:
             claimed[item.row["name"]] = item
+            if (item.provider, item.canonical) not in served:
+                served.add((item.provider, item.canonical))
+                item = replace(item, primary=True)
         result.append(item)
     return result
 
@@ -513,3 +571,134 @@ def current_models(mapped: list[Mapped]) -> dict[str, str]:
         if best is None or (item.release_date, item.canonical) > best:
             newest[item.line] = (item.release_date, item.canonical)
     return {line: canonical for line, (_, canonical) in newest.items()}
+
+
+# ── The directory layer (stage 2) ──────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class DirectoryLayer:
+    rows: list[dict] = field(default_factory=list)
+    """Catalog rows this install loads from the directory, in ranking order."""
+    known_routes: frozenset[tuple[str, str]] = frozenset()
+    """Every (provider, upstream id) the directory maps: curated rows for these yield to it."""
+    retired: dict[str, str | None] = field(default_factory=dict)
+    """Older models of followed lines -> the route that replaces them."""
+    followed: tuple[str, ...] = ()
+
+
+def _days_between(earlier: str, later: str) -> int | None:
+    try:
+        start = datetime.fromisoformat(earlier[:10])
+        end = datetime.fromisoformat(later[:10])
+    except ValueError:
+        return None
+    return (end - start).days
+
+
+def default_lines(mapped: list[Mapped], current: dict[str, str], snapshot: dict,
+                  corrections: Corrections) -> set[str]:
+    """Lines followed unless the owner says otherwise (corrections ``featured``)."""
+    featured = corrections.featured
+    labs = set(featured.get("labs") or ())
+    max_age = int(featured.get("max_age_days") or 365)
+    exclude = set(featured.get("exclude_words") or ())
+    released = {item.canonical: item.release_date for item in mapped}
+    as_of = str(snapshot.get("fetched_at") or _utc_now())
+    lines = set()
+    for line, canonical in current.items():
+        lab, _, words = line.partition("/")
+        if lab not in labs or exclude.intersection(words.split()):
+            continue
+        age = _days_between(released.get(canonical, ""), as_of)
+        if age is not None and age <= max_age:
+            lines.add(line)
+    return lines
+
+
+def ready_providers(config: dict, corrections: Corrections, ready: Callable[[dict, dict], bool]) -> set[str]:
+    """Gateway providers this install serves at the endpoint corrections expect, with a key."""
+    found = set()
+    for provider, facts in corrections.providers.items():
+        if not facts.get("base_url"):
+            continue
+        profile = {"provider": {"id": provider, "base_url": facts["base_url"],
+                                "protocol": facts.get("protocol", "openai")}}
+        if ready(profile, config):
+            found.add(provider)
+    return found
+
+
+def ranking(config: dict, corrections: Corrections) -> list[str]:
+    """The owner's ``catalog.provider_preference``, else the corrections' default."""
+    owner = list((config.get("catalog") or {}).get("provider_preference") or [])
+    return owner or list(corrections.ranking)
+
+
+def _apply_policy(row: dict, policy: dict[str, dict]) -> dict:
+    if row["provider"] == "openrouter" and not policy.get("openrouter", {}).get("zero_retention_only", True):
+        quirks = [quirk for quirk in row.get("quirks") or [] if quirk != "openrouter_zdr"]
+        row = {key: value for key, value in row.items() if key not in ("quirks", "zdr")}
+        if quirks:
+            row["quirks"] = quirks
+    return row
+
+
+def layer(config: dict, *, ready: Callable[[dict, dict], bool], keep: frozenset[str] | set[str] = frozenset(),
+          snapshot: dict | None = None, corrections: Corrections | None = None,
+          config_path: Path | None = None) -> DirectoryLayer:
+    """The directory rows this install loads (ADR 0005).
+
+    Each followed line loads its current model on every ready provider that serves it; an
+    owner-turned-on model loads by name. A followed line's older models are retired to its
+    current model's route, except names in ``keep`` (pinned, or bound by a registered
+    consumer profile), which keep loading.
+    """
+    if snapshot is None:
+        snapshot, _ = load_snapshot(config_path)
+    if snapshot is None:
+        return DirectoryLayer()
+    corrections = corrections or load_corrections()
+    owner = settings(config)
+    policy = provider_policy(config)
+    mapped = map_snapshot(snapshot, corrections)
+    current = current_models(mapped)
+    followed = default_lines(mapped, current, snapshot, corrections)
+    followed |= {line for line, on in owner["lines"].items() if on}
+    followed -= {line for line, on in owner["lines"].items() if not on}
+    selected = {current[line] for line in followed if line in current}
+    serving = ready_providers(config, corrections, ready)
+    order = ranking(config, corrections)
+    turned_on = set(owner["models"])
+
+    def rank(item: Mapped) -> tuple:
+        return (order.index(item.provider) if item.provider in order else len(order), item.row["name"])
+
+    offered = sorted((item for item in mapped if item.row is not None and item.provider in serving), key=rank)
+    loaded: list[Mapped] = []
+    older: list[Mapped] = []
+    claimed: set[str] = set()
+    for item in offered:
+        name = item.row["name"]
+        load = name in turned_on or (item.primary and item.canonical in selected)
+        if not load and item.primary and item.line in followed and item.followable:
+            if name not in keep:
+                older.append(item)
+                continue
+            load = True
+        # A route whose identifiers a higher-ranked route already uses (a direct provider's
+        # upstream id that is another route's name or alias) would only yield in the catalog.
+        identifiers = {name, item.model_id, *(item.row.get("alternate_ids") or ()), item.row.get("alias")} - {None}
+        if load and not identifiers & claimed:
+            claimed |= identifiers
+            loaded.append(item)
+    retired: dict[str, str | None] = {}
+    for item in older:
+        successor = [other for other in loaded if other.primary and other.canonical == current.get(item.line)]
+        same_provider = [other for other in successor if other.provider == item.provider]
+        choices = same_provider or successor
+        retired[item.row["name"]] = choices[0].row["name"] if choices else None
+    origin = {"layer": "shipped", "profile": "models.dev"}
+    rows = [{**_apply_policy(item.row, policy), "origin": {**origin, "line": item.line}} for item in loaded]
+    known = frozenset((item.provider, item.model_id) for item in mapped if item.row is not None)
+    return DirectoryLayer(rows=rows, known_routes=known, retired=retired, followed=tuple(sorted(followed)))

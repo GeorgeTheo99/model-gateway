@@ -39,7 +39,7 @@ def corrections():
 
 @pytest.fixture
 def state_dir(tmp_path, monkeypatch):
-    monkeypatch.setattr(directory, "directory_dir", lambda: tmp_path / "models-dev")
+    monkeypatch.setattr(directory, "directory_dir", lambda config_path=None: tmp_path / "models-dev")
     monkeypatch.setattr(directory, "BUNDLED_SNAPSHOT", tmp_path / "bundled.json")
     return tmp_path / "models-dev"
 
@@ -201,12 +201,16 @@ def test_sync_is_due_daily():
 
 
 def test_directory_settings_validate():
-    assert directory.settings({}) == {"sync": "daily"}
-    assert directory.settings({"catalog": {"directory": {"sync": "off"}}}) == {"sync": "off"}
-    with pytest.raises(ValueError, match="daily or off"):
-        directory.settings({"catalog": {"directory": {"sync": "hourly"}}})
-    with pytest.raises(ValueError, match="unknown field"):
-        directory.settings({"catalog": {"directory": {"lines": []}}})
+    assert directory.settings({}) == {"sync": "daily", "lines": {}, "models": []}
+    on = {"catalog": {"directory": {"sync": "off", "lines": {"openai/gpt sol": False}, "models": ["x"]}}}
+    assert directory.settings(on) == {"sync": "off", "lines": {"openai/gpt sol": False}, "models": ["x"]}
+    for bad, message in (({"sync": "hourly"}, "daily or off"), ({"extra": 1}, "unknown field"),
+                         ({"lines": ["a"]}, "true or false"), ({"models": "x"}, "list of model names")):
+        with pytest.raises(ValueError, match=message):
+            directory.settings({"catalog": {"directory": bad}})
+    assert directory.provider_policy({}) == {"openrouter": {"zero_retention_only": True}}
+    with pytest.raises(ValueError, match="openrouter only"):
+        directory.provider_policy({"catalog": {"provider_policy": {"fireworks": {"zero_retention_only": True}}}})
 
 
 def test_every_offered_model_in_the_release_snapshot_is_a_valid_catalog_row(corrections):
@@ -270,7 +274,9 @@ def client(tmp_path, monkeypatch, state_dir, corrections):
 def test_admin_directory_status_and_browse(client):
     status = client.get("/admin/api/directory", headers=ADMIN).json()
     assert status["snapshot"] == {"origin": "bundled", "fetched_at": "2026-11-19T00:00:00Z", "models": 3, "offered": 2}
-    assert status["lines"] == [{"line": "openai/gpt sol", "current": "openai/gpt-6.2-sol", "providers": ["openai"]}]
+    assert status["lines"] == [{"line": "openai/gpt sol", "current": "openai/gpt-6.2-sol", "providers": ["openai"],
+                                "followed": True, "owner": None}]
+    assert status["loaded"] == [] and status["ranking"][0] == "anthropic"  # openai has no key here
     browse = client.get("/admin/api/directory/models", headers=ADMIN, params={"offered": "1"}).json()
     assert browse["total"] == 2
     assert [(m["model_id"], m["current"], m["loaded"]) for m in browse["models"]] == [
@@ -282,4 +288,145 @@ def test_admin_directory_status_and_browse(client):
 
 def test_admin_directory_sync_runs_a_sync(client, monkeypatch):
     monkeypatch.setattr(directory, "sync", lambda: {"error": None, "changed": True, "models": 3})
-    assert client.post("/admin/api/directory/sync", headers=ADMIN).json() == {"error": None, "changed": True, "models": 3}
+    assert client.post("/admin/api/directory/sync", headers=ADMIN).json() == {
+        "error": None, "changed": True, "models": 3, "catalogs": "regenerated"}
+
+
+# ── The directory layer (stage 2) ──────────────────────────────────────────
+
+LABS = {
+    "openai/gpt-6-sol": {"name": "GPT-6 Sol", "release_date": "2026-09-01"},
+    "openai/gpt-6.2-sol": {"name": "GPT-6.2 Sol", "release_date": "2026-11-17"},
+    "openai/gpt-6-luna": {"name": "GPT-6 Luna", "release_date": "2026-09-22"},
+    "openai/gpt-6-cyber": {"name": "GPT-6 Cyber", "release_date": "2026-11-05"},
+    "openai/gpt-4o": {"name": "GPT-4o", "release_date": "2024-05-13"},
+}
+
+
+def _layer_snapshot(corrections):
+    def m(model_id, canonical):
+        return _model(model_id, canonical_model_id=canonical)
+
+    api = _api(
+        openai=[m("gpt-6-sol", "openai/gpt-6-sol"), m("gpt-6.2-sol", "openai/gpt-6.2-sol"),
+                m("gpt-6-luna", "openai/gpt-6-luna"), m("gpt-6-cyber", "openai/gpt-6-cyber"),
+                m("gpt-4o", "openai/gpt-4o")],
+        openrouter=[m("openai/gpt-6.2-sol", "openai/gpt-6.2-sol"), m("openai/gpt-6-sol", "openai/gpt-6-sol")],
+    )
+    snapshot = _snapshot(corrections, api, LABS)
+    snapshot["fetched_at"] = "2026-11-19T00:00:00Z"
+    return snapshot
+
+
+def _ready(*providers_ready):
+    return lambda profile, config: profile["provider"]["id"] in providers_ready
+
+
+def test_followed_lines_load_their_current_model_on_every_ready_provider(corrections):
+    found = directory.layer({}, ready=_ready("openai", "openrouter"), snapshot=_layer_snapshot(corrections),
+                            corrections=corrections)
+    assert [row["name"] for row in found.rows] == ["gpt-6-luna", "gpt-6.2-sol", "gpt-6.2-sol-or"]
+    assert found.rows[0]["origin"] == {"layer": "shipped", "profile": "models.dev", "line": "openai/gpt luna"}
+    # gpt-4o is too old to be followed by default and GPT-6 Cyber is special-purpose.
+    assert found.followed == ("openai/gpt luna", "openai/gpt sol")
+    assert found.retired == {"gpt-6-sol": "gpt-6.2-sol", "gpt-6-sol-or": "gpt-6.2-sol-or"}
+    assert ("openai", "gpt-4o") in found.known_routes
+
+
+def test_owner_choices_follow_unfollow_turn_on_keep_and_rank(corrections):
+    config = {"catalog": {
+        "directory": {"lines": {"openai/gpt luna": False, "openai/gpt cyber": True}, "models": ["gpt-4o"]},
+        "provider_preference": ["openrouter", "openai"],
+    }}
+    found = directory.layer(config, ready=_ready("openai", "openrouter"), snapshot=_layer_snapshot(corrections),
+                            corrections=corrections, keep={"gpt-6-sol"})
+    assert [row["name"] for row in found.rows] == ["gpt-6.2-sol-or", "gpt-4o", "gpt-6-cyber", "gpt-6-sol", "gpt-6.2-sol"]
+    assert found.retired == {"gpt-6-sol-or": "gpt-6.2-sol-or"}
+
+
+def test_openrouter_policy_controls_zero_retention_routing(corrections):
+    snapshot = _layer_snapshot(corrections)
+    zdr = directory.layer({}, ready=_ready("openrouter"), snapshot=snapshot, corrections=corrections)
+    assert zdr.rows[0]["quirks"] == ["openrouter_zdr"] and zdr.rows[0]["zdr"] is True
+    config = {"catalog": {"provider_policy": {"openrouter": {"zero_retention_only": False}}}}
+    open_routes = directory.layer(config, ready=_ready("openrouter"), snapshot=snapshot, corrections=corrections)
+    assert "quirks" not in open_routes.rows[0] and "zdr" not in open_routes.rows[0]
+
+
+def test_a_provider_counts_as_ready_only_at_the_expected_endpoint_with_a_key(corrections, monkeypatch):
+    from src import shipped
+
+    config = {"providers": {"openai": {"base_url": "https://api.openai.com/v1", "api_key": "k"},
+                            "openrouter": {"base_url": "https://elsewhere.test/v1", "api_key": "k"},
+                            "fireworks": {"base_url": "https://api.fireworks.ai/inference/v1"}}}
+    for name in ("OPENAI", "OPENROUTER", "FIREWORKS"):
+        monkeypatch.delenv(f"MODEL_GATEWAY_PROVIDER_{name}_API_KEY", raising=False)
+    assert directory.ready_providers(config, corrections, shipped.provider_ready) == {"openai"}
+
+
+def test_shipped_layer_loads_directory_rows_and_curated_rows_yield(corrections, monkeypatch, tmp_path):
+    from src import onboarding, shipped
+
+    snapshot = _layer_snapshot(corrections)
+    monkeypatch.setattr(shipped, "_directory", lambda config, ready, keep, config_path=None: directory.layer(
+        config, ready=_ready("openai"), keep=keep, snapshot=snapshot, corrections=corrections))
+    profile = onboarding.validate_profile({
+        "schema_version": 1, "id": "openai-curated", "auto_add": True,
+        "provider": {"id": "openai", "base_url": "https://api.openai.com/v1", "protocol": "openai"},
+        "models": [
+            {"name": "gpt-6-luna", "provider": "openai", "provider_model_id": "gpt-6-luna", "context": 1000,
+             "pricing": {"input": 9.0, "output": 9.0}},
+            {"name": "curated-only", "provider": "openai", "provider_model_id": "not-in-directory", "context": 1000,
+             "pricing": {"input": 1.0, "output": 2.0}},
+        ],
+    })
+    found = shipped.layer({"catalog": {"pinned": []}}, profiles={"openai-curated": profile},
+                          ready=lambda p, c: True, config_path=tmp_path / "config.yaml")
+    names = [row["name"] for row in found.entries]
+    assert names == ["gpt-6-luna", "gpt-6.2-sol", "curated-only"]
+    assert found.entries[0]["pricing"]["input"] == 1.0  # the directory's row, not the curated copy
+    assert found.retired == {"gpt-6-sol": "gpt-6.2-sol"}
+
+
+def test_default_ranking_resolves_base_models_when_the_owner_sets_none(corrections):
+    from src import shipped
+
+    assert shipped.provider_preference({}) == list(corrections.ranking)
+    assert shipped.provider_preference({"catalog": {"provider_preference": ["openrouter"]}}) == ["openrouter"]
+
+
+def test_admin_directory_settings_round_trip(client):
+    response = client.put("/admin/api/directory/settings", headers=ADMIN, json={
+        "lines": {"openai/gpt sol": False}, "provider_preference": ["openrouter", "openai"],
+        "provider_policy": {"openrouter": {"zero_retention_only": True}}})
+    assert response.status_code == 200, response.text
+    assert response.json()["settings"]["lines"] == {"openai/gpt sol": False}
+    status = client.get("/admin/api/directory", headers=ADMIN).json()
+    assert status["ranking"] == ["openrouter", "openai"]
+    assert [line["followed"] for line in status["lines"]] == [False]
+    restored = client.put("/admin/api/directory/settings", headers=ADMIN,
+                          json={"lines": {"openai/gpt sol": None}, "provider_preference": []}).json()
+    assert restored["settings"]["lines"] == {}
+    stored = yaml.safe_load(providers.CONFIG_PATH.read_text())
+    assert "directory" not in stored["catalog"] and "provider_preference" not in stored["catalog"]
+    bad = client.put("/admin/api/directory/settings", headers=ADMIN, json={"sync": "hourly"})
+    assert bad.status_code == 400 and "daily or off" in bad.text
+
+
+def test_a_lower_ranked_route_whose_upstream_id_is_a_loaded_name_is_left_out(corrections):
+    labs = {"moonshotai/kimi-k3": {"name": "Kimi K3", "release_date": "2026-11-01"}}
+    api = _api(**{"fireworks-ai": [_model("accounts/fireworks/models/kimi-k3", canonical_model_id="moonshotai/kimi-k3")],
+                  "moonshotai": [_model("kimi-k3", canonical_model_id="moonshotai/kimi-k3")]})
+    snapshot = _snapshot(corrections, api, labs)
+    found = directory.layer({}, ready=_ready("fireworks", "moonshot"), snapshot=snapshot, corrections=corrections)
+    # Fireworks' route is named kimi-k3 (corrections); Moonshot's upstream id kimi-k3 would collide.
+    assert [row["name"] for row in found.rows] == ["kimi-k3"]
+
+
+def test_latest_and_preview_names_never_become_a_line_current_model(corrections):
+    labs = {"anthropic/claude-q-1": {"name": "Claude Q 1", "release_date": "2026-10-01"},
+            "anthropic/claude-q-latest": {"name": "Claude Q (latest)", "release_date": "2026-11-01"}}
+    api = _api(anthropic=[_model("claude-q-1", canonical_model_id="anthropic/claude-q-1"),
+                          _model("claude-q-latest-alias", canonical_model_id="anthropic/claude-q-latest")])
+    mapped = directory.map_snapshot(_snapshot(corrections, api, labs), corrections)
+    assert directory.current_models(mapped) == {"anthropic/claude q": "anthropic/claude-q-1"}

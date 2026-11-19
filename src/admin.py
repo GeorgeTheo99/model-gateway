@@ -1069,8 +1069,24 @@ async def admin_directory_status(request: Request):
         for item in mapped:
             if item.row is not None:
                 offered.setdefault(item.canonical, set()).add(item.provider)
+        config = providers._load_config()
+        corrections = directory.load_corrections()
+        found = shipped.layer(config, include_packs=False)
+        followed = set(directory.default_lines(mapped, current, snapshot or {}, corrections))
+        owner = directory.settings(config)
+        followed |= {line for line, on in owner["lines"].items() if on}
+        followed -= {line for line, on in owner["lines"].items() if not on}
         return {
-            "settings": directory.settings(providers._load_config()),
+            "settings": owner,
+            "ranking": directory.ranking(config, corrections),
+            "default_ranking": list(corrections.ranking),
+            "provider_policy": directory.provider_policy(config),
+            "providers": [{"id": provider, "display_name": facts["display_name"],
+                           "ready": provider in directory.ready_providers(config, corrections, shipped.provider_ready)}
+                          for provider, facts in corrections.providers.items()],
+            "loaded": sorted(row["name"] for row in found.entries
+                             if (row.get("origin") or {}).get("profile") == "models.dev"),
+            "retired": {name: successor for name, successor in sorted(found.retired.items())},
             "state": directory.load_state(),
             "snapshot": {
                 "origin": origin,
@@ -1078,7 +1094,8 @@ async def admin_directory_status(request: Request):
                 "models": directory.model_count(snapshot or {}),
                 "offered": sum(1 for item in mapped if item.row is not None),
             },
-            "lines": [{"line": line, "current": canonical, "providers": sorted(offered.get(canonical, ()))}
+            "lines": [{"line": line, "current": canonical, "providers": sorted(offered.get(canonical, ())),
+                       "followed": line in followed, "owner": owner["lines"].get(line)}
                       for line, canonical in sorted(current.items())],
         }
 
@@ -1124,12 +1141,58 @@ async def admin_directory_models(request: Request):
     return await run_in_threadpool(build)
 
 
+@router.put("/admin/api/directory/settings")
+async def admin_directory_settings(request: Request):
+    """Change directory settings: sync, followed lines, turned-on models, ranking, policy."""
+    require_admin_auth(request)
+    require_admin_writes()
+    try:
+        body = await request.json()
+    except Exception:
+        return _bad_request("Invalid JSON body")
+    if not isinstance(body, dict):
+        return _bad_request("Settings must be an object")
+    try:
+        result, reload_error = _apply_registry_mutation(lambda: config_io.update_directory_settings(body))
+    except ValueError as exc:
+        return _bad_request(str(exc))
+    if reload_error is not None:
+        return _bad_request(f"Provider registry update rejected: {reload_error}")
+    return {"settings": result, "catalogs": await _regenerate_catalogs()}
+
+
+def _sync_directory() -> dict:
+    """Sync models.dev and load the result; a snapshot the catalog rejects is rolled back."""
+    path = directory.snapshot_path()
+    with config_write_lock(config_io.CONFIG_PATH):
+        previous = path.read_bytes() if path.exists() else None
+        state = directory.sync()
+        if not state.get("changed"):
+            return state
+        error = _reload_registry_transactionally(snapshot_provider_registry())
+        if error is not None:
+            if previous is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(previous)
+            state = directory.record_error(f"catalog rejected the snapshot: {error}")
+    return state
+
+
+async def _sync_directory_and_export() -> dict:
+    state = await run_in_threadpool(_sync_directory)
+    if state.get("changed") and not state.get("error"):
+        state["catalogs"] = await _regenerate_catalogs()
+        discovery.refresh()
+    return state
+
+
 @router.post("/admin/api/directory/sync")
 async def admin_directory_sync(request: Request):
     """Sync the models.dev directory now."""
     require_admin_auth(request)
     require_admin_writes()
-    return await run_in_threadpool(directory.sync)
+    return await _sync_directory_and_export()
 
 
 async def watch_directory(check_seconds: float = DIRECTORY_CHECK_SECONDS,
@@ -1142,7 +1205,7 @@ async def watch_directory(check_seconds: float = DIRECTORY_CHECK_SECONDS,
         try:
             if (directory.settings(providers._load_config())["sync"] == "daily"
                     and directory.sync_due(directory.load_state())):
-                state = await run_in_threadpool(directory.sync)
+                state = await _sync_directory_and_export()
                 log.info("directory sync: %s", "failed: " + state["error"] if state.get("error")
                          else ("updated" if state.get("changed") else "unchanged"))
         except Exception as exc:  # noqa: BLE001 — the watcher must outlive any one sync
