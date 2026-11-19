@@ -1163,7 +1163,9 @@ def _curated_local_base(model_id: str) -> str | None:
 
 
 # Why a route named after its base model may be served by another route of that base.
-_REROUTABLE = frozenset({"model_not_found", "provider_not_configured"})
+# A directory route that failed its test completion falls back like an unconfigured one
+# (docs/adr/0005-models-dev-directory.md).
+_REROUTABLE = frozenset({"model_not_found", "provider_not_configured", "smoke_test_failed"})
 
 
 @_registry_locked
@@ -1181,7 +1183,8 @@ def base_model_route(model_id: str, *, locality: str | None = None) -> str | Non
     """The route serving ``model_id`` as a base-model reference, when it is not served as named.
 
     Only a name that is no route here, or a route named after its base model whose
-    provider is not set up here, is rerouted, and only within its locality. A
+    provider is not set up here or that failed its test completion, is rerouted, and only
+    within its locality. A
     provider-specific route name is never rerouted (that could change retention or
     cost), nor is a model the owner turned off, a turned-off provider, or an
     override the release no longer accepts.

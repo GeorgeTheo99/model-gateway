@@ -536,3 +536,16 @@ def test_admin_holds_endpoint(client, monkeypatch):
     assert client.post("/admin/api/directory/holds/missing", headers=ADMIN, json={"approve": True}).status_code == 404
     assert client.post("/admin/api/directory/holds/x", headers=ADMIN, json={}).status_code == 400
     assert calls == [("openrouter:google/gemini-x", False), ("missing", True)]
+
+
+def test_a_base_named_route_that_failed_its_test_falls_back_to_the_next_ranked_route(monkeypatch):
+    entries = {
+        "kimi-k3.1-pro": {"name": "kimi-k3.1-pro", "provider": "moonshot", "base_model": "kimi-k3.1-pro",
+                          "origin": {"layer": "shipped", "profile": "models.dev", "smoke_error": "suspended"}},
+        "kimi-k3.1-pro-fw": {"name": "kimi-k3.1-pro-fw", "provider": "fireworks", "base_model": "kimi-k3.1-pro",
+                             "origin": {"layer": "shipped", "profile": "models.dev"}},
+    }
+    monkeypatch.setattr(providers, "_load_models", lambda **kwargs: entries)
+    monkeypatch.setattr(providers, "resolve_base_model",
+                        lambda base, locality=None: "kimi-k3.1-pro-fw" if base == "kimi-k3.1-pro" else None)
+    assert providers.base_model_route("kimi-k3.1-pro") == "kimi-k3.1-pro-fw"
