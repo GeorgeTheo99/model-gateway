@@ -1,8 +1,9 @@
 # Model updates (proposed)
 
-> **Status:** proposed and tabled 2026-10-22; nothing is built. Reviewed with GPT-6 Astra and
-> GLM 5.3. Companion proposal: Myai's coding jobs (`my-ai/docs/coding-jobs.md`), whose weekly
-> model scout would produce this feature's curated models.
+> **Status:** superseded 2026-11-19 by [ADR 0005](adr/0005-models-dev-directory.md): the owner
+> chose a models.dev-backed catalog with a provider ranking, follow-latest model lines, held
+> changes and test completions, built in the gateway. This proposal (tabled 2026-10-22) is
+> kept for its app-side ideas (switch prompts, local fit), which are not built.
 
 An opt-in feature that tells a gateway's owner which models are new, which are being replaced,
 and which local models fit their Mac, and applies the owner's choices.

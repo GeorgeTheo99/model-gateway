@@ -1,5 +1,5 @@
 {
- "fetched_at": "2026-11-19T06:26:33Z",
+ "fetched_at": "2026-11-19T07:25:23Z",
  "labs": {
   "aion-labs/aion-2.0": {
    "name": "Aion-2.0",
@@ -9006,7 +9006,7 @@
      "canonical_model_id": "deepseek/deepseek-v4-flash-0731",
      "cost": {
       "cache_read": 0.035,
-      "input": 0.047,
+      "input": 0.055,
       "output": 0.3
      },
      "family": "deepseek-flash",
@@ -9191,9 +9191,9 @@
     "deepseek/deepseek-v4.1-flash-1017": {
      "canonical_model_id": "deepseek/deepseek-v4.1-flash-1017",
      "cost": {
-      "cache_read": 0.003,
-      "input": 0.15,
-      "output": 0.6
+      "cache_read": 0.006,
+      "input": 0.3,
+      "output": 1.2
      },
      "family": "deepseek-flash",
      "id": "deepseek/deepseek-v4.1-flash-1017",
@@ -10590,9 +10590,9 @@
     "google/gemma-4-26b-a4b-it": {
      "canonical_model_id": "google/gemma-4-26b-a4b-it",
      "cost": {
-      "cache_read": 0.0425,
-      "input": 0.0765,
-      "output": 0.255
+      "cache_read": 0.05,
+      "input": 0.09,
+      "output": 0.3
      },
      "family": "gemma",
      "id": "google/gemma-4-26b-a4b-it",
@@ -11889,9 +11889,9 @@
     "minimax/minimax-m3.1-flash": {
      "canonical_model_id": "minimax/MiniMax-M3.1-Flash",
      "cost": {
-      "cache_read": 0.0075,
-      "input": 0.075,
-      "output": 0.3
+      "cache_read": 0.015,
+      "input": 0.15,
+      "output": 0.6
      },
      "family": "minimax",
      "id": "minimax/minimax-m3.1-flash",
@@ -17117,9 +17117,9 @@
     "qwen/qwen3.5-9b": {
      "canonical_model_id": "alibaba/qwen3.5-9b",
      "cost": {
-      "cache_read": 0.128,
-      "input": 0.142,
-      "output": 0.21
+      "cache_read": 0.138,
+      "input": 0.154,
+      "output": 0.226
      },
      "family": "qwen",
      "id": "qwen/qwen3.5-9b",
@@ -19910,9 +19910,9 @@
     "z-ai/glm-5.1": {
      "canonical_model_id": "zhipuai/glm-5.1",
      "cost": {
-      "cache_read": 0.26,
-      "input": 1.4,
-      "output": 4.4
+      "cache_read": 0.6,
+      "input": 1.19,
+      "output": 3.74
      },
      "family": "glm",
      "id": "z-ai/glm-5.1",
@@ -20439,7 +20439,7 @@
     "~deepseek/deepseek-v4-flash-latest": {
      "cost": {
       "cache_read": 0.035,
-      "input": 0.047,
+      "input": 0.055,
       "output": 0.3
      },
      "family": "deepseek",
@@ -22219,6 +22219,6 @@
  "source": {
   "api": "https://models.dev/api.json",
   "labs": "https://models.dev/models.json",
-  "sha256": "d4e0e5d140875be5a7e4e78b7b685ceb7cceb2e7821ef16c2c04a4da935d480c"
+  "sha256": "e8b14e9fca144945d3c814a2f1a5ed836b66443032c5a2effc76c004caa22dfd"
  }
 }

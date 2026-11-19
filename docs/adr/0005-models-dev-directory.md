@@ -149,9 +149,14 @@ load (about 50 rows by default), which keeps `/v1/models/canonical` inside My AI
 
 - The curated profiles' models become directory rows: corrections give them their
   established names, aliases and display names, so routes, aliases, ledger
-  history and consumer bindings keep their identity. Profiles keep their provider
-  blocks for onboarding and key checks; their `models` lists are removed in the
-  final stage.
+  history and consumer bindings keep their identity. A curated row for a route the
+  directory maps yields to the directory row, so only routes models.dev cannot
+  know (the ChatGPT plan, Fireworks spot) are still served from a profile.
+- The profiles stay as onboarding manifests: their provider blocks drive key
+  entry and the key check (a test completion on the first model), and consumers
+  find the profile that serves their routes by its model names (My AI's Cloud
+  Best setup). Their model lists are therefore kept, not removed as first
+  planned; their prices no longer reach the catalog for directory routes.
 - Owner rows are untouched; a directory row whose name an owner row claims yields
   as shipped rows do.
 - Lines the owner already retired by hand are unfollowed (Gemini 3.x Flash and
@@ -164,8 +169,8 @@ load (about 50 rows by default), which keeps `/v1/models/canonical` inside My AI
    move onto it.
 3. Follow-latest retirement, holds and smoke tests.
 4. Admin Settings: providers and the model browser.
-5. My AI Settings and Pi shortcuts on the same API; curated model lists removed;
-   release.
+5. My AI Settings and Pi shortcuts on the same API (`catalog:manage`, generated
+   Pi shortcuts); release.
 
 ## Consequences
 
