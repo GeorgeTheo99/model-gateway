@@ -411,6 +411,19 @@ async def watch_local_ai(poll_seconds: float = LOCAL_AI_POLL_SECONDS) -> None:
 _background: set[asyncio.Task] = set()
 
 
+def _spawn(coroutine) -> None:
+    """Run a background coroutine, logging instead of losing its failure."""
+    async def run() -> None:
+        try:
+            await coroutine
+        except Exception as exc:  # noqa: BLE001
+            log.warning("background task failed: %s", exc)
+
+    task = asyncio.create_task(run())
+    _background.add(task)
+    task.add_done_callback(_background.discard)
+
+
 def sync_local_ai_pins_soon() -> None:
     """Pin the local models registered profiles use, without holding up the caller: an oMLX
     reload can take minutes while it preloads a pinned model."""
@@ -1087,7 +1100,11 @@ async def admin_directory_status(request: Request):
             "loaded": sorted(row["name"] for row in found.entries
                              if (row.get("origin") or {}).get("profile") == "models.dev"),
             "retired": {name: successor for name, successor in sorted(found.retired.items())},
-            "state": directory.load_state(),
+            "state": {key: value for key, value in directory.load_state().items() if key not in ("holds", "smoke")},
+            "holds": [{key: value for key, value in hold.items() if key != "fingerprint"}
+                      for hold in (directory.load_state().get("holds") or {}).values()],
+            "smoke_failures": {name: record for name, record in (directory.load_state().get("smoke") or {}).items()
+                               if not record.get("ok")},
             "snapshot": {
                 "origin": origin,
                 "fetched_at": (snapshot or {}).get("fetched_at"),
@@ -1158,7 +1175,17 @@ async def admin_directory_settings(request: Request):
         return _bad_request(str(exc))
     if reload_error is not None:
         return _bad_request(f"Provider registry update rejected: {reload_error}")
-    return {"settings": result, "catalogs": await _regenerate_catalogs()}
+    catalogs = await _regenerate_catalogs()
+    _spawn(_smoke_test_and_export(retest_failed=False))
+    return {"settings": result, "catalogs": catalogs}
+
+
+def _directory_entries() -> list[dict]:
+    """The catalog entries loaded from the directory (shipped rows of the models.dev profile)."""
+    import src.providers as providers
+
+    return [entry for entry in {id(v): v for v in providers._load_models().values()}.values()
+            if (entry.get("origin") or {}).get("profile") == "models.dev"]
 
 
 def _sync_directory() -> dict:
@@ -1166,7 +1193,8 @@ def _sync_directory() -> dict:
     path = directory.snapshot_path()
     with config_write_lock(config_io.CONFIG_PATH):
         previous = path.read_bytes() if path.exists() else None
-        state = directory.sync()
+        protect = {(str(entry["provider"]), str(entry["provider_model_id"])) for entry in _directory_entries()}
+        state = directory.sync(protect=protect)
         if not state.get("changed"):
             return state
         error = _reload_registry_transactionally(snapshot_provider_registry())
@@ -1179,12 +1207,73 @@ def _sync_directory() -> dict:
     return state
 
 
+def _smoke_test_directory(retest_failed: bool) -> bool:
+    """Test each loaded directory route not yet tested (and failed ones when asked); reload when a
+    route started or stopped failing. True when the catalog changed."""
+    import src.providers as providers
+
+    config = providers._load_config()
+    smoke = directory.load_state().get("smoke") or {}
+    results = {}
+    for entry in _directory_entries():
+        if directory.needs_smoke_test(entry, smoke, retest_failed=retest_failed):
+            provider_config = providers._effective_provider_config(config, str(entry["provider"]))
+            error = directory.smoke_test(entry, provider_config)
+            results[entry["name"]] = (directory.smoke_key(entry), error)
+            if error:
+                log.warning("directory: %s failed its test completion: %s", entry["name"], error)
+    if not results or not directory.record_smoke(results):
+        return False
+    with config_write_lock(config_io.CONFIG_PATH):
+        error = _reload_registry_transactionally(snapshot_provider_registry())
+    if error is not None:
+        log.warning("directory: reload after test completions failed: %s", error)
+        return False
+    return True
+
+
+async def _smoke_test_and_export(retest_failed: bool) -> None:
+    if await run_in_threadpool(_smoke_test_directory, retest_failed):
+        await _regenerate_catalogs()
+        discovery.refresh()
+
+
 async def _sync_directory_and_export() -> dict:
     state = await run_in_threadpool(_sync_directory)
     if state.get("changed") and not state.get("error"):
         state["catalogs"] = await _regenerate_catalogs()
         discovery.refresh()
+    if not state.get("error"):
+        await _smoke_test_and_export(retest_failed=True)
     return state
+
+
+@router.post("/admin/api/directory/holds/{hold_id:path}")
+async def admin_directory_hold(hold_id: str, request: Request):
+    """Approve (``{"approve": true}``) or reject (``false``) a held directory change."""
+    require_admin_auth(request)
+    require_admin_writes()
+    try:
+        body = await request.json()
+    except Exception:
+        return _bad_request("Invalid JSON body")
+    if not isinstance(body, dict) or not isinstance(body.get("approve"), bool):
+        return _bad_request('Body must be {"approve": true} or {"approve": false}')
+    try:
+        result, reload_error = _apply_registry_mutation(
+            lambda: directory.resolve_hold(hold_id, body["approve"]),
+            extra_paths=lambda: [directory.snapshot_path(), directory.state_path()],
+        )
+    except KeyError:
+        return _bad_request(f"No held change {hold_id!r}", status=404)
+    except directory.DirectoryError as exc:
+        return _bad_request(str(exc), status=409)
+    if reload_error is not None:
+        return _bad_request(f"Provider registry update rejected: {reload_error}")
+    catalogs = await _regenerate_catalogs()
+    if body["approve"]:
+        _spawn(_smoke_test_and_export(retest_failed=False))
+    return {"hold": {key: value for key, value in result.items() if key != "fingerprint"}, "catalogs": catalogs}
 
 
 @router.post("/admin/api/directory/sync")
@@ -1201,6 +1290,10 @@ async def watch_directory(check_seconds: float = DIRECTORY_CHECK_SECONDS,
     import src.providers as providers
 
     await asyncio.sleep(first_check_seconds)
+    try:
+        await _smoke_test_and_export(retest_failed=False)  # routes a release or restart newly loads
+    except Exception as exc:  # noqa: BLE001
+        log.warning("directory test completions failed: %s", exc)
     while True:
         try:
             if (directory.settings(providers._load_config())["sync"] == "daily"

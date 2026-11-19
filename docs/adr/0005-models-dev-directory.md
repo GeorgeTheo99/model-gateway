@@ -118,9 +118,12 @@ Corrections win over directory fields; owner rows still win over both (ADR 0002)
 - A sync that would change a loaded model's input or output price by more than 50%,
   remove a loaded model, or drop its price holds that change: the model keeps its
   previous values until the owner approves or rejects the change in Settings.
-- A model newly loaded from the directory gets one cheap completion through its
-  route. A failure marks it unavailable with the upstream's reason and is retried
-  on the next sync.
+- A model newly loaded from the directory gets one cheap completion straight to its
+  provider, with the route's request quirks (the onboarding key check). A failure
+  marks it unavailable (`smoke_test_failed`, with the provider's reason) and is
+  retried after the next sync. Results are kept in `models-dev/state.json`.
+- A rejected change stays rejected while models.dev proposes the same entry; a
+  different proposal opens a new hold. A change models.dev withdraws closes its hold.
 
 ### Settings and API
 

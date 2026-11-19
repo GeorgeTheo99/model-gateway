@@ -170,8 +170,8 @@ def snapshot_path(config_path: Path | None = None) -> Path:
     return directory_dir(config_path) / "snapshot.json"
 
 
-def state_path() -> Path:
-    return directory_dir() / "state.json"
+def state_path(config_path: Path | None = None) -> Path:
+    return directory_dir(config_path) / "state.json"
 
 
 def _atomic_json(path: Path, value: dict) -> None:
@@ -203,8 +203,8 @@ def load_snapshot(config_path: Path | None = None) -> tuple[dict | None, str]:
     return None, "none"
 
 
-def load_state() -> dict:
-    return _read_json(state_path()) or {}
+def load_state(config_path: Path | None = None) -> dict:
+    return _read_json(state_path(config_path)) or {}
 
 
 # ── Settings ───────────────────────────────────────────────────────────────
@@ -278,8 +278,97 @@ def _download(url: str) -> bytes:
             return b"".join(chunks)
 
 
-def sync(*, fetch: Callable[[str], bytes] = _download, corrections: Corrections | None = None) -> dict:
-    """Fetch models.dev and store the snapshot if it passes validation. Returns the new state."""
+PRICE_CHANGE_LIMIT = 1.5
+"""A loaded model's input or output price moving by more than this factor (50%) is held."""
+
+
+def _fingerprint(entry: dict | None) -> str:
+    return hashlib.sha256(json.dumps(entry, sort_keys=True).encode()).hexdigest()
+
+
+def _hold_kind(previous: dict, proposed: dict | None) -> str | None:
+    if proposed is None or proposed.get("status") == "deprecated":
+        return "removed"
+    old_cost, new_cost = previous.get("cost") or {}, proposed.get("cost") or {}
+    if not all(isinstance(new_cost.get(key), (int, float)) for key in ("input", "output")):
+        return "price_missing"
+    for key in ("input", "output"):
+        old, new = old_cost.get(key), new_cost[key]
+        if isinstance(old, (int, float)) and old > 0 and not (1 / PRICE_CHANGE_LIMIT <= new / old <= PRICE_CHANGE_LIMIT):
+            return "price_change"
+    return None
+
+
+def apply_holds(snapshot: dict, previous: dict | None, protect: set[tuple[str, str]], corrections: Corrections,
+                holds: dict[str, dict]) -> dict[str, dict]:
+    """Keep a loaded model's previous entry where the update looks wrong (ADR 0005), in place.
+
+    ``protect`` holds the (gateway provider, model id) routes the catalog loads. A removal, a
+    lost price or an input/output price moving by more than 50% is held: the snapshot keeps the
+    previous entry until the owner approves. A change the owner rejected stays rejected while
+    models.dev proposes the same entry. Returns the holds still open or rejected.
+    """
+    result: dict[str, dict] = {}
+    if not previous:
+        return result
+    for provider, model_id in sorted(protect):
+        facts = corrections.providers.get(provider)
+        dev_id = facts and facts["models_dev"]
+        prev_entry = ((previous.get("providers") or {}).get(dev_id) or {}).get("models", {}).get(model_id)
+        if prev_entry is None:
+            continue
+        new_models = snapshot["providers"].setdefault(dev_id, {"name": dev_id, "models": {}})["models"]
+        proposed = new_models.get(model_id)
+        kind = _hold_kind(prev_entry, proposed)
+        hold_id = f"{dev_id}:{model_id}"
+        if kind is None:
+            continue
+        fingerprint = _fingerprint(proposed)
+        existing = holds.get(hold_id) or {}
+        status = existing.get("status") if existing.get("fingerprint") == fingerprint else "pending"
+        same = existing.get("fingerprint") == fingerprint
+        result[hold_id] = {
+            "id": hold_id, "provider": provider, "model_id": model_id, "kind": kind, "status": status,
+            "previous": prev_entry, "proposed": proposed, "fingerprint": fingerprint,
+            "detected_at": existing["detected_at"] if same and existing.get("detected_at") else _utc_now(),
+        }
+        new_models[model_id] = prev_entry
+    return result
+
+
+def resolve_hold(hold_id: str, approve: bool) -> dict:
+    """Approve (apply models.dev's entry) or reject (keep the previous one) a held change."""
+    state = load_state()
+    holds = dict(state.get("holds") or {})
+    hold = holds.get(hold_id)
+    if hold is None:
+        raise KeyError(hold_id)
+    if approve:
+        snapshot, origin = load_snapshot()
+        if snapshot is None or origin != "synced":
+            raise DirectoryError("no synced snapshot to apply the change to")
+        dev_id, model_id = hold_id.split(":", 1)
+        models = snapshot["providers"].setdefault(dev_id, {"name": dev_id, "models": {}})["models"]
+        if hold["proposed"] is None:
+            models.pop(model_id, None)
+        else:
+            models[model_id] = hold["proposed"]
+        _atomic_json(snapshot_path(), snapshot)
+        holds.pop(hold_id)
+        result = {**hold, "status": "approved"}
+    else:
+        holds[hold_id] = result = {**hold, "status": "rejected"}
+    state["holds"] = holds
+    _atomic_json(state_path(), state)
+    return result
+
+
+def sync(*, fetch: Callable[[str], bytes] = _download, corrections: Corrections | None = None,
+         protect: set[tuple[str, str]] | None = None) -> dict:
+    """Fetch models.dev and store the snapshot if it passes validation. Returns the new state.
+
+    ``protect`` names the routes the catalog loads; suspicious changes to them are held.
+    """
     corrections = corrections or load_corrections()
     state = load_state()
     state["last_attempt"] = _utc_now()
@@ -297,6 +386,8 @@ def sync(*, fetch: Callable[[str], bytes] = _download, corrections: Corrections 
         if origin == "synced" and previous.get("source", {}).get("sha256") == digest:
             state.update(last_success=state["last_attempt"], error=None, changed=False)
         else:
+            state["holds"] = apply_holds(snapshot, previous, set(protect or ()), corrections,
+                                         dict(state.get("holds") or {}))
             _atomic_json(snapshot_path(), snapshot)
             state.update(last_success=state["last_attempt"], error=None, changed=True,
                          models=model_count(snapshot), sha256=digest)
@@ -305,6 +396,50 @@ def sync(*, fetch: Callable[[str], bytes] = _download, corrections: Corrections 
         log.warning("directory sync failed: %s", state["error"])
     _atomic_json(state_path(), state)
     return state
+
+
+# ── Smoke tests ────────────────────────────────────────────────────────────
+
+
+def smoke_key(row: dict) -> str:
+    return f"{row['provider']}:{row['provider_model_id']}"
+
+
+def needs_smoke_test(row: dict, smoke: dict[str, dict], *, retest_failed: bool) -> bool:
+    record = smoke.get(row["name"])
+    if record is None or record.get("key") != smoke_key(row):
+        return True
+    return retest_failed and not record.get("ok")
+
+
+def smoke_test(row: dict, provider_config: dict) -> str | None:
+    """One cheap completion straight to the route's provider; the error, or None when it answered."""
+    from src.onboarding import OnboardingError, validate_upstream_completion
+
+    profile = {"provider": {"id": row["provider"], "base_url": provider_config.get("base_url", ""),
+                            "protocol": provider_config.get("protocol") or "openai"},
+               "models": [row]}
+    try:
+        validate_upstream_completion(profile, str(provider_config.get("api_key") or ""))
+    except OnboardingError as exc:
+        return str(exc)
+    except Exception as exc:  # noqa: BLE001 — a failed probe is a result, never a crash
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
+def record_smoke(results: dict[str, tuple[str, str | None]]) -> bool:
+    """Store smoke results (``{name: (key, error)}``); True when a route's pass/fail changed."""
+    state = load_state()
+    smoke = dict(state.get("smoke") or {})
+    changed = False
+    for name, (key, error) in results.items():
+        before = smoke.get(name)
+        changed |= before is None or before.get("key") != key or bool(before.get("ok")) != (error is None)
+        smoke[name] = {"key": key, "ok": error is None, "error": error, "at": _utc_now()}
+    state["smoke"] = smoke
+    _atomic_json(state_path(), state)
+    return changed
 
 
 def record_error(message: str) -> dict:
@@ -698,7 +833,13 @@ def layer(config: dict, *, ready: Callable[[dict, dict], bool], keep: frozenset[
         same_provider = [other for other in successor if other.provider == item.provider]
         choices = same_provider or successor
         retired[item.row["name"]] = choices[0].row["name"] if choices else None
-    origin = {"layer": "shipped", "profile": "models.dev"}
-    rows = [{**_apply_policy(item.row, policy), "origin": {**origin, "line": item.line}} for item in loaded]
+    smoke = load_state(config_path).get("smoke") or {}
+    rows = []
+    for item in loaded:
+        origin = {"layer": "shipped", "profile": "models.dev", "line": item.line}
+        record = smoke.get(item.row["name"]) or {}
+        if record.get("key") == smoke_key(item.row) and not record.get("ok", True):
+            origin["smoke_error"] = record.get("error") or "test completion failed"
+        rows.append({**_apply_policy(item.row, policy), "origin": origin})
     known = frozenset((item.provider, item.model_id) for item in mapped if item.row is not None)
     return DirectoryLayer(rows=rows, known_routes=known, retired=retired, followed=tuple(sorted(followed)))

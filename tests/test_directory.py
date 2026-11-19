@@ -287,7 +287,7 @@ def test_admin_directory_status_and_browse(client):
 
 
 def test_admin_directory_sync_runs_a_sync(client, monkeypatch):
-    monkeypatch.setattr(directory, "sync", lambda: {"error": None, "changed": True, "models": 3})
+    monkeypatch.setattr(directory, "sync", lambda **kwargs: {"error": None, "changed": True, "models": 3})
     assert client.post("/admin/api/directory/sync", headers=ADMIN).json() == {
         "error": None, "changed": True, "models": 3, "catalogs": "regenerated"}
 
@@ -430,3 +430,109 @@ def test_latest_and_preview_names_never_become_a_line_current_model(corrections)
                           _model("claude-q-latest-alias", canonical_model_id="anthropic/claude-q-latest")])
     mapped = directory.map_snapshot(_snapshot(corrections, api, labs), corrections)
     assert directory.current_models(mapped) == {"anthropic/claude q": "anthropic/claude-q-1"}
+
+
+# ── Holds and smoke tests (stage 3) ────────────────────────────────────────
+
+
+def _hold_snapshots(corrections, new_cost=None, drop=False):
+    old = _snapshot(corrections, _api(openai=[_model("g1"), _model("g2")]))
+    models = [] if drop else [_model("g1", **({"cost": new_cost} if new_cost is not None else {}))]
+    new = _snapshot(corrections, _api(openai=[*models, _model("g2", cost={"input": 9.0, "output": 9.0})]))
+    return old, new
+
+
+@pytest.mark.parametrize("new_cost, drop, kind", [
+    ({"input": 1.6, "output": 5.0}, False, "price_change"),
+    ({"input": 1.0, "output": 3.0}, False, "price_change"),
+    ({}, False, "price_missing"),
+    (None, True, "removed"),
+])
+def test_suspicious_changes_to_loaded_models_are_held(corrections, new_cost, drop, kind):
+    old, new = _hold_snapshots(corrections, new_cost, drop)
+    holds = directory.apply_holds(new, old, {("openai", "g1")}, corrections, {})
+    assert list(holds) == ["openai:g1"] and holds["openai:g1"]["kind"] == kind
+    assert holds["openai:g1"]["status"] == "pending"
+    assert new["providers"]["openai"]["models"]["g1"] == old["providers"]["openai"]["models"]["g1"]
+    # g2 is not loaded, so its 9x price change goes through.
+    assert new["providers"]["openai"]["models"]["g2"]["cost"]["input"] == 9.0
+
+
+def test_small_changes_pass_and_a_rejected_change_stays_rejected_until_it_changes(corrections):
+    old, new = _hold_snapshots(corrections, {"input": 1.4, "output": 6.0})
+    assert directory.apply_holds(new, old, {("openai", "g1")}, corrections, {}) == {}
+    old, new = _hold_snapshots(corrections, {"input": 3.0, "output": 5.0})
+    first = directory.apply_holds(new, old, {("openai", "g1")}, corrections, {})
+    rejected = {"openai:g1": {**first["openai:g1"], "status": "rejected"}}
+    old, again = _hold_snapshots(corrections, {"input": 3.0, "output": 5.0})
+    assert directory.apply_holds(again, old, {("openai", "g1")}, corrections, rejected)["openai:g1"]["status"] == "rejected"
+    old, other = _hold_snapshots(corrections, {"input": 4.0, "output": 5.0})
+    assert directory.apply_holds(other, old, {("openai", "g1")}, corrections, rejected)["openai:g1"]["status"] == "pending"
+
+
+def test_sync_holds_changes_to_protected_routes_and_approval_applies_them(corrections, state_dir):
+    payloads = {directory.API_URL: json.dumps(_api(openai=[_model("g1"), _model("g2")])).encode(),
+                directory.LABS_URL: b"{}"}
+    directory.sync(fetch=payloads.__getitem__, corrections=corrections)
+    payloads[directory.API_URL] = json.dumps(_api(openai=[_model("g1", cost={"input": 5.0, "output": 25.0}),
+                                                          _model("g2")])).encode()
+    state = directory.sync(fetch=payloads.__getitem__, corrections=corrections, protect={("openai", "g1")})
+    assert state["holds"]["openai:g1"]["kind"] == "price_change"
+    assert directory.load_snapshot()[0]["providers"]["openai"]["models"]["g1"]["cost"]["input"] == 1.0
+    assert directory.resolve_hold("openai:g1", approve=True)["status"] == "approved"
+    assert directory.load_snapshot()[0]["providers"]["openai"]["models"]["g1"]["cost"]["input"] == 5.0
+    assert directory.load_state()["holds"] == {}
+    with pytest.raises(KeyError):
+        directory.resolve_hold("openai:g1", approve=False)
+
+
+def test_smoke_records_decide_retests_and_failures_make_a_route_unavailable(corrections, state_dir, monkeypatch):
+    row = {"name": "gpt-6.2-sol", "provider": "openai", "provider_model_id": "gpt-6.2-sol"}
+    assert directory.needs_smoke_test(row, {}, retest_failed=False)
+    assert directory.record_smoke({"gpt-6.2-sol": ("openai:gpt-6.2-sol", "provider refused (HTTP 403)")})
+    smoke = directory.load_state()["smoke"]
+    assert not directory.needs_smoke_test(row, smoke, retest_failed=False)
+    assert directory.needs_smoke_test(row, smoke, retest_failed=True)
+    assert not directory.record_smoke({"gpt-6.2-sol": ("openai:gpt-6.2-sol", "still refused")})
+
+    found = directory.layer({}, ready=_ready("openai"), snapshot=_layer_snapshot(corrections), corrections=corrections)
+    by_name = {r["name"]: r for r in found.rows}
+    assert by_name["gpt-6.2-sol"]["origin"]["smoke_error"] == "still refused"
+    availability = providers._availability_for_entry("gpt-6.2-sol", by_name["gpt-6.2-sol"])
+    assert (availability["available"], availability["reason"]) == (False, "smoke_test_failed")
+    assert "smoke_error" not in by_name["gpt-6-luna"]["origin"]
+
+
+def test_smoke_test_reports_the_provider_error(monkeypatch):
+    from src import onboarding
+
+    seen = {}
+
+    def refuse(profile, key):
+        seen.update(profile=profile, key=key)
+        raise onboarding.OnboardingError("provider refused a test completion (HTTP 404): no such model")
+
+    monkeypatch.setattr(onboarding, "validate_upstream_completion", refuse)
+    row = {"name": "x", "provider": "openrouter", "provider_model_id": "a/x", "quirks": ["openrouter_zdr"]}
+    error = directory.smoke_test(row, {"base_url": "https://openrouter.ai/api/v1", "api_key": "k"})
+    assert error.endswith("no such model")
+    assert seen["profile"]["models"] == [row] and seen["key"] == "k"
+    monkeypatch.setattr(onboarding, "validate_upstream_completion", lambda profile, key: None)
+    assert directory.smoke_test(row, {"base_url": "https://openrouter.ai/api/v1", "api_key": "k"}) is None
+
+
+def test_admin_holds_endpoint(client, monkeypatch):
+    calls = []
+
+    def resolve(hold_id, approve):
+        calls.append((hold_id, approve))
+        if hold_id == "missing":
+            raise KeyError(hold_id)
+        return {"id": hold_id, "status": "approved" if approve else "rejected", "fingerprint": "x"}
+
+    monkeypatch.setattr(directory, "resolve_hold", resolve)
+    ok = client.post("/admin/api/directory/holds/openrouter:google/gemini-x", headers=ADMIN, json={"approve": False})
+    assert ok.status_code == 200 and ok.json()["hold"] == {"id": "openrouter:google/gemini-x", "status": "rejected"}
+    assert client.post("/admin/api/directory/holds/missing", headers=ADMIN, json={"approve": True}).status_code == 404
+    assert client.post("/admin/api/directory/holds/x", headers=ADMIN, json={}).status_code == 400
+    assert calls == [("openrouter:google/gemini-x", False), ("missing", True)]

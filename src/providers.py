@@ -912,6 +912,15 @@ def _availability_for_entry(model_id: str, entry: dict | None) -> dict:
             "provider": provider,
             "message": f"Model {name!r} has an owner override this release no longer accepts: {override_error}",
         }
+    smoke_error = (entry.get("origin") or {}).get("smoke_error")
+    if smoke_error:
+        return {
+            "available": False,
+            "reason": "smoke_test_failed",
+            "model": name,
+            "provider": provider,
+            "message": f"Model {name!r} failed its test completion: {smoke_error}",
+        }
     if not _is_model_enabled(name):
         return {
             "available": False,
