@@ -264,8 +264,10 @@ model-gateway consumer revoke myai-deployer       # removes the entry and delete
   `models:register`, limited to its `--provider` allowlist (see
   [scoped management](deployment-auth.md#scoped-management-credentials)).
   `--local-ai` adds `local_ai:manage` to any role (see [Local AI](#local-ai)),
-  and `--custom-providers` adds `providers:custom` (see
-  [owner-added providers](deployment-auth.md#owner-added-provider-credentials)).
+  `--custom-providers` adds `providers:custom` (see
+  [owner-added providers](deployment-auth.md#owner-added-provider-credentials)),
+  and `--catalog` adds `catalog:manage` (see
+  [catalog settings](deployment-auth.md#catalog-settings-credentials)).
   The namespace defaults to the consumer
   id (`--namespace` is repeatable). Re-running an identical `add` is a no-op;
   an existing valid key file at the default path is adopted, not replaced, and

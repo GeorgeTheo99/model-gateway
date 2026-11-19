@@ -796,6 +796,8 @@ def layer(config: dict, *, ready: Callable[[dict, dict], bool], keep: frozenset[
     consumer profile), which keep loading.
     """
     if snapshot is None:
+        if os.environ.get("MODEL_GATEWAY_DIRECTORY", "").strip().lower() == "off":
+            return DirectoryLayer()  # the owner (or a test suite) turned the directory off
         snapshot, _ = load_snapshot(config_path)
     if snapshot is None:
         return DirectoryLayer()
@@ -839,6 +841,19 @@ def layer(config: dict, *, ready: Callable[[dict, dict], bool], keep: frozenset[
         same_provider = [other for other in successor if other.provider == item.provider]
         choices = same_provider or successor
         retired[item.row["name"]] = choices[0].row["name"] if choices else None
+    # Each base model's first route gets a Pi-safe shortcut when corrections gave it none:
+    # gpt-6.2-sol -> gpt62sol (letters and digits, as pi-catalog requires).
+    aliased: set[str] = set()
+    aliases: dict[str, str] = {}
+    for item in loaded:
+        base = item.row["base_model"]
+        if base in aliased:
+            continue
+        aliased.add(base)
+        shortcut = re.sub(r"[^a-z0-9]", "", base)
+        if not item.row.get("alias") and shortcut and shortcut not in claimed:
+            claimed.add(shortcut)
+            aliases[item.row["name"]] = shortcut
     smoke = load_state(config_path).get("smoke") or {}
     rows = []
     for item in loaded:
@@ -846,6 +861,9 @@ def layer(config: dict, *, ready: Callable[[dict, dict], bool], keep: frozenset[
         record = smoke.get(item.row["name"]) or {}
         if record.get("key") == smoke_key(item.row) and not record.get("ok", True):
             origin["smoke_error"] = record.get("error") or "test completion failed"
-        rows.append({**_apply_policy(item.row, policy), "origin": origin})
+        row = _apply_policy(item.row, policy)
+        if item.row["name"] in aliases:
+            row = {**row, "alias": aliases[item.row["name"]]}
+        rows.append({**row, "origin": origin})
     known = frozenset((item.provider, item.model_id) for item in mapped if item.row is not None)
     return DirectoryLayer(rows=rows, known_routes=known, retired=retired, followed=tuple(sorted(followed)))

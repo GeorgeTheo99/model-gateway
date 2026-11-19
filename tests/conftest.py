@@ -78,6 +78,7 @@ def _isolate_shipped_layer(monkeypatch):
 
     monkeypatch.setattr(shipped, "_packaged", lambda: {})
     monkeypatch.setattr(shipped, "_directory", lambda *args, **kwargs: directory.DirectoryLayer())
+    monkeypatch.setenv("MODEL_GATEWAY_DIRECTORY", "off")  # catalog exports run in a subprocess
     yield
 
 

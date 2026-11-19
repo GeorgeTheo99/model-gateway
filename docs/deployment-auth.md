@@ -88,6 +88,17 @@ registry, ETag, and execution contract.
 (status, add, cancel; writes need `MODEL_GATEWAY_ADMIN_WRITES`). It needs no
 `providers` allowlist and grants nothing else; removing local AI needs the CLI.
 
+## Catalog settings credentials
+
+`catalog:manage` (`model-gateway consumer add ... --catalog`) lets an application
+show and change the models.dev catalog settings
+([ADR 0005](adr/0005-models-dev-directory.md)): `GET /admin/api/directory`,
+`GET /admin/api/directory/models`, `PUT /admin/api/directory/settings` (provider
+order and policy, followed lines, turned-on models), `POST
+/admin/api/directory/sync` and `POST /admin/api/directory/holds/{id}`. It needs no
+`providers` allowlist and grants nothing else; writes need
+`MODEL_GATEWAY_ADMIN_WRITES`.
+
 ## Owner-added provider credentials
 
 `providers:custom` (`model-gateway consumer add ... --custom-providers`) lets an

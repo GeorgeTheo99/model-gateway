@@ -1072,7 +1072,7 @@ def _loaded_routes() -> set[tuple[str, str]]:
 @router.get("/admin/api/directory")
 async def admin_directory_status(request: Request):
     """Directory sync state, snapshot and model lines with their current models."""
-    require_admin_auth(request)
+    require_admin_or_scope(request, "catalog:manage")
     import src.providers as providers
 
     def build() -> dict:
@@ -1126,7 +1126,7 @@ async def admin_directory_status(request: Request):
 @router.get("/admin/api/directory/models")
 async def admin_directory_models(request: Request):
     """Browse directory models with the catalog row each maps to (read-only)."""
-    require_admin_auth(request)
+    require_admin_or_scope(request, "catalog:manage")
     query = request.query_params
     try:
         limit = max(1, min(int(query.get("limit", "100")), 1000))
@@ -1165,7 +1165,7 @@ async def admin_directory_models(request: Request):
 @router.put("/admin/api/directory/settings")
 async def admin_directory_settings(request: Request):
     """Change directory settings: sync, followed lines, turned-on models, ranking, policy."""
-    require_admin_auth(request)
+    require_admin_or_scope(request, "catalog:manage")
     require_admin_writes()
     try:
         body = await request.json()
@@ -1255,7 +1255,7 @@ async def _sync_directory_and_export() -> dict:
 @router.post("/admin/api/directory/holds/{hold_id:path}")
 async def admin_directory_hold(hold_id: str, request: Request):
     """Approve (``{"approve": true}``) or reject (``false``) a held directory change."""
-    require_admin_auth(request)
+    require_admin_or_scope(request, "catalog:manage")
     require_admin_writes()
     try:
         body = await request.json()
@@ -1283,7 +1283,7 @@ async def admin_directory_hold(hold_id: str, request: Request):
 @router.post("/admin/api/directory/sync")
 async def admin_directory_sync(request: Request):
     """Sync the models.dev directory now."""
-    require_admin_auth(request)
+    require_admin_or_scope(request, "catalog:manage")
     require_admin_writes()
     return await _sync_directory_and_export()
 

@@ -45,6 +45,7 @@ request quirks, and our established names and aliases.
 - A sync is accepted whole or not at all. It is rejected (the last good snapshot
   stays) when it does not parse, when a mapped provider that had models has none,
   or when more than 20% of the mapped models disappear at once.
+- `MODEL_GATEWAY_DIRECTORY=off` turns the directory layer off (the test suite does).
 - The accepted snapshot is stored as `directory/snapshot.json` beside
   `config.yaml`; every release also ships a filtered snapshot
   (`config/directory/models-dev-snapshot.json`) used until the first sync

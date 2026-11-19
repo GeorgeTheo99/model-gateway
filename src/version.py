@@ -14,6 +14,7 @@ CAPABILITIES = (
     "catalog_packs.v1",
     "chatgpt_plan.v1",
     "custom_providers.v1",
+    "directory.v1",
     "endpoint_file.v1",
     "federation_catalog.v2",
     "layered_catalog.v1",

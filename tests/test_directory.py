@@ -557,3 +557,33 @@ def test_a_base_named_route_that_failed_its_test_falls_back_to_the_next_ranked_r
 ])
 def test_line_labels_drop_versions(name, label):
     assert directory.line_label(name) == label
+
+
+def test_each_base_model_gets_a_pi_safe_shortcut_on_its_first_route(corrections):
+    found = directory.layer({}, ready=_ready("openai", "openrouter"), snapshot=_layer_snapshot(corrections),
+                            corrections=corrections)
+    assert {row["name"]: row.get("alias") for row in found.rows} == {
+        "gpt-6-luna": "gpt6luna", "gpt-6.2-sol": "gpt62sol", "gpt-6.2-sol-or": None}
+
+
+def test_a_catalog_manager_credential_reads_and_changes_catalog_settings(client, tmp_path):
+    key = tmp_path / "manager.key"
+    key.write_text("catalog-token")
+    key.chmod(0o600)
+    config = yaml.safe_load(providers.CONFIG_PATH.read_text())
+    config["auth"]["consumer_credentials"] = [
+        {"id": "myai-manager", "consumer": "myai", "key_file": str(key), "namespaces": ["myai"],
+         "permissions": ["catalog:manage"]},
+        {"id": "myai-runtime", "consumer": "myai", "key": "runtime-token", "namespaces": ["myai"],
+         "permissions": ["profiles:read", "profiles:invoke"]},
+    ]
+    providers.CONFIG_PATH.write_text(yaml.safe_dump(config))
+    providers.reload()
+    manager = {"Authorization": "Bearer catalog-token"}
+    assert client.get("/admin/api/directory", headers=manager).status_code == 200
+    assert client.get("/admin/api/directory/models", headers=manager).status_code == 200
+    changed = client.put("/admin/api/directory/settings", headers=manager, json={"lines": {"openai/gpt sol": False}})
+    assert changed.status_code == 200, changed.text
+    runtime = {"Authorization": "Bearer runtime-token"}
+    assert client.get("/admin/api/directory", headers=runtime).status_code == 403
+    assert client.get("/admin/api/models", headers=manager).status_code in (401, 403)

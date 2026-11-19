@@ -30,7 +30,10 @@ LOCAL_AI_PERMISSION = "local_ai:manage"
 # Add and manage owner-defined OpenAI-compatible providers (src.custom_providers):
 # only ones this credential created, under reserved ids; no provider allowlist.
 CUSTOM_PROVIDERS_PERMISSION = "providers:custom"
-ADMIN_SCOPES = MANAGEMENT_PERMISSIONS | {LOCAL_AI_PERMISSION, CUSTOM_PROVIDERS_PERMISSION}
+# Read and change the models.dev catalog settings: provider order and policy, followed
+# lines, turned-on models, held changes (docs/adr/0005-models-dev-directory.md); no allowlist.
+CATALOG_PERMISSION = "catalog:manage"
+ADMIN_SCOPES = MANAGEMENT_PERMISSIONS | {LOCAL_AI_PERMISSION, CUSTOM_PROVIDERS_PERMISSION, CATALOG_PERMISSION}
 # A credential that can register profiles or models could route around its own
 # ``models`` allowlist, so the two never combine.
 MODEL_ALLOWLIST_EXCLUDED_PERMISSIONS = frozenset({"profiles:write"}) | MANAGEMENT_PERMISSIONS
