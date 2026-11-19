@@ -43,7 +43,7 @@ from src.providers import (
     routable_ids,
     snapshot_registry as snapshot_provider_registry,
 )
-from src import bundle, chatgpt_auth, config_io, custom_providers, discovery, federation, inflight, ledger, local_runtime, onboarding, profiles, shipped
+from src import bundle, chatgpt_auth, config_io, custom_providers, directory, discovery, federation, inflight, ledger, local_runtime, onboarding, profiles, shipped
 from src.version import CAPABILITIES, VERSION
 
 log = logging.getLogger("model-gateway")
@@ -1034,6 +1034,120 @@ async def admin_discover_provider_models(provider_id: str, request: Request):
         "http_status": result.get("http_status"),
         "models": models,
     }
+
+
+# ── models.dev directory (docs/adr/0005-models-dev-directory.md) ────────────
+
+DIRECTORY_CHECK_SECONDS = 3600.0
+DIRECTORY_FIRST_CHECK_SECONDS = 60.0
+
+
+def _directory_mapped() -> tuple[list, dict | None, str]:
+    snapshot, origin = directory.load_snapshot()
+    if snapshot is None:
+        return [], None, origin
+    return directory.map_snapshot(snapshot, directory.load_corrections()), snapshot, origin
+
+
+def _loaded_routes() -> set[tuple[str, str]]:
+    import src.providers as providers
+
+    return {(str(entry.get("provider")), str(entry.get("provider_model_id")))
+            for entry in {id(v): v for v in providers._load_models().values()}.values()}
+
+
+@router.get("/admin/api/directory")
+async def admin_directory_status(request: Request):
+    """Directory sync state, snapshot and model lines with their current models."""
+    require_admin_auth(request)
+    import src.providers as providers
+
+    def build() -> dict:
+        mapped, snapshot, origin = _directory_mapped()
+        current = directory.current_models(mapped)
+        offered: dict[str, set[str]] = {}
+        for item in mapped:
+            if item.row is not None:
+                offered.setdefault(item.canonical, set()).add(item.provider)
+        return {
+            "settings": directory.settings(providers._load_config()),
+            "state": directory.load_state(),
+            "snapshot": {
+                "origin": origin,
+                "fetched_at": (snapshot or {}).get("fetched_at"),
+                "models": directory.model_count(snapshot or {}),
+                "offered": sum(1 for item in mapped if item.row is not None),
+            },
+            "lines": [{"line": line, "current": canonical, "providers": sorted(offered.get(canonical, ()))}
+                      for line, canonical in sorted(current.items())],
+        }
+
+    return await run_in_threadpool(build)
+
+
+@router.get("/admin/api/directory/models")
+async def admin_directory_models(request: Request):
+    """Browse directory models with the catalog row each maps to (read-only)."""
+    require_admin_auth(request)
+    query = request.query_params
+    try:
+        limit = max(1, min(int(query.get("limit", "100")), 1000))
+        offset = max(0, int(query.get("offset", "0")))
+    except ValueError:
+        return _bad_request("limit and offset must be integers")
+    filters = {key: query.get(key) for key in ("provider", "lab", "line") if query.get(key)}
+    search = (query.get("q") or "").strip().lower()
+    offered_only = query.get("offered") in ("1", "true")
+
+    def build() -> dict:
+        mapped, _, _ = _directory_mapped()
+        current = set(directory.current_models(mapped).values())
+        loaded = _loaded_routes()
+        items = []
+        for item in mapped:
+            if any(getattr(item, key) != value for key, value in filters.items()):
+                continue
+            if offered_only and item.row is None:
+                continue
+            if search and search not in f"{item.model_id} {item.canonical} {item.line}".lower():
+                continue
+            items.append({
+                "provider": item.provider, "model_id": item.model_id, "canonical": item.canonical,
+                "lab": item.lab, "line": item.line, "release_date": item.release_date,
+                "status": item.status or None, "offered": item.row is not None, "skipped": item.skipped,
+                "notes": list(item.notes), "current": item.canonical in current,
+                "loaded": (item.provider, item.model_id) in loaded, "row": item.row,
+            })
+        items.sort(key=lambda entry: (entry["release_date"], entry["canonical"]), reverse=True)
+        return {"total": len(items), "offset": offset, "models": items[offset:offset + limit]}
+
+    return await run_in_threadpool(build)
+
+
+@router.post("/admin/api/directory/sync")
+async def admin_directory_sync(request: Request):
+    """Sync the models.dev directory now."""
+    require_admin_auth(request)
+    require_admin_writes()
+    return await run_in_threadpool(directory.sync)
+
+
+async def watch_directory(check_seconds: float = DIRECTORY_CHECK_SECONDS,
+                          first_check_seconds: float = DIRECTORY_FIRST_CHECK_SECONDS) -> None:
+    """Sync the models.dev directory once a day unless the owner turned it off."""
+    import src.providers as providers
+
+    await asyncio.sleep(first_check_seconds)
+    while True:
+        try:
+            if (directory.settings(providers._load_config())["sync"] == "daily"
+                    and directory.sync_due(directory.load_state())):
+                state = await run_in_threadpool(directory.sync)
+                log.info("directory sync: %s", "failed: " + state["error"] if state.get("error")
+                         else ("updated" if state.get("changed") else "unchanged"))
+        except Exception as exc:  # noqa: BLE001 — the watcher must outlive any one sync
+            log.warning("directory sync check failed: %s", exc)
+        await asyncio.sleep(check_seconds)
 
 
 # ── Model management (writeable) ────────────────────────────────────────────

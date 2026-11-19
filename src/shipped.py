@@ -12,6 +12,7 @@ The owner's choices live in the config ``catalog:`` block::
       hidden: [model-name]    # deleted shipped models; never loaded
       pinned: [model-name]    # kept even when a release retires them
       provider_preference: [provider-id]  # route order for base-model references
+      directory: {sync: daily}  # models.dev directory sync, or off (src.directory)
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ def settings(config: dict) -> tuple[str | frozenset[str], frozenset[str], frozen
         raw = {}
     if not isinstance(raw, dict):
         raise ValueError("config catalog must be an object")
-    unknown = set(raw) - {"shipped", "hidden", "pinned", "provider_preference"}
+    unknown = set(raw) - {"shipped", "hidden", "pinned", "provider_preference", "directory"}
     if unknown:
         raise ValueError("config catalog has unknown field(s): " + ", ".join(sorted(unknown)))
     selection = raw.get("shipped", "all")
@@ -62,6 +63,9 @@ def settings(config: dict) -> tuple[str | frozenset[str], frozenset[str], frozen
     elif selection not in ("all", "none"):
         raise ValueError("config catalog.shipped must be all, none, or a list")
     _names(raw, "provider_preference")
+    from src import directory
+
+    directory.settings(config)
     return selection, _names(raw, "hidden"), _names(raw, "pinned")
 
 

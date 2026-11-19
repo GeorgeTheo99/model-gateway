@@ -135,15 +135,17 @@ async def _lifespan(_app: FastAPI):
     log.info("catalog exports: %s", await _regenerate_catalogs())
     discovery.refresh()
     await federation.start()
-    from src.admin import sync_local_ai_pins_soon, watch_local_ai
+    from src.admin import sync_local_ai_pins_soon, watch_directory, watch_local_ai
     local_ai_watch = asyncio.create_task(watch_local_ai())
+    directory_watch = asyncio.create_task(watch_directory())
     sync_local_ai_pins_soon()  # e.g. after an upgrade that started pinning
     try:
         yield
     finally:
-        local_ai_watch.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await local_ai_watch
+        for task in (local_ai_watch, directory_watch):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
         await federation.stop()
 
 
