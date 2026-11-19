@@ -172,6 +172,18 @@ def test_sync_stores_a_valid_snapshot_and_keeps_the_last_good_one_on_failure(cor
     assert directory.load_snapshot()[0]["providers"]["anthropic"]["models"].keys() == {"m1", "m2"}
 
 
+def test_a_first_sync_stores_its_snapshot_even_when_the_release_has_the_same_one(corrections, state_dir):
+    api = _api(anthropic=[_model("m1")])
+    payloads = {directory.API_URL: json.dumps(api).encode(), directory.LABS_URL: b"{}"}
+    import hashlib
+
+    bundled = _snapshot(corrections, api)
+    bundled["source"]["sha256"] = hashlib.sha256(payloads[directory.API_URL]).hexdigest()
+    directory.BUNDLED_SNAPSHOT.write_text(json.dumps(bundled))
+    assert directory.sync(fetch=payloads.__getitem__, corrections=corrections)["changed"] is True
+    assert directory.load_snapshot()[1] == "synced"
+
+
 def test_without_a_sync_the_release_snapshot_is_used(corrections, state_dir):
     assert directory.load_snapshot() == (None, "none")
     bundled = _snapshot(corrections, _api(openai=[_model("g")]))

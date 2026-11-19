@@ -250,9 +250,9 @@ def sync(*, fetch: Callable[[str], bytes] = _download, corrections: Corrections 
             raise DirectoryError(f"models.dev returned invalid JSON: {exc}") from exc
         digest = hashlib.sha256(api_bytes).hexdigest()
         snapshot = build_snapshot(api, labs, corrections, source_sha256=digest)
-        previous, _ = load_snapshot()
+        previous, origin = load_snapshot()
         validate_update(snapshot, previous)
-        if previous and previous.get("source", {}).get("sha256") == digest:
+        if origin == "synced" and previous.get("source", {}).get("sha256") == digest:
             state.update(last_success=state["last_attempt"], error=None, changed=False)
         else:
             _atomic_json(snapshot_path(), snapshot)
