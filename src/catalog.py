@@ -136,6 +136,46 @@ def canonical_provider(provider: str | None) -> str:
     return _PROVIDER_SYNONYMS.get(raw, raw)
 
 
+def _is_rate(value: object) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value >= 0)
+
+
+def pricing_problem(pricing: object) -> str | None:
+    """Why a metered ``pricing`` object is invalid, or None when it is valid.
+
+    Rates are $/Mtok. The optional ``long_context`` tier (docs/provider-pricing-sources.md)
+    re-prices a whole request whose prompt exceeds ``above_prompt_tokens``; it must
+    rate exactly the classes the base rates, so no class silently keeps its short rate.
+    """
+    if not isinstance(pricing, dict) or not pricing:
+        return "pricing must be a non-empty object"
+    unknown = set(pricing) - _PRICING_RATE_FIELDS - {"long_context"}
+    if unknown:
+        return "pricing has unknown field(s): " + ", ".join(sorted(unknown))
+    missing = {"input", "output"} - set(pricing)
+    if missing:
+        return "pricing requires: " + ", ".join(sorted(missing))
+    rates = {key: value for key, value in pricing.items() if key != "long_context"}
+    if not all(_is_rate(value) for value in rates.values()):
+        return "pricing values must be finite non-negative numbers"
+    if "long_context" not in pricing:
+        return None
+    tier = pricing["long_context"]
+    if not isinstance(tier, dict):
+        return "pricing long_context must be an object"
+    threshold = tier.get("above_prompt_tokens")
+    if not isinstance(threshold, int) or isinstance(threshold, bool) or threshold <= 0:
+        return "pricing long_context.above_prompt_tokens must be a positive integer"
+    tier_rates = {key: value for key, value in tier.items() if key != "above_prompt_tokens"}
+    if set(tier_rates) != set(rates):
+        return ("pricing long_context must rate exactly the base classes: "
+                + ", ".join(sorted(rates)))
+    if not all(_is_rate(value) for value in tier_rates.values()):
+        return "pricing values must be finite non-negative numbers"
+    return None
+
+
 def validate_pricing_policy(entry: dict) -> str:
     """Validate and classify a catalog entry's pricing policy.
 
@@ -150,28 +190,9 @@ def validate_pricing_policy(entry: dict) -> str:
     provider = canonical_provider(entry.get("provider"))
 
     if pricing is not None:
-        if not isinstance(pricing, dict) or not pricing:
-            raise ValueError(f"model {entry.get('name')!r} pricing must be a non-empty object")
-        unknown = set(pricing) - _PRICING_RATE_FIELDS
-        if unknown:
-            raise ValueError(
-                f"model {entry.get('name')!r} has unknown pricing field(s): "
-                + ", ".join(sorted(unknown))
-            )
-        missing = {"input", "output"} - set(pricing)
-        if missing:
-            raise ValueError(
-                f"model {entry.get('name')!r} pricing requires: "
-                + ", ".join(sorted(missing))
-            )
-        if any(
-            not isinstance(value, (int, float))
-            or isinstance(value, bool)
-            or not math.isfinite(value)
-            or value < 0
-            for value in pricing.values()
-        ):
-            raise ValueError(f"model {entry.get('name')!r} pricing values must be finite non-negative numbers")
+        problem = pricing_problem(pricing)
+        if problem:
+            raise ValueError(f"model {entry.get('name')!r} {problem}")
         if marker is not None:
             raise ValueError(f"model {entry.get('name')!r} cannot combine pricing with pricing_status")
         return "metered"

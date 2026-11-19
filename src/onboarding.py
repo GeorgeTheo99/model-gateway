@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import re
 import secrets
@@ -26,6 +25,7 @@ from src.catalog import (
     canonical_provider,
     entry_routable_ids,
     normalize_thinking_capabilities,
+    pricing_problem,
     validate_client_metadata,
     validate_pricing_policy,
 )
@@ -193,31 +193,8 @@ def validate_profile(data: object) -> dict:
             if field in model and (not isinstance(model[field], int) or model[field] <= 0):
                 raise OnboardingError(f"model {model['name']!r} {field} must be a positive integer")
         pricing = model.get("pricing")
-        if pricing is not None:
-            if not isinstance(pricing, dict) or not pricing:
-                raise OnboardingError(f"model {model['name']!r} pricing must be a non-empty object")
-            unknown_pricing = set(pricing) - {
-                "input", "output", "cache_read", "cache_write", "cache_write_1h", "reasoning",
-            }
-            if unknown_pricing:
-                raise OnboardingError(
-                    f"model {model['name']!r} has unknown pricing field(s): "
-                    + ", ".join(sorted(unknown_pricing))
-                )
-            missing_pricing = {"input", "output"} - set(pricing)
-            if missing_pricing:
-                raise OnboardingError(
-                    f"model {model['name']!r} pricing requires: "
-                    + ", ".join(sorted(missing_pricing))
-                )
-            if any(
-                not isinstance(value, (int, float))
-                or isinstance(value, bool)
-                or not math.isfinite(value)
-                or value < 0
-                for value in pricing.values()
-            ):
-                raise OnboardingError(f"model {model['name']!r} pricing values must be finite non-negative numbers")
+        if pricing is not None and (problem := pricing_problem(pricing)):
+            raise OnboardingError(f"model {model['name']!r} {problem}")
         try:
             validate_pricing_policy(model)
             validate_client_metadata(model)

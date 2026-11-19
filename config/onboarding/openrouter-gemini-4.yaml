@@ -28,7 +28,7 @@ models:
     pricing:
       input: 2.0
       output: 10.0
-      cache_read: 0.2
+      cache_read: 0.1
     quirks:
       - openrouter_zdr
     zdr: true

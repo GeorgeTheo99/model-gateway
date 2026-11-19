@@ -387,6 +387,12 @@ _CLASS_FIELDS = [
 ]
 
 
+def prompt_tokens(usage: Usage) -> int:
+    """Every input token of a request, cached or not: what long-context tiers count."""
+    return (usage.input_tokens + usage.cached_read_tokens
+            + usage.cache_write_tokens + usage.cache_write_1h_tokens)
+
+
 def estimate_cost(
     usage: Usage,
     pricing: dict | None,
@@ -398,7 +404,10 @@ def estimate_cost(
     ``pricing`` keys are $/Mtok: ``input``, ``output``, ``cache_read``,
     ``cache_write`` (default lifetime: Anthropic 5-minute, OpenAI 30-minute),
     ``cache_write_1h`` (extended lifetime: Anthropic 1-hour, OpenAI 12-hour),
-    ``reasoning`` (any may be absent). ``pricing_status`` may
+    ``reasoning`` (any may be absent). An optional ``long_context`` object holds
+    the rates for a request whose :func:`prompt_tokens` exceed its
+    ``above_prompt_tokens`` (Anthropic and OpenAI re-price the whole request).
+    ``pricing_status`` may
     be ``unmetered`` for local models whose marginal provider charge is known
     to be zero. Unmetered cost is complete even when token usage was not
     reported; token coverage remains represented separately by
@@ -424,6 +433,9 @@ def estimate_cost(
         return CostEstimate(cost_usd=None, pricing_complete=False, missing_classes=[])
     if not pricing:
         return CostEstimate(cost_usd=None, pricing_complete=False, missing_classes=[])
+    long_context = pricing.get("long_context")
+    if long_context and prompt_tokens(usage) > long_context["above_prompt_tokens"]:
+        pricing = long_context
 
     total = 0.0
     missing: list[str] = []

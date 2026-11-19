@@ -10,7 +10,8 @@ provider:
   display_name: Anthropic
   secret_name: anthropic.api-key
 
-# List prices as of 2026-10-17. The key check runs a completion on the first
+# List prices as of 2026-10-17; Haiku 5.5's long_context rates (prompts over
+# 100K tokens) checked 2026-11-18. The key check runs a completion on the first
 # (cheapest) model. Anthropic's API keeps prompts unless the account has a
 # zero-data-retention agreement, so no route declares zdr.
 models:
@@ -31,6 +32,13 @@ models:
       cache_read: 0.01
       cache_write: 0.125
       cache_write_1h: 0.2
+      long_context:
+        above_prompt_tokens: 100000
+        input: 0.5
+        output: 2.5
+        cache_read: 0.05
+        cache_write: 0.625
+        cache_write_1h: 1.0
     desc: Claude Haiku 5.5 on the Anthropic API, 1M context / 128K max output
 
   - name: claude-sonnet-5.5

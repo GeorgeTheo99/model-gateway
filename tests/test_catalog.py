@@ -230,6 +230,21 @@ def test_pricing_policy_rejects_nonfinite_rates(tmp_path):
             catalog.load_catalog_entries(mi)
 
 
+def test_pricing_long_context_tier_validation():
+    base = {"input": 1.0, "output": 2.0, "cache_read": 0.1}
+    tier = {"above_prompt_tokens": 272_000, "input": 2.0, "output": 3.0, "cache_read": 0.2}
+    assert catalog.pricing_problem({**base, "long_context": tier}) is None
+    for bad, message in (
+        ("x", "must be an object"),
+        ({**tier, "above_prompt_tokens": 0}, "positive integer"),
+        ({**tier, "above_prompt_tokens": True}, "positive integer"),
+        ({k: v for k, v in tier.items() if k != "cache_read"}, "exactly the base classes"),
+        ({**tier, "cache_write": 1.0}, "exactly the base classes"),
+        ({**tier, "output": -1}, "finite non-negative"),
+    ):
+        assert message in catalog.pricing_problem({**base, "long_context": bad})
+
+
 def test_pricing_policy_rejects_cloud_unmetered_and_conflicts(tmp_path):
     mi = tmp_path / "model-info.json"
     _write_model_info(mi, [{"name": "cloud", "provider": "openai", "pricing_status": "unmetered"}])

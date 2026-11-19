@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 import re
 import secrets
@@ -21,7 +20,7 @@ from urllib.parse import urlsplit
 import httpx
 import yaml
 
-from src.catalog import normalize_thinking_capabilities
+from src.catalog import normalize_thinking_capabilities, pricing_problem
 from src.onboarding import OnboardingError
 
 STRUCTURAL_MODEL_FIELDS = {"name", "provider", "provider_model_id"}
@@ -53,9 +52,6 @@ ALLOWED_QUIRKS = {
     "gemini_thought_signatures",
     "openrouter_zdr",
     "openrouter_fireworks_only",
-}
-ALLOWED_PRICING_FIELDS = {
-    "input", "output", "cache_read", "cache_write", "cache_write_1h", "reasoning",
 }
 DISCOVERY_OVERRIDE_STATES = {
     "unavailable",
@@ -388,21 +384,8 @@ def build_draft(
     unknown_quirks = set(explicit_quirks) - ALLOWED_QUIRKS
     if unknown_quirks:
         raise OnboardingError("unsupported request quirk(s): " + ", ".join(sorted(unknown_quirks)))
-    if pricing is not None:
-        unknown_pricing = set(pricing) - ALLOWED_PRICING_FIELDS
-        if unknown_pricing:
-            raise OnboardingError("unknown pricing field(s): " + ", ".join(sorted(unknown_pricing)))
-        missing_pricing = {"input", "output"} - set(pricing)
-        if missing_pricing:
-            raise OnboardingError("pricing requires: " + ", ".join(sorted(missing_pricing)))
-        if any(
-            not isinstance(value, (int, float))
-            or isinstance(value, bool)
-            or not math.isfinite(value)
-            or value < 0
-            for value in pricing.values()
-        ):
-            raise OnboardingError("pricing values must be finite non-negative numbers")
+    if pricing is not None and (problem := pricing_problem(pricing)):
+        raise OnboardingError(problem)
     for index, model_id in enumerate(models):
         row: dict = {
             "name": model_id,

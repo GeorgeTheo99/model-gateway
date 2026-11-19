@@ -34,6 +34,17 @@ useful only as a cross-check, never as the source of record.
     (cache reads only) — set `cache_read` when the provider charges a distinct
     cache-read rate, omit `cache_write`.
   - OpenRouter: the upstream's classes, as listed in its models API.
+- `long_context`: for a model whose provider re-prices the whole request once
+  the prompt passes a size, an object with `above_prompt_tokens` and the rates
+  that then apply to every class the base rates (it must rate exactly those
+  classes). The prompt counts uncached input, cache reads and cache writes.
+  Current tiers: Claude Haiku 5.5 over 100K tokens (Anthropic) and GPT-6.x over
+  272K tokens (OpenAI's "long context" columns), on direct and OpenRouter routes.
+
+  ```json
+  "long_context": {"above_prompt_tokens": 272000, "input": 4.0, "output": 15.0,
+                   "cache_read": 0.2, "cache_write": 5.0, "cache_write_1h": 10.0}
+  ```
 - `reasoning`: omit unless the provider bills reasoning tokens at a separate
   rate from output. None of the current providers do.
 - If a rate is genuinely unknown, **omit the whole `pricing` field** — the
@@ -102,7 +113,8 @@ https://openrouter.ai/api/v1/models` returns `{data: [...]}`. Each model has
 `provider_model_id`. This is the only provider with a machine-readable source
 — prefer it for `openrouter` models. Map `input_cache_read`→cache_read and,
 for Anthropic and OpenAI upstreams, `input_cache_write`→cache_write and
-`input_cache_write_1h`→cache_write_1h. Omit cache_write for Google upstreams:
+`input_cache_write_1h`→cache_write_1h; a `pricing.overrides` entry with
+`min_prompt_tokens` is a `long_context` tier. Omit cache_write for Google upstreams:
 Gemini via OpenRouter has not reported cache-write tokens to this gateway, and
 its listed `input_cache_write` is not a per-token write rate like Anthropic's
 or OpenAI's. OpenRouter usually returns
@@ -147,7 +159,5 @@ Use this to know which source to read for each model. Regenerate with:
 | minimax-m3-fw | fireworks | accounts/fireworks/models/minimax-m3 | fireworks |
 | qwen3.8-max-fw | fireworks | accounts/fireworks/models/qwen3p8-max | fireworks |
 | deepseek-v4-flash-or | openrouter | deepseek/deepseek-v4-flash | openrouter API |
-| gemini-3.1-pro | openrouter | google/gemini-3.1-pro-preview | openrouter API |
-| gemini-3-flash | openrouter | google/gemini-3-flash-preview | openrouter API |
-| gemini-3.5-flash | openrouter | google/gemini-3.5-flash | openrouter API |
+| gemini-4-argon / carbon / neon / hydrogen | openrouter | google/gemini-4-* | openrouter API (Google Vertex rows) |
 | glm-5-zai-turbo | zhipuai | glm-5-turbo | zhipuai (CNY→USD) |

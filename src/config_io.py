@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import secrets
 import shutil
@@ -35,6 +34,7 @@ from src.catalog import (
     OWNER_META_FIELDS,
     canonical_provider,
     normalize_thinking_capabilities,
+    pricing_problem,
     route_differs,
     same_field,
     validate_client_metadata,
@@ -1123,29 +1123,13 @@ _MODEL_FIELDS = [
     "system_instruction", "pricing", "pricing_status", "desc", "display_name", "zdr",
     "family", "base_model", "modality",
 ]
-_PRICING_RATE_FIELDS = {
-    "input", "output", "cache_read", "cache_write", "cache_write_1h", "reasoning",
-}
 _LOCAL_PROVIDERS = {"local", "omlx", "mlx", "media"}
 
 
 def _validated_pricing(pricing: object) -> dict:
-    if not isinstance(pricing, dict) or not pricing:
-        raise ValueError("metered pricing must be a non-empty object")
-    unknown = set(pricing) - _PRICING_RATE_FIELDS
-    if unknown:
-        raise ValueError("unknown pricing field(s): " + ", ".join(sorted(unknown)))
-    missing = {"input", "output"} - set(pricing)
-    if missing:
-        raise ValueError("metered pricing requires: " + ", ".join(sorted(missing)))
-    if any(
-        not isinstance(value, (int, float))
-        or isinstance(value, bool)
-        or not math.isfinite(value)
-        or value < 0
-        for value in pricing.values()
-    ):
-        raise ValueError("pricing values must be finite non-negative numbers")
+    problem = pricing_problem(pricing)
+    if problem:
+        raise ValueError(problem)
     return dict(pricing)
 
 

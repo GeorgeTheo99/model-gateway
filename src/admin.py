@@ -6818,7 +6818,15 @@ _ADMIN_HTML = r"""
               "USD / million tokens",
               m.pricing
                 ? Object.entries(m.pricing)
-                    .map(([k, v]) => esc(k.replace(/_/g, " ")) + ": $" + esc(v))
+                    .map(([k, v]) =>
+                      k === "long_context" && v && typeof v === "object"
+                        ? "over " + num(v.above_prompt_tokens) + " prompt tokens: " +
+                          Object.entries(v)
+                            .filter(([tk]) => tk !== "above_prompt_tokens")
+                            .map(([tk, tv]) => esc(tk.replace(/_/g, " ")) + " $" + esc(tv))
+                            .join(", ")
+                        : esc(k.replace(/_/g, " ")) + ": $" + esc(v),
+                    )
                     .join(" · ")
                 : price === "unmetered"
                   ? "Unmetered; recorded cost is zero"

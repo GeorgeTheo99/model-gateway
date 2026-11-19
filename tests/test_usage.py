@@ -308,6 +308,34 @@ def test_estimate_cost_missing_pricing_class():
     assert cost.cost_usd == round(100 * 3.0 / 1_000_000, 6)
 
 
+_HAIKU_PRICING = {
+    "input": 0.1, "output": 0.5, "cache_read": 0.01, "cache_write": 0.125,
+    "long_context": {"above_prompt_tokens": 100_000, "input": 0.5, "output": 2.5,
+                     "cache_read": 0.05, "cache_write": 0.625},
+}
+
+
+def test_long_context_tier_reprices_the_whole_request_past_its_threshold():
+    # 20k uncached + 70k cache reads + 10k writes = 100k prompt tokens: at the
+    # threshold, not over it, so the short rates apply.
+    at = Usage(input_tokens=20_000, cached_read_tokens=70_000, cache_write_tokens=10_000,
+               output_tokens=1_000, reported=True)
+    assert estimate_cost(at, _HAIKU_PRICING).cost_usd == round(
+        (20_000 * 0.1 + 70_000 * 0.01 + 10_000 * 0.125 + 1_000 * 0.5) / 1_000_000, 6)
+    # One more cached token tips every class onto the long-context rates.
+    over = Usage(input_tokens=20_000, cached_read_tokens=70_001, cache_write_tokens=10_000,
+                 output_tokens=1_000, reported=True)
+    cost = estimate_cost(over, _HAIKU_PRICING)
+    assert cost.pricing_complete is True
+    assert cost.cost_usd == round(
+        (20_000 * 0.5 + 70_001 * 0.05 + 10_000 * 0.625 + 1_000 * 2.5) / 1_000_000, 6)
+
+
+def test_provider_reported_cost_wins_over_long_context_tier():
+    usage = Usage(input_tokens=300_000, output_tokens=10, reported=True, provider_cost_usd=0.42)
+    assert estimate_cost(usage, _HAIKU_PRICING).cost_usd == 0.42
+
+
 def test_estimate_cost_no_pricing_is_unknown():
     usage = Usage(input_tokens=100, output_tokens=50, reported=True)
     cost = estimate_cost(usage, None)
