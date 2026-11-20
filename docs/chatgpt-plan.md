@@ -95,8 +95,14 @@ return 400. Each request is translated to the plan's Responses API:
 - **Success and failure.** Success is `response.completed`. A request for the plan's own route
   (`gpt-6.1-sol-chatgpt`, or a routing profile bound to it) never falls back to another route.
 - **Provider order.** The plan is ahead of the OpenAI key in the default provider order
-  ([ADR 0005](adr/0005-models-dev-directory.md)): a Chat Completions request for a bare model name
-  the plan serves (`gpt-6.1-sol`) runs on the plan; `gpt-6.1-sol-openai` names the key route.
+  ([ADR 0005](adr/0005-models-dev-directory.md)): a Chat Completions or Responses request for a
+  bare model name the plan serves (`gpt-6.1-terra`) runs on the plan; `gpt-6.1-terra-openai`
+  names the key route.
+- **Responses clients** (Pi's GPT models, for one) run on the plan with the same rules: `store`
+  false and `stream` true upstream (a non-streaming client gets the finished response), leading
+  `system` input moved into `instructions`, function tools and `function_call` input items put in
+  the plan's namespace (removed again from the output), unsupported fields dropped, and no
+  `previous_response_id` (the plan keeps nothing).
   The plan's models come from models.dev's experimental v2 API (`openai-codex`).
 - **Usage limit.** A usage limit (`subscription_sharing_usage_limit_exceeded`) is never retried
   on the plan. When the plan served a bare model name, the request runs again on the next

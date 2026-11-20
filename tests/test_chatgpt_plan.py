@@ -751,3 +751,38 @@ def test_a_bare_model_name_runs_on_the_plan_first_and_on_the_key_after_a_usage_l
     # The plan's own route name still goes to the plan, limit or not.
     assert _chat(ADMIN, stream=False, model="gpt-6.1-sol-chatgpt").status_code == 429
     monkeypatch.setattr(chatgpt_auth, "_limited_until", 0.0)
+
+
+def test_responses_clients_run_on_the_plan_with_its_rules_and_without_its_namespace(plan_upstream, monkeypatch):
+    seen, state = plan_upstream
+    call = {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "look", "namespace": "app",
+            "arguments": "{\"q\":2}", "status": "completed"}
+    state["events"] = _sse(
+        {"type": "response.output_item.done", "output_index": 0, "item": call},
+        {"type": "response.completed", "response": {"id": "resp_1", "status": "completed", "output": [call],
+                                                    "usage": {"input_tokens": 5, "output_tokens": 3}}})
+    body = {"model": "gpt-6.1-sol-chatgpt", "instructions": "be brief", "temperature": 0.3, "max_output_tokens": 50,
+            "reasoning": {"effort": "high"},
+            "input": [{"role": "system", "content": "sys"},
+                      {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                      {"type": "function_call", "call_id": "call_0", "name": "look", "arguments": "{}"},
+                      {"type": "function_call_output", "call_id": "call_0", "output": "x"}],
+            "tools": [{"type": "function", "name": "look", "parameters": {"type": "object"}}]}
+    client = TestClient(server.app)
+    result = client.post("/v1/responses", headers={"Authorization": f"Bearer {MYAI}"}, json=body)
+    assert result.status_code == 200, result.text
+    assert result.json()["output"] == [{k: v for k, v in call.items() if k != "namespace"}]
+    sent = seen[-1]["body"]
+    assert seen[-1]["url"] == "https://api.openai.com/v1/responses"
+    assert sent["store"] is False and sent["stream"] is True and sent["model"] == "gpt-6.1-sol"
+    assert sent["instructions"] == "be brief\n\nsys" and "temperature" not in sent and "max_output_tokens" not in sent
+    assert sent["input"][1] == {"type": "function_call", "call_id": "call_0", "name": "look", "arguments": "{}",
+                                "namespace": "app"}
+    assert sent["tools"][0]["type"] == "namespace" and sent["tools"][0]["tools"][0]["name"] == "look"
+    assert sent["reasoning"]["effort"] == "high" and "reasoning.encrypted_content" in sent["include"]
+    streamed = client.post("/v1/responses", headers={"Authorization": f"Bearer {MYAI}"}, json={**body, "stream": True})
+    assert streamed.status_code == 200
+    assert "event: response.completed" in streamed.text and '"namespace"' not in streamed.text
+    refused = client.post("/v1/responses", headers={"Authorization": f"Bearer {MYAI}"},
+                          json={**body, "previous_response_id": "resp_0"})
+    assert refused.status_code == 400 and "full history" in refused.text

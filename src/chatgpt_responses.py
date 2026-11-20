@@ -447,3 +447,114 @@ async def responses_sse_to_chat_completion(byte_iter, model: str) -> tuple[dict 
     if usage:
         result["usage"] = usage
     return result, None
+
+
+# ── Responses clients on the plan ─────────────────────────────────────────────
+
+# Responses fields the plan takes as sent; everything else (temperature, max_output_tokens,
+# metadata, user, truncation, service_tier, ...) is dropped, as the preview rules require.
+_PLAN_RESPONSES_FIELDS = ("parallel_tool_calls", "text", "prompt_cache_key")
+
+
+def _plan_input_item(item: object) -> dict:
+    if not isinstance(item, dict):
+        raise TranslationError("every input item must be an object")
+    if item.get("type") == "function_call" and not item.get("namespace"):
+        return {**item, "namespace": NAMESPACE}
+    return item
+
+
+def _responses_tools(tools) -> list[dict]:
+    """Responses function tools grouped in the plan's namespace."""
+    chat_shaped = []
+    for tool in tools or []:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            raise TranslationError("This model takes only function tools")
+        spec = {key: tool[key] for key in ("name", "description", "parameters") if key in tool}
+        spec["strict"] = tool.get("strict") is True
+        chat_shaped.append({"type": "function", "function": spec})
+    return _tools(chat_shaped)
+
+
+def responses_to_plan_request(body: dict, upstream_model: str) -> dict:
+    """A Responses API body as a plan request: the same API under the preview rules."""
+    if body.get("previous_response_id"):
+        raise TranslationError("This model keeps no responses: send the full history in input")
+    raw = body.get("input")
+    if isinstance(raw, str):
+        raw = [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": raw}]}]
+    if not isinstance(raw, list) or not raw:
+        raise TranslationError("input must be a string or a non-empty list")
+    instructions = [body["instructions"]] if isinstance(body.get("instructions"), str) and body["instructions"] else []
+    items: list[dict] = []
+    for item in raw:
+        item = _plan_input_item(item)
+        if item.get("role") == "system" and item.get("type", "message") == "message":
+            text = _text_of(item.get("content"))
+            if not items:
+                if text:
+                    instructions.append(text)
+                continue
+            item = {**item, "role": "developer"}
+        items.append(item)
+    request: dict = {"model": upstream_model, "input": items, "store": False, "stream": True}
+    include = [value for value in body.get("include") or [] if isinstance(value, str)]
+    request["include"] = list(dict.fromkeys([*include, "reasoning.encrypted_content"]))
+    if instructions:
+        request["instructions"] = "\n\n".join(instructions)
+    tools = _responses_tools(body.get("tools"))
+    if tools:
+        choice = body.get("tool_choice")
+        if isinstance(choice, dict) and choice.get("type") == "function" and choice.get("name"):
+            functions = [tool for tool in tools[0]["tools"] if tool["name"] == choice["name"]]
+            if not functions:
+                raise TranslationError(f"tool_choice names {choice['name']!r}, which isn't in tools")
+            tools, choice = [{**tools[0], "tools": functions}], "required"
+        elif choice not in (None, "auto", "none", "required"):
+            raise TranslationError("Unsupported tool_choice for this model")
+        request["tools"] = tools
+        if choice is not None:
+            request["tool_choice"] = choice
+    if isinstance(body.get("reasoning"), dict):
+        request["reasoning"] = {"summary": "auto", **body["reasoning"]}
+    for key in _PLAN_RESPONSES_FIELDS:
+        if body.get(key) is not None:
+            request[key] = body[key]
+    return request
+
+
+def _without_namespaces(value):
+    """The plan's output with its tool namespace removed, as a plain Responses client expects."""
+    if isinstance(value, dict):
+        out = {key: _without_namespaces(item) for key, item in value.items()
+               if not (key == "namespace" and value.get("type") == "function_call")}
+        return out
+    if isinstance(value, list):
+        return [_without_namespaces(item) for item in value]
+    return value
+
+
+async def plan_sse_to_responses(byte_iter):
+    """Relay a plan stream to a Responses client (bytes), namespaces removed. A stream that
+    ends without response.completed or response.incomplete ends with an error event."""
+    finished = False
+    async for event in _events(byte_iter):
+        kind = str(event.get("type") or "")
+        finished = finished or kind in ("response.completed", "response.incomplete", "response.failed", "error")
+        yield f"event: {kind}\ndata: {json.dumps(_without_namespaces(event))}\n\n".encode()
+    if not finished:
+        error = {"type": "error", "message": "The ChatGPT plan's stream ended before the response completed"}
+        yield f"event: error\ndata: {json.dumps(error)}\n\n".encode()
+
+
+async def plan_sse_to_response(byte_iter) -> tuple[dict | None, dict | None]:
+    """(the finished Responses object, None) or (None, error) from a plan stream."""
+    async for event in _events(byte_iter):
+        kind = event.get("type")
+        if kind in ("response.completed", "response.incomplete") and isinstance(event.get("response"), dict):
+            return _without_namespaces(event["response"]), None
+        if kind == "response.failed":
+            return None, _error_payload((event.get("response") or {}).get("error"), "The ChatGPT plan failed")
+        if kind == "error":
+            return None, _error_payload(event, "The ChatGPT plan failed")
+    return None, {"type": "api_error", "message": "The ChatGPT plan's stream ended before the response completed"}

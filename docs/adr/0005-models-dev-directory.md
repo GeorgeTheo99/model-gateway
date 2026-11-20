@@ -114,8 +114,8 @@ Corrections win over directory fields; owner rows still win over both (ADR 0002)
   as other route names never do.
 - The ChatGPT plan's models come from models.dev's experimental v2 API
   (`openai-codex`, fetched with each sync; when it fails the plan keeps the models
-  it had). The plan serves only Chat Completions, so bare names resolve to it only
-  there, and only for callers allowed to use it. When the plan answers a bare name
+  it had). The plan serves Chat Completions and Responses (not Anthropic Messages),
+  so bare names resolve to it only there, and only for callers allowed to use it. When the plan answers a bare name
   with a usage limit, the request runs again on the next provider and bare names
   skip the plan for 15 minutes. The plan gets no test completion: its sign-in is
   its availability.

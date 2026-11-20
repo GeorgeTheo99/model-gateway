@@ -247,8 +247,9 @@ def _responses_only_error_message(model: str, route: str = "/v1/responses") -> s
 
 
 def _chat_only_message(model: str, route: str) -> str:
-    """Client-facing error for a ChatGPT plan route on an endpoint other than Chat Completions."""
-    return f"Model '{model}' runs on a ChatGPT plan and is served only through POST /v1/chat/completions, not {route}"
+    """Client-facing error for a ChatGPT plan route on Anthropic Messages."""
+    return (f"Model '{model}' runs on a ChatGPT plan and is served only through POST /v1/chat/completions "
+            f"and POST /v1/responses, not {route}")
 
 
 def _non_chat_model_message(model: str, info) -> str | None:
@@ -1942,7 +1943,7 @@ _LEDGER_PATHS = {"/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/i
 
 def _route_acceptor(request: Request, *, plan: bool):
     """Which routes a base-model name may resolve to for this caller: ones it may use, and the
-    ChatGPT plan only on Chat Completions (the one protocol the plan's translation serves)."""
+    ChatGPT plan only on Chat Completions and Responses (not Anthropic Messages)."""
     def accept(entry: dict) -> bool:
         provider = catalog.canonical_provider(entry.get("provider"))
         if provider == chatgpt_auth.PROVIDER and not plan:
@@ -2999,9 +3000,24 @@ async def create_response(request: Request):
     tier_error = _take_reasoning_tier(request, body, _error_openai)
     if tier_error is not None:
         return tier_error
-    model = _redirect_retired_model(request, body)
-    is_stream = body.get("stream", False)
+    requested = body.get("model")
+    model = _redirect_retired_model(request, body, plan=True)
+    resolved = getattr(request.state, "base_route", None)
+    fallback_body = copy.deepcopy({**body, "model": requested}) if resolved else None
+    response = await _serve_responses(request, body, model)
+    if fallback_body is not None and _plan_usage_limited(response):
+        # As on Chat Completions: the next provider in the owner's order serves the base name.
+        chatgpt_auth.note_usage_limit()
+        retry_model = _redirect_retired_model(request, fallback_body, plan=True)
+        if retry_model != resolved[1]:
+            log.info("ChatGPT plan usage limit: %s served by %s instead", requested, retry_model)
+            return await _serve_responses(request, fallback_body, retry_model)
+    return response
 
+
+async def _serve_responses(request: Request, body: dict, model: str):
+    """Serve a Responses request for its resolved route ``model``."""
+    is_stream = body.get("stream", False)
     inbound_source = getattr(request.state, "federation_source", None)
     if inbound_source:
         model_error = _validate_inbound_peer_model(request, "/v1/responses", model)
@@ -3019,8 +3035,6 @@ async def create_response(request: Request):
         return _error_openai(404, "invalid_request_error", _model_error_message(model))
     if (non_chat := _non_chat_model_message(model, info)) is not None:
         return _error_openai(400, "invalid_request_error", non_chat)
-    if info.provider == chatgpt_auth.PROVIDER:
-        return _error_openai(400, "invalid_request_error", _chat_only_message(model, "/v1/responses"))
     thinking_error = _thinking_validation_response(request, body, info, _error_openai)
     if thinking_error is not None:
         return thinking_error
@@ -3028,6 +3042,8 @@ async def create_response(request: Request):
     _set_ledger_ctx(request, model, info, is_stream=is_stream)
     _inject_responses_instruction(body, info.system_instruction)
     _strip_gateway_controls(body)
+    if info.provider == chatgpt_auth.PROVIDER:
+        return await _handle_responses_plan(body, info, model, request, is_stream)
     # Images are inspected on the Chat translation. A vision model keeps its
     # Responses body unchanged; for a text-only one each image becomes a note,
     # in the native body too, so native Responses routes keep their path.
@@ -3551,6 +3567,69 @@ def _chatgpt_error_response(status: int, error: dict) -> JSONResponse:
 
 # Chat Completions fields the API-key Responses route carries over; the plan takes none of them.
 _RESPONSES_API_FIELDS = ("temperature", "top_p", "prompt_cache_retention", "service_tier", "safety_identifier", "user")
+
+
+async def _handle_responses_plan(body: dict, info, model: str, request: Request, is_stream: bool):
+    """Serve a Responses client on the owner's ChatGPT plan: the same API under its preview
+    rules (src/chatgpt_responses.py), with the plan's tool namespace removed from the output."""
+    if not info.api_key:
+        return _error_openai(401, "authentication_error", "The ChatGPT plan is signed out: sign in again in the gateway's settings")
+    _apply_gateway_reasoning(body, info, target_api="responses", request=request)
+    try:
+        upstream = chatgpt_responses.responses_to_plan_request(body, info.provider_model_id)
+    except chatgpt_responses.TranslationError as exc:
+        return _error_openai(400, "invalid_request_error", str(exc))
+    request.state.api_key = info.api_key
+    headers = _forward_headers(request, provider=info.provider)
+    endpoint = _upstream_endpoint(info, "/responses")
+    log.info("Responses %s -> ChatGPT plan (stream=%s)", model, is_stream)
+    client = httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT_SECONDS)
+    try:
+        resp = await _retry_send_stream_with_model_fallback(
+            client, endpoint, json=upstream, headers=headers, provider=info.provider, request=request,
+        )
+    except httpx.ConnectError:
+        await client.aclose()
+        return _error_openai(502, "api_error", "Cannot connect to the ChatGPT plan")
+    except Exception as exc:  # noqa: BLE001
+        await client.aclose()
+        return _error_openai(502, "api_error", f"The ChatGPT plan error: {type(exc).__name__}")
+    if resp.status_code != 200:
+        err_body = await resp.aread()
+        await resp.aclose()
+        await client.aclose()
+        refused = upstream_error_openai(resp, err_body.decode(errors="replace"), "ChatGPT")
+        try:
+            error = json.loads(refused.body)["error"]
+        except (ValueError, KeyError, TypeError):
+            return refused
+        return _chatgpt_error_response(refused.status_code, error)
+    if not is_stream:
+        try:
+            result, error = await chatgpt_responses.plan_sse_to_response(resp.aiter_bytes())
+        except httpx.HTTPError as exc:
+            result, error = None, {"type": "api_error", "message": f"Provider stream failed: {type(exc).__name__}"}
+        finally:
+            await resp.aclose()
+            await client.aclose()
+        if error is not None:
+            status = {_CHATGPT_LIMIT_CODE: 429, _CHATGPT_UNAVAILABLE_CODE: 503}.get(error.get("code"), 502)
+            return _chatgpt_error_response(status, error)
+        return JSONResponse(content=result)
+
+    async def stream_generator():
+        try:
+            async for chunk in chatgpt_responses.plan_sse_to_responses(resp.aiter_bytes()):
+                yield chunk
+        except httpx.HTTPError as exc:
+            log.warning("ChatGPT plan Responses stream failed for %s: %s", model, exc)
+            yield _stream_error_event(f"Provider stream failed: {type(exc).__name__}")
+        finally:
+            await resp.aclose()
+            await client.aclose()
+
+    return StreamingResponse(stream_generator(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
 
 async def _handle_chat_responses(body: dict, info, model: str, request: Request, is_stream: bool):
