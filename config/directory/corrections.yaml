@@ -11,10 +11,19 @@ providers:
     display_name: Anthropic
     base_url: https://api.anthropic.com/v1
     protocol: anthropic
+    route_suffix: -anthropic
+  # The owner's ChatGPT plan (src/chatgpt_auth.py): no key, zero price, Chat Completions only.
+  chatgpt:
+    models_dev: openai-codex
+    display_name: ChatGPT plan
+    base_url: https://api.openai.com/v1
+    auth: chatgpt
+    route_suffix: -chatgpt
   openai:
     models_dev: openai
     display_name: OpenAI
     base_url: https://api.openai.com/v1
+    route_suffix: -openai
   google:
     models_dev: google
     display_name: Google
@@ -62,9 +71,10 @@ providers:
     route_suffix: -xai
 
 # Default provider ranking (catalog.provider_preference overrides it): a model is served by the
-# first ready provider that offers it. The lab's own API first, then Fireworks (open weights,
-# no retention), then OpenRouter.
-ranking: [anthropic, openai, google, fireworks, moonshot, zhipuai, deepseek, xai, openrouter]
+# first ready provider that offers it. The lab's own API first, with the owner's ChatGPT plan
+# ahead of the OpenAI key (owner, 2026-11-19), then Fireworks (open weights, no retention),
+# then OpenRouter.
+ranking: [anthropic, chatgpt, openai, google, fireworks, moonshot, zhipuai, deepseek, xai, openrouter]
 
 # Lines followed by default: these labs' lines whose current model is under max_age_days old,
 # except special-purpose lines (any of exclude_words in the line).

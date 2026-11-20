@@ -1117,12 +1117,14 @@ def unmatched_model_names(names: frozenset[str]) -> list[str]:
 
 
 @_registry_locked
-def resolve_base_model(model_id: str, *, locality: str | None = None) -> str | None:
+def resolve_base_model(model_id: str, *, locality: str | None = None, accept=None) -> str | None:
     """The available route for a base-model reference (docs/adr/0002-layered-model-catalog.md R1).
 
     Routes sharing ``base_model`` are tried in the owner's
     ``catalog.provider_preference`` order, then catalog order. ``locality``
-    (``local_only``/``cloud_explicit``) keeps only local or only cloud routes.
+    (``local_only``/``cloud_explicit``) keeps only local or only cloud routes. ``accept``
+    (an entry predicate) leaves out routes the caller can't use. A ChatGPT plan that just
+    answered with a usage limit is passed over for a while.
     """
     models = _load_models()
     try:
@@ -1141,6 +1143,10 @@ def resolve_base_model(model_id: str, *, locality: str | None = None) -> str | N
         return preference.index(provider) if provider in preference else len(preference)
 
     for entry in sorted(entries, key=rank):
+        if _canonical_provider(entry.get("provider")) == chatgpt_auth.PROVIDER and chatgpt_auth.usage_limited():
+            continue
+        if accept is not None and not accept(entry):
+            continue
         if _availability_for_entry(entry["name"], entry)["available"]:
             return entry["name"]
     return None
@@ -1179,19 +1185,24 @@ def is_spot_route(model_id: str) -> bool:
 
 
 @_registry_locked
-def base_model_route(model_id: str, *, locality: str | None = None) -> str | None:
+def base_model_route(model_id: str, *, locality: str | None = None, accept=None) -> str | None:
     """The route serving ``model_id`` as a base-model reference, when it is not served as named.
 
-    Only a name that is no route here, or a route named after its base model whose
-    provider is not set up here or that failed its test completion, is rerouted, and only
-    within its locality. A
-    provider-specific route name is never rerouted (that could change retention or
-    cost), nor is a model the owner turned off, a turned-off provider, or an
-    override the release no longer accepts.
+    A name that is no route here, or a route named after its base model whose provider is
+    not set up here or that failed its test completion, is rerouted, and only within its
+    locality. A models.dev route named after its base model answers as that base model even
+    when available: the owner's provider order decides who serves it (the ChatGPT plan ahead
+    of an OpenAI key by default; docs/adr/0005-models-dev-directory.md), and the route itself
+    stays reachable by its provider-suffixed id. A provider-specific route name is never
+    rerouted (that could change retention or cost), nor is a model the owner turned off, a
+    turned-off provider, or an override the release no longer accepts.
     """
     entry = _load_models().get(model_id)
     availability = _availability_for_entry(model_id, entry)
-    if availability["available"] or availability["reason"] not in _REROUTABLE:
+    ranked = (availability["available"] and entry is not None and entry.get("name") == model_id
+              and entry.get("base_model") == model_id
+              and (entry.get("origin") or {}).get("profile") == "models.dev")
+    if not ranked and (availability["available"] or availability["reason"] not in _REROUTABLE):
         return None
     base = model_id
     if entry is None and _curated_local_name(model_id) and locality != "cloud_explicit":
@@ -1211,7 +1222,7 @@ def base_model_route(model_id: str, *, locality: str | None = None) -> str | Non
         if locality not in (None, entry_locality):
             return None
         locality = entry_locality
-    route = resolve_base_model(base, locality=locality)
+    route = resolve_base_model(base, locality=locality, accept=accept)
     return route if route != model_id else None
 
 

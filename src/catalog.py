@@ -266,7 +266,9 @@ def entry_routable_ids(entry: dict) -> list[str]:
     Mirrors ``src.providers._entry_routable_ids`` so the merge keys the same way
     the router does. An owner-added (``custom-``) provider's upstream id is not
     one: it could otherwise claim another route's identifier. Nor is a ChatGPT
-    plan's: ``gpt-6.1-sol`` stays the API-key route, so a name never switches billing.
+    plan's: ``gpt-6.1-sol`` stays the API-key route's name. (A bare model name is
+    served in the owner's provider order, which puts the plan first by default:
+    docs/adr/0005-models-dev-directory.md.)
     """
     ids = []
     provider = canonical_provider(entry.get("provider"))

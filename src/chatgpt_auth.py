@@ -165,6 +165,21 @@ def _signed_in(record: dict) -> bool:
                 and PLAN_SCOPE in (record.get("scopes") or []))
 
 
+# After the plan answers with a usage limit, model requests by base name use the next provider
+# for a while (docs/adr/0005-models-dev-directory.md); the plan's own route names still go to it.
+USAGE_LIMIT_BACKOFF_SECONDS = 15 * 60
+_limited_until = 0.0
+
+
+def note_usage_limit(now: float | None = None) -> None:
+    global _limited_until
+    _limited_until = (time.time() if now is None else now) + USAGE_LIMIT_BACKOFF_SECONDS
+
+
+def usage_limited(now: float | None = None) -> bool:
+    return (time.time() if now is None else now) < _limited_until
+
+
 def access_token() -> str:
     """The current access token for the provider config, or "" when signed out.
 

@@ -23,8 +23,10 @@ def main() -> int:
     corrections = directory.load_corrections()
     api_bytes = directory._download(directory.API_URL)
     labs_bytes = directory._download(directory.LABS_URL)
-    snapshot = directory.build_snapshot(json.loads(api_bytes), json.loads(labs_bytes), corrections,
-                                        source_sha256=hashlib.sha256(api_bytes).hexdigest())
+    plan_bytes = directory._download(directory.PLAN_URL)
+    api = {**json.loads(api_bytes), directory.PLAN_PROVIDER: directory.plan_models(json.loads(plan_bytes))}
+    snapshot = directory.build_snapshot(api, json.loads(labs_bytes), corrections,
+                                        source_sha256=hashlib.sha256(api_bytes + plan_bytes).hexdigest())
     previous = None
     if directory.BUNDLED_SNAPSHOT.exists():
         previous = json.loads(directory.BUNDLED_SNAPSHOT.read_text(encoding="utf-8"))

@@ -361,7 +361,8 @@ def test_a_provider_counts_as_ready_only_at_the_expected_endpoint_with_a_key(cor
                             "fireworks": {"base_url": "https://api.fireworks.ai/inference/v1"}}}
     for name in ("OPENAI", "OPENROUTER", "FIREWORKS"):
         monkeypatch.delenv(f"MODEL_GATEWAY_PROVIDER_{name}_API_KEY", raising=False)
-    assert directory.ready_providers(config, corrections, shipped.provider_ready) == {"openai"}
+    # The ChatGPT plan has no key: its rows load signed out (unavailable until sign-in).
+    assert directory.ready_providers(config, corrections, shipped.provider_ready) == {"openai", "chatgpt"}
 
 
 def test_shipped_layer_loads_directory_rows_and_curated_rows_yield(corrections, monkeypatch, tmp_path):
@@ -547,7 +548,7 @@ def test_a_base_named_route_that_failed_its_test_falls_back_to_the_next_ranked_r
     }
     monkeypatch.setattr(providers, "_load_models", lambda **kwargs: entries)
     monkeypatch.setattr(providers, "resolve_base_model",
-                        lambda base, locality=None: "kimi-k3.1-pro-fw" if base == "kimi-k3.1-pro" else None)
+                        lambda base, locality=None, accept=None: "kimi-k3.1-pro-fw" if base == "kimi-k3.1-pro" else None)
     assert providers.base_model_route("kimi-k3.1-pro") == "kimi-k3.1-pro-fw"
 
 
@@ -587,3 +588,79 @@ def test_a_catalog_manager_credential_reads_and_changes_catalog_settings(client,
     runtime = {"Authorization": "Bearer runtime-token"}
     assert client.get("/admin/api/directory", headers=runtime).status_code == 403
     assert client.get("/admin/api/models", headers=manager).status_code in (401, 403)
+
+
+
+# ── The ChatGPT plan ahead of an OpenAI key (owner, 2026-11-19) ────────────
+
+V2_PLAN = {"openai-codex": {"name": "OpenAI Codex (ChatGPT plan)", "models": {"gpt-6.1-sol": {
+    "id": "gpt-6.1-sol", "canonical_id": "openai/gpt-6.1-sol", "type": "chat", "name": "GPT-6.1 Sol",
+    "family": "gpt-sol", "release_date": "2026-09-29",
+    "modalities": {"input": ["text", "image/png", "image/jpeg", "application/pdf"], "output": ["text"]},
+    "capabilities": {"tools": {"supported": True}, "reasoning": {"supported": True, "effort": ["low", "high"]}},
+    "limit": {"context": 1050000, "output": 128000},
+    "cost": {"text": {"input": {"price": 0, "cache": {"read": 0}}, "output": {"price": 0}}},
+}}}}
+
+
+def test_plan_models_come_from_the_v2_api_in_the_v1_shape(corrections):
+    plan = directory.plan_models(V2_PLAN)
+    model = plan["models"]["gpt-6.1-sol"]
+    assert model["modalities"]["input"] == ["text", "image", "pdf"]
+    assert model["reasoning_options"] == [{"type": "effort", "values": ["low", "high"]}]
+    assert model["cost"] == {"input": 0, "output": 0, "cache_read": 0}
+    assert model["canonical_model_id"] == "openai/gpt-6.1-sol"
+    snapshot = _snapshot(corrections, {**_api(openai=[_model("gpt-6.1-sol", canonical_model_id="openai/gpt-6.1-sol")]),
+                                        "openai-codex": plan}, {"openai/gpt-6.1-sol": {"name": "GPT-6.1 Sol"}})
+    rows = {(m.provider, m.model_id): m.row for m in directory.map_snapshot(snapshot, corrections)}
+    plan_row, key_row = rows[("chatgpt", "gpt-6.1-sol")], rows[("openai", "gpt-6.1-sol")]
+    assert (plan_row["name"], plan_row["pricing"], plan_row["vision"]) == (
+        "gpt-6.1-sol-chatgpt", {"input": 0.0, "output": 0.0, "cache_read": 0.0}, True)
+    # The bare name asks for the model; the key route stays reachable as gpt-6.1-sol-openai.
+    assert key_row["name"] == "gpt-6.1-sol" and key_row["alternate_ids"] == ["gpt-6.1-sol-openai"]
+    found = directory.layer({}, ready=_ready("chatgpt", "openai"), snapshot=snapshot, corrections=corrections)
+    assert [row["name"] for row in found.rows] == ["gpt-6.1-sol-chatgpt", "gpt-6.1-sol"]
+    assert found.rows[0]["alias"] == "gpt61sol"
+
+
+def test_a_failed_plan_list_keeps_the_plan_models_the_snapshot_had(corrections, state_dir):
+    api = json.dumps(_api(openai=[_model("g")])).encode()
+    payloads = {directory.API_URL: api, directory.LABS_URL: b"{}", directory.PLAN_URL: json.dumps(V2_PLAN).encode()}
+    directory.sync(fetch=payloads.__getitem__, corrections=corrections)
+    assert "gpt-6.1-sol" in directory.load_snapshot()[0]["providers"]["openai-codex"]["models"]
+    payloads[directory.PLAN_URL] = b"oops"
+    payloads[directory.API_URL] = json.dumps(_api(openai=[_model("g"), _model("h")])).encode()
+    state = directory.sync(fetch=payloads.__getitem__, corrections=corrections)
+    assert state["error"] is None and state["plan_error"].startswith("JSONDecodeError")
+    assert "gpt-6.1-sol" in directory.load_snapshot()[0]["providers"]["openai-codex"]["models"]
+
+
+def _plan_catalog(monkeypatch):
+    origin = {"layer": "shipped", "profile": "models.dev"}
+    entries = {
+        "gpt-6.1-sol": {"name": "gpt-6.1-sol", "provider": "openai", "base_model": "gpt-6.1-sol", "origin": origin},
+        "gpt-6.1-sol-chatgpt": {"name": "gpt-6.1-sol-chatgpt", "provider": "chatgpt", "base_model": "gpt-6.1-sol",
+                                "origin": origin},
+    }
+    monkeypatch.setattr(providers, "_load_models", lambda **kwargs: entries)
+    monkeypatch.setattr(providers, "_availability_for_entry", lambda name, entry: {"available": entry is not None})
+    monkeypatch.setattr(providers.shipped, "provider_preference", lambda config: ["chatgpt", "openai"])
+    return entries
+
+
+def test_a_bare_name_is_served_in_provider_order_and_the_plan_steps_aside_after_a_usage_limit(monkeypatch):
+    from src import chatgpt_auth
+
+    _plan_catalog(monkeypatch)
+    monkeypatch.setattr(chatgpt_auth, "_limited_until", 0.0)
+    assert providers.base_model_route("gpt-6.1-sol") == "gpt-6.1-sol-chatgpt"
+    # Off Chat Completions (or for a caller that may not use the plan) the key route answers as named.
+    assert providers.base_model_route("gpt-6.1-sol", accept=lambda e: e["provider"] != "chatgpt") is None
+    chatgpt_auth.note_usage_limit()
+    assert providers.base_model_route("gpt-6.1-sol") is None
+    monkeypatch.setattr(chatgpt_auth, "_limited_until", 0.0)
+
+
+def test_a_route_name_that_is_not_its_base_model_is_never_rerouted(monkeypatch):
+    _plan_catalog(monkeypatch)
+    assert providers.base_model_route("gpt-6.1-sol-chatgpt") is None

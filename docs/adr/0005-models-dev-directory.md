@@ -105,10 +105,20 @@ Corrections win over directory fields; owner rows still win over both (ADR 0002)
 ### Provider ranking and policy
 
 - `catalog.provider_preference` (ADR 0002 R1) is the ranking. Its default is the
-  lab's own API first (Anthropic, OpenAI, Google), then Fireworks, Moonshot, Zhipu,
-  then OpenRouter. A base-model name is served by the first ready provider in the
-  ranking that serves it and falls back to the next; a route name never changes
-  provider.
+  lab's own API first (Anthropic; the owner's ChatGPT plan, then the OpenAI key
+  (owner, 2026-11-19); Google), then Fireworks, Moonshot, Zhipu, then OpenRouter.
+- A bare model name (`gpt-6.1-sol`, `claude-opus-5.5`) asks for the model: it is
+  served by the first ready provider in the ranking that serves it, and falls back
+  to the next. Each bare-named route also answers to a provider-suffixed id
+  (`gpt-6.1-sol-openai`, `claude-opus-5.5-anthropic`) that never changes provider,
+  as other route names never do.
+- The ChatGPT plan's models come from models.dev's experimental v2 API
+  (`openai-codex`, fetched with each sync; when it fails the plan keeps the models
+  it had). The plan serves only Chat Completions, so bare names resolve to it only
+  there, and only for callers allowed to use it. When the plan answers a bare name
+  with a usage limit, the request runs again on the next provider and bare names
+  skip the plan for 15 minutes. The plan gets no test completion: its sign-in is
+  its availability.
 - `catalog.provider_policy` holds per-provider rules. `openrouter:
   {zero_retention_only: true}` (the default, as today) adds `openrouter_zdr` to every
   OpenRouter directory row.

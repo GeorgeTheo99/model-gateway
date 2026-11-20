@@ -704,3 +704,50 @@ def test_peers_are_not_offered_the_plan(monkeypatch, token_endpoint):
     _configure(monkeypatch)
     ids = {row["id"] for row in server._federation_rows(2)}
     assert "gpt-6.1-sol-chatgpt" not in ids and "gpt-6.1-sol" in ids
+
+
+def test_a_bare_model_name_runs_on_the_plan_first_and_on_the_key_after_a_usage_limit(monkeypatch, token_endpoint):
+    """The ChatGPT plan is ahead of the OpenAI key in the default provider order (owner,
+    2026-11-19; docs/adr/0005-models-dev-directory.md); its usage limit hands the request on."""
+    from src import directory
+
+    corrections = directory.load_corrections()
+    model = {"id": "gpt-6.1-sol", "name": "GPT-6.1 Sol", "reasoning": True, "tool_call": True,
+             "reasoning_options": [{"type": "effort", "values": ["low", "high"]}],
+             "modalities": {"input": ["text"], "output": ["text"]}, "limit": {"context": 1000, "output": 100},
+             "cost": {"input": 2.0, "output": 10.0}, "canonical_model_id": "openai/gpt-6.1-sol",
+             "release_date": "2026-11-18"}
+    plan = {**model, "cost": {"input": 0, "output": 0}}
+    snapshot = directory.build_snapshot(
+        {"openai": {"models": {"gpt-6.1-sol": model}}, "openai-codex": {"models": {"gpt-6.1-sol": plan}}},
+        {"openai/gpt-6.1-sol": {"name": "GPT-6.1 Sol", "release_date": "2026-11-18"}}, corrections,
+        fetched_at="2026-11-19T00:00:00Z")
+    _configure(monkeypatch)
+    monkeypatch.setattr(shipped, "_packaged", lambda: {})
+    monkeypatch.setattr(shipped, "_directory", lambda config, ready, keep, config_path=None: directory.layer(
+        config, ready=ready, keep=keep, snapshot=snapshot, corrections=corrections))
+    asyncio.run(_sign_in(token_endpoint))
+    _configure(monkeypatch)
+    monkeypatch.setattr(shipped, "_packaged", lambda: {})
+    monkeypatch.setattr(upstream, "_RETRY_MAX", 1)
+    monkeypatch.setattr(chatgpt_auth, "_limited_until", 0.0)
+    calls = []
+
+    def handler(request):
+        plan_call = request.headers.get("authorization") == f"Bearer {chatgpt_auth.access_token()}"
+        calls.append("plan" if plan_call else "key")
+        if plan_call:
+            return httpx.Response(429, json={"error": {"type": "usage_limit_error", "message": "Limit reached",
+                                                       "code": "subscription_sharing_usage_limit_exceeded"}})
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=b"".join(TOOL_STREAM))
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda **kw: _AsyncClient(transport=httpx.MockTransport(handler), **kw))
+    assert providers.base_model_route("gpt-6.1-sol") == "gpt-6.1-sol-chatgpt"
+    first = _chat(ADMIN, stream=False, model="gpt-6.1-sol")
+    assert first.status_code == 200, first.text
+    assert calls == ["plan", "key"]
+    second = _chat(ADMIN, stream=False, model="gpt-6.1-sol")
+    assert second.status_code == 200 and calls == ["plan", "key", "key"]
+    # The plan's own route name still goes to the plan, limit or not.
+    assert _chat(ADMIN, stream=False, model="gpt-6.1-sol-chatgpt").status_code == 429
+    monkeypatch.setattr(chatgpt_auth, "_limited_until", 0.0)

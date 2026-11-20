@@ -1220,6 +1220,10 @@ def _smoke_test_directory(retest_failed: bool) -> bool:
     smoke = directory.load_state().get("smoke") or {}
     results = {}
     for entry in _directory_entries():
+        # The ChatGPT plan has no key to check: its sign-in state is its availability, and it runs
+        # only through the Responses translation (src/chatgpt_responses.py).
+        if entry.get("provider") == chatgpt_auth.PROVIDER:
+            continue
         if directory.needs_smoke_test(entry, smoke, retest_failed=retest_failed):
             provider_config = providers._effective_provider_config(config, str(entry["provider"]))
             error = directory.smoke_test(entry, provider_config)

@@ -1940,7 +1940,18 @@ _LEDGER_PATHS = {"/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/i
                  *(f"{federation.LOCAL_FORWARD_PREFIX}/{name}" for name in ("chat/completions", "messages", "responses"))}
 
 
-def _redirect_retired_model(request: Request, body: dict) -> str:
+def _route_acceptor(request: Request, *, plan: bool):
+    """Which routes a base-model name may resolve to for this caller: ones it may use, and the
+    ChatGPT plan only on Chat Completions (the one protocol the plan's translation serves)."""
+    def accept(entry: dict) -> bool:
+        provider = catalog.canonical_provider(entry.get("provider"))
+        if provider == chatgpt_auth.PROVIDER and not plan:
+            return False
+        return _direct_model_permitted(request, entry["name"]) and _provider_permitted(request, provider)
+    return accept
+
+
+def _redirect_retired_model(request: Request, body: dict, *, plan: bool = False) -> str:
     """The concrete model a request is served by (docs/adr/0002-layered-model-catalog.md).
 
     A retired name is served by its successor, noted for the response headers; a
@@ -1958,9 +1969,10 @@ def _redirect_retired_model(request: Request, body: dict) -> str:
             return model  # the catalog changed since the request was authorized; serve nothing new
         request.state.model_redirect = (model, successor)
     else:
-        successor = base_model_route(model)
+        successor = base_model_route(model, accept=_route_acceptor(request, plan=plan))
         if successor is None:
             return model
+        request.state.base_route = (model, successor)
         if model in local_runtime.MODELS and not _direct_model_permitted(request, successor):
             # A local AI model's name is a route name: listing it never permits another route
             # (docs/adr/0003-scoped-access-and-lightweight-local-models.md section 1); _resolve_for
@@ -3360,7 +3372,29 @@ async def chat_completions(request: Request):
     tier_error = _take_reasoning_tier(request, body, _error_openai)
     if tier_error is not None:
         return tier_error
-    model = _redirect_retired_model(request, body)
+    requested = body.get("model")
+    model = _redirect_retired_model(request, body, plan=True)
+    resolved = getattr(request.state, "base_route", None)
+    fallback_body = copy.deepcopy({**body, "model": requested}) if resolved else None
+    response = await _serve_chat_completions(request, body, model)
+    if fallback_body is not None and _plan_usage_limited(response):
+        # The plan served a base-model name and is out of allowance: the next provider in the
+        # owner's order serves it instead (docs/adr/0005-models-dev-directory.md).
+        chatgpt_auth.note_usage_limit()
+        retry_model = _redirect_retired_model(request, fallback_body, plan=True)
+        if retry_model != resolved[1]:
+            log.info("ChatGPT plan usage limit: %s served by %s instead", requested, retry_model)
+            return await _serve_chat_completions(request, fallback_body, retry_model)
+    return response
+
+
+def _plan_usage_limited(response) -> bool:
+    headers = getattr(response, "headers", None)
+    return headers is not None and headers.get(_ERROR_CODE_HEADER) == _CHATGPT_LIMIT_CODE
+
+
+async def _serve_chat_completions(request: Request, body: dict, model: str):
+    """Serve a Chat Completions request for its resolved route ``model``."""
     inbound_source = getattr(request.state, "federation_source", None)
     if inbound_source:
         model_error = _validate_inbound_peer_model(request, "/v1/chat/completions", model)

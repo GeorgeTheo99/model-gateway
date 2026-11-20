@@ -92,8 +92,15 @@ return 400. Each request is translated to the plan's Responses API:
   (as `text.format`) and `verbosity` are sent.
 - **Reasoning.** The reasoning summary streams as `reasoning_content`. Encrypted reasoning items
   are kept by tool call id and sent again before that call, so reasoning carries across a tool loop.
-- **Success and failure.** Success is `response.completed`. Nothing falls back to another route.
-- **Usage limit.** A usage limit (`subscription_sharing_usage_limit_exceeded`) is never retried.
+- **Success and failure.** Success is `response.completed`. A request for the plan's own route
+  (`gpt-6.1-sol-chatgpt`, or a routing profile bound to it) never falls back to another route.
+- **Provider order.** The plan is ahead of the OpenAI key in the default provider order
+  ([ADR 0005](adr/0005-models-dev-directory.md)): a Chat Completions request for a bare model name
+  the plan serves (`gpt-6.1-sol`) runs on the plan; `gpt-6.1-sol-openai` names the key route.
+  The plan's models come from models.dev's experimental v2 API (`openai-codex`).
+- **Usage limit.** A usage limit (`subscription_sharing_usage_limit_exceeded`) is never retried
+  on the plan. When the plan served a bare model name, the request runs again on the next
+  provider in the owner's order, and bare names skip the plan for 15 minutes.
   - Before streaming, it is a 429.
   - Mid-stream, it ends the stream with an error event, or becomes a 429 when the client asked for
     no stream.

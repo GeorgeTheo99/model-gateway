@@ -23,12 +23,15 @@ from typing import Callable
 import httpx
 import yaml
 
-from src.catalog import ENABLED_THINKING_LEVELS
+from src.catalog import ENABLED_THINKING_LEVELS, entry_routable_ids
 
 log = logging.getLogger("model-gateway")
 
 API_URL = "https://models.dev/api.json"
 LABS_URL = "https://models.dev/models.json"
+# The ChatGPT plan's models are listed only in the experimental v2 API, opt-in as openai-codex.
+PLAN_URL = "https://models.dev/experimental/v2.0/api.json?include=openai-codex"
+PLAN_PROVIDER = "openai-codex"
 SNAPSHOT_SCHEMA = 1
 MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
 FETCH_TIMEOUT_SECONDS = 60.0
@@ -108,6 +111,41 @@ def load_corrections(path: Path = CORRECTIONS_PATH) -> Corrections:
 
 def _trim_model(model: dict) -> dict:
     return {key: model[key] for key in _MODEL_FIELDS if key in model}
+
+
+def plan_models(v2: dict) -> dict:
+    """The ChatGPT plan's models from the v2 API, in the v1 shape the rest of this module reads."""
+    entry = v2.get(PLAN_PROVIDER) if isinstance(v2, dict) else None
+    if not isinstance(entry, dict) or not isinstance(entry.get("models"), dict):
+        raise DirectoryError("models.dev lists no ChatGPT plan models")
+    models = {}
+    for model_id, model in entry["models"].items():
+        if not isinstance(model, dict):
+            continue
+        capabilities = model.get("capabilities") or {}
+        reasoning = capabilities.get("reasoning") or {}
+        efforts = [value for value in reasoning.get("effort") or [] if isinstance(value, str)]
+        text = (model.get("cost") or {}).get("text") or {}
+        cost = {"input": ((text.get("input") or {}).get("price")), "output": ((text.get("output") or {}).get("price"))}
+        cache_read = ((text.get("input") or {}).get("cache") or {}).get("read")
+        if cache_read is not None:
+            cost["cache_read"] = cache_read
+        inputs = []
+        for kind in (model.get("modalities") or {}).get("input") or []:
+            kind = "image" if str(kind).startswith("image/") else "pdf" if kind == "application/pdf" else str(kind)
+            if kind not in inputs:
+                inputs.append(kind)
+        models[model_id] = _trim_model({
+            "id": model_id, "name": model.get("name"), "family": model.get("family"),
+            "type": None if model.get("type") in (None, "chat") else model.get("type"),
+            "reasoning": bool(reasoning.get("supported")),
+            "reasoning_options": [{"type": "effort", "values": efforts}] if efforts else [],
+            "tool_call": bool((capabilities.get("tools") or {}).get("supported")),
+            "modalities": {"input": inputs, "output": list((model.get("modalities") or {}).get("output") or [])},
+            "limit": model.get("limit"), "cost": cost, "release_date": model.get("release_date"),
+            "status": model.get("status"), "canonical_model_id": model.get("canonical_id"),
+        })
+    return {"id": PLAN_PROVIDER, "name": entry.get("name", PLAN_PROVIDER), "models": models}
 
 
 def build_snapshot(api: dict, labs: dict, corrections: Corrections, *, fetched_at: str | None = None,
@@ -379,9 +417,21 @@ def sync(*, fetch: Callable[[str], bytes] = _download, corrections: Corrections 
             api, labs = json.loads(api_bytes), json.loads(labs_bytes)
         except ValueError as exc:
             raise DirectoryError(f"models.dev returned invalid JSON: {exc}") from exc
-        digest = hashlib.sha256(api_bytes).hexdigest()
-        snapshot = build_snapshot(api, labs, corrections, source_sha256=digest)
         previous, origin = load_snapshot()
+        plan_bytes = b""
+        if PLAN_PROVIDER in corrections.by_models_dev_id:
+            # Experimental and optional: when it fails, the plan keeps the models it had.
+            try:
+                plan_bytes = fetch(PLAN_URL)
+                api = {**api, PLAN_PROVIDER: plan_models(json.loads(plan_bytes))}
+                state.pop("plan_error", None)
+            except Exception as exc:  # noqa: BLE001 — an optional source never fails the sync
+                state["plan_error"] = f"{type(exc).__name__}: {exc}"
+                kept = ((previous or {}).get("providers") or {}).get(PLAN_PROVIDER)
+                if kept:
+                    api = {**api, PLAN_PROVIDER: kept}
+        digest = hashlib.sha256(api_bytes + plan_bytes).hexdigest()
+        snapshot = build_snapshot(api, labs, corrections, source_sha256=digest)
         validate_update(snapshot, previous)
         if origin == "synced" and previous.get("source", {}).get("sha256") == digest:
             state.update(last_success=state["last_attempt"], error=None, changed=False)
@@ -599,6 +649,9 @@ def map_model(dev_provider: str, model: dict, snapshot: dict, corrections: Corre
     for rule in rules:
         suffix = rule.get("route_suffix", suffix)
     name = base if lab_facts.get("home") == provider else base + suffix
+    # A bare name asks for the model, served in the owner's provider order; the route on this
+    # provider stays reachable as base + suffix.
+    pinned_id = base + suffix if name == base and suffix else None
     thinking, levels = _thinking(model)
     row: dict = {
         "name": name,
@@ -637,6 +690,8 @@ def map_model(dev_provider: str, model: dict, snapshot: dict, corrections: Corre
         row.update(rule.get("set") or {})
     if quirks:
         row["quirks"] = quirks
+    if pinned_id and row["name"] == base and pinned_id not in (row.get("alternate_ids") or []):
+        row["alternate_ids"] = [*(row.get("alternate_ids") or []), pinned_id]
     if not row.get("thinking"):
         row.pop("thinking_levels", None)
     return Mapped(provider, model_id, canonical, lab, line, release, row, None, tuple(notes), status)
@@ -764,7 +819,8 @@ def ready_providers(config: dict, corrections: Corrections, ready: Callable[[dic
         if not facts.get("base_url"):
             continue
         profile = {"provider": {"id": provider, "base_url": facts["base_url"],
-                                "protocol": facts.get("protocol", "openai")}}
+                                "protocol": facts.get("protocol", "openai"),
+                                **({"auth": facts["auth"]} if facts.get("auth") else {})}}
         if ready(profile, config):
             found.add(provider)
     return found
@@ -831,7 +887,7 @@ def layer(config: dict, *, ready: Callable[[dict, dict], bool], keep: frozenset[
             load = True
         # A route whose identifiers a higher-ranked route already uses (a direct provider's
         # upstream id that is another route's name or alias) would only yield in the catalog.
-        identifiers = {name, item.model_id, *(item.row.get("alternate_ids") or ()), item.row.get("alias")} - {None}
+        identifiers = set(entry_routable_ids(item.row)) - {None}
         if load and not identifiers & claimed:
             claimed |= identifiers
             loaded.append(item)

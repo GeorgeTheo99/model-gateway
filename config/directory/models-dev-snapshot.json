@@ -1,5 +1,5 @@
 {
- "fetched_at": "2026-11-19T07:25:23Z",
+ "fetched_at": "2026-11-20T05:52:21Z",
  "labs": {
   "aion-labs/aion-2.0": {
    "name": "Aion-2.0",
@@ -1358,11 +1358,6 @@
    "family": "grok",
    "name": "Grok 4.7",
    "release_date": "2026-09-21"
-  },
-  "xai/grok-build-0.1": {
-   "family": "grok-build",
-   "name": "Grok Build 0.1",
-   "release_date": "2026-04-16"
   },
   "xai/grok-imagine-image": {
    "family": "grok",
@@ -2909,9 +2904,9 @@
     "accounts/fireworks/routers/deepseek-v4p1-flash-1017-spot": {
      "canonical_model_id": "deepseek/deepseek-v4.1-flash-1017",
      "cost": {
-      "cache_read": 0.0042,
-      "input": 0.21,
-      "output": 0.84
+      "cache_read": 0.003,
+      "input": 0.15,
+      "output": 0.6
      },
      "family": "deepseek-flash",
      "id": "accounts/fireworks/routers/deepseek-v4p1-flash-1017-spot",
@@ -2949,9 +2944,9 @@
     "accounts/fireworks/routers/deepseek-v4p1-flash-1017-ultrafast": {
      "canonical_model_id": "deepseek/deepseek-v4.1-flash-1017",
      "cost": {
-      "cache_read": 0.048,
-      "input": 2.4,
-      "output": 9.6
+      "cache_read": 0.024,
+      "input": 1.2,
+      "output": 4.8
      },
      "family": "deepseek-flash",
      "id": "accounts/fireworks/routers/deepseek-v4p1-flash-1017-ultrafast",
@@ -2989,9 +2984,9 @@
     "accounts/fireworks/routers/deepseek-v4p1-flash-spot": {
      "canonical_model_id": "deepseek/deepseek-v4.1-flash",
      "cost": {
-      "cache_read": 0.0042,
-      "input": 0.21,
-      "output": 0.84
+      "cache_read": 0.003,
+      "input": 0.15,
+      "output": 0.6
      },
      "family": "deepseek-flash",
      "id": "accounts/fireworks/routers/deepseek-v4p1-flash-spot",
@@ -3065,9 +3060,9 @@
     "accounts/fireworks/routers/glm-5p3-spot": {
      "canonical_model_id": "zhipuai/glm-5.3",
      "cost": {
-      "cache_read": 0.182,
-      "input": 0.98,
-      "output": 3.08
+      "cache_read": 0.13,
+      "input": 0.7,
+      "output": 2.2
      },
      "family": "glm",
      "id": "accounts/fireworks/routers/glm-5p3-spot",
@@ -7303,6 +7298,97 @@
    },
    "name": "OpenAI"
   },
+  "openai-codex": {
+   "models": {
+    "gpt-6.1-sol": {
+     "canonical_model_id": "openai/gpt-6.1-sol",
+     "cost": {
+      "cache_read": 0,
+      "input": 0,
+      "output": 0
+     },
+     "family": "gpt-sol",
+     "id": "gpt-6.1-sol",
+     "limit": {
+      "context": 1050000,
+      "input": 922000,
+      "output": 128000
+     },
+     "modalities": {
+      "input": [
+       "text",
+       "image",
+       "pdf"
+      ],
+      "output": [
+       "text"
+      ]
+     },
+     "name": "GPT-6.1 Sol",
+     "reasoning": true,
+     "reasoning_options": [
+      {
+       "type": "effort",
+       "values": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+       ]
+      }
+     ],
+     "release_date": "2026-09-29",
+     "status": null,
+     "tool_call": true,
+     "type": null
+    },
+    "gpt-6.1-terra": {
+     "canonical_model_id": "openai/gpt-6.1-terra",
+     "cost": {
+      "cache_read": 0,
+      "input": 0,
+      "output": 0
+     },
+     "family": "gpt-terra",
+     "id": "gpt-6.1-terra",
+     "limit": {
+      "context": 1050000,
+      "input": 922000,
+      "output": 128000
+     },
+     "modalities": {
+      "input": [
+       "text",
+       "image",
+       "pdf"
+      ],
+      "output": [
+       "text"
+      ]
+     },
+     "name": "GPT-6.1 Terra",
+     "reasoning": true,
+     "reasoning_options": [
+      {
+       "type": "effort",
+       "values": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+       ]
+      }
+     ],
+     "release_date": "2026-10-26",
+     "status": null,
+     "tool_call": true,
+     "type": null
+    }
+   },
+   "name": "OpenAI Codex (ChatGPT plan)"
+  },
   "openrouter": {
    "models": {
     "aion-labs/aion-2.0": {
@@ -9005,8 +9091,8 @@
     "deepseek/deepseek-v4-flash-0731": {
      "canonical_model_id": "deepseek/deepseek-v4-flash-0731",
      "cost": {
-      "cache_read": 0.035,
-      "input": 0.055,
+      "cache_read": 0.05,
+      "input": 0.1,
       "output": 0.3
      },
      "family": "deepseek-flash",
@@ -9080,7 +9166,7 @@
     "deepseek/deepseek-v4-pro": {
      "canonical_model_id": "deepseek/deepseek-v4-pro",
      "cost": {
-      "cache_read": 0.25,
+      "cache_read": 0.2,
       "input": 0.9,
       "output": 1.5
      },
@@ -9116,9 +9202,9 @@
     "deepseek/deepseek-v4-pro-0813": {
      "canonical_model_id": "deepseek/deepseek-v4-pro-0813",
      "cost": {
-      "cache_read": 0.097,
-      "input": 0.111,
-      "output": 4.44
+      "cache_read": 0.17,
+      "input": 0.22,
+      "output": 9.5
      },
      "family": "deepseek-thinking",
      "id": "deepseek/deepseek-v4-pro-0813",
@@ -9191,15 +9277,15 @@
     "deepseek/deepseek-v4.1-flash-1017": {
      "canonical_model_id": "deepseek/deepseek-v4.1-flash-1017",
      "cost": {
-      "cache_read": 0.006,
-      "input": 0.3,
-      "output": 1.2
+      "cache_read": 0.01,
+      "input": 0.036,
+      "output": 0.5
      },
      "family": "deepseek-flash",
      "id": "deepseek/deepseek-v4.1-flash-1017",
      "limit": {
       "context": 1048576,
-      "output": 393216
+      "output": 943718
      },
      "modalities": {
       "input": [
@@ -10590,9 +10676,9 @@
     "google/gemma-4-26b-a4b-it": {
      "canonical_model_id": "google/gemma-4-26b-a4b-it",
      "cost": {
-      "cache_read": 0.05,
-      "input": 0.09,
-      "output": 0.3
+      "cache_read": 0.0425,
+      "input": 0.0765,
+      "output": 0.255
      },
      "family": "gemma",
      "id": "google/gemma-4-26b-a4b-it",
@@ -11889,9 +11975,9 @@
     "minimax/minimax-m3.1-flash": {
      "canonical_model_id": "minimax/MiniMax-M3.1-Flash",
      "cost": {
-      "cache_read": 0.015,
-      "input": 0.15,
-      "output": 0.6
+      "cache_read": 0.0075,
+      "input": 0.075,
+      "output": 0.3
      },
      "family": "minimax",
      "id": "minimax/minimax-m3.1-flash",
@@ -12694,9 +12780,9 @@
     "moonshotai/kimi-k2.7-code": {
      "canonical_model_id": "moonshotai/kimi-k2.7-code",
      "cost": {
-      "cache_read": 0.16,
+      "cache_read": 0.12,
       "input": 0.6,
-      "output": 3.5
+      "output": 3
      },
      "family": "kimi-k2",
      "id": "moonshotai/kimi-k2.7-code",
@@ -15839,15 +15925,14 @@
     "openai/gpt-oss-120b": {
      "canonical_model_id": "openai/gpt-oss-120b",
      "cost": {
-      "cache_read": 0.075,
-      "input": 0.15,
-      "output": 0.6
+      "input": 0.09,
+      "output": 0.36
      },
      "family": "gpt-oss",
      "id": "openai/gpt-oss-120b",
      "limit": {
       "context": 131072,
-      "output": 65536
+      "output": 117964
      },
      "modalities": {
       "input": [
@@ -17019,14 +17104,14 @@
     "qwen/qwen3.5-27b": {
      "canonical_model_id": "alibaba/qwen3.5-27b",
      "cost": {
-      "input": 0.195,
-      "output": 1.56
+      "input": 0.26,
+      "output": 2.6
      },
      "family": "qwen",
      "id": "qwen/qwen3.5-27b",
      "limit": {
       "context": 262144,
-      "output": 65536
+      "output": 81920
      },
      "modalities": {
       "input": [
@@ -17117,15 +17202,14 @@
     "qwen/qwen3.5-9b": {
      "canonical_model_id": "alibaba/qwen3.5-9b",
      "cost": {
-      "cache_read": 0.138,
-      "input": 0.154,
-      "output": 0.226
+      "input": 0.17,
+      "output": 0.25
      },
      "family": "qwen",
      "id": "qwen/qwen3.5-9b",
      "limit": {
       "context": 262144,
-      "output": 40960
+      "output": 235929
      },
      "modalities": {
       "input": [
@@ -18806,44 +18890,6 @@
      "release_date": "2026-11-05",
      "tool_call": true
     },
-    "thinkingmachines/inkling-2-small:free": {
-     "canonical_model_id": "thinkingmachines/inkling-2-small",
-     "cost": {
-      "input": 0,
-      "output": 0
-     },
-     "family": "ling",
-     "id": "thinkingmachines/inkling-2-small:free",
-     "limit": {
-      "context": 1048576,
-      "output": 131072
-     },
-     "modalities": {
-      "input": [
-       "text",
-       "image"
-      ],
-      "output": [
-       "text"
-      ]
-     },
-     "name": "Inkling 2 Small (free)",
-     "reasoning": true,
-     "reasoning_options": [
-      {
-       "type": "effort",
-       "values": [
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "max"
-       ]
-      }
-     ],
-     "release_date": "2026-11-05",
-     "tool_call": true
-    },
     "thinkingmachines/inkling-small": {
      "canonical_model_id": "thinkingmachines/inkling-small",
      "cost": {
@@ -19411,51 +19457,6 @@
      "release_date": "2026-09-21",
      "tool_call": true
     },
-    "x-ai/grok-build-0.1": {
-     "canonical_model_id": "xai/grok-build-0.1",
-     "cost": {
-      "cache_read": 0.2,
-      "context_over_200k": {
-       "cache_read": 0.4,
-       "input": 2,
-       "output": 4
-      },
-      "input": 1,
-      "output": 2,
-      "tiers": [
-       {
-        "cache_read": 0.4,
-        "input": 2,
-        "output": 4,
-        "tier": {
-         "size": 200000,
-         "type": "context"
-        }
-       }
-      ]
-     },
-     "family": "grok-build",
-     "id": "x-ai/grok-build-0.1",
-     "limit": {
-      "context": 256000,
-      "output": 230400
-     },
-     "modalities": {
-      "input": [
-       "text",
-       "image",
-       "pdf"
-      ],
-      "output": [
-       "text"
-      ]
-     },
-     "name": "Grok Build 0.1",
-     "reasoning": true,
-     "reasoning_options": [],
-     "release_date": "2026-04-16",
-     "tool_call": true
-    },
     "xiaomi/mimo-v2.5": {
      "canonical_model_id": "xiaomi/mimo-v2.5",
      "cost": {
@@ -19941,9 +19942,9 @@
     "z-ai/glm-5.2": {
      "canonical_model_id": "zhipuai/glm-5.2",
      "cost": {
-      "cache_read": 0.006,
-      "input": 0.007,
-      "output": 6.8
+      "cache_read": 0.14,
+      "input": 0.62,
+      "output": 2.42
      },
      "family": "glm",
      "id": "z-ai/glm-5.2",
@@ -20365,9 +20366,9 @@
     },
     "~deepseek/deepseek-flash-latest": {
      "cost": {
-      "cache_read": 0.0015,
-      "input": 0.035,
-      "output": 0.15
+      "cache_read": 0.01,
+      "input": 0.036,
+      "output": 0.5
      },
      "family": "deepseek-flash",
      "id": "~deepseek/deepseek-flash-latest",
@@ -20402,8 +20403,8 @@
     },
     "~deepseek/deepseek-pro-latest": {
      "cost": {
-      "cache_read": 0.0999,
-      "input": 0.0999,
+      "cache_read": 0.2,
+      "input": 0.198,
       "output": 8
      },
      "family": "deepseek",
@@ -20438,15 +20439,15 @@
     },
     "~deepseek/deepseek-v4-flash-latest": {
      "cost": {
-      "cache_read": 0.035,
-      "input": 0.055,
-      "output": 0.3
+      "cache_read": 0.015,
+      "input": 0.06,
+      "output": 0.18
      },
      "family": "deepseek",
      "id": "~deepseek/deepseek-v4-flash-latest",
      "limit": {
       "context": 1048576,
-      "output": 943718
+      "output": 384000
      },
      "modalities": {
       "input": [
@@ -20576,7 +20577,7 @@
     "~moonshotai/kimi-latest": {
      "cost": {
       "cache_read": 0.18,
-      "input": 0.1824,
+      "input": 0.1805,
       "output": 11.0055
      },
      "family": "kimi",
@@ -21404,50 +21405,6 @@
      "release_date": "2026-09-21",
      "tool_call": true
     },
-    "grok-build-0.1": {
-     "cost": {
-      "cache_read": 0.2,
-      "context_over_200k": {
-       "cache_read": 0.4,
-       "input": 2,
-       "output": 4
-      },
-      "input": 1,
-      "output": 2,
-      "tiers": [
-       {
-        "cache_read": 0.4,
-        "input": 2,
-        "output": 4,
-        "tier": {
-         "size": 200000,
-         "type": "context"
-        }
-       }
-      ]
-     },
-     "family": "grok-build",
-     "id": "grok-build-0.1",
-     "limit": {
-      "context": 256000,
-      "output": 256000
-     },
-     "modalities": {
-      "input": [
-       "text",
-       "image",
-       "pdf"
-      ],
-      "output": [
-       "text"
-      ]
-     },
-     "name": "Grok Build 0.1",
-     "reasoning": true,
-     "reasoning_options": [],
-     "release_date": "2026-04-16",
-     "tool_call": true
-    },
     "grok-imagine-image": {
      "canonical_model_id": "xai/grok-imagine-image",
      "family": "grok",
@@ -22219,6 +22176,6 @@
  "source": {
   "api": "https://models.dev/api.json",
   "labs": "https://models.dev/models.json",
-  "sha256": "e8b14e9fca144945d3c814a2f1a5ed836b66443032c5a2effc76c004caa22dfd"
+  "sha256": "c7c99379a151f70d2af474a8f59c06f32a0d77eb095d80eefd7d8833bfb758b1"
  }
 }
