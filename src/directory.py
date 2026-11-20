@@ -897,13 +897,15 @@ def layer(config: dict, *, ready: Callable[[dict, dict], bool], keep: frozenset[
         same_provider = [other for other in successor if other.provider == item.provider]
         choices = same_provider or successor
         retired[item.row["name"]] = choices[0].row["name"] if choices else None
-    # Each base model's first route gets a Pi-safe shortcut when corrections gave it none:
-    # gpt-6.2-sol -> gpt62sol (letters and digits, as pi-catalog requires).
+    # Each base model gets a Pi-safe shortcut when corrections gave it none (gpt-6.2-sol ->
+    # gpt62sol: letters and digits, as pi-catalog requires), on its bare-named route, which
+    # answers in the provider order, else on its first route.
     aliased: set[str] = set()
     aliases: dict[str, str] = {}
+    bare = {item.row["base_model"] for item in loaded if item.row["name"] == item.row["base_model"]}
     for item in loaded:
         base = item.row["base_model"]
-        if base in aliased:
+        if base in aliased or (base in bare and item.row["name"] != base):
             continue
         aliased.add(base)
         shortcut = re.sub(r"[^a-z0-9]", "", base)

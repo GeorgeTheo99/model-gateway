@@ -620,7 +620,8 @@ def test_plan_models_come_from_the_v2_api_in_the_v1_shape(corrections):
     assert key_row["name"] == "gpt-6.1-sol" and key_row["alternate_ids"] == ["gpt-6.1-sol-openai"]
     found = directory.layer({}, ready=_ready("chatgpt", "openai"), snapshot=snapshot, corrections=corrections)
     assert [row["name"] for row in found.rows] == ["gpt-6.1-sol-chatgpt", "gpt-6.1-sol"]
-    assert found.rows[0]["alias"] == "gpt61sol"
+    # Pi's shortcut names the bare route, which answers in the provider order (the plan first).
+    assert [row.get("alias") for row in found.rows] == [None, "gpt61sol"]
 
 
 def test_a_failed_plan_list_keeps_the_plan_models_the_snapshot_had(corrections, state_dir):
