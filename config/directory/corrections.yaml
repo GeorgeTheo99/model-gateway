@@ -129,6 +129,8 @@ rules:
       alias: glm53fw
       alternate_ids: [glm-5.3]
       display_name: GLM 5.3 (Fireworks)
+      # models.dev says 1048573; glm-5.3-spot-fw (onboarding) must match it for Open Best's spot tier.
+      context: 1048576
       max_output_tokens: 131072
       thinking_levels: [minimal, low, medium, high, xhigh, max]
   - match: {provider: fireworks, id: accounts/fireworks/models/glm-5p3-flash}
@@ -136,6 +138,7 @@ rules:
       alias: glm53flashfw
       alternate_ids: [glm-5.3-flash]
       display_name: GLM 5.3 Flash (Fireworks)
+      context: 1048576
       max_output_tokens: 131072
       thinking_levels: [minimal, low, medium, high, xhigh, max]
       pi: {aliases: [glm53flash]}

@@ -665,3 +665,30 @@ def test_a_bare_name_is_served_in_provider_order_and_the_plan_steps_aside_after_
 def test_a_route_name_that_is_not_its_base_model_is_never_rerouted(monkeypatch):
     _plan_catalog(monkeypatch)
     assert providers.base_model_route("gpt-6.1-sol-chatgpt") is None
+
+
+def test_shipped_spot_routes_match_their_directory_primary(corrections):
+    """A models.dev value the onboarding spot row does not share (GLM 5.3's context, 2026-11-20)
+    breaks every profile that prefers spot until re-registered, so corrections keep them equal."""
+    from src import profiles
+
+    snapshot = json.loads(directory.BUNDLED_SNAPSHOT.read_text())
+    dev_provider = corrections.providers["fireworks"]["models_dev"]
+    mapped = {
+        model_id: directory.map_model(dev_provider, model, snapshot, corrections).row
+        for model_id, model in snapshot["providers"][dev_provider]["models"].items()
+    }
+    onboarding = {
+        row["name"]: row
+        for path in (directory._PACKAGE_DIR.parent / "onboarding").glob("*.yaml")
+        for row in (yaml.safe_load(path.read_text()).get("models") or [])
+        if row.get("provider") == "fireworks"
+    }
+    spots = [row for row in onboarding.values() if row.get("spot_of")]
+    assert spots
+    for spot in spots:
+        primary = mapped.get(onboarding[spot["spot_of"]]["provider_model_id"])
+        assert primary, spot["name"]
+        for field in profiles._SPOT_MATCH_FIELDS:
+            if field in primary and field in spot:
+                assert primary[field] == spot[field], (spot["name"], field)
