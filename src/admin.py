@@ -1013,14 +1013,18 @@ async def admin_discover_provider_models(provider_id: str, request: Request):
     """List upstream model ids from the provider's /models endpoint.
 
     Read-only upstream probe (no config writes). Marks which ids are already
-    registered in the catalog so the UI can offer only new ones.
+    registered in the catalog so the UI can offer only new ones. A models:register
+    credential may list its own providers' models (built-in providers only), to add one.
     """
-    require_admin_auth(request)
+    principal = require_admin_or_scope(request, "models:register")
     require_admin_writes()
     import src.providers as providers
     from src.onboarding_generation import discover_models
 
     provider_id = providers._canonical_provider(provider_id.strip().lower())
+    _require_provider_scope(principal, provider_id)
+    if principal is not None and not _ownable_provider(provider_id):
+        return _onboarding_refusal(400, "unsupported_provider", "Models can't be added to this provider here")
     config = providers._load_config()
     block = providers._effective_provider_config(config, provider_id)
     if not block:
@@ -1030,7 +1034,8 @@ async def admin_discover_provider_models(provider_id: str, request: Request):
         return _bad_request("provider missing base_url")
 
     result = await asyncio.to_thread(
-        discover_models, base_url, block.get("api_key") or None
+        discover_models, base_url, block.get("api_key") or None, block.get("protocol") or "openai",
+        block.get("quirks") or (),
     )
     registered: set[str] = set()
     for entry in {id(v): v for v in providers._load_models().values()}.values():
@@ -1038,15 +1043,217 @@ async def admin_discover_provider_models(provider_id: str, request: Request):
             value = entry.get(key)
             if value:
                 registered.add(str(value))
-    models = [
-        {"id": mid, "registered": mid in registered}
-        for mid in result.get("model_ids", [])
-    ]
+    ids = [_upstream_id(provider_id, str(mid)) for mid in result.get("model_ids", [])]
+    models = [{"id": mid, "registered": mid in registered} for mid in dict.fromkeys(ids)]
     return {
         "status": result.get("status"),
         "http_status": result.get("http_status"),
         "models": models,
     }
+
+
+# ── Models a provider lists, added one at a time (docs/adr/0005-models-dev-directory.md) ──
+
+
+def _ownable_provider(provider_id: str) -> bool:
+    """A built-in provider the directory knows, other than the ChatGPT plan (its token must never go upstream
+    in a probe) and local runtimes; custom providers have their own add-model path."""
+    return provider_id in directory.load_corrections().providers and provider_id != chatgpt_auth.PROVIDER
+
+
+# A full admin's rows: parentheses keep it apart from every consumer id (auth._PRINCIPAL_ID_RE).
+ADMIN_REGISTRANT = "(admin)"
+
+
+def _registrant(principal) -> str:
+    return principal.consumer if principal is not None else ADMIN_REGISTRANT
+
+
+def _upstream_id(provider: str, model: str) -> str:
+    """The id the directory uses: Google's OpenAI-compatible list prefixes its ids with ``models/``."""
+    return model.removeprefix("models/") if provider == "google" else model
+
+
+def _owner_rows() -> list[dict]:
+    return [row for row in config_io.load_model_info().get("llm") or []
+            if isinstance(row, dict) and isinstance(row.get("registered_by"), str)]
+
+
+def _maintained(mapped: list, row: dict) -> str | None:
+    """The directory row offering the same provider model, when the directory maps one now."""
+    provider = str(row.get("provider"))
+    wanted = _upstream_id(provider, str(row.get("provider_model_id")))
+    return next((item.row["name"] for item in mapped if item.row is not None and item.provider == provider
+                 and _upstream_id(provider, item.model_id) == wanted), None)
+
+
+def _owned_row(principal, name: str) -> dict:
+    """The owner row ``name`` that ``principal`` registered (admin: any registered row); 404 or 403 otherwise."""
+    row = next((r for r in _owner_rows() if r.get("name") == name), None)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No model added from a provider's list has that name")
+    if principal is not None and row.get("registered_by") != principal.consumer:
+        raise HTTPException(status_code=403, detail="Credential did not add this model")
+    _require_provider_scope(principal, row.get("provider"))
+    return row
+
+
+def _require_unbound(name: str) -> None:
+    if name in profiles.routed_models():
+        raise HTTPException(status_code=409, detail="A registered routing profile uses this model")
+
+
+@router.post("/admin/api/providers/{provider_id}/models")
+async def admin_add_provider_model(provider_id: str, request: Request):
+    """Add one model a built-in provider lists now and the directory doesn't offer. Body: {model: upstream id}.
+
+    The row gets only the provider's facts (no price or capabilities), a name under the provider's prefix and
+    ``registered_by``; it answers a test completion before anything is written."""
+    principal = require_admin_or_scope(request, "models:register")
+    require_admin_writes()
+    import src.providers as providers
+    from src.onboarding_generation import discover_models
+
+    try:
+        body = await request.json()
+    except Exception:
+        return _bad_request("Invalid JSON body")
+    model = body.get("model") if isinstance(body, dict) else None
+    if not isinstance(model, str) or not model.strip() or len(model) > 200:
+        return _onboarding_refusal(400, "invalid_model", "Send the provider's model id as model")
+    provider_id = providers._canonical_provider(provider_id.strip().lower())
+    _require_provider_scope(principal, provider_id)
+    if not _ownable_provider(provider_id):
+        return _onboarding_refusal(400, "unsupported_provider", "Models can't be added to this provider here")
+    model = _upstream_id(provider_id, model.strip())
+    if not model:
+        return _onboarding_refusal(400, "invalid_model", "Send the provider's model id as model")
+    block = providers._effective_provider_config(providers._load_config(), provider_id)
+    if not block or not block.get("base_url") or not str(block.get("api_key") or "").strip():
+        return _onboarding_refusal(409, "provider_not_ready", "Connect this provider first")
+    mapped, _, _ = await run_in_threadpool(_directory_mapped)
+    offered = _maintained(mapped, {"provider": provider_id, "provider_model_id": model})
+    if offered is not None:
+        return _onboarding_refusal(409, "in_directory", f"The catalog offers this model as {offered}: turn that on instead")
+    if any(catalog_row.get("provider") == provider_id and catalog_row.get("provider_model_id") == model
+           for catalog_row in {id(v): v for v in providers._load_models().values()}.values()):
+        return _onboarding_refusal(409, "already_added", "This model is already in the catalog")
+    listed = await asyncio.to_thread(discover_models, block["base_url"], block.get("api_key"),
+                                     block.get("protocol") or "openai", block.get("quirks") or ())
+    if model not in {_upstream_id(provider_id, str(found)) for found in listed.get("model_ids") or []}:
+        if listed.get("status") != "verified":
+            return _onboarding_refusal(502, "listing_failed", f"The provider's model list failed ({listed.get('status')})")
+        return _onboarding_refusal(400, "model_not_listed", "The provider doesn't list that model")
+    row = directory.owner_row(provider_id, model, directory.load_corrections())
+    error = await asyncio.to_thread(directory.smoke_test, row, block)
+    if error:
+        key = str(block.get("api_key") or "")
+        return _onboarding_refusal(400, "upstream_rejected", (error.replace(key, "[redacted]") if key else error)[:500])
+    plan: dict = {}
+
+    def precondition():
+        # Again under the lock: a directory sync may have mapped it meanwhile, and the own row would shadow it.
+        if _maintained(_directory_mapped()[0], row) is not None:
+            raise HTTPException(status_code=409, detail="The catalog offers this model now: turn that on instead")
+        taken: set[str] = set()
+        for entry in _catalog_rows() + list({id(v): v for v in providers._load_models().values()}.values()):
+            try:
+                taken.update(entry_routable_ids(entry))
+            except ValueError:
+                continue
+        name = custom_providers.model_name_for(provider_id, model, taken)
+        _require_model_absent(name, row)  # also refuses a retired or hidden name and a federation peer's
+        plan["entry"] = {"name": name, **row, "registered_by": _registrant(principal)}
+
+    try:
+        _result, reload_error = _apply_registry_mutation(
+            lambda: config_io.add_onboarded_models(provider_id, define=None, api_key=None, models=[plan["entry"]]),
+            precondition=precondition,
+        )
+    except HTTPException as exc:
+        code = ("already_added" if exc.status_code == 412 else "in_directory" if "catalog offers" in str(exc.detail)
+                else "refused")
+        return _onboarding_refusal(exc.status_code, code, str(exc.detail))
+    except (ValueError, OSError) as exc:
+        log.warning("adding %s on %s failed: %s", model, provider_id, exc)
+        return _onboarding_refusal(400, "write_failed", "The model couldn't be saved")
+    if reload_error is not None:
+        log.warning("adding %s on %s was rejected: %s", model, provider_id, reload_error)
+        return _onboarding_refusal(400, "reload_rejected", "The catalog didn't accept the model")
+    catalogs = await _regenerate_catalogs()
+    return {"model": {"name": plan["entry"]["name"], "upstream_id": model}, "catalogs": catalogs}
+
+
+@router.get("/admin/api/models/registered")
+async def admin_registered_models(request: Request):
+    """Models added from a provider's list by this credential's consumer (admin: all), and the directory row
+    that now offers each, if any."""
+    principal = require_admin_or_scope(request, "models:register")
+
+    def build() -> dict:
+        mapped, _, _ = _directory_mapped()
+        return {"models": [
+            {"name": row.get("name"), "provider": row.get("provider"), "provider_model_id": row.get("provider_model_id"),
+             "display_name": row.get("display_name"), "registered_by": row.get("registered_by"),
+             "maintained": _maintained(mapped, row)}
+            for row in _owner_rows()
+            if principal is None or (row.get("registered_by") == principal.consumer
+                                     and canonical_provider(str(row.get("provider"))) in
+                                     {canonical_provider(p) for p in principal.providers})]}
+
+    return await run_in_threadpool(build)
+
+
+@router.post("/admin/api/models/{model_name}/maintained")
+async def admin_switch_to_maintained(model_name: str, request: Request):
+    """Replace a model added from a provider's list with the directory row now offering it: turn that row on and
+    remove this one, in one change (the owner row would otherwise shadow it). Returns {name: the directory row}."""
+    import src.providers as providers
+
+    principal = require_admin_or_scope(request, "models:register")
+    require_admin_writes()
+    row = _owned_row(principal, model_name)
+    _require_unbound(model_name)
+    mapped, _, _ = await run_in_threadpool(_directory_mapped)
+    twin = next((item.row for item in mapped if item.row is not None and item.row["name"] == _maintained(mapped, row)), None)
+    if twin is None:
+        return _onboarding_refusal(409, "not_in_directory", "The catalog doesn't offer this model yet")
+    block = providers._effective_provider_config(providers._load_config(), str(twin["provider"]))
+    if not block or not block.get("base_url") or not str(block.get("api_key") or "").strip():
+        return _onboarding_refusal(409, "provider_not_ready", "Connect this provider first")
+    # The directory row answers before the working row goes: a refusing one would leave nothing that works.
+    error = await asyncio.to_thread(directory.smoke_test, twin, block)
+    if error:
+        log.warning("switching %s to %s: its test completion failed: %s", model_name, twin["name"], error)
+        return _onboarding_refusal(409, "maintained_failed", "The catalog's version didn't answer its test; the model you added stays")
+    plan: dict = {}
+
+    def precondition():
+        current = _owned_row(principal, model_name)
+        _require_unbound(model_name)
+        if _maintained(_directory_mapped()[0], current) != twin["name"]:
+            raise HTTPException(status_code=409, detail="The catalog changed; try again")
+        plan["twin"] = twin["name"]
+
+    def mutate():
+        config_io.delete_model(model_name)
+        chosen = directory.settings(config_io.load_config_full())["models"]
+        result = config_io.update_directory_settings({"models": sorted({*chosen, plan["twin"]})})
+        # Hidden, its provider not ready, or its ids taken by a higher-ranked route: keep the own row instead.
+        if plan["twin"] not in {row["name"] for row in config_io.loaded_shipped_rows()}:
+            raise ValueError("The catalog can't load that model now; the model you added stays")
+        return result
+
+    try:
+        _result, reload_error = _apply_registry_mutation(mutate, precondition=precondition)
+    except ValueError as exc:
+        return _onboarding_refusal(400, "not_loadable", str(exc))
+    if reload_error is not None:
+        log.warning("switching %s to %s was rejected: %s", model_name, plan.get("twin"), reload_error)
+        return _onboarding_refusal(400, "reload_rejected", "The catalog didn't accept the change")
+    catalogs = await _regenerate_catalogs()
+    _spawn(_smoke_test_and_export(retest_failed=False))
+    return {"name": plan["twin"], "catalogs": catalogs}
 
 
 # ── models.dev directory (docs/adr/0005-models-dev-directory.md) ────────────
@@ -1517,16 +1724,26 @@ async def admin_upsert_model(model_name: str, request: Request):
 
 @router.delete("/admin/api/models/{model_name}")
 async def admin_delete_model(model_name: str, request: Request):
-    """Remove a model entry by name."""
-    require_admin_auth(request)
+    """Remove a model entry by name. A models:register credential may remove only a model its consumer added
+    from a provider's list, and none a registered routing profile uses."""
+    principal = require_admin_or_scope(request, "models:register")
     require_admin_writes()
+
+    def precondition():
+        if principal is not None:
+            _owned_row(principal, model_name)
+            _require_unbound(model_name)
+
     try:
         result, reload_error = _apply_registry_mutation(
-            lambda: config_io.delete_model(model_name)
+            lambda: config_io.delete_model(model_name), precondition=precondition,
         )
     except KeyError as exc:
         return _bad_request(str(exc), status=404)
     if reload_error is not None:
+        if principal is not None:
+            log.warning("removing %s was rejected: %s", model_name, reload_error)
+            return _bad_request("The catalog didn't accept the change")
         return _bad_request(f"Provider registry update rejected: {reload_error}")
     result["catalogs"] = await _regenerate_catalogs()
     return result

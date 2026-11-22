@@ -347,7 +347,9 @@ def _load_overlay(config_path: Path) -> list[dict]:
 
 
 # Owner-row bookkeeping (ADR 0002). ``origin`` is computed, never trusted from a file.
-OWNER_META_FIELDS = frozenset({"shipped_base", "review", "origin"})
+# registered_by: the consumer that added an owner row through its scoped key, the only one that may
+# remove it (docs/adr/0005-models-dev-directory.md, "Models a provider lists").
+OWNER_META_FIELDS = frozenset({"shipped_base", "review", "origin", "registered_by"})
 # Fields that say where a model routes. An owner row that changes one replaces the
 # lower row outright; merging the rest of a different route over it could misroute.
 ROUTE_FIELDS = ("provider", "pool", "provider_model_id", "omlx_id")

@@ -139,9 +139,14 @@ def test_manager_registers_only_new_models_for_its_providers(client):
     assert "claude-new" not in providers._load_models()
 
 
+def test_manager_removes_only_models_it_added_from_a_providers_list(client):
+    # claude-test came from the owner, not through this credential (tests/test_owner_models.py covers its own).
+    assert client.delete("/admin/api/models/claude-test", headers=MANAGER).status_code == 404
+    assert "claude-test" in providers._load_models()
+
+
 @pytest.mark.parametrize("method,path", [
     ("delete", "/admin/api/providers/fireworks"),
-    ("delete", "/admin/api/models/claude-test"),
     ("post", "/admin/api/models/claude-test/disable"),
     ("post", "/admin/api/reload"),
     ("get", "/admin/api/consumers"),

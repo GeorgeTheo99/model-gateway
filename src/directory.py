@@ -462,6 +462,31 @@ def needs_smoke_test(row: dict, smoke: dict[str, dict], *, retest_failed: bool) 
     return retest_failed and not record.get("ok")
 
 
+def owner_row(provider: str, model_id: str, corrections: Corrections) -> dict:
+    """A row for a model a provider lists that the directory doesn't map: only what the gateway knows of the
+    provider (its quirks, retention, request rules), no price or capability claims. The provider's retention
+    quirks are always applied, so the row is never laxer than the owner's policy."""
+    facts = corrections.providers[provider]
+    row: dict = {
+        "provider": provider,
+        "provider_model_id": model_id,
+        "display_name": f"{model_id} ({facts['display_name']})"[:80],
+        "desc": f"{model_id} on {facts['display_name']}, added from the provider's own model list",
+    }
+    quirks = list(facts.get("quirks") or [])
+    if facts.get("zdr"):
+        row["zdr"] = True
+    # An aggregator's id names its lab first (OpenRouter's google/…), as the directory's rules expect.
+    lab = model_id.split("/", 1)[0] if "/" in model_id else ""
+    for rule in _rules_for(corrections, provider, lab, model_id):
+        if rule.get("max_output_tokens"):
+            row["max_output_tokens"] = int(rule["max_output_tokens"])
+        quirks.extend(quirk for quirk in rule.get("quirks") or [] if quirk not in quirks)
+    if quirks:
+        row["quirks"] = quirks
+    return row
+
+
 def smoke_test(row: dict, provider_config: dict) -> str | None:
     """One cheap completion straight to the route's provider; the error, or None when it answered."""
     from src.onboarding import OnboardingError, validate_upstream_completion

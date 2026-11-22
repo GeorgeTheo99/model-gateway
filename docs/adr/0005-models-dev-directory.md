@@ -155,6 +155,31 @@ The directory is data, not catalog rows: only followed lines and turned-on model
 load (about 50 rows by default), which keeps `/v1/models/canonical` inside My AI's
 512-row and Pi's 1,000-row limits.
 
+### Models a provider lists (added 2026-11-22)
+
+When models.dev lags a provider's new model, or stops, a consumer with
+`models:register` for that provider can add the model from the provider's own
+list, one at a time:
+
+- `POST /admin/api/providers/{id}/discover` (also for that credential, built-in
+  providers only; the ChatGPT plan, local runtimes and custom providers are
+  excluded) lists the provider's ids, with protocol-aware auth headers.
+- `POST /admin/api/providers/{id}/models {model}` refuses a model the directory
+  maps (turn that row on instead), checks the provider lists it, gives it a test
+  completion before writing, and adds an owner row named under the provider's
+  prefix with only the provider's facts (its retention quirks always applied, no
+  price or capabilities) and `registered_by: <consumer>`, an owner meta field the
+  runtime row never carries. Create-only checks (routable ids, retired or hidden
+  names, federation peers) apply.
+- `GET /admin/api/models/registered` lists the consumer's rows with `maintained`:
+  the directory row that now maps the same provider model.
+- `POST /admin/api/models/{name}/maintained` turns that directory row on and
+  removes the owner row in one change (an owner row claiming the same upstream id
+  would shadow it). `DELETE /admin/api/models/{name}` lets the registrant remove
+  its own row. Neither touches a row a registered routing profile uses.
+
+Capability `owner_models.v1`.
+
 ## Migration
 
 - The curated profiles' models become directory rows: corrections give them their

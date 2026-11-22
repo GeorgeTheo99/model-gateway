@@ -29,6 +29,7 @@ CAPABILITIES = (
     "model_allowlists.v1",
     "onboarding_auto_add.v1",
     "onboarding_profiles.v1",
+    "owner_models.v1",
     "profiles.v1",
     "profile_prefer_spot.v1",
     "reasoning_tiers.v1",

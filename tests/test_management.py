@@ -1889,7 +1889,7 @@ def test_admin_discover_provider_models(client, monkeypatch):
     """Discovery lists upstream ids and marks already-registered ones."""
     import src.admin as admin_module
 
-    def fake_discover(base_url, api_key=None):
+    def fake_discover(base_url, api_key=None, protocol="openai", quirks=()):
         return {"status": "verified", "http_status": 200,
                 "model_ids": ["claude-test-1", "brand-new-model"]}
     import src.onboarding_generation as og

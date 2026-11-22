@@ -93,15 +93,18 @@ def validate_generation_inputs(provider_id: str, base_url: str, model_ids: Itera
     return provider_id, base_url, models
 
 
-def discover_models(base_url: str, api_key: str | None = None) -> dict:
-    """Observe an OpenAI-compatible /models endpoint without guessing fields."""
+def discover_models(base_url: str, api_key: str | None = None, protocol: str = "openai", quirks=()) -> dict:
+    """Observe a provider's /models endpoint without guessing fields; ``protocol`` picks its auth headers."""
+    from src.request_options import upstream_auth_headers
+
     url = f"{base_url.rstrip('/')}/models"
     headers = {
         "Accept": "application/json",
         "User-Agent": "model-gateway-onboard-generate/1",
     }
     if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+        headers.update(upstream_auth_headers(api_key, protocol, quirks))
+        headers.pop("content-type", None)
     try:
         response = httpx.get(url, headers=headers, timeout=30)
     except httpx.HTTPError as exc:
