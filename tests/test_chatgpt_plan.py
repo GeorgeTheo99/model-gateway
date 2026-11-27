@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import json
 import os
 import stat
@@ -751,6 +752,76 @@ def test_a_bare_model_name_runs_on_the_plan_first_and_on_the_key_after_a_usage_l
     # The plan's own route name still goes to the plan, limit or not.
     assert _chat(ADMIN, stream=False, model="gpt-6.1-sol-chatgpt").status_code == 429
     monkeypatch.setattr(chatgpt_auth, "_limited_until", 0.0)
+
+
+def _bare_name_catalog(monkeypatch, token_endpoint):
+    """``gpt-6.1-sol`` as a models.dev base-model name, on an OpenAI key and the signed-in plan."""
+    from src import directory
+
+    corrections = directory.load_corrections()
+    model = {"id": "gpt-6.1-sol", "name": "GPT-6.1 Sol", "reasoning": True, "tool_call": True,
+             "modalities": {"input": ["text"], "output": ["text"]}, "limit": {"context": 1000, "output": 100},
+             "cost": {"input": 2.0, "output": 10.0}, "canonical_model_id": "openai/gpt-6.1-sol",
+             "release_date": "2026-11-18"}
+    snapshot = directory.build_snapshot(
+        {"openai": {"models": {"gpt-6.1-sol": model}},
+         "openai-codex": {"models": {"gpt-6.1-sol": {**model, "cost": {"input": 0, "output": 0}}}}},
+        {"openai/gpt-6.1-sol": {"name": "GPT-6.1 Sol", "release_date": "2026-11-18"}}, corrections,
+        fetched_at="2026-11-19T00:00:00Z")
+
+    def configure():
+        _configure(monkeypatch)
+        monkeypatch.setattr(shipped, "_packaged", lambda: {})
+        monkeypatch.setattr(shipped, "_directory", lambda config, ready, keep, config_path=None: directory.layer(
+            config, ready=ready, keep=keep, snapshot=snapshot, corrections=corrections))
+    configure()
+    asyncio.run(_sign_in(token_endpoint))
+    configure()
+    monkeypatch.setattr(chatgpt_auth, "_limited_until", 0.0)
+
+
+def test_a_bare_name_is_labeled_by_the_route_that_answers_each_caller(monkeypatch, token_endpoint):
+    """A consumer the plan is granted to sees ``gpt-6.1-sol`` as the plan's model, since the plan
+    answers it; one without the grant sees the OpenAI key's (ADR 0005 provider order)."""
+    _bare_name_catalog(monkeypatch, token_endpoint)
+    assert providers.base_model_route("gpt-6.1-sol") == "gpt-6.1-sol-chatgpt"
+    client = TestClient(server.app)
+
+    def row(key, model="gpt-6.1-sol"):
+        response = client.get("/v1/models/canonical?include=display_name", headers={"Authorization": f"Bearer {key}"})
+        assert response.status_code == 200, response.text
+        return next(item for item in response.json()["data"] if item["id"] == model)
+
+    for key in (MYAI, ADMIN):
+        granted = row(key)
+        assert (granted["owned_by"], granted["display_name"]) == ("chatgpt", "GPT-6.1 Sol (ChatGPT plan)")
+    other = row(OTHER)
+    assert other["owned_by"] == "openai" and "ChatGPT plan" not in other["display_name"]
+    # The plan's own route always names the plan.
+    assert row(OTHER, "gpt-6.1-sol-chatgpt")["owned_by"] == "chatgpt"
+    # Without display_name asked for, rows keep their exact shape.
+    plain = client.get("/v1/models/canonical", headers={"Authorization": f"Bearer {MYAI}"}).json()["data"]
+    assert all("display_name" not in item for item in plain)
+    # A plan resting after a usage limit hands the name, and its label, back to the key.
+    monkeypatch.setattr(chatgpt_auth, "usage_limited", lambda: True)
+    assert row(MYAI)["owned_by"] == "openai"
+
+
+def test_a_profile_binds_a_bare_name_only_to_a_route_its_consumer_may_use(monkeypatch, token_endpoint):
+    from src import profiles
+
+    _bare_name_catalog(monkeypatch, token_endpoint)
+    manifest = {"schema_version": 1, "namespace": "myai", "source_revision": "test", "profiles": [{
+        "id": "myai/pick", "description": "pick", "locality": "cloud_explicit", "credential_policy": "gateway_managed",
+        "protocols": ["openai_chat"], "routes": {"text": "gpt-6.1-sol"}, "defaults": {}}]}
+    def no_plan(entry):
+        return entry.get("provider") != "chatgpt"
+
+    # A consumer granted the plan binds the name to it; one without binds to the key.
+    bound, _ = profiles.validate_manifest(copy.deepcopy(manifest), accept=lambda _entry: True)
+    assert bound["profiles"][0]["routes"]["text"] == "gpt-6.1-sol-chatgpt"
+    bound, _ = profiles.validate_manifest(copy.deepcopy(manifest), accept=no_plan)
+    assert bound["profiles"][0]["routes"]["text"] == "gpt-6.1-sol"
 
 
 def test_responses_clients_run_on_the_plan_with_its_rules_and_without_its_namespace(plan_upstream, monkeypatch):

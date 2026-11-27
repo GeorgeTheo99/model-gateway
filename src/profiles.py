@@ -455,7 +455,10 @@ def _binding_for(profile: dict, inventory: dict[str, dict]) -> str:
     return hashlib.sha256(_canonical_bytes(closure)).hexdigest()
 
 
-def validate_manifest(raw: object) -> tuple[dict, dict[str, str]]:
+def validate_manifest(raw: object, *, accept=None) -> tuple[dict, dict[str, str]]:
+    """The normalized manifest and its bindings. ``accept`` (an entry predicate, see
+    ``providers.resolve_base_model``) leaves out routes the registering consumer can't use, so a
+    base-model reference never binds to, say, a ChatGPT plan not granted to it."""
     if not isinstance(raw, dict):
         raise ProfileError(422, "invalid_profile_manifest", "Manifest must be an object")
     _reject_unknown(raw, _ROOT_FIELDS, "manifest")
@@ -571,7 +574,8 @@ def validate_manifest(raw: object) -> tuple[dict, dict[str, str]]:
             # profile's locality (docs/adr/0002-layered-model-catalog.md R1): for
             # trusted_local, this Mac's local route first, then a trusted peer's.
             local = profile["locality"] in _LOCAL_LOCALITIES
-            route = providers.base_model_route(model, locality="local_only" if local else profile["locality"])
+            route = providers.base_model_route(model, locality="local_only" if local else profile["locality"],
+                                               accept=accept)
             if route is None and profile["locality"] == "trusted_local" and model not in inventory:
                 peer = federation.manager().trusted_local_route(model)
                 route = peer.route_id if peer is not None else None
@@ -664,8 +668,9 @@ def local_route_models() -> set[str]:
         return _local_routes(_load(path)["namespaces"])
 
 
-def register(namespace: str, raw: object, *, if_match: str | None, if_none_match: str | None) -> tuple[dict, str, bool]:
-    manifest, bindings = validate_manifest(raw)
+def register(namespace: str, raw: object, *, if_match: str | None, if_none_match: str | None,
+             accept=None) -> tuple[dict, str, bool]:
+    manifest, bindings = validate_manifest(raw, accept=accept)
     if manifest["namespace"] != namespace:
         raise ProfileError(422, "invalid_profile_manifest", "Path namespace must match manifest namespace")
     with _lock, _file_lock(exclusive=True) as path:

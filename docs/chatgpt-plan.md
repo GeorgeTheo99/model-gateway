@@ -97,7 +97,11 @@ return 400. Each request is translated to the plan's Responses API:
 - **Provider order.** The plan is ahead of the OpenAI key in the default provider order
   ([ADR 0005](adr/0005-models-dev-directory.md)): a Chat Completions or Responses request for a
   bare model name the plan serves (`gpt-6.1-terra`) runs on the plan; `gpt-6.1-terra-openai`
-  names the key route.
+  names the key route. `/v1/models/canonical` labels a bare name by the route that would answer
+  the caller now: for a consumer granted the plan its row says `owned_by: chatgpt` and, with
+  `include=display_name`, "GPT-6.1 Terra (ChatGPT plan)"; for one without the grant, or while the
+  plan rests after a usage limit, the OpenAI key's. A routing profile binds a bare name the same
+  way, so a profile registered by a consumer without the grant never binds to the plan.
 - **Responses clients** (Pi's GPT models, for one) run on the plan with the same rules: `store`
   false and `stream` true upstream (a non-streaming client gets the finished response), leading
   `system` input moved into `instructions`, function tools and `function_call` input items put in

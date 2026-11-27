@@ -1941,6 +1941,13 @@ _LEDGER_PATHS = {"/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/i
                  *(f"{federation.LOCAL_FORWARD_PREFIX}/{name}" for name in ("chat/completions", "messages", "responses"))}
 
 
+def _provider_acceptor(request: Request):
+    """Routes whose provider this caller may use, for binding its profiles' base-model references."""
+    def accept(entry: dict) -> bool:
+        return _provider_permitted(request, catalog.canonical_provider(entry.get("provider")))
+    return accept
+
+
 def _route_acceptor(request: Request, *, plan: bool):
     """Which routes a base-model name may resolve to for this caller: ones it may use, and the
     ChatGPT plan only on Chat Completions and Responses (not Anthropic Messages)."""
@@ -2437,6 +2444,35 @@ def _canonical_model_rows(inventory: list[dict], include: frozenset[str] = froze
     return rows
 
 
+def _label_by_serving_route(rows: list[dict], request: Request) -> None:
+    """Name a base-model row after the route that answers this caller's request for it now.
+
+    The owner's provider order decides who serves a base-model name (ADR 0005): with the ChatGPT
+    plan signed in and granted to this caller, ``gpt-6.2-sol`` runs on the plan, not the OpenAI key
+    its row names. Its ``owned_by`` and ``display_name`` then say "chatgpt" and "(ChatGPT plan)",
+    so a plan model never reads as an API one. Profiles bind such names the same way.
+    """
+    accept = _route_acceptor(request, plan=True)
+    entries = {}
+    for row in rows:
+        if row["scope"] != "cloud":
+            continue
+        try:
+            route = providers.base_model_route(row["id"], accept=accept)
+        except Exception:  # noqa: BLE001 — a catalog that can't load never fails the listing; rows keep their names
+            return
+        if route is None:
+            continue
+        if not entries:
+            entries = {model.get("name"): model for model in effective_model_inventory()}
+        served = entries.get(route)
+        if served is None:
+            continue
+        row["owned_by"] = catalog.canonical_provider(served.get("effective_provider") or served.get("provider") or "")
+        if "display_name" in row:
+            row["display_name"] = _bounded_catalog_string(served.get("display_name"), limit=80) or row["display_name"]
+
+
 def _on_demand_inventory() -> list[dict]:
     """Inventory rows for the local AI models a request would install (none serves their name
     now), which load once installed."""
@@ -2602,6 +2638,7 @@ async def register_profile_snapshot(namespace: str, request: Request):
             body,
             if_match=request.headers.get("if-match"),
             if_none_match=request.headers.get("if-none-match"),
+            accept=_provider_acceptor(request),
         )
     except profiles.ProfileError as exc:
         return _profile_api_error(exc.status, exc.code, exc.message)
@@ -2836,6 +2873,7 @@ async def list_canonical_models(request: Request):
     if "modality" not in include:
         inventory = _chat_inventory(inventory)
     rows = _canonical_model_rows(inventory, include)
+    _label_by_serving_route(rows, request)
     auto_models, model_presets = _canonical_cloud_policy(inventory, rows)
     return {
         "object": "list",
