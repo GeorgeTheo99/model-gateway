@@ -105,6 +105,10 @@ CASES = [
     pytest.param("deepseek-v4-dsml", "chat", {}, True,
                  {"chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True, "reasoning_effort": "high"}},
                  id="deepseek-v4-dsml-always-default"),
+    pytest.param("inkling-chat-template", "chat", {}, True,
+                 {"chat_template_kwargs": {"reasoning_effort": "high"}}, id="inkling-ctk-always-default"),
+    pytest.param("inkling-chat-template", "chat", {"reasoning_effort": "low"}, True,
+                 {"chat_template_kwargs": {"reasoning_effort": "low"}}, id="inkling-ctk-low"),
     pytest.param("qwen", "chat", {}, True,
                  {"enable_thinking": True}, id="qwen-always-default"),
     pytest.param("deepseek", "chat", {}, True,
@@ -133,6 +137,8 @@ CASES = [
     pytest.param("deepseek-v4-dsml", "chat", {"reasoning_effort": "max"}, True,
                  {"chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True, "reasoning_effort": "max"}},
                  id="deepseek-v4-dsml-max"),
+    pytest.param("inkling-chat-template", "chat", {"reasoning_effort": "max"}, True,
+                 {"chat_template_kwargs": {"reasoning_effort": "max"}}, id="inkling-ctk-max"),
     pytest.param("qwen", "chat", {"reasoning_effort": "max"}, True,
                  {"enable_thinking": True}, id="qwen-max"),
     pytest.param("deepseek", "chat", {"reasoning_effort": "max"}, True,
@@ -1483,6 +1489,7 @@ def test_chat_native_vision_model_receives_images(client, monkeypatch):
     ("google", "gemini", "", "google-openai"),
     ("omlx", "qwen3", "", "qwen-chat-template"),
     ("omlx", "glm-5", "", "glm-chat-template"),
+    ("omlx", "inkling-2-mini-oq3e", "", "inkling-chat-template"),
     ("zai_coding", "glm-5.2", "zai", "zai"),       # explicit wins
 ])
 def test_infer_thinking_format(provider, model_id, explicit, expected):

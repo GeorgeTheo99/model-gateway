@@ -132,7 +132,7 @@ def test_status_on_a_mac_that_cannot_run_local_ai():
                      "bytes_done": 0, "bytes_total": 0, "message": "", "base_url": None, "loaded": None}
     assert models == [{"name": name, "eligible": False, "installed": False, "min_memory_gb": gb, "loaded": None,
                        "source": "release"}
-                      for name, gb in (("qwen3.8-27b", 48), ("qwen3.8-27b-4bit", 32))]
+                      for name, gb in (("qwen3.8-27b", 48), ("qwen3.8-27b-4bit", 32), ("inkling-2-mini", 24))]
     assert not lr.runtime_root().exists()  # reading status creates nothing
 
 
@@ -207,9 +207,10 @@ def test_add_refuses_to_guess_the_label_of_an_unlabelled_gateway(eligible, gatew
 
 def test_eligibility_is_per_model_and_uses_absolute_sysctl(monkeypatch):
     monkeypatch.setattr(lr, "_apple_silicon", lambda: True)
-    small = lr.MODELS["qwen3.8-27b-4bit"]
+    small, inkling = lr.MODELS["qwen3.8-27b-4bit"], lr.MODELS["inkling-2-mini"]
     for memory, any_model, eight_bit, preferred in ((48 * GIB, True, True, QWEN), (48 * GIB - 1, True, False, small),
-                                                   (32 * GIB, True, False, small), (32 * GIB - 1, False, False, QWEN)):
+                                                   (32 * GIB, True, False, small), (32 * GIB - 1, True, False, inkling),
+                                                   (24 * GIB, True, False, inkling), (24 * GIB - 1, False, False, QWEN)):
         calls = []
         monkeypatch.setattr(lr.subprocess, "check_output", lambda args, **kw: calls.append(args) or f"{memory}\n")
         monkeypatch.setattr(lr, "_memory_bytes", REAL_MEMORY_BYTES)
@@ -1637,6 +1638,75 @@ def test_a_second_model_joins_the_running_runtime_without_a_restart(eligible, ga
     assert [m.name for m in lr.installed_models()] == ["qwen3.8-27b", "qwen3.8-27b-4bit"]
 
 
+def earlier_runtime(gateway, launchctl, monkeypatch) -> tuple[list[str], bytes]:
+    """A runtime this gateway built with an earlier release's oMLX (omlx-0.7.0), serving the 8-bit model."""
+    return running_runtime(gateway, launchctl, monkeypatch), earlier_omlx()
+
+
+def earlier_omlx() -> bytes:
+    """Point the running runtime's LaunchAgent at an earlier release's oMLX build."""
+    old = lr.runtime_root() / "omlx-0.7.0"
+    (old / "bin").mkdir(parents=True)
+    (old / "bin" / "omlx").write_text("")
+    agent = lr.omlx_plist(9110)
+    agent["ProgramArguments"][0] = str(old / "bin" / "omlx")
+    write_plist(lr.omlx_plist_path(), agent)
+    return lr.omlx_plist_path().read_bytes()
+
+
+def test_an_earlier_releases_omlx_keeps_its_models_until_a_model_is_added_then_this_releases_replaces_it(
+        eligible, gateway, launchctl, monkeypatch):
+    reloads, _ = earlier_runtime(gateway, launchctl, monkeypatch)
+    # Its models are still managed (pins, removal) while it runs...
+    assert lr.runtime_ready() is True and lr.runtime_current() is False
+    # ...and adding one builds this release's oMLX, restarts it on the new build and serves every model.
+    payload = tiny_payload(SMALL_ID)
+    runs, health = [], []
+    monkeypatch.setattr(lr, "manifest", lambda local: payload if local is SMALL else REAL_MANIFEST(local))
+    monkeypatch.setattr(lr, "_run", lambda *args, env=None: runs.append(args))
+    monkeypatch.setattr(lr, "_wait_health", health.append)
+    monkeypatch.setattr(lr, "_uv", lambda: "/fake/uv")
+    lr.install(SMALL, payload)
+    assert runs[0][:2] == ("/fake/uv", "sync") and runs[1][0] == str(lr.venv_dir() / "bin/python")
+    assert plistlib.loads(lr.omlx_plist_path().read_bytes())["ProgramArguments"][0] == str(lr.venv_dir() / "bin/omlx")
+    assert ("bootstrap", f"gui/{os.getuid()}", str(lr.omlx_plist_path())) in launchctl.calls
+    assert health[0] == "http://127.0.0.1:9110/health" and reloads == []
+    assert lr.runtime_current() is True
+    settings = json.loads((lr.inference_dir() / "model_settings.json").read_text())["models"]
+    assert set(settings) == {QWEN_ID, SMALL_ID}
+    # Once the new build passes its check, the earlier one is deleted.
+    lr._prune_runtimes()
+    assert sorted(path.name for path in lr.runtime_root().glob("omlx-*")) == [lr.venv_dir().name]
+
+
+@pytest.mark.parametrize("fails", ["build", "start"])
+def test_a_failed_upgrade_puts_back_the_earlier_omlx_and_its_models(eligible, gateway, launchctl, monkeypatch, fails):
+    _, previous = earlier_runtime(gateway, launchctl, monkeypatch)
+    payload = tiny_payload(SMALL_ID)
+    monkeypatch.setattr(lr, "manifest", lambda local: payload if local is SMALL else REAL_MANIFEST(local))
+    monkeypatch.setattr(lr, "_uv", lambda: "/fake/uv")
+
+    def run(*args, env=None):
+        if fails == "build":
+            raise lr.LocalRuntimeError("uv sync failed")
+
+    def health(url):
+        raise lr.LocalRuntimeError("oMLX did not start")
+    monkeypatch.setattr(lr, "_run", run)
+    monkeypatch.setattr(lr, "_wait_health", health)
+    with pytest.raises(lr.LocalRuntimeError):
+        lr.install(SMALL, payload)
+    assert lr.omlx_plist_path().read_bytes() == previous and lr.runtime_current() is False
+    assert [path.name for path in lr.mlx_dir().iterdir()] == [QWEN_ID]  # the new payload is out of oMLX's sight
+    settings = json.loads((lr.inference_dir() / "model_settings.json").read_text())["models"]
+    assert set(settings) == {QWEN_ID}
+    bootstraps = [call for call in launchctl.calls if call[0] == "bootstrap"]
+    # A failed build never touched the running oMLX; a failed start restarts the earlier one.
+    assert len(bootstraps) == (0 if fails == "build" else 2)
+    lr._prune_runtimes()  # never while the earlier build serves
+    assert (lr.runtime_root() / "omlx-0.7.0").is_dir()
+
+
 def test_the_base_model_name_is_served_by_whichever_qwen_is_installed(gateway, launchctl, monkeypatch):
     lr._key(lr.api_key_path(), create=True)
     wire_local_ai_config(gateway)
@@ -1708,7 +1778,7 @@ def test_status_describes_each_model(eligible, monkeypatch):
     assert (value["model"], value["installed"], value["loaded"], value["state"]) == (
         "qwen3.8-27b-4bit", True, False, "done")
     assert [(row["name"], row["loaded"]) for row in value["models"]] == [
-        ("qwen3.8-27b", True), ("qwen3.8-27b-4bit", False)]
+        ("qwen3.8-27b", True), ("qwen3.8-27b-4bit", False), ("inkling-2-mini", None)]
     # A job for one model never reports as another's progress.
     lr._atomic(lr.status_path(), json.dumps({"state": "failed", "model": "qwen3.8-27b-4bit", "message": "x",
                                              "updated_at": lr._now()}))
@@ -2033,6 +2103,11 @@ def test_a_request_starts_installing_a_listed_model_and_returns_at_once(on_deman
     assert again.json()["error"]["code"] == "model_installing" and on_demand == ["qwen3.8-27b-4bit"]
 
 
+def test_a_request_never_rebuilds_an_earlier_releases_omlx(on_demand):
+    earlier_omlx()
+    assert chat("qwen3.8-27b-4bit").status_code == 404 and on_demand == []
+
+
 def test_only_listed_models_install_on_demand(on_demand, gateway):
     config = yaml.safe_load(gateway.read_text())
     config["local_ai"] = {"auto_install": []}
@@ -2242,7 +2317,7 @@ def test_a_pin_records_a_verified_manifest_and_joins_the_local_models(open_model
     local = lr.models()["tiny"]
     assert lr.manifest(local)["model_id"] == "pin-tiny"
     assert "base_model" not in local.catalog and local.settings["max_context_window"] == 8192
-    assert [row["source"] for row in lr.status()["models"]] == ["release", "release", "pin"]
+    assert [row["source"] for row in lr.status()["models"]] == ["release", "release", "release", "pin"]
     # A single-file payload verifies against the pin, and installs like a curated model.
     staged = lr.partial_dir("pin-tiny")
     staged.mkdir(parents=True)

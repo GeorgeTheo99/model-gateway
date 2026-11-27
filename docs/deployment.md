@@ -331,9 +331,15 @@ silicon, and serves any that fit side by side
 |---|---|---|
 | `qwen3.8-27b` (8-bit) | 30 GB | 48 GiB and up |
 | `qwen3.8-27b-4bit` | 16 GB | 32 GiB and up |
+| `inkling-2-mini` (3-bit oQ3e) | 13.7 GB | 24 GiB and up |
 
-Both serve base model `qwen3.8-27b`, so a request or profile naming it is
-served by whichever is installed (ADR 0002 R1).
+Both Qwen builds serve base model `qwen3.8-27b`, so a request or profile naming
+it is served by whichever is installed (ADR 0002 R1); `add` with no model gives
+a 24 to 31 GiB Mac Inkling 2 Mini, base model `inkling-2-mini`. Inkling always
+thinks: its levels are minimal to max (its chat template's `reasoning_effort`,
+`thinking_format: inkling-chat-template`). With oMLX's memory guard at a 24 GB
+Mac's GPU limit (17.7 GiB on macOS 26) a 28,769-token prompt fits its 32,768
+token window; nothing smaller than 24 GiB is offered.
 
 ```bash
 model-gateway local-ai status [MODEL] [--json]  # eligible, managed, installed, state, progress; every model
@@ -347,7 +353,7 @@ model-gateway local-ai remove [MODEL]           # one model, or (none, or the la
 `~/Library/LaunchAgents`, so it does not rerun at login). The job downloads the
 pinned payload in `local-models/` over HTTPS only (resumable, capped at
 150 Mbit/s, SHA-256 verified per file) into `local-ai/models/staging/`, outside
-oMLX's model directory, then, for the first model, builds oMLX 0.7.0 from the locked
+oMLX's model directory, then, for the first model, builds oMLX 0.8.4 from the locked
 `local-runtime/` project with uv, installs the `com.local.omlx` LaunchAgent
 (loopback, port `MODEL_GATEWAY_LOCAL_AI_PORT`, default 9110), adds the `omlx`
 provider (key file `local-ai/inference/api.key`, mode 0600, marked
@@ -357,7 +363,12 @@ this gateway, restarts the gateway, and requires a real completion through
 `model_settings.json`, asks oMLX to rescan (`/admin/api/reload`, which unloads
 its loaded models; the next request loads its model again), and bumps
 `local-ai/catalog-generation`, which the gateway checks every 5 seconds to
-reload its catalog. Nothing restarts. Models that a registered `local_only`
+reload its catalog. Nothing restarts, unless the running oMLX is an earlier
+release's build (`local-ai/omlx-<version>`): it keeps serving its models until
+the next `add` (never a request's on-demand install), which builds this
+release's oMLX and restarts it on that build with every model (a newer model
+may need it). If that fails, the earlier LaunchAgent and its models are put
+back; once the new build passes its check, earlier builds are deleted. Models that a registered `local_only`
 profile routes to are pinned (kept loaded); registering a profile that would
 pin more than 75% of the Mac's memory in payloads fails with
 `409 local_memory_exceeded`. oMLX keeps one request at a time

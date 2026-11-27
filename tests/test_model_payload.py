@@ -208,6 +208,27 @@ class ModelPayloadTests(unittest.TestCase):
         self.refresh_manifest()
         self.assertTrue(self.verify()["ok"])
 
+    def test_a_draft_head_beside_the_index_is_listed_and_hashed_but_not_indexed(self):
+        (self.root / "mtp.safetensors").write_bytes(b"tiny draft head")
+        self.refresh_manifest()
+        self.assertTrue(self.verify()["ok"])
+        (self.root / "mtp.safetensors").write_bytes(b"X" * len(b"tiny draft head"))
+        with self.assertRaisesRegex(verifier.VerificationError, "sha256 mismatch"):
+            self.verify()
+        # Indexed too, as some payloads do.
+        (self.root / "mtp.safetensors").write_bytes(b"tiny draft head")
+        self.write_index({"layer.0": "model-00001.safetensors", "layer.1": "shards/model-00002.safetensors",
+                          "mtp.0": "mtp.safetensors"})
+        self.refresh_manifest()
+        self.assertTrue(self.verify()["ok"])
+        self.write_index({"layer.0": "model-00001.safetensors", "layer.1": "shards/model-00002.safetensors"})
+        # Only that name: another unindexed weights file still fails.
+        (self.root / "mtp.safetensors").unlink()
+        (self.root / "extra.safetensors").write_bytes(b"tiny extra")
+        self.refresh_manifest()
+        with self.assertRaisesRegex(verifier.VerificationError, "weight_map must reference exactly"):
+            self.verify()
+
     def test_index_required(self):
         (self.root / "model.safetensors.index.json").unlink()
         self.refresh_manifest()

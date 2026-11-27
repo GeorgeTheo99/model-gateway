@@ -93,7 +93,7 @@ def _package_root() -> Path:
 PACKAGE_ROOT = _package_root()
 MODELS_DIR = PACKAGE_ROOT / "local-models"
 RUNTIME_PROJECT = PACKAGE_ROOT / "local-runtime"
-OMLX_VERSION = "0.7.0"
+OMLX_VERSION = "0.8.4"
 OMLX_LABEL = "com.local.omlx"
 SETUP_LABEL = "com.local.model-gateway.local-ai-setup"
 GATEWAY_LABEL = "com.local.model-gateway"
@@ -161,8 +161,16 @@ _QWEN_CATALOG = {
 _QWEN_SETTINGS = {"max_context_window": 32768, "max_tokens": 4096,
                   "enable_thinking": True, "preserve_thinking": True}
 
+_INKLING_CATALOG = {
+    "family": "inkling", "base_model": "inkling-2-mini",
+    "context": 32768, "max_output_tokens": 8192, "thinking": "always",
+    "thinking_levels": ["minimal", "low", "medium", "high", "max"], "thinking_format": "inkling-chat-template",
+    "vision": True, "pricing_status": "unmetered",
+}
+
 # In preference order: ``add`` without a model installs the first that fits this Mac.
-# Both serve base model qwen3.8-27b, so a profile naming it gets whichever is installed.
+# Both Qwen builds serve base model qwen3.8-27b, so a profile naming it gets whichever is installed;
+# Macs with 24 to 31 GB get Inkling 2 Mini instead.
 MODELS = {
     "qwen3.8-27b": LocalModel(
         name="qwen3.8-27b",
@@ -177,6 +185,15 @@ MODELS = {
         catalog={**_QWEN_CATALOG, "desc": "Qwen3.8-27B dense 4-bit MLX VL, served by Model Gateway local AI"},
         settings=_QWEN_SETTINGS,
         min_memory_bytes=32 * GiB,
+    ),
+    "inkling-2-mini": LocalModel(
+        name="inkling-2-mini",
+        manifest="inkling-2-mini-oq3e.json",
+        catalog={**_INKLING_CATALOG, "desc": "Inkling 2 Mini 3-bit (oQ3e) MLX VL, served by Model Gateway local AI"},
+        settings={"max_context_window": 32768, "max_tokens": 8192},
+        # Measured with oMLX's memory guard at a 24 GB Mac's GPU limit (17.7 GiB on macOS 26):
+        # a 28,769-token prompt fits; 13.7 GB of weights leave too little below 24 GB.
+        min_memory_bytes=24 * GiB,
     ),
 }
 # The model a bare ``model(None)`` names (what earlier releases always installed).
@@ -915,11 +932,23 @@ def bump_generation() -> None:
     _atomic(runtime_root() / GENERATION_FILE, secrets.token_hex(8) + "\n", runtime_root())
 
 
+def _running_omlx() -> Path | None:
+    """The oMLX executable this gateway's LaunchAgent runs (an earlier release's until a model is added)."""
+    args = (_plist(omlx_plist_path()) or {}).get("ProgramArguments") or []
+    return Path(args[0]) if args and isinstance(args[0], str) else None
+
+
 def runtime_ready() -> bool:
-    """Whether this gateway's oMLX runtime is built, loaded, and wired, so a model can join it."""
+    """Whether this gateway's oMLX runtime is built, loaded, and wired, so its models can be managed."""
     provider = (config_io.load_config_full().get("providers") or {}).get("omlx")
-    return (omlx_owner() == "gateway" and _loaded(OMLX_LABEL) and (venv_dir() / "bin" / "omlx").is_file()
+    executable = _running_omlx() if omlx_owner() == "gateway" else None
+    return (executable is not None and _loaded(OMLX_LABEL) and executable.is_file()
             and _our_provider(provider))
+
+
+def runtime_current() -> bool:
+    """Whether the running oMLX is this release's (OMLX_VERSION), so a new model can join it as is."""
+    return _running_omlx() == venv_dir() / "bin" / "omlx"
 
 
 def _pinned(names: set[str], installed: list[LocalModel]) -> list[LocalModel]:
@@ -1475,7 +1504,9 @@ def install(local: LocalModel, payload: dict) -> None:
     start it, and wire it into the gateway."""
     _require_owned()
     single_file_ok = local.manifest.startswith(PIN_PREFIX)
-    if runtime_ready():
+    # An earlier release's oMLX keeps serving its models until a model is added; then this
+    # release's is built and replaces it (a newer model may need it), serving every model.
+    if runtime_ready() and runtime_current():
         _promote(payload, single_file_ok=single_file_ok)
         try:
             _apply_settings(_promoted_models(), rescan=True)
@@ -1491,7 +1522,38 @@ def install(local: LocalModel, payload: dict) -> None:
                                                                safe_message(exc))
             raise
         return
+    if runtime_ready():
+        _upgrade(local, payload, single_file_ok=single_file_ok)
+        return
     _promote(payload, single_file_ok=single_file_ok)
+    _build_and_start(local)
+
+
+def _upgrade(local: LocalModel, payload: dict, *, single_file_ok: bool) -> None:
+    """Add a model while an earlier release's oMLX serves the others: build this release's oMLX and
+    restart on it. Any failure puts back the earlier LaunchAgent and the models it served."""
+    plist = omlx_plist_path()
+    previous = plist.read_bytes()
+    _promote(payload, single_file_ok=single_file_ok)
+    try:
+        _build_and_start(local)
+    except BaseException:
+        def restore() -> None:
+            if plist.read_bytes() != previous:  # the earlier oMLX was stopped for this release's
+                _atomic(plist, previous, base=plist.parent)
+                _bootstrap(plist, OMLX_LABEL)
+
+        for undo in (lambda: _unpromote(payload["model_id"]),
+                     lambda: _write_model_settings(_promoted_models()), restore, bump_generation):
+            try:
+                undo()
+            except Exception as exc:  # noqa: BLE001 — keep undoing; the original error is raised
+                logging.getLogger("model-gateway").warning("local AI rollback step failed: %s", safe_message(exc))
+        raise
+
+
+def _build_and_start(local: LocalModel) -> None:
+    """Build this release's oMLX, (re)start it on the promoted models and wire it into the gateway."""
     env = dict(os.environ, UV_PROJECT_ENVIRONMENT=str(venv_dir()))
     _run(_uv(), "sync", "--locked", "--no-dev", "--project", str(RUNTIME_PROJECT), env=env)
     _run(str(venv_dir() / "bin" / "python"), "-c", METAL_SMOKE)
@@ -1514,6 +1576,15 @@ def install(local: LocalModel, payload: dict) -> None:
     _bootstrap(plist, OMLX_LABEL)
     _wait_health(f"http://127.0.0.1:{omlx_port}/health")
     configure_gateway(local, omlx_port)
+
+
+def _prune_runtimes() -> None:
+    """Delete earlier releases' oMLX builds once this release's serves every model."""
+    if not runtime_current():
+        return
+    for path in runtime_root().glob("omlx-*"):
+        if path != venv_dir() and path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path, ignore_errors=True)
 
 
 def _gateway_token() -> str:
@@ -1567,9 +1638,18 @@ def _check_direct(local: LocalModel, payload: dict) -> dict:
             or provider.get("base_url") != f"http://127.0.0.1:{omlx_port}/v1"
             or not _catalog_routes(local)):
         raise LocalRuntimeError(f"The gateway does not route {local.name} to local AI")
+    level = _least_thinking(local)
     return _request(f"http://127.0.0.1:{omlx_port}/v1/chat/completions", _key(api_key_path()), {
         "model": payload["model_id"], "messages": [{"role": "user", "content": "Reply with exactly OK."}],
-        "max_tokens": 32, "chat_template_kwargs": {"enable_thinking": False}, "stream": False}, timeout=300)
+        **({"max_tokens": 32, "chat_template_kwargs": {"enable_thinking": False}} if level == "off" else
+           {"max_tokens": 1024, "chat_template_kwargs": {"reasoning_effort": level}}),
+        "stream": False}, timeout=300)
+
+
+def _least_thinking(local: LocalModel) -> str:
+    """The least thinking ``local`` allows: off, or for a model that always thinks its lowest level."""
+    levels = local.catalog.get("thinking_levels") or []
+    return levels[0] if local.catalog.get("thinking") == "always" and levels else "off"
 
 
 def check(local: LocalModel, payload: dict) -> None:
@@ -1596,7 +1676,9 @@ def check(local: LocalModel, payload: dict) -> None:
         time.sleep(2)
     completion = _request(f"{gateway}/v1/chat/completions", token, {
         "model": local.name, "messages": [{"role": "user", "content": "Reply with exactly OK."}],
-        "max_tokens": 32, "reasoning_effort": "off", "stream": False}, timeout=300)
+        # Room for the thinking a model that always thinks does first.
+        "max_tokens": 32 if _least_thinking(local) == "off" else 1024,
+        "reasoning_effort": _least_thinking(local), "stream": False}, timeout=300)
     _completion_ok(completion)
 
 
@@ -1809,8 +1891,8 @@ def on_demand_models(config: dict) -> list[LocalModel]:
     """Listed models a request may install now: this gateway's runtime exists, they fit this Mac,
     and they are not installed."""
     installed = installed_models()
-    if not installed:
-        return []  # building the runtime is never request-triggered
+    if not installed or not runtime_current():
+        return []  # building or rebuilding the runtime is never request-triggered
     memory, available = _usable_memory(), models()
     return [available[name] for name in auto_install_names(config)
             if available[name] not in installed and eligible(available[name], memory=memory)]
@@ -2022,6 +2104,7 @@ def run_job(name: str) -> None:
                 progress.update(state="installing")
                 install(local, payload)
                 check(local, payload)
+                _prune_runtimes()
             progress.update(state="done", message="")
             with contextlib.suppress(Exception):  # a profile registered while this job held the lock
                 sync_pins()

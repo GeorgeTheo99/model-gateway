@@ -27,6 +27,8 @@ class VerificationError(ValueError):
 MODEL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 HF_REPO_RE = re.compile(r"[\w.-]+/[\w.-]+", re.ASCII)
 HF_REVISION_RE = re.compile(r"[0-9a-f]{40}")
+# Weights a model directory holds beside its index: oMLX's multi-token-prediction draft head.
+SIDECAR_WEIGHTS = frozenset({"mtp.safetensors"})
 
 
 def safe_path(value: object) -> str:
@@ -172,9 +174,11 @@ def verify_payload(directory: str | Path, manifest: dict, *, single_file_ok: boo
                 or any(not key.strip() for key in weight_map)):
             raise VerificationError("index weight_map must be a nonempty object with tensor names")
         references = {safe_path(value) for value in weight_map.values()}
-        shards = {name for name in files if name.endswith(".safetensors")}
-        if not shards or references != shards:
-            raise VerificationError("index weight_map must reference exactly the manifest safetensors shards")
+        shards = {name for name in files if name.endswith(".safetensors") and name not in SIDECAR_WEIGHTS}
+        # A draft head may also be indexed; it is then a listed file like any other.
+        if not shards or references - SIDECAR_WEIGHTS != shards or not (references & SIDECAR_WEIGHTS) <= set(files):
+            raise VerificationError("index weight_map must reference exactly the manifest safetensors shards "
+                                    "(besides a draft head, mtp.safetensors)")
     except OSError:
         raise VerificationError("cannot read payload; check existence, permissions, and file types") from None
     return {"ok": True, "model_id": manifest["model_id"],

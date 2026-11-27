@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "model_id": "inkling-2-mini-oq3e",
+  "hf_repo": "mlx-community/Inkling-2-Mini-oQ3e-mtp",
+  "hf_revision": "5552e32ec7a50fa8e9b0bfe2002aab72f8b78975",
+  "license": "apache-2.0",
+  "total_bytes": 13700344753,
+  "files": [
+    {
+      "path": ".gitattributes",
+      "size_bytes": 1570,
+      "sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930"
+    },
+    {
+      "path": "README.md",
+      "size_bytes": 2202,
+      "sha256": "051766c82dcb1c6c30f1f12b3c1b4e6c322e8c707d0d59b281d1b09527a01fbc"
+    },
+    {
+      "path": "chat_template.jinja",
+      "size_bytes": 6868,
+      "sha256": "53a9035f3255945704b5857657cfb00c1165090c0641c4f782a0cbf268cc16dc"
+    },
+    {
+      "path": "config.json",
+      "size_bytes": 15233,
+      "sha256": "a5d4b22244cc253668eb209b617ba4dbae591bad41ec6389f7e0059a4fa46a55"
+    },
+    {
+      "path": "generation_config.json",
+      "size_bytes": 98,
+      "sha256": "a08737c07a65a8fdf69f7cf086576210e5aad4b241437090b26d7b0c4f7905f7"
+    },
+    {
+      "path": "model-00001-of-00003.safetensors",
+      "size_bytes": 5210355613,
+      "sha256": "2f5073870e115e83651541a125b1f12e231f1ea8d800920549fadb8dc2a4e8e8"
+    },
+    {
+      "path": "model-00002-of-00003.safetensors",
+      "size_bytes": 5262058719,
+      "sha256": "151d2d41b0c6cf1c5d8885bd0f76620804c21d0f4ba894fcbbf65ab0a8049421"
+    },
+    {
+      "path": "model-00003-of-00003.safetensors",
+      "size_bytes": 2565819942,
+      "sha256": "651d791ec135667bce1669b270899c7afea516970b4a014354fc3a863cf5bc60"
+    },
+    {
+      "path": "model.safetensors.index.json",
+      "size_bytes": 90189,
+      "sha256": "68a565a3c8561dd2ebf03a120a212e8806f61148dbd43ee3989e077c3ca63079"
+    },
+    {
+      "path": "mtp.safetensors",
+      "size_bytes": 635801416,
+      "sha256": "7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2"
+    },
+    {
+      "path": "processor_config.json",
+      "size_bytes": 461,
+      "sha256": "d7350adce18c8be4b607f261c8f0f7eabbf720bb7aaf648a43d4f8372bbacc2d"
+    },
+    {
+      "path": "special_tokens_map.json",
+      "size_bytes": 529,
+      "sha256": "c16f44b3594563d82743ddb0417a2be1bfe3e2000dfad2da4b8f32554593e1a0"
+    },
+    {
+      "path": "tokenizer.json",
+      "size_bytes": 26178678,
+      "sha256": "7f332727f9a3f093dd452a39cc978e6757627e5dad1b0673aa4e75174f236dd6"
+    },
+    {
+      "path": "tokenizer_config.json",
+      "size_bytes": 13235,
+      "sha256": "bf09342d285139fd37ce10c70878af1d52cb390e9901e10248654293a80ee636"
+    }
+  ]
+}

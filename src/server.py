@@ -1446,6 +1446,8 @@ def _infer_thinking_format(info, target_api: str) -> str:
             return "qwen-chat-template"
         if "glm" in model_id:
             return "glm-chat-template"
+        if "inkling" in model_id:
+            return "inkling-chat-template"
     if provider == "google":
         return "google-openai"
     return "openai"
@@ -1738,6 +1740,16 @@ def _apply_gateway_reasoning(req: dict, info, target_api: str = "chat", request:
             if effort and effort != "off":
                 ctk["reasoning_effort"] = "max" if effort in {"xhigh", "max"} else "high"
         req["chat_template_kwargs"] = ctk
+        if budget:
+            req["thinking_budget"] = budget
+        return bool(enabled)
+
+    if fmt == "inkling-chat-template":
+        # Inkling always thinks; its chat template takes the level by name (minimal..max here).
+        if enabled and effort and effort != "off":
+            ctk = dict(req.get("chat_template_kwargs") or {})
+            ctk["reasoning_effort"] = effort
+            req["chat_template_kwargs"] = ctk
         if budget:
             req["thinking_budget"] = budget
         return bool(enabled)
