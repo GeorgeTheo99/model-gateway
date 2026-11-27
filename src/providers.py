@@ -17,7 +17,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 import yaml
 
-from src import catalog, chatgpt_auth, shipped
+from src import catalog, chatgpt_auth, databricks_models, shipped
 from src.config_lock import config_write_lock
 from src.secret_files import read_api_key_file
 
@@ -196,6 +196,10 @@ def _pool_members(entry: dict, config: dict) -> list[str]:
     entry's provider so a config typo degrades to current behavior.
     """
     pool_name = entry.get("pool")
+    if pool_name == databricks_models.AUTO_POOL:
+        # Every Databricks workspace that serves the model (docs/adr/0006-databricks-directory.md).
+        found = [workspace for workspace, _ in databricks_models.members(entry, config)]
+        return found or [_canonical_provider(entry.get("provider") or databricks_models.PROVIDER)]
     if pool_name:
         members = _pools(config).get(str(pool_name))
         if members:
@@ -883,7 +887,12 @@ def _configured_pool_members(entry: dict, config: dict) -> list[str]:
     An owner-added provider (``managed_by: custom``) may be a local server that takes no key.
     """
     members = []
-    for member in _pool_members(entry, config):
+    if entry.get("pool") == databricks_models.AUTO_POOL:
+        # No workspace serves it: nothing to route to, whatever the fallback name.
+        declared = [workspace for workspace, _ in databricks_models.members(entry, config)]
+    else:
+        declared = _pool_members(entry, config)
+    for member in declared:
         provider_config = _effective_provider_config(config, member)
         if provider_config.get("enabled") is False:
             continue
@@ -945,6 +954,14 @@ def _availability_for_entry(model_id: str, entry: dict | None) -> dict:
     configured = _configured_pool_members(entry, config)
     if configured:
         return {"available": True, "reason": "", "model": name, "provider": configured[0], "message": ""}
+    if entry.get("pool") == databricks_models.AUTO_POOL:
+        return {
+            "available": False,
+            "reason": "no_serving_workspace",
+            "model": name,
+            "provider": provider,
+            "message": f"No Databricks workspace serves {name!r} with a passing test completion yet",
+        }
 
     # Nothing in the pool is usable — report why using the first member.
     provider_config = _effective_provider_config(config, provider)
@@ -1263,6 +1280,11 @@ def resolve(model_id: str, provider_override: str | None = None) -> ProviderInfo
                     break
             if provider != candidates[0]:
                 log.warning("pool: %r routing to %r (circuit open on %r)", model_id, provider, candidates[0])
+    return route_info(entry, model_id, provider, config)
+
+
+def route_info(entry: dict, model_id: str, provider: str, config: dict) -> ProviderInfo:
+    """The upstream route of a catalog entry on one of its providers (or pool members)."""
     provider_config = _effective_provider_config(config, provider)
 
     base_url = provider_config.get("base_url", "")
@@ -1270,6 +1292,9 @@ def resolve(model_id: str, provider_override: str | None = None) -> ProviderInfo
     protocol = provider_config.get("protocol", "openai")
 
     provider_model_id = entry.get("provider_model_id", "")
+    if entry.get("pool") == databricks_models.AUTO_POOL:
+        # A workspace may serve the model under its legacy endpoint or its Unity name.
+        provider_model_id = dict(databricks_models.members(entry, config)).get(provider, provider_model_id)
     if not provider_model_id:
         provider_model_id = entry.get("omlx_id", "")
     if not provider_model_id:

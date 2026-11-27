@@ -37,7 +37,9 @@ translation between them.
   older ones redirect to them, your provider order decides who serves a model,
   suspicious price changes wait for your approval, and each new route gets a test
   completion first ([ADR 0005](docs/adr/0005-models-dev-directory.md); the Catalog
-  tab in `/admin`).
+  tab in `/admin`). Databricks models load the same way: each one routes over every
+  configured workspace that serves it, with failover between them
+  ([ADR 0006](docs/adr/0006-databricks-directory.md)).
 - **Reasoning tiers** — a client says how hard a request is
   (`model_gateway.reasoning_tier`: none, light, normal, hard) and the gateway
   picks the served model's own level ([docs](docs/reasoning-tiers.md)).
@@ -298,6 +300,7 @@ multi-tenant isolation; run the gateway on loopback or behind a trusted proxy.
 | `docs/consumer-profiles.md` | Consumer credential, snapshot API, and profile execution contract |
 | `docs/adr/0001-consumer-profile-security.md` | Consumer-profile security boundary decision |
 | `docs/adr/0005-models-dev-directory.md` | models.dev directory, provider ranking, follow-latest model lines |
+| `docs/adr/0006-databricks-directory.md` | Databricks models from the directory, pooled over every workspace that serves them |
 | `docs/productionization-plan.md` | Admin/control-plane roadmap |
 | `docs/admin-ui-roadmap.md` | Admin UI phases (first-run wizard, runtime visibility) |
 | `PRODUCT.md` | Product definition and design principles |

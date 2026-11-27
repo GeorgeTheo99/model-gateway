@@ -43,7 +43,7 @@ from src.providers import (
     routable_ids,
     snapshot_registry as snapshot_provider_registry,
 )
-from src import bundle, chatgpt_auth, config_io, custom_providers, directory, discovery, federation, inflight, ledger, local_runtime, onboarding, profiles, shipped
+from src import bundle, chatgpt_auth, config_io, custom_providers, databricks_models, directory, discovery, federation, inflight, ledger, local_runtime, onboarding, profiles, shipped
 from src.version import CAPABILITIES, VERSION
 
 log = logging.getLogger("model-gateway")
@@ -363,6 +363,7 @@ async def admin_reload(request: Request):
     federation_status = await federation.reconfigure(config=federation_config)
     catalogs = await _regenerate_catalogs()
     discovery.refresh()
+    _spawn(_discover_databricks_and_test(stale_only=True))  # a workspace `workspace add` just configured
     return {
         "status": "ok",
         "message": "provider registry and federation reloaded",
@@ -1025,6 +1026,10 @@ async def admin_discover_provider_models(provider_id: str, request: Request):
     _require_provider_scope(principal, provider_id)
     if principal is not None and not _ownable_provider(provider_id):
         return _onboarding_refusal(400, "unsupported_provider", "Models can't be added to this provider here")
+    if provider_id == databricks_models.PROVIDER:
+        if principal is not None:  # it reaches every workspace, whatever the credential's allowlist
+            return _onboarding_refusal(403, "unsupported_provider", "Only an admin key lists Databricks workspaces")
+        return await _discover_databricks_models()
     config = providers._load_config()
     block = providers._effective_provider_config(config, provider_id)
     if not block:
@@ -1083,8 +1088,10 @@ def _maintained(mapped: list, row: dict) -> str | None:
     """The directory row offering the same provider model, when the directory maps one now."""
     provider = str(row.get("provider"))
     wanted = _upstream_id(provider, str(row.get("provider_model_id")))
+    # A Databricks model goes by its legacy endpoint name and its Unity name.
+    same = (set(databricks_models.twins(wanted)) if provider == databricks_models.PROVIDER else {wanted})
     return next((item.row["name"] for item in mapped if item.row is not None and item.provider == provider
-                 and _upstream_id(provider, item.model_id) == wanted), None)
+                 and _upstream_id(provider, item.model_id) in same), None)
 
 
 def _owned_row(principal, name: str) -> dict:
@@ -1128,6 +1135,10 @@ async def admin_add_provider_model(provider_id: str, request: Request):
     model = _upstream_id(provider_id, model.strip())
     if not model:
         return _onboarding_refusal(400, "invalid_model", "Send the provider's model id as model")
+    if provider_id == databricks_models.PROVIDER:
+        if principal is not None:  # its route reaches every workspace, whatever the credential's allowlist
+            return _onboarding_refusal(403, "unsupported_provider", "Only an admin key adds Databricks models")
+        return await _add_databricks_model(principal, model)
     block = providers._effective_provider_config(providers._load_config(), provider_id)
     if not block or not block.get("base_url") or not str(block.get("api_key") or "").strip():
         return _onboarding_refusal(409, "provider_not_ready", "Connect this provider first")
@@ -1149,6 +1160,13 @@ async def admin_add_provider_model(provider_id: str, request: Request):
     if error:
         key = str(block.get("api_key") or "")
         return _onboarding_refusal(400, "upstream_rejected", (error.replace(key, "[redacted]") if key else error)[:500])
+    return await _save_owner_row(principal, provider_id, model, row)
+
+
+async def _save_owner_row(principal, provider_id: str, model: str, row: dict, *, name_from: str | None = None):
+    """Write an owner row that answered its test completion, under the provider's prefix."""
+    from src import providers
+
     plan: dict = {}
 
     def precondition():
@@ -1161,7 +1179,7 @@ async def admin_add_provider_model(provider_id: str, request: Request):
                 taken.update(entry_routable_ids(entry))
             except ValueError:
                 continue
-        name = custom_providers.model_name_for(provider_id, model, taken)
+        name = custom_providers.model_name_for(provider_id, name_from or model, taken)
         _require_model_absent(name, row)  # also refuses a retired or hidden name and a federation peer's
         plan["entry"] = {"name": name, **row, "registered_by": _registrant(principal)}
 
@@ -1182,6 +1200,154 @@ async def admin_add_provider_model(provider_id: str, request: Request):
         return _onboarding_refusal(400, "reload_rejected", "The catalog didn't accept the model")
     catalogs = await _regenerate_catalogs()
     return {"model": {"name": plan["entry"]["name"], "upstream_id": model}, "catalogs": catalogs}
+
+
+# ── Databricks workspaces (docs/adr/0006-databricks-directory.md) ──────────
+
+_databricks_lock = asyncio.Lock()
+
+
+def _reload_after_coverage(previous: bytes | None, *, rollback: bool = True) -> str | None:
+    """Load the catalog after workspace coverage changed; a coverage file it rejects is rolled back."""
+    with config_write_lock(config_io.CONFIG_PATH):
+        error = _reload_registry_transactionally(snapshot_provider_registry())
+        if error is not None and rollback:
+            databricks_models.restore_coverage(previous)
+            log.warning("databricks: catalog rejected the new coverage: %s", error)
+    return error
+
+
+async def _refresh_workspace_tokens() -> None:
+    """Refresh the workspaces' OAuth tokens from the CLI cache (never browser sign-in) before testing."""
+    from src import providers
+
+    for workspace in databricks_models.workspaces(providers._load_config()):
+        try:
+            await providers.ensure_fresh_oauth_token(workspace, allow_login=False)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("databricks: token refresh for %s failed: %s", workspace, exc)
+
+
+async def _discover_databricks(*, stale_only: bool, clear_failures: bool = False) -> dict:
+    """Ask every configured workspace which models it serves (cached sign-in only), then reload."""
+    async with _databricks_lock:
+        path = databricks_models.coverage_path()
+        previous = path.read_bytes() if path.exists() else None
+        result = await databricks_models.discover(stale_only=stale_only, clear_failures=clear_failures)
+        if result["changed"]:
+            result["reload_error"] = await run_in_threadpool(_reload_after_coverage, previous)
+            if result["reload_error"] is None:
+                result["catalogs"] = await _regenerate_catalogs()
+                discovery.refresh()
+    return result
+
+
+async def _discover_databricks_and_test(*, stale_only: bool) -> None:
+    """Check stale workspaces, then test new routes and routes whose failure is a day old (no-op without any)."""
+    from src import providers
+
+    if not databricks_models.workspaces(providers._load_config()):
+        return
+    await _discover_databricks(stale_only=stale_only)
+    await _smoke_test_and_export(retest_failed=False)
+
+
+def _registered_ids() -> set[str]:
+    from src import providers
+
+    registered: set[str] = set()
+    for entry in {id(v): v for v in providers._load_models().values()}.values():
+        try:
+            registered.update(entry_routable_ids(entry))
+        except ValueError:
+            continue
+    return registered
+
+
+async def _discover_databricks_models() -> dict:
+    """Every model a configured workspace serves, the workspaces serving it, and its directory route."""
+    from src import providers
+
+    result = await _discover_databricks(stale_only=False)
+    config = providers._load_config()
+    mapped, _, _ = await run_in_threadpool(_directory_mapped)
+    offered = {item.model_id: item.row["name"] for item in mapped
+               if item.row is not None and item.provider == databricks_models.PROVIDER}
+    coverage = databricks_models.load_coverage()
+    registered = await run_in_threadpool(_registered_ids)
+    serving: dict[str, list[str]] = {}
+    for workspace in databricks_models.workspaces(config):
+        for name in (coverage["workspaces"].get(workspace) or {}).get("served") or ():
+            serving.setdefault(name, []).append(workspace)
+    models = [{"id": name, "registered": name in registered, "workspaces": found,
+               "directory": next((offered[twin] for twin in databricks_models.twins(name) if twin in offered), None)}
+              for name, found in sorted(serving.items())]
+    checked = [summary for summary in result["workspaces"].values() if not summary.get("error")]
+    return {"status": "verified" if checked else ("failed" if result["workspaces"] else "not_configured"),
+            "http_status": None, "models": models, "workspaces": result["workspaces"]}
+
+
+async def _add_databricks_model(principal, model: str):
+    """Add a model Databricks workspaces serve that the directory doesn't map: checked on every configured
+    workspace, it routes over all that serve it, each answering a test completion first."""
+    from src import providers
+
+    if not databricks_models.workspaces(providers._load_config()):
+        return _onboarding_refusal(409, "provider_not_ready", "Connect a Databricks workspace first")
+    mapped, _, _ = await run_in_threadpool(_directory_mapped)
+    offered = _maintained(mapped, {"provider": databricks_models.PROVIDER, "provider_model_id": model})
+    if offered is not None:
+        return _onboarding_refusal(409, "in_directory", f"The catalog offers this model as {offered}: turn that on instead")
+    if set(databricks_models.twins(model)) & await run_in_threadpool(_registered_ids):
+        return _onboarding_refusal(409, "already_added", "This model is already in the catalog")
+    result = await _discover_databricks(stale_only=False)
+    config = providers._load_config()
+    row = {**directory.owner_row(databricks_models.PROVIDER, model, directory.load_corrections()),
+           "pool": databricks_models.AUTO_POOL, "name": model}
+    serving = databricks_models.serving(row, config)
+    if not serving:
+        if result["workspaces"] and all(summary.get("error") for summary in result["workspaces"].values()):
+            return _onboarding_refusal(502, "listing_failed", "No Databricks workspace could list its models")
+        return _onboarding_refusal(400, "model_not_listed", "No configured Databricks workspace serves that model")
+    # An explicit add tests every workspace serving it again, earlier failures included; the results
+    # are kept for its pool.
+    databricks_models.forget_routes({key for _, _, key in serving})
+    async with _smoke_lock:
+        await asyncio.to_thread(databricks_models.test_routes, [row], config)
+    if not databricks_models.members(row, config):
+        failures = [record.get("error") for key, record in databricks_models.load_coverage()["routes"].items()
+                    if not record.get("ok") and key.split("|")[1] in databricks_models.twins(model)]
+        return _onboarding_refusal(400, "upstream_rejected",
+                                   (failures[0] if failures else "No workspace answered a test completion")[:500])
+    row.pop("name")
+    core = model.removeprefix("system.ai.").removeprefix("databricks-")
+    return await _save_owner_row(principal, databricks_models.PROVIDER, model, row, name_from=core)
+
+
+@router.get("/admin/api/databricks")
+async def admin_databricks_status(request: Request):
+    """Configured Databricks workspaces, what each was last seen serving, and each Databricks route's pool."""
+    require_admin_or_scope(request, "catalog:manage")
+    from src import providers
+
+    def build() -> dict:
+        rows = list({id(v): v for v in providers._load_models().values()}.values())
+        config = providers._load_config()
+        mapped, _, _ = _directory_mapped()
+        ids = {item.model_id for item in mapped if item.row is not None and item.provider == databricks_models.PROVIDER}
+        return {**databricks_models.status(config, rows), "unmapped": databricks_models.unmapped(config, ids)}
+
+    return await run_in_threadpool(build)
+
+
+@router.post("/admin/api/databricks/discover")
+async def admin_databricks_discover(request: Request):
+    """Ask every configured workspace which models it serves now, then test new routes."""
+    require_admin_or_scope(request, "catalog:manage")
+    require_admin_writes()
+    result = await _discover_databricks(stale_only=False, clear_failures=True)
+    await _smoke_test_and_export(retest_failed=False)
+    return result
 
 
 @router.get("/admin/api/models/registered")
@@ -1218,11 +1384,22 @@ async def admin_switch_to_maintained(model_name: str, request: Request):
     twin = next((item.row for item in mapped if item.row is not None and item.row["name"] == _maintained(mapped, row)), None)
     if twin is None:
         return _onboarding_refusal(409, "not_in_directory", "The catalog doesn't offer this model yet")
-    block = providers._effective_provider_config(providers._load_config(), str(twin["provider"]))
-    if not block or not block.get("base_url") or not str(block.get("api_key") or "").strip():
-        return _onboarding_refusal(409, "provider_not_ready", "Connect this provider first")
-    # The directory row answers before the working row goes: a refusing one would leave nothing that works.
-    error = await asyncio.to_thread(directory.smoke_test, twin, block)
+    config = providers._load_config()
+    if twin.get("pool") == databricks_models.AUTO_POOL:
+        # The directory row answers before the working row goes: a refusing one would leave nothing that works.
+        async with _smoke_lock:
+            await _refresh_workspace_tokens()
+            changed = await asyncio.to_thread(databricks_models.test_routes, [twin], providers._load_config())
+        if changed:
+            await run_in_threadpool(_reload_after_coverage, None, rollback=False)
+        error = None if databricks_models.members(twin, providers._load_config()) else \
+            "No Databricks workspace serving it answered its test completion"
+    else:
+        block = providers._effective_provider_config(config, str(twin["provider"]))
+        if not block or not block.get("base_url") or not str(block.get("api_key") or "").strip():
+            return _onboarding_refusal(409, "provider_not_ready", "Connect this provider first")
+        # The directory row answers before the working row goes: a refusing one would leave nothing that works.
+        error = await asyncio.to_thread(directory.smoke_test, twin, block)
     if error:
         log.warning("switching %s to %s: its test completion failed: %s", model_name, twin["name"], error)
         return _onboarding_refusal(409, "maintained_failed", "The catalog's version didn't answer its test; the model you added stays")
@@ -1304,7 +1481,8 @@ async def admin_directory_status(request: Request):
             "default_ranking": list(corrections.ranking),
             "provider_policy": directory.provider_policy(config),
             "providers": [{"id": provider, "display_name": facts["display_name"],
-                           "ready": provider in directory.ready_providers(config, corrections, shipped.provider_ready)}
+                           "ready": provider in directory.ready_providers(config, corrections, shipped.provider_ready)
+                           or (bool(facts.get("workspaces")) and bool(databricks_models.workspaces(config)))}
                           for provider, facts in corrections.providers.items()],
             "loaded": sorted(row["name"] for row in found.entries
                              if (row.get("origin") or {}).get("profile") == "models.dev"),
@@ -1380,6 +1558,18 @@ async def admin_directory_settings(request: Request):
         return _bad_request("Invalid JSON body")
     if not isinstance(body, dict):
         return _bad_request("Settings must be an object")
+    from src import providers
+
+    try:
+        config_io.update_directory_settings(body, dry_run=True)
+    except ValueError as exc:
+        return _bad_request(str(exc))
+    if (body.get("models") is not None or body.get("lines") is not None) and \
+            databricks_models.workspaces(providers._load_config()):
+        try:  # a Databricks model turned on is checked on every workspace
+            await _discover_databricks(stale_only=False)
+        except Exception as exc:  # noqa: BLE001 — the settings change never depends on a workspace
+            log.warning("databricks: coverage check before a settings change failed: %s", exc)
     try:
         result, reload_error = _apply_registry_mutation(lambda: config_io.update_directory_settings(body))
     except ValueError as exc:
@@ -1425,11 +1615,15 @@ def _smoke_test_directory(retest_failed: bool) -> bool:
 
     config = providers._load_config()
     smoke = directory.load_state().get("smoke") or {}
+    # A Databricks route is tested per workspace and joins the model's pool when it answers; one that
+    # fails leaves only that workspace out.
+    pools_changed = databricks_models.test_routes(
+        list({id(v): v for v in providers._load_models().values()}.values()), config)
     results = {}
     for entry in _directory_entries():
         # The ChatGPT plan has no key to check: its sign-in state is its availability, and it runs
         # only through the Responses translation (src/chatgpt_responses.py).
-        if entry.get("provider") == chatgpt_auth.PROVIDER:
+        if entry.get("provider") == chatgpt_auth.PROVIDER or entry.get("pool") == databricks_models.AUTO_POOL:
             continue
         if directory.needs_smoke_test(entry, smoke, retest_failed=retest_failed):
             provider_config = providers._effective_provider_config(config, str(entry["provider"]))
@@ -1437,7 +1631,8 @@ def _smoke_test_directory(retest_failed: bool) -> bool:
             results[entry["name"]] = (directory.smoke_key(entry), error)
             if error:
                 log.warning("directory: %s failed its test completion: %s", entry["name"], error)
-    if not results or not directory.record_smoke(results):
+    smoke_changed = bool(results) and directory.record_smoke(results)
+    if not (pools_changed or smoke_changed):
         return False
     with config_write_lock(config_io.CONFIG_PATH):
         error = _reload_registry_transactionally(snapshot_provider_registry())
@@ -1447,8 +1642,14 @@ def _smoke_test_directory(retest_failed: bool) -> bool:
     return True
 
 
+_smoke_lock = asyncio.Lock()
+
+
 async def _smoke_test_and_export(retest_failed: bool) -> None:
-    if await run_in_threadpool(_smoke_test_directory, retest_failed):
+    async with _smoke_lock:  # one test pass at a time: no route is tested (and paid for) twice
+        await _refresh_workspace_tokens()
+        changed = await run_in_threadpool(_smoke_test_directory, retest_failed)
+    if changed:
         await _regenerate_catalogs()
         discovery.refresh()
 
@@ -1458,6 +1659,7 @@ async def _sync_directory_and_export() -> dict:
     if state.get("changed") and not state.get("error"):
         state["catalogs"] = await _regenerate_catalogs()
         discovery.refresh()
+    await _discover_databricks(stale_only=False)
     if not state.get("error"):
         await _smoke_test_and_export(retest_failed=True)
     return state
@@ -1506,10 +1708,15 @@ async def watch_directory(check_seconds: float = DIRECTORY_CHECK_SECONDS,
 
     await asyncio.sleep(first_check_seconds)
     try:
+        await _discover_databricks(stale_only=True)  # a workspace added, changed or unchecked for a day
         await _smoke_test_and_export(retest_failed=False)  # routes a release or restart newly loads
     except Exception as exc:  # noqa: BLE001
         log.warning("directory test completions failed: %s", exc)
     while True:
+        try:
+            await _discover_databricks_and_test(stale_only=True)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("databricks coverage check failed: %s", exc)
         try:
             if (directory.settings(providers._load_config())["sync"] == "daily"
                     and directory.sync_due(directory.load_state())):

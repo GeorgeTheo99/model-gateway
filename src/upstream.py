@@ -536,6 +536,8 @@ class PoolContext:
     api_key: str            # that provider's credential as sent in headers
     protocol: str = "openai"
     api_style: str = ""
+    provider_model_id: str = ""  # the upstream id the prepared body names
+
 
 
 def _fallback_endpoint(endpoint: str, requested_model: str, fallback_model: str) -> str:
@@ -687,7 +689,13 @@ async def _send_with_pool(
         wired = _rewire_for_provider(pool, endpoint, headers, info)
         if wired is None:
             return None
-        return info, *wired
+        body = json
+        # A member may serve the model under another name (a Databricks workspace's legacy
+        # endpoint vs its Unity model service): the body names the member's own.
+        if (pool.provider_model_id and info.provider_model_id != pool.provider_model_id
+                and isinstance(json, dict) and json.get("model") == pool.provider_model_id):
+            body = {**json, "model": info.provider_model_id}
+        return info, *wired, body
 
     candidates = [provider, *_pool_failover_candidates(pool)]
     resp = None
@@ -696,14 +704,17 @@ async def _send_with_pool(
     try:
         for index, candidate in enumerate(candidates):
             await _raise_if_disconnected(request)
-            cand_endpoint, cand_headers = endpoint, headers
+            cand_endpoint, cand_headers, cand_json = endpoint, headers, json
             if index:
                 # Resolve just in time: a concurrent OAuth refresh/config reload
                 # may have changed this workspace while the primary was running.
                 route = candidate_route(candidate)
                 if route is None:
                     continue
-                _, cand_endpoint, cand_headers = route
+                info, cand_endpoint, cand_headers, cand_json = route
+                ctx = getattr(request.state, "ledger_ctx", None) if request is not None else None
+                if isinstance(ctx, dict) and pool is not None and pool.provider_model_id:
+                    ctx["provider_model_id"] = info.provider_model_id  # the upstream id this member serves
                 if resp is not None:
                     # No need to drain an error body on a discarded route.
                     await resp.aclose()
@@ -721,7 +732,7 @@ async def _send_with_pool(
             previous = candidate
             try:
                 resp = await send(
-                    client, cand_endpoint, json=json, headers=cand_headers,
+                    client, cand_endpoint, json=cand_json, headers=cand_headers,
                     provider=candidate, request=request, fast_failover=fast_failover,
                 )
             except asyncio.CancelledError:

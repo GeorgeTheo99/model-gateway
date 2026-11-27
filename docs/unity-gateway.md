@@ -70,4 +70,10 @@ Responses compatibility. Do not use `--style auto` for a Unity-only migration:
 it may fall back to legacy invocations. Use explicit, verified private config
 until those workflows support Unity model-service discovery end to end.
 
+Models the models.dev directory lists need none of this hand configuration: a
+workspace with Unity path prefixes is asked for its model services and serving
+endpoints. Each directory model then routes over every workspace that serves it,
+under the name that workspace uses
+([ADR 0006](adr/0006-databricks-directory.md)).
+
 Reference: [Query model APIs (model services)](https://docs.databricks.com/aws/en/ai-gateway/query-model-services).

@@ -2032,6 +2032,7 @@ def _set_ledger_ctx(request: Request, model: str, info, is_stream: bool = False)
         api_key=info.api_key,
         protocol=info.protocol,
         api_style=getattr(info, "api_style", ""),
+        provider_model_id=info.provider_model_id,
     )
 
 

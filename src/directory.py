@@ -109,8 +109,13 @@ def load_corrections(path: Path = CORRECTIONS_PATH) -> Corrections:
 # ── Snapshot ───────────────────────────────────────────────────────────────
 
 
-def _trim_model(model: dict) -> dict:
-    return {key: model[key] for key in _MODEL_FIELDS if key in model}
+def _trim_model(model: dict, *, keep_api: bool = False) -> dict:
+    trimmed = {key: model[key] for key in _MODEL_FIELDS if key in model}
+    # Databricks serves some models only through one wire API, named by the model's AI SDK package.
+    npm = (model.get("provider") or {}).get("npm") if isinstance(model.get("provider"), dict) else None
+    if keep_api and isinstance(npm, str):
+        trimmed["provider"] = {"npm": npm}
+    return trimmed
 
 
 def plan_models(v2: dict) -> dict:
@@ -162,7 +167,8 @@ def build_snapshot(api: dict, labs: dict, corrections: Corrections, *, fetched_a
         models = {}
         for model_id, model in entry["models"].items():
             if isinstance(model, dict) and isinstance(model.get("id"), str):
-                models[model_id] = _trim_model(model)
+                models[model_id] = _trim_model(model, keep_api=bool(corrections.providers[
+                    corrections.by_models_dev_id[dev_id]].get("workspaces")))
                 if isinstance(model.get("canonical_model_id"), str):
                     referenced.add(model["canonical_model_id"])
         providers[dev_id] = {"name": entry.get("name", dev_id), "models": models}
@@ -715,6 +721,10 @@ def map_model(dev_provider: str, model: dict, snapshot: dict, corrections: Corre
         row.update(rule.get("set") or {})
     if quirks:
         row["quirks"] = quirks
+    if facts.get("workspaces"):
+        from src import databricks_models
+
+        databricks_models.bind_directory_row(row, model)
     if pinned_id and row["name"] == base and pinned_id not in (row.get("alternate_ids") or []):
         row["alternate_ids"] = [*(row.get("alternate_ids") or []), pinned_id]
     if not row.get("thinking"):
@@ -898,7 +908,17 @@ def layer(config: dict, *, ready: Callable[[dict, dict], bool], keep: frozenset[
     def rank(item: Mapped) -> tuple:
         return (order.index(item.provider) if item.provider in order else len(order), item.row["name"])
 
-    offered = sorted((item for item in mapped if item.row is not None and item.provider in serving), key=rank)
+    # A Databricks route is served when a configured workspace serves its model (src.databricks_models).
+    from src import databricks_models
+
+    coverage = databricks_models.load_coverage(config_path)
+
+    def served(item: Mapped) -> bool:
+        if item.row.get("pool") == databricks_models.AUTO_POOL:
+            return bool(databricks_models.candidates(item.row, config, coverage))
+        return item.provider in serving
+
+    offered = sorted((item for item in mapped if item.row is not None and served(item)), key=rank)
     loaded: list[Mapped] = []
     older: list[Mapped] = []
     claimed: set[str] = set()

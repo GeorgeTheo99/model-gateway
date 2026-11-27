@@ -35,10 +35,13 @@ Date: 2026-07-07
 
 ## Non-goals
 
-- Auto-exposing every serving endpoint on a workspace. The catalog stays
-  curated (context/max_output/thinking metadata is not discoverable and wrong
-  metadata = broken coding model). Discovery is used for *validation and
-  suggestions*, not live exposure.
+- ~~Auto-exposing every serving endpoint on a workspace.~~ Superseded
+  2026-11-27 by [ADR 0006](adr/0006-databricks-directory.md). models.dev now
+  lists Databricks models with prices, limits and reasoning controls, so a
+  directory model loads with correct metadata. It routes over the reserved
+  `databricks:auto` pool, which holds every configured workspace that serves
+  the model. Models the directory doesn't map are still never exposed on their
+  own: they are listed, and added one at a time.
 - Load balancing / cost-based routing. Pools are ordered failover only.
 
 ---

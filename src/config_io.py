@@ -1221,12 +1221,13 @@ def _update_catalog_names(add: dict[str, str] | None = None, remove: dict[str, s
 
 
 @_write_transaction
-def update_directory_settings(changes: dict) -> dict:
+def update_directory_settings(changes: dict, *, dry_run: bool = False) -> dict:
     """Apply owner choices for the models.dev directory (docs/adr/0005-models-dev-directory.md).
 
     ``changes`` may set ``sync``, ``lines`` (``{line: true|false|null}``; null restores the
     default), ``models`` (route names turned on), ``provider_preference`` (ranking; empty
-    restores the default) and ``provider_policy``. Returns the stored settings.
+    restores the default) and ``provider_policy``. Returns the stored settings; ``dry_run``
+    validates them without writing.
     """
     from src import directory
 
@@ -1272,6 +1273,8 @@ def update_directory_settings(changes: dict) -> dict:
     if not isinstance(ranking, list) or any(not isinstance(p, str) or not p for p in ranking) \
             or len(set(ranking)) != len(ranking):
         raise ValueError("provider_preference must be a list of distinct provider ids")
+    if dry_run:
+        return stored
     _backup(CONFIG_PATH)
     _atomic_write(CONFIG_PATH, yaml.safe_dump(candidate, sort_keys=False, default_flow_style=False))
     return stored

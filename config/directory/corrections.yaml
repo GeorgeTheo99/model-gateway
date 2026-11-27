@@ -69,12 +69,19 @@ providers:
     display_name: xAI
     base_url: https://api.x.ai/v1
     route_suffix: -xai
+  # Databricks has no single endpoint: every configured workspace that serves a model joins its
+  # pool (src/databricks_models.py, docs/adr/0006-databricks-directory.md).
+  databricks:
+    models_dev: databricks
+    display_name: Databricks
+    route_suffix: -dbx
+    workspaces: true
 
 # Default provider ranking (catalog.provider_preference overrides it): a model is served by the
 # first ready provider that offers it. The lab's own API first, with the owner's ChatGPT plan
 # ahead of the OpenAI key (owner, 2026-11-19), then Fireworks (open weights, no retention),
-# then OpenRouter.
-ranking: [anthropic, chatgpt, openai, google, fireworks, moonshot, zhipuai, deepseek, xai, openrouter]
+# then Databricks workspaces, then OpenRouter.
+ranking: [anthropic, chatgpt, openai, google, fireworks, moonshot, zhipuai, deepseek, xai, databricks, openrouter]
 
 # Lines followed by default: these labs' lines whose current model is under max_age_days old,
 # except special-purpose lines (any of exclude_words in the line).

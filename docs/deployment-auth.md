@@ -95,7 +95,9 @@ show and change the models.dev catalog settings
 ([ADR 0005](adr/0005-models-dev-directory.md)): `GET /admin/api/directory`,
 `GET /admin/api/directory/models`, `PUT /admin/api/directory/settings` (provider
 order and policy, followed lines, turned-on models), `POST
-/admin/api/directory/sync` and `POST /admin/api/directory/holds/{id}`. It needs no
+/admin/api/directory/sync`, `POST /admin/api/directory/holds/{id}`, and the Databricks
+workspace coverage `GET /admin/api/databricks` and `POST /admin/api/databricks/discover`
+([ADR 0006](adr/0006-databricks-directory.md)). It needs no
 `providers` allowlist and grants nothing else; writes need
 `MODEL_GATEWAY_ADMIN_WRITES`.
 

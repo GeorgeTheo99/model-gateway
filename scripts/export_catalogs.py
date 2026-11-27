@@ -176,7 +176,7 @@ def _drop_image_input_hint(alias_entry: dict) -> None:
         del alias_entry["pi"]
 
 
-def _effective_provider(entry: dict, config: dict) -> str:
+def _effective_provider(entry: dict, config: dict, config_path: Path = DEFAULT_CONFIG) -> str:
     """The provider a model actually routes to.
 
     Pooled models (``pool:`` with no meaningful ``provider:``) resolve to the
@@ -185,6 +185,12 @@ def _effective_provider(entry: dict, config: dict) -> str:
     from the alias file as local models with no ``omlx_id``.
     """
     pool_name = entry.get("pool")
+    if pool_name == "databricks:auto":
+        # Every Databricks workspace that serves the model (src/databricks_models.py).
+        from src import databricks_models
+
+        found = databricks_models.members(entry, config, databricks_models.load_coverage(config_path))
+        return found[0][0] if found else str(entry.get("provider") or "databricks")
     if pool_name:
         members = (config.get("pools") or {}).get(str(pool_name)) or []
         if isinstance(members, str):
@@ -224,8 +230,8 @@ def _model_available(entry: dict, provider: str, config: dict) -> bool:
     provider-level serveability) or lists the model's provider_model_id.
     """
     providers = config.get("providers")
-    if not isinstance(providers, dict) or not providers:
-        return True
+    if not isinstance(providers, dict) or not providers or entry.get("pool") == "databricks:auto":
+        return True  # a Databricks pool holds only workspaces seen serving the model
     pmid = str(entry.get("provider_model_id") or entry.get("name") or "")
     candidates = [provider]
     pool_name = entry.get("pool")
@@ -293,7 +299,7 @@ def render_model_aliases(
             continue  # image/video model: launchers and Pi catalogs are chat-only (ADR 0004)
         alias = entry.get("alias")
         supported = entry.get("supported", True)
-        provider = _effective_provider(entry, config)
+        provider = _effective_provider(entry, config, config_path)
         if not _provider_serveable(provider, config, config_path):
             continue  # this machine's gateway cannot route the model
         if not _model_available(entry, provider, config):

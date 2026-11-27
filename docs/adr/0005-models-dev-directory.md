@@ -40,7 +40,8 @@ request quirks, and our established names and aliases.
   and on demand (`POST /admin/api/directory/sync`). No LLM runs on the gateway.
 - Only providers the gateway can map are kept: `anthropic`, `openai`,
   `openrouter`, `fireworks-ai`→`fireworks`, `moonshotai`→`moonshot`, `zhipuai`
-  (open.bigmodel.cn), `google`, `deepseek`, `xai`. Specialised model types,
+  (open.bigmodel.cn), `google`, `deepseek`, `xai`, and since
+  [ADR 0006](0006-databricks-directory.md) `databricks` (pooled over the owner's workspaces). Specialised model types,
   models without text output, and `deprecated` models are not offered.
 - A sync is accepted whole or not at all. It is rejected (the last good snapshot
   stays) when it does not parse, when a mapped provider that had models has none,
